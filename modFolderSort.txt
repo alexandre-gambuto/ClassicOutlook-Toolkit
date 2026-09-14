@@ -1,0 +1,258 @@
+Option Explicit
+
+'=============================================================================
+' modFolderSort v2  (2026-08-22)
+' Purpose (EN): resets the manual (drag-and-drop) ordering of subfolders in
+'   EVERY store of the profile so that Outlook falls back to alphabetical
+'   (A-Z) ordering, i.e. the same result as right-click > "Sort subfolders
+'   A to Z" applied to every folder of every mailbox at once.
+'
+'   Mechanism : Outlook 2013+ stores manual ordering in two MAPI properties
+'   on each subfolder : PR_SORT_POSITION (0x3020, binary) and
+'   PR_SORT_PARENTID (0x3021, binary). Deleting them puts the folder back in
+'   alphabetical position (documented MFCMAPI approach). Nothing else is
+'   modified : no rename, no move, no item touched.
+'
+' FR : remet tous les sous-dossiers de toutes les boites en ordre A-Z en
+'   supprimant les proprietes de tri manuel posees par le glisser-deposer.
+'   Aucun dossier renomme, deplace ni supprime.
+'
+' Points d'entree publics :
+'   FolderSortProbe : simulation, ne modifie rien. Compte les dossiers
+'                     porteurs d'un ordre manuel, detail dans debug.log.
+'   FolderSortAZ    : Simulation / Appliquer / Annuler puis traitement.
+'
+' Limites connues :
+'   - l'arborescence peut ne se rafraichir qu'apres repli/deploiement du
+'     dossier parent, ou au redemarrage d'Outlook ;
+'   - en mode cache, la suppression est ecrite dans l'OST puis synchronisee
+'     avec Exchange (delai de quelques secondes) ;
+'   - les magasins non accessibles (dossiers publics, boites partagees en
+'     lecture seule) sont ignores et comptes en erreur.
+'
+' v2 (2026-08-22) : revue UX pop-ups.
+'   (a) Le RECAPITULATIF de fin passe en toast (modUi.Toast). Il n'appelle
+'       aucune decision : la confirmation utile a deja eu lieu AVANT, via
+'       Confirm3. Le toast porte l'essentiel (mode + nombre de dossiers
+'       remis en A-Z) ; les cinq compteurs detailles restent dans debug.log,
+'       ou ils sont de toute facon plus exploitables qu'en modale.
+'   (b) EXCEPTION CONSERVEE EN MODALE : la mention "si l'arborescence ne
+'       bouge pas, replier/deployer le parent ou redemarrer Outlook".
+'       C'est une INSTRUCTION D'ACTION, pas un compte-rendu - sans elle
+'       l'utilisateur conclut que la commande n'a rien fait alors qu'elle a
+'       reussi (limite connue du module, cf. ci-dessus). Elle n'apparait que
+'       dans le cas ou elle sert : hors simulation ET au moins un dossier
+'       reellement remis en A-Z.
+'   (c) Erreurs via modUi.Fail (garantie de premier plan).
+'   Dependance ajoutee : modUi.
+'
+' Dependances : modConfig (T), modDebugLog, modMsgBoxCustom (Confirm3), modUi.
+'=============================================================================
+
+Private Const MOD_NAME As String = "FolderSort"
+Private Const MOD_VERSION As String = "v2 - 2026-08-22"
+
+Private Const PR_SORT_POSITION As String = "http://schemas.microsoft.com/mapi/proptag/0x30200102"
+Private Const PR_SORT_PARENTID As String = "http://schemas.microsoft.com/mapi/proptag/0x30210102"
+
+' Compteurs de la passe en cours
+Private mStores As Long
+Private mFolders As Long
+Private mMarked As Long
+Private mReset As Long
+Private mErrors As Long
+Private mDryRun As Boolean
+
+'=============================================================================
+' ModVersion - version REELLEMENT chargee dans le VBE.
+'=============================================================================
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+'=============================================================================
+' FolderSortProbe  (epinglable au QAT) - simulation seule.
+'=============================================================================
+Public Sub FolderSortProbe()
+    RunPass True
+End Sub
+
+'=============================================================================
+' FolderSortAZ  (epinglable au QAT) - Simulation / Appliquer / Annuler.
+'=============================================================================
+Public Sub FolderSortAZ()
+    Dim choice As VbMsgBoxResult
+    choice = modMsgBoxCustom.Confirm3( _
+        T("Remet TOUS les sous-dossiers de TOUTES les bo~ites en ordre A-Z " & _
+          "(annule les tris manuels par glisser-d~eposer)." & vbCrLf & vbCrLf & _
+          "Aucun dossier n'est renomm~e, d~eplac~e ni supprim~e." & vbCrLf & _
+          "Simulation : compte seulement, rien n'est ~ecrit.", _
+          "Resets EVERY subfolder of EVERY mailbox to A-Z order " & _
+          "(cancels drag-and-drop manual ordering)." & vbCrLf & vbCrLf & _
+          "No folder is renamed, moved or deleted." & vbCrLf & _
+          "Dry run: counts only, nothing is written."), _
+        UiTitle(), _
+        T("&Simulation", "&Dry run"), T("&Appliquer", "&Apply"), T("A&nnuler", "&Cancel"))
+    Select Case choice
+        Case vbYes: RunPass True
+        Case vbNo:  RunPass False
+        Case Else:  Exit Sub
+    End Select
+End Sub
+
+'=============================================================================
+' RunPass - parcours de tous les magasins, puis rapport.
+'=============================================================================
+Private Sub RunPass(ByVal dryRun As Boolean)
+    Dim errNo As Long, errDesc As String
+    On Error GoTo ErrH
+    mDryRun = dryRun
+    mStores = 0: mFolders = 0: mMarked = 0: mReset = 0: mErrors = 0
+
+    modDebugLog.DInfo MOD_NAME, "Pass start dryRun=" & dryRun
+
+    Dim st As Outlook.Store
+    Dim root As Outlook.MAPIFolder
+    For Each st In Application.Session.Stores
+        Set root = Nothing
+        On Error Resume Next
+        Set root = st.GetRootFolder
+        If Err.Number <> 0 Then
+            modDebugLog.DError MOD_NAME, "Store inaccessible : " & st.DisplayName & " err " & Err.Number
+            Err.Clear
+            mErrors = mErrors + 1
+        End If
+        On Error GoTo ErrH
+        If Not root Is Nothing Then
+            mStores = mStores + 1
+            modDebugLog.DInfo MOD_NAME, "Store : " & st.DisplayName
+            ProcessTree root
+        End If
+    Next st
+
+    modDebugLog.DInfo MOD_NAME, "Pass end stores=" & mStores & " folders=" & mFolders & _
+        " marked=" & mMarked & " reset=" & mReset & " errors=" & mErrors
+
+    ' --- v2 : recapitulatif en toast --------------------------------------
+    ' Ligne 1 (gras) = le verdict, ligne 2 = le chiffre qui compte.
+    ' Les cinq compteurs detailles sont dans debug.log (cf. DInfo ci-dessus).
+    Dim msg As String
+    If dryRun Then
+        msg = T("Simulation termin~ee (rien n'a ~et~e ~ecrit).", _
+                "Dry run done (nothing written).") & vbLf & _
+              mMarked & T(" dossier(s) avec ordre manuel sur ", _
+                          " folder(s) with manual order out of ") & mFolders
+    Else
+        msg = T("Tri A-Z appliqu~e.", "A-Z sort applied.") & vbLf & _
+              mReset & T(" dossier(s) remis en A-Z sur ", _
+                         " folder(s) reset to A-Z out of ") & mFolders
+    End If
+    If mErrors > 0 Then
+        msg = msg & T(" - erreurs : ", " - errors: ") & mErrors
+    End If
+
+    modUi.Toast msg, uiInfo, True
+
+    ' --- v2 : rappel de rafraichissement, MODAL a dessein -----------------
+    ' Ce n'est pas un compte-rendu mais une instruction : sans elle,
+    ' l'utilisateur voit une arborescence inchangee et conclut a un echec.
+    If Not dryRun And mReset > 0 Then
+        modUi.Inform _
+            T("L'arborescence ne se rafra~ichit pas toujours imm~ediatement." & vbCrLf & vbCrLf & _
+              "Si l'ordre n'a pas chang~e a l'~ecran : replier puis d~eployer " & _
+              "le dossier parent, ou red~emarrer Outlook." & vbCrLf & vbCrLf & _
+              "En mode cache, la suppression est aussi synchronis~ee avec " & _
+              "Exchange (quelques secondes).", _
+              "The folder tree does not always refresh immediately." & vbCrLf & vbCrLf & _
+              "If the order has not changed on screen: collapse then expand " & _
+              "the parent folder, or restart Outlook." & vbCrLf & vbCrLf & _
+              "In cached mode, the deletion is also synchronised with " & _
+              "Exchange (a few seconds)."), _
+            UiTitle()
+    End If
+    Exit Sub
+
+ErrH:
+    errNo = Err.Number: errDesc = Err.Description
+    modDebugLog.DError MOD_NAME, "RunPass err " & errNo & " - " & errDesc
+    modUi.Fail T("Erreur : ", "Error: ") & errNo & " - " & errDesc, UiTitle()
+End Sub
+
+'=============================================================================
+' ProcessTree - recursif. Pour chaque sous-dossier : detecte / supprime les
+' proprietes de tri manuel, puis descend.
+'=============================================================================
+Private Sub ProcessTree(ByVal parentFolder As Outlook.MAPIFolder)
+    Dim i As Long
+    Dim child As Outlook.MAPIFolder
+    On Error Resume Next
+    ' Pack v3 (B7) : collection Folders evaluee une fois.
+    Dim subs As Outlook.Folders
+    Set subs = parentFolder.Folders
+    For i = 1 To subs.count
+        Set child = Nothing
+        Set child = subs.Item(i)
+        If Not child Is Nothing Then
+            mFolders = mFolders + 1
+            HandleFolder child
+            ProcessTree child
+        End If
+    Next i
+End Sub
+
+'=============================================================================
+' HandleFolder - un dossier : a-t-il un ordre manuel ? si oui et pas dry-run,
+' suppression des deux proprietes.
+'=============================================================================
+Private Sub HandleFolder(ByVal f As Outlook.MAPIFolder)
+    On Error Resume Next
+    Dim pa As Outlook.PropertyAccessor
+    Set pa = f.PropertyAccessor
+    If pa Is Nothing Then Exit Sub
+
+    Dim hasPos As Boolean, hasPar As Boolean
+    Dim v As Variant
+    Err.Clear
+    v = pa.GetProperty(PR_SORT_POSITION)
+    hasPos = (Err.Number = 0)
+    Err.Clear
+    v = pa.GetProperty(PR_SORT_PARENTID)
+    hasPar = (Err.Number = 0)
+    Err.Clear
+
+    If Not (hasPos Or hasPar) Then Exit Sub
+
+    mMarked = mMarked + 1
+    modDebugLog.DDebug MOD_NAME, "Manual order : " & f.FolderPath & _
+        " (pos=" & hasPos & " parent=" & hasPar & ")"
+    If mDryRun Then Exit Sub
+
+    Dim ok As Boolean
+    ok = True
+    If hasPos Then
+        pa.DeleteProperty PR_SORT_POSITION
+        If Err.Number <> 0 Then
+            ok = False
+            modDebugLog.DError MOD_NAME, "DeleteProperty POSITION err " & Err.Number & " on " & f.FolderPath
+            Err.Clear
+        End If
+    End If
+    If hasPar Then
+        pa.DeleteProperty PR_SORT_PARENTID
+        If Err.Number <> 0 Then
+            ok = False
+            modDebugLog.DError MOD_NAME, "DeleteProperty PARENTID err " & Err.Number & " on " & f.FolderPath
+            Err.Clear
+        End If
+    End If
+    If ok Then
+        mReset = mReset + 1
+        modDebugLog.DInfo MOD_NAME, "Reset A-Z : " & f.FolderPath
+    Else
+        mErrors = mErrors + 1
+    End If
+End Sub
+
+Private Function UiTitle() As String
+    UiTitle = T("Tri des dossiers A-Z", "Folder sort A-Z")
+End Function

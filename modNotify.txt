@@ -1,0 +1,450 @@
+Option Explicit
+
+' =====================================================================
+' modNotify v4.5
+' Purpose (EN): non-blocking, auto-closing toast notification via an external
+'   mshta.exe process (chosen after every native non-modal channel failed in
+'   the target environment). Colors and duration come from config.ini.
+'
+' Notification toast non bloquante, auto-fermee, via mshta.exe externe.
+'
+' POURQUOI mshta : tous les canaux non-modaux natifs ont ete elimines
+' par sonde dans l'environnement cible (tenant M365 restreint, un EDR
+' actif, pas d'admin) :
+'   - Explorer.StatusBar  : pilotable mais trop discret (souvent ignore).
+'   - WinRT toast          : erreur 429 (VBA n'active pas WinRT).
+'   - WScript.Shell.Popup  : le timeout d'auto-fermeture est neutralise.
+'   - Shell_NotifyIcon     : appel OK mais aucune bulle visible.
+'   - mshta.exe externe     : VALIDE. Processus separe (non bloquant pour
+'                            Outlook), auto-fermeture geree par le HTA
+'                            lui-meme (window.setTimeout), independante du
+'                            timeout Popup. Apparait en bas-droite.
+'
+' PRINCIPE : on ecrit un fichier .hta A NOM UNIQUE dans %TEMP% (les
+' anciens sont purges a chaque appel : pas d'accumulation, v4.2), puis on
+' le lance via WScript.Shell
+' .Run en mode non bloquant (3e parametre = False). VBA rend la main
+' immediatement. Le HTA s'affiche puis se ferme seul apres g_ToastDurationMs.
+'
+' v4.5 (2026-08-18) : NotifyEx - parametre soundPath (chemin local d'un
+'   .wav). Le son est joue PAR LE HTA (balise <bgsound>, moteur IE de mshta),
+'   donc par le processus mshta.exe et non par Outlook : contourne les cas
+'   ou la sortie audio du processus Outlook est muette (mixeur / routage).
+'   Vide = pas de son (comportement inchange pour tous les appels existants).
+'
+' v4.4 (2026-08-18) : NotifyEx(message, borderColor, durationMs, heightPx,
+'   boldFirstLine) - variante multi-lignes (vbLf -> <br>), duree et hauteur
+'   par appel, premiere ligne en gras optionnelle. Utilisee par
+'   modInboxAlert (alertes nouveau mail par boite). Notify delegue a NotifyEx
+'   avec les valeurs historiques (72 px, ToastDurationMs). Le positionnement
+'   bas-droite tient compte de la hauteur reelle du toast.
+'
+' v4.3 (2026-07-05) : lecture config via getters modConfig (g_Toast* ->
+'   ToastEnabled()/ToastColor*()/ToastDurationMs()/ToastKeptInSent(),
+'   EnsureLoaded-safe). L'appel EnsureLoaded en tete de Notify (v4.2)
+'   devient une ceinture de securite redondante, conserve.
+'
+' v4.2 (2026-07-05) : (a) nom de fichier HTA UNIQUE par toast + purge des
+'   anciens. L'ancien notify.hta fixe pouvait etre reecrit pendant que le
+'   mshta du toast precedent le chargeait (toasts en rafale) -> toast
+'   perdu. (b) modConfig.EnsureLoaded en tete de Notify : les g_Toast*
+'   sont lus en direct ; apres un Ctrl+S VBE ils valaient 0 (toasts muets,
+'   duree nulle) jusqu'au prochain rechargement de config.
+'
+' v4.1 (2026-06-17) : ciblage moniteur fiable pour le toast "reponse rangee".
+'   AVANT : tous les toasts se placent sur le moniteur de GetForegroundWindow.
+'   Or le toast "reponse rangee" part depuis mSentItems_ItemAdd, juste APRES
+'   que la fenetre de reponse s'est fermee : le premier plan est alors
+'   instable (peut etre l'autre fenetre, sur l'autre ecran), d'ou un toast qui
+'   s'affichait sur le mauvais moniteur (visible depuis l'ajout des deux
+'   fenetres a role courrier/calendrier sur deux ecrans). APRES : nouvelle
+'   API publique RememberToastMonitorFromForeground, appelee depuis
+'   Application_ItemSend quand la fenetre d'envoi est ENCORE au premier plan ;
+'   elle epingle ce moniteur pour le PROCHAIN toast uniquement. GetActiveToastPos
+'   l'utilise en priorite puis le consomme. Tous les autres toasts (QuickMove,
+'   etc.) restent inchanges (GetForegroundWindow). Best-effort : si la capture
+'   echoue, repli transparent sur l'ancien comportement.
+'
+' v4 (2026-06-10) : EscapeHtml migre vers modCommon.EscapeHTML (copie
+'   privee supprimee). Dependance ajoutee : modCommon.
+'
+' v3 : MULTI-MONITEUR. Le toast se place en bas-droite du MONITEUR qui
+' heberge la fenetre Outlook active (explorer ou inspector au premier
+' plan), et non plus systematiquement sur l'ecran principal. Cote VBA :
+' MonitorFromWindow + GetMonitorInfo (rcWork, hors barre des taches) sur
+' le HWND Outlook ; les coordonnees absolues du coin bas-droite sont
+' injectees en dur dans le HTA. Si la resolution du moniteur echoue
+' (HWND introuvable), on retombe sur screen.availWidth/Height (ecran
+' principal), comportement v2.
+'
+' v2 : ENCODAGE UTF-8. Le HTA est ecrit via ADODB.Stream en UTF-8 (et non
+' plus FileSystemObject ASCII) + <meta charset=utf-8> dans le HTML, pour
+' que les accents des noms de dossiers ("Reunions", "Operes"...) et des
+' libelles s'affichent correctement. Les libelles passent par A() (helper
+' accents de modConfig), seule source de verite UI accentuee.
+'
+' EMPILEMENT : si plusieurs notifications surviennent en rafale, les
+' fenetres mshta se chevauchent en bas-droite. Comportement accepte.
+'
+' STYLE : fond blanc, bordure gauche epaisse coloree (couleur configurable),
+' texte fonce. Couleurs et duree pilotees par config.ini.
+'
+' API PUBLIQUE :
+'   Notify(message, borderColor)   - notification generique (1 ligne)
+'   NotifyEx(message, borderColor, durationMs, heightPx, boldFirstLine, widthPx, soundPath)
+'                                  - multi-lignes (vbLf), duree/taille au choix,
+'                                    son .wav joue par le HTA (v4.5)
+'   NotifyFiled(dossier)              - "Filed in: <folder>" (accent colour)
+'   NotifyKeptInSent()              - "Reste dans les Elements envoyes"
+'                                         (pilote par g_ToastKeptInSent ;
+'                                          desactive par defaut)
+' =====================================================================
+
+Private Const MOD_NAME As String = "Notify"
+
+' Prefixe des fichiers HTA (v4.2 : nom unique par toast, anciens purges).
+Private Const HTA_PREFIX As String = "notify_"
+Private mHtaSeq As Long
+
+' Dimensions de la fenetre toast (doivent matcher window.resizeTo).
+Private Const TOAST_W As Long = 340
+Private Const TOAST_H As Long = 72
+' Marge depuis le coin bas-droite du work area.
+Private Const TOAST_MARGIN As Long = 16
+
+' --- API Win32 multi-moniteur (late binding impossible -> Declare) ---
+' Pack v3 (D1) : 64-bit seul, branches #Else supprimees (convention projet).
+Private Declare PtrSafe Function GetForegroundWindow Lib "user32" () As LongPtr
+Private Declare PtrSafe Function MonitorFromWindow Lib "user32" ( _
+    ByVal hWnd As LongPtr, ByVal dwFlags As Long) As LongPtr
+Private Declare PtrSafe Function GetMonitorInfo Lib "user32" Alias "GetMonitorInfoA" ( _
+    ByVal hMonitor As LongPtr, ByRef lpmi As MONITORINFO) As Long
+Private Const MOD_VERSION As String = "v4.5 - 2026-08-18"
+
+' Moniteur "epingle" pour le PROCHAIN toast uniquement (v4, 2026-06-17).
+' Arme par RememberToastMonitorFromForeground (appele depuis ItemSend, quand
+' la fenetre d'envoi est encore au premier plan). Le prochain toast s'affiche
+' sur CE moniteur au lieu de GetForegroundWindow (qui, au moment ou le toast
+' "reponse rangee" part, capte un premier plan instable : la fenetre de
+' reponse vient de se fermer). Consomme (remis a 0) apres usage : tous les
+' autres toasts (QuickMove, etc.) restent sur GetForegroundWindow comme avant.
+Private mPinnedMonitor As LongPtr
+' Pack v3 (D4) : le moniteur epingle n'est CONSOMME que par NotifyFiled (le
+' toast "reponse rangee" pour lequel il a ete pose). Avant, le premier toast
+' venu (ex. une alerte nouveau mail) le volait.
+Private mUseFiledMonitor As Boolean
+
+Private Type RECT
+    Left As Long
+    Top As Long
+    Right As Long
+    Bottom As Long
+End Type
+
+Private Type MONITORINFO
+    cbSize As Long
+    rcMonitor As RECT
+    rcWork As RECT
+    dwFlags As Long
+End Type
+
+Private Const MONITOR_DEFAULTTONEAREST As Long = 2
+
+' ---------------------------------------------------------------------
+' Notify
+' Affiche une notification toast non bloquante.
+'   message        : texte a afficher (sera echappe pour HTML).
+'   borderColor : left-border hex colour (e.g. "#0078D4").
+'                    Si vide -> g_ToastColorFiled par defaut.
+' ---------------------------------------------------------------------
+Public Sub Notify(ByVal message As String, Optional ByVal borderColor As String = "")
+    NotifyEx message, borderColor, 0, 0, False
+End Sub
+
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+' ---------------------------------------------------------------------
+' NotifyEx (v4.4)
+' Variante generale : message multi-lignes (separateur vbLf -> <br>),
+' duree et hauteur par appel, premiere ligne en gras optionnelle.
+'   durationMs    : 0 = ToastDurationMs (config)
+'   heightPx      : 0 = hauteur standard (TOAST_H, 1 ligne)
+'   boldFirstLine : True = premiere ligne en gras (titre)
+'   widthPx       : 0 = largeur standard (TOAST_W)
+'   soundPath     : chemin local d'un .wav joue par le HTA ("" = silence)
+' En multi-lignes, chaque ligne est tronquee avec "..." si trop longue
+' (pas de retour a la ligne : la hauteur demandee reste fiable).
+' ---------------------------------------------------------------------
+Public Sub NotifyEx(ByVal message As String, Optional ByVal borderColor As String = "", _
+                    Optional ByVal durationMs As Long = 0, Optional ByVal heightPx As Long = 0, _
+                    Optional ByVal boldFirstLine As Boolean = False, _
+                    Optional ByVal widthPx As Long = 0, _
+                    Optional ByVal soundPath As String = "")
+    On Error GoTo ErrH
+
+    ' v4.2 : garantir la config chargee (les g_Toast* sont lus en direct ;
+    ' apres un Ctrl+S VBE ils vaudraient 0 -> toasts muets, duree nulle).
+    modConfig.EnsureLoaded
+
+    ' Garde globale : si les toasts sont desactives, ne rien faire.
+    If Not modConfig.ToastEnabled() Then
+        modDebugLog.DDebug MOD_NAME, "Toast desactive (ToastEnabled=0), skip"
+        Exit Sub
+    End If
+
+    If Len(borderColor) = 0 Then borderColor = modConfig.ToastColorFiled()
+
+    If durationMs <= 0 Then durationMs = modConfig.ToastDurationMs()
+    If durationMs <= 0 Then durationMs = 3000
+    If heightPx <= 0 Then heightPx = TOAST_H
+    If widthPx <= 0 Then widthPx = TOAST_W
+
+    Dim htaPath As String
+    htaPath = WriteHTA(message, borderColor, durationMs, widthPx, heightPx, boldFirstLine, soundPath)
+    If Len(htaPath) = 0 Then Exit Sub   ' echec ecriture, deja logue
+
+    Dim sh As Object
+    Set sh = CreateObject("WScript.Shell")
+    ' 3e parametre False = non bloquant : VBA continue immediatement.
+    sh.Run "mshta.exe """ & htaPath & """", 1, False
+
+    ' Log ASCII (pas d'accents dans les logs).
+    modDebugLog.DInfo MOD_NAME, "Toast affiche"
+    Exit Sub
+
+ErrH:
+    ' Une notification ne doit JAMAIS casser le flux appelant.
+    modDebugLog.DError MOD_NAME, "NotifyEx error " & Err.Number & _
+        " - " & Err.Description
+End Sub
+
+' ---------------------------------------------------------------------
+' NotifyFiled
+' Raccourci : "Range dans : <dossier>" avec bordure de couleur configurable.
+' Utilise pour reponse rangee (modReplyInPlace) ET element envoye classe.
+' Libelle accentue via A() ("Rang~e dans : " -> "Range dans : ").
+' ---------------------------------------------------------------------
+Public Sub NotifyFiled(ByVal folderName As String)
+    mUseFiledMonitor = True
+    Notify modConfig.T("Rang~e dans : ", "Filed in: ") & folderName, modConfig.ToastColorFiled()
+    mUseFiledMonitor = False
+End Sub
+
+' ---------------------------------------------------------------------
+' NotifyKeptInSent
+' Notification pour le cas "mail NON deplace, reste dans Elements
+' envoyes". DESACTIVE par defaut (g_ToastKeptInSent=0). Neutral border.
+' ---------------------------------------------------------------------
+Public Sub NotifyKeptInSent()
+    If Not modConfig.ToastKeptInSent() Then Exit Sub
+    Notify modConfig.T("Reste dans les ~El~ements envoy~es", "Kept in Sent Items"), modConfig.ToastColorKept()
+End Sub
+
+' ---------------------------------------------------------------------
+' RememberToastMonitorFromForeground (v4, 2026-06-17)
+' Epingle, pour le PROCHAIN toast uniquement, le moniteur de la fenetre
+' actuellement au premier plan. A appeler quand cette fenetre est encore
+' la bonne reference - typiquement depuis Application_ItemSend, ou la
+' fenetre de reponse (Inspector) ou la fenetre courrier est encore active.
+' Ainsi le toast "reponse rangee", emis un instant plus tard (apres la
+' fermeture de la fenetre de reponse, quand GetForegroundWindow devient
+' instable), s'affiche sur le bon ecran : celui d'ou part le mail.
+' Best-effort : si la capture echoue, le toast retombe simplement sur
+' GetForegroundWindow (comportement actuel).
+' ---------------------------------------------------------------------
+Public Sub RememberToastMonitorFromForeground()
+    On Error Resume Next
+    mPinnedMonitor = 0
+    Dim hWnd As LongPtr
+    hWnd = GetForegroundWindow()
+    If hWnd = 0 Then Exit Sub
+    mPinnedMonitor = MonitorFromWindow(hWnd, MONITOR_DEFAULTTONEAREST)
+End Sub
+
+' ---------------------------------------------------------------------
+' GetActiveToastPos (interne)
+' Calcule le coin bas-droite (coordonnees absolues, pixels) du WORK AREA
+' du moniteur qui heberge la fenetre Outlook active. Renvoie True si la
+' resolution a reussi (x,y remplis), False sinon (l'appelant retombe
+' alors sur le positionnement screen.* cote HTA).
+'
+' On utilise EN PRIORITE le moniteur epingle par
+' RememberToastMonitorFromForeground (cas "reponse rangee", consomme une
+' fois). Sinon, on part du HWND au premier plan (GetForegroundWindow) : au
+' moment ou un classement/une action declenche le toast, la fenetre active
+' EST Outlook (explorer ou inspector), donc ce HWND pointe le bon moniteur.
+' Si le premier plan n'est pas Outlook, MONITOR_DEFAULTTONEAREST garantit
+' quand meme un moniteur valide proche du curseur logique.
+' ---------------------------------------------------------------------
+Private Function GetActiveToastPos(ByRef x As Long, ByRef y As Long, _
+                                   ByVal widthPx As Long, ByVal heightPx As Long) As Boolean
+    On Error GoTo ErrH
+    GetActiveToastPos = False
+
+    Dim hWnd As LongPtr
+    Dim hMon As LongPtr
+
+    ' v4 : moniteur epingle par RememberToastMonitorFromForeground (cas
+    ' "reponse rangee") en priorite. Consomme immediatement (usage unique) :
+    ' les toasts suivants repartent sur GetForegroundWindow.
+    ' Pack v3 (D4) : uniquement pour le toast NotifyFiled.
+    If mPinnedMonitor <> 0 And mUseFiledMonitor Then
+        hMon = mPinnedMonitor
+        mPinnedMonitor = 0
+    Else
+        hWnd = GetForegroundWindow()
+        If hWnd = 0 Then Exit Function
+        hMon = MonitorFromWindow(hWnd, MONITOR_DEFAULTTONEAREST)
+    End If
+    If hMon = 0 Then Exit Function
+
+    Dim mi As MONITORINFO
+    mi.cbSize = Len(mi)
+    If GetMonitorInfo(hMon, mi) = 0 Then Exit Function
+
+    ' rcWork exclut la barre des taches : le toast ne la recouvre pas.
+    x = mi.rcWork.Right - widthPx - TOAST_MARGIN
+    y = mi.rcWork.Bottom - heightPx - TOAST_MARGIN
+
+    GetActiveToastPos = True
+    Exit Function
+
+ErrH:
+    modDebugLog.DError MOD_NAME, "GetActiveToastPos error " & Err.Number & _
+        " - " & Err.Description
+    GetActiveToastPos = False
+End Function
+
+' ---------------------------------------------------------------------
+' WriteHTA (interne)
+' Genere le contenu HTA et l'ecrit dans %TEMP%\notify.hta (reecrit),
+' en UTF-8 via ADODB.Stream. Renvoie le chemin complet, ou "" si echec.
+'
+' Le HTA :
+'   - <meta charset=utf-8> pour interpreter correctement les accents
+'   - fenetre sans bordure/menu/barre des taches (HTA:APPLICATION)
+'   - fond blanc, bordure gauche epaisse borderColor, neutral text colour
+'   - se positionne en bas-droite du moniteur Outlook (coordonnees
+'     absolues calculees cote VBA) ; fallback screen.* si indisponible
+'   - se ferme seul apres g_ToastDurationMs (window.setTimeout)
+' ---------------------------------------------------------------------
+Private Function WriteHTA(ByVal message As String, ByVal borderColor As String, _
+                          ByVal durationMs As Long, ByVal widthPx As Long, _
+                          ByVal heightPx As Long, ByVal boldFirstLine As Boolean, _
+                          ByVal soundPath As String) As String
+    On Error GoTo ErrH
+    WriteHTA = ""
+
+    Dim sh As Object
+    Set sh = CreateObject("WScript.Shell")
+    Dim tempDir As String
+    tempDir = sh.ExpandEnvironmentStrings("%TEMP%")
+
+    ' v4.2 : nom UNIQUE par toast. L'ancien notify.hta fixe pouvait etre
+    ' reecrit pendant que le mshta du toast precedent le chargeait (rafale)
+    ' -> toast perdu. On purge au passage les anciens notify_*.hta : ceux
+    ' encore tenus par un mshta actif resistent au Kill et partent au tour
+    ' suivant (pas d'accumulation).
+    On Error Resume Next
+    Kill tempDir & "\" & HTA_PREFIX & "*.hta"
+    On Error GoTo ErrH
+    mHtaSeq = mHtaSeq + 1
+    Dim htaPath As String
+    htaPath = tempDir & "\" & HTA_PREFIX & Format(Now, "hhnnss") & "_" & mHtaSeq & ".hta"
+
+    Dim textColor As String
+    textColor = modConfig.ToastColorText()
+    If Len(textColor) = 0 Then textColor = "#222222"
+
+    ' Echappement HTML du message (evite la casse si < > & dans un nom de dossier).
+    ' v4.4 : multi-lignes (vbLf -> <br>) et premiere ligne en gras optionnelle.
+    ' On echappe LIGNE PAR LIGNE puis on reassemble avec <br> : le <br> ne
+    ' doit pas passer par EscapeHTML.
+    Dim msgHtml As String
+    Dim lines() As String, li As Long
+    lines = Split(Replace(message, vbCrLf, vbLf), vbLf)
+    If UBound(lines) = LBound(lines) Then
+        ' 1 ligne : rendu historique (retour a la ligne autorise).
+        msgHtml = modCommon.EscapeHTML(message)
+    Else
+        ' Multi-lignes : un <div> par ligne, tronque par "..." si trop long,
+        ' pour que la hauteur demandee corresponde au nombre de lignes.
+        Const LINE_STYLE As String = "white-space:nowrap;overflow:hidden;text-overflow:ellipsis;"
+        msgHtml = "<div style='width:100%;'>"
+        For li = LBound(lines) To UBound(lines)
+            If li = LBound(lines) And boldFirstLine Then
+                msgHtml = msgHtml & "<div style='" & LINE_STYLE & "font-weight:bold;'>" & _
+                          modCommon.EscapeHTML(lines(li)) & "</div>"
+            Else
+                msgHtml = msgHtml & "<div style='" & LINE_STYLE & "'>" & _
+                          modCommon.EscapeHTML(lines(li)) & "</div>"
+            End If
+        Next li
+        msgHtml = msgHtml & "</div>"
+    End If
+
+    ' Position : moniteur Outlook si resolvable, sinon fallback HTA screen.*.
+    Dim posX As Long, posY As Long
+    Dim moveJs As String
+    If GetActiveToastPos(posX, posY, widthPx, heightPx) Then
+        moveJs = "  window.moveTo " & posX & "," & posY & vbCrLf
+    Else
+        moveJs = "  window.moveTo screen.availWidth-" & (widthPx + TOAST_MARGIN) & _
+                 ", screen.availHeight-" & (heightPx + TOAST_MARGIN) & vbCrLf
+    End If
+
+    ' v4.5 : son joue par le HTA lui-meme (bgsound, moteur IE). Chemin en
+    ' file:/// avec slashes ; volume=0 = plein volume (echelle IE 0..-10000).
+    Dim soundHtml As String
+    soundHtml = ""
+    If Len(soundPath) > 0 Then
+        soundHtml = "<bgsound src=""file:///" & _
+                    modCommon.EscapeHTML(Replace(soundPath, "\", "/")) & _
+                    """ loop=""1"" volume=""0"" />" & vbCrLf
+    End If
+
+    Dim hta As String
+    hta = "<html><head>" & _
+          "<meta http-equiv=""Content-Type"" content=""text/html; charset=utf-8"" />" & vbCrLf & _
+          "<title>Notification</title>" & vbCrLf & _
+          "<HTA:APPLICATION ID='notif' BORDER='none' SCROLL='no' " & _
+          "SYSMENU='no' CAPTION='no' SHOWINTASKBAR='no' " & _
+          "MAXIMIZEBUTTON='no' MINIMIZEBUTTON='no' />" & vbCrLf & _
+          soundHtml & _
+          "</head>" & vbCrLf & _
+          "<body style='margin:0;padding:0;background:#ffffff;" & _
+          "font-family:Segoe UI,Arial,sans-serif;overflow:hidden;'>" & vbCrLf & _
+          "<div style='border-left:6px solid " & borderColor & ";" & _
+          "height:100%;box-sizing:border-box;padding:14px 18px;" & _
+          "color:" & textColor & ";font-size:13px;line-height:1.3;" & _
+          "display:flex;align-items:center;" & _
+          "box-shadow:0 2px 8px rgba(0,0,0,0.18);'>" & _
+          msgHtml & "</div>" & vbCrLf & _
+          "<script language='vbscript'>" & vbCrLf & _
+          "  window.resizeTo " & widthPx & "," & heightPx & vbCrLf & _
+          moveJs & _
+          "  window.setTimeout ""window.close()"", " & durationMs & vbCrLf & _
+          "</script></body></html>"
+
+    ' Ecriture UTF-8 via ADODB.Stream (FileSystemObject ne sait pas
+    ' ecrire en UTF-8 sans BOM proprement ; Stream gere l'encodage).
+    Dim stm As Object
+    Set stm = CreateObject("ADODB.Stream")
+    stm.Type = 2                 ' adTypeText
+    stm.Charset = "utf-8"
+    stm.Open
+    stm.WriteText hta
+    stm.SaveToFile htaPath, 2    ' adSaveCreateOverWrite
+    stm.Close
+
+    WriteHTA = htaPath
+    Exit Function
+
+ErrH:
+    modDebugLog.DError MOD_NAME, "WriteHTA error " & Err.Number & _
+        " - " & Err.Description
+    WriteHTA = ""
+End Function
+

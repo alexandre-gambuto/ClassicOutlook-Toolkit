@@ -1,0 +1,317 @@
+Option Explicit
+
+'=============================================================================
+' modFolderScan (v6)
+' v6 (2026-07-05) : lecture config via getters modConfig (EnsureLoaded-safe)
+' au lieu des globales g_ en direct (AutoArchiveFolders/Months,
+' ArchiveSubfolderName) : valeurs a zero apres un Ctrl+S VBE sinon.
+' Purpose (EN): auto-archives inactive Outlook subfolders at startup. For each
+'   Inbox subfolder listed in config (AutoArchiveFolders), subfolders whose
+'   most recent mail is older than AutoArchiveMonths are moved into an archive
+'   subfolder; reactivated ones are moved back up. Runs silently. Config-driven
+'   (no hardcoded folder names). The archive subfolder itself is never moved.
+'
+' Archivage automatique des sous-dossiers Outlook inactifs (au demarrage).
+' Pour chaque sous-dossier de la Boite de reception declare dans la config
+' (cle AutoArchiveFolders), les sous-dossiers inactifs (derniere ACTIVITE
+' plus ancienne que AutoArchiveMonths) sont deplaces vers le sous-dossier
+' d'archives (cle ArchiveSubfolderName), et remontes s'ils redeviennent actifs.
+'
+' v4 (2026-06-10) - revue globale :
+'   - FIX : boucles d'archivage en index DESCENDANT. MoveTo pendant un
+'     For Each modifie la collection en cours d'enumeration -> le frere
+'     suivant du dossier deplace etait saute (non deterministe, masque
+'     par le re-scan a chaque demarrage).
+'   - FIX : GetLastMailDate devient une date d'ACTIVITE :
+'       (a) tout item date compte (ReceivedTime/SentOn via
+'           modCommon.SafeReceivedTime), plus seulement les MailItem ;
+'           un dossier de reunions/rapports recents n'est plus archive
+'           a tort (l'ancien scan des 50 premiers items renvoyait
+'           1/1/1900 s'il n'y trouvait aucun MailItem).
+'       (b) RECURSIF sur les sous-dossiers : un dossier-conteneur dont
+'           l'activite vit dans ses sous-dossiers n'est plus archive
+'           avec tout son arbre (MoveTo emporte la hierarchie).
+'   Dependance ajoutee : modCommon (SafeReceivedTime).
+'
+' v5 (2026-06-10) : AutoArchiveMove_OnTime - point d'entree du differe
+'   +2 min arme par Application_Startup (P1 : le scan ne bloque plus le
+'   demarrage). AutoArchiveMove reste appelable en direct (QAT/Execution).
+' (Historique des versions -> CHANGELOG.)
+'=============================================================================
+
+Private Const MOD_NAME As String = "FolderScan"
+Private Const MOD_VERSION As String = "v6.1 - 2026-07-05"
+
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+'=============================================================================
+' Point d'entree : appele par ThisOutlookSession.Application_Startup
+'=============================================================================
+Public Sub AutoArchiveMove()
+    Dim ns As Outlook.NameSpace
+    Dim inbox As Outlook.folder
+
+    On Error GoTo ErrHandler
+
+    Set ns = Application.GetNamespace("MAPI")
+    Set inbox = ns.GetDefaultFolder(olFolderInbox)
+
+    modDebugLog.DInfo MOD_NAME, "AutoArchiveMove demarre"
+
+    ' Liste des dossiers a archiver lue depuis la config (separes par |).
+    ' Vide => archivage automatique desactive.
+    Dim raw As String
+    raw = Trim$(modConfig.AutoArchiveFolders())
+    If Len(raw) = 0 Then
+        modDebugLog.DInfo MOD_NAME, "AutoArchiveFolders vide, archivage desactive"
+        Exit Sub
+    End If
+
+    Dim targets() As String, t As Long, nm As String
+    targets = Split(raw, "|")
+    For t = LBound(targets) To UBound(targets)
+        nm = Trim$(targets(t))
+        If Len(nm) > 0 Then archiveFolder inbox, nm, modConfig.AutoArchiveMonths()
+    Next t
+
+    modDebugLog.DInfo MOD_NAME, "AutoArchiveMove termine"
+    Exit Sub
+
+ErrHandler:
+    modDebugLog.DError MOD_NAME, "AutoArchiveMove err " & Err.Number & _
+        " - " & Err.Description
+End Sub
+
+'=============================================================================
+' Traitement d'un dossier parent (issu de la cle AutoArchiveFolders)
+' Deplace les sous-dossiers inactifs vers _Archives, et remonte les
+' sous-dossiers reactives vers le parent.
+'=============================================================================
+Private Sub archiveFolder(inbox As Outlook.folder, folderName As String, _
+                          monthsThreshold As Long)
+    Dim parentFolder As Outlook.folder
+    Dim archivesFolder As Outlook.folder
+    Dim subFolder As Outlook.folder
+    Dim latestMailDate As Date
+    Dim cutoffDate As Date
+    Dim archivedCount As Long, restoredCount As Long
+
+    ' Verification du dossier parent
+    On Error Resume Next
+    Set parentFolder = inbox.Folders(folderName)
+    On Error GoTo 0
+    If parentFolder Is Nothing Then
+        modDebugLog.DDebug MOD_NAME, "Dossier parent '" & folderName & _
+            "' absent, skip"
+        Exit Sub
+    End If
+
+    ' Verification du dossier _Archives
+    On Error Resume Next
+    Set archivesFolder = parentFolder.Folders(modConfig.ArchiveSubfolderName())
+    On Error GoTo 0
+    If archivesFolder Is Nothing Then
+        modDebugLog.DDebug MOD_NAME, "Sous-dossier d'archives absent sous '" & _
+            folderName & "', skip"
+        Exit Sub
+    End If
+
+    cutoffDate = DateAdd("m", -monthsThreshold, Now)
+
+    ' Parent -> _Archives (sous-dossiers inactifs).
+    ' v4 : index DESCENDANT obligatoire : MoveTo retire le dossier de la
+    ' collection ; un For Each sauterait le frere suivant.
+    ' Pack v3 (B7) : collection Folders evaluee une fois (avant : recreee a
+    ' chaque tour par .Folders.count / .Folders.Item(i)).
+    Dim i As Long
+    Dim subsP As Object
+    Set subsP = parentFolder.Folders
+    For i = subsP.count To 1 Step -1
+        DoEvents
+        Set subFolder = Nothing
+        On Error Resume Next
+        Set subFolder = subsP.Item(i)
+        On Error GoTo 0
+        If Not subFolder Is Nothing Then
+            If subFolder.name <> modConfig.ArchiveSubfolderName() Then
+                latestMailDate = GetLastMailDate(subFolder)
+                If latestMailDate < cutoffDate Then
+                    On Error Resume Next
+                    subFolder.MoveTo archivesFolder
+                    If Err.Number = 0 Then
+                        archivedCount = archivedCount + 1
+                        modDebugLog.DInfo MOD_NAME, "Archive '" & _
+                            subFolder.name & "' sous " & folderName & _
+                            " (derniere activite " & Format(latestMailDate, "yyyy-mm-dd") & ")"
+                    End If
+                    Err.Clear
+                    On Error GoTo 0
+                End If
+            End If
+        End If
+    Next i
+
+    ' _Archives -> Parent (sous-dossiers reactives). Index descendant idem.
+    Dim subsA As Object
+    Set subsA = archivesFolder.Folders
+    For i = subsA.count To 1 Step -1
+        DoEvents
+        Set subFolder = Nothing
+        On Error Resume Next
+        Set subFolder = subsA.Item(i)
+        On Error GoTo 0
+        If Not subFolder Is Nothing Then
+            latestMailDate = GetLastMailDate(subFolder)
+            If latestMailDate >= cutoffDate Then
+                On Error Resume Next
+                subFolder.MoveTo parentFolder
+                If Err.Number = 0 Then
+                    restoredCount = restoredCount + 1
+                    modDebugLog.DInfo MOD_NAME, "Remonte '" & subFolder.name & _
+                        "' vers " & folderName & " (derniere activite " & _
+                        Format(latestMailDate, "yyyy-mm-dd") & ")"
+                End If
+                Err.Clear
+                On Error GoTo 0
+            End If
+        End If
+    Next i
+
+    modDebugLog.DInfo MOD_NAME, folderName & " : " & archivedCount & _
+        " archive(s), " & restoredCount & " remonte(s)"
+End Sub
+
+'=============================================================================
+' GetLastMailDate (v4)
+' Retourne la date d'ACTIVITE la plus recente du dossier : item date le plus
+' recent (toute classe : mail, demande de reunion, rapport... via
+' modCommon.SafeReceivedTime), en RECURSIF sur les sous-dossiers.
+'
+' Valeurs retournees :
+'   - Date d'activite la plus recente si trouvee (dossier + sous-dossiers)
+'   - 1/1/1900 si l'arbre ne contient AUCUN item date -> archive (intention :
+'     dossier reellement inactif)
+'   - Now si exception (tri impossible, dossier inaccessible...) :
+'     un dossier en erreur est PRESERVE (Now > cutoffDate => non archive).
+'
+' Optimisation conservee : tri decroissant ReceivedTime + scan plafonne aux
+' 50 premiers items par dossier (le 1er item date rencontre suffit en
+' pratique ; le max sur 50 couvre les items non dates intercales).
+' Signature publique inchangee (utilisee aussi comme accesseur ailleurs).
+'=============================================================================
+Public Function GetLastMailDate(fld As Outlook.folder) As Date
+    GetLastMailDate = GetLastActivityDate(fld, 0)
+End Function
+
+Private Function GetLastActivityDate(fld As Outlook.folder, ByVal depth As Long) As Date
+    GetLastActivityDate = #1/1/1900#
+
+    On Error GoTo ErrHandler
+
+    If depth > 8 Then Exit Function   ' garde-fou profondeur (arbres anormaux)
+
+    Dim best As Date
+    best = #1/1/1900#
+
+    ' --- 1) Items directs du dossier ---
+    ' Pack v3 (B10) : plus de Sort + lecture de 50 items par dossier. On
+    ' interroge MAPI par plages de dates decroissantes (Restrict sur
+    ' ReceivedTime, filtre evalue cote MAPI) : le premier intervalle non
+    ' vide donne le mois d'activite ; la date exacte est lue sur UN seul
+    ' item (GetFirst apres tri du sous-ensemble). Un dossier vide ou sans
+    ' item date reste a 1/1/1900 (archive), un dossier en erreur a Now.
+    Dim itms As Outlook.items
+    Set itms = fld.items
+    If itms.count > 0 Then
+        Dim probe As Date, stepMonths As Long, limitDate As Date
+        Dim sub_ As Outlook.items, first As Object, d As Date
+        limitDate = #1/1/1900#
+        probe = Now
+        stepMonths = 1
+        Do
+            Dim lowBound As Date
+            lowBound = DateAdd("m", -stepMonths, probe)
+            Set sub_ = itms.Restrict("[ReceivedTime] >= '" & modCommon.FormatDaslDate(lowBound) & _
+                                     "' AND [ReceivedTime] <= '" & modCommon.FormatDaslDate(probe) & "'")
+            If sub_.count > 0 Then
+                sub_.Sort "[ReceivedTime]", True
+                Set first = sub_.GetFirst
+                If Not first Is Nothing Then
+                    d = modCommon.SafeReceivedTime(first)
+                    If d > best Then best = d
+                End If
+                Exit Do
+            End If
+            probe = lowBound
+            If stepMonths < 24 Then stepMonths = stepMonths * 2
+            If probe < DateAdd("yyyy", -15, Now) Then
+                ' Rien depuis 15 ans par ReceivedTime : repli sur le max des
+                ' 50 premiers items (items non dates, tri impossible...).
+                itms.Sort "[ReceivedTime]", True
+                Dim itm As Object, j As Long, maxScan As Long
+                maxScan = itms.count
+                If maxScan > 50 Then maxScan = 50
+                For j = 1 To maxScan
+                    Set itm = itms.Item(j)
+                    d = modCommon.SafeReceivedTime(itm)
+                    If d > best Then best = d
+                Next j
+                Exit Do
+            End If
+        Loop
+    End If
+
+    ' --- 2) Recursion sous-dossiers ---
+    ' Un dossier-conteneur dont l'activite vit dans ses sous-dossiers ne
+    ' doit pas etre archive : MoveTo emporterait tout l'arbre.
+    ' Pack v3 (B7) : collection evaluee une fois.
+    Dim sf As Outlook.folder
+    Dim ds As Date
+    Dim subs As Outlook.Folders
+    Set subs = fld.Folders
+    For Each sf In subs
+        DoEvents
+        ds = GetLastActivityDate(sf, depth + 1)
+        If ds > best Then best = ds
+    Next sf
+
+    GetLastActivityDate = best
+    Exit Function
+
+ErrHandler:
+    ' En cas d'erreur (tri impossible, dossier inaccessible...) on retourne
+    ' Now pour que le dossier ne soit PAS archive. Mieux vaut rater un
+    ' archivage qu'archiver par erreur un dossier actif sur lequel le scan
+    ' a juste plante. (Fix v3 conserve.)
+    modDebugLog.DError MOD_NAME, "GetLastActivityDate('" & fld.name & _
+        "') err " & Err.Number & " - " & Err.Description & _
+        " => retour Now (preservation)"
+    GetLastActivityDate = Now
+End Function
+
+'=============================================================================
+' AutoArchiveMove_OnTime (v5)
+' Point d'entree du differe +2 min arme par ThisOutlookSession au demarrage
+' (P1 : l'archivage ne bloque plus l'ouverture d'Outlook). Meme convention
+' _OnTime que modMeetingColor.CatchUpUncolored_OnTime.
+'=============================================================================
+Public Sub AutoArchiveMove_OnTime()
+    On Error Resume Next
+    ' v6.1 : GARDE QUOTIDIENNE. Le parcours de l'arborescence (1000+
+    ' dossiers) est le plus lourd des traitements recurrents ; il ne
+    ' tourne plus qu'une fois par jour, quel que soit le nombre de
+    ' (re)demarrages d'Outlook. Le drapeau n'est pose qu'APRES une
+    ' execution reelle (un echec avant sera retente au prochain
+    ' demarrage).
+    Dim today As String
+    today = Format(Date, "yyyy-mm-dd")
+    If GetSetting("FolderScan", "AutoArchive", "LastRunDay", "") = today Then
+        modDebugLog.DInfo MOD_NAME, "AutoArchiveMove : deja execute aujourd'hui, skip"
+        Exit Sub
+    End If
+    modDebugLog.DInfo MOD_NAME, "AutoArchiveMove differe (+2 min) : depart"
+    AutoArchiveMove
+    SaveSetting "FolderScan", "AutoArchive", "LastRunDay", today
+End Sub

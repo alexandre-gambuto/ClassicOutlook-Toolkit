@@ -1,0 +1,140 @@
+Option Explicit
+
+'=============================================================================
+' modHideBcc v1.0  (2026-08-18)
+' Purpose (EN): force the Bcc field hidden on every new compose window
+'   (Inspector) and on inline responses. Outlook persists the "Show Bcc"
+'   toggle across sessions: once switched on, it comes back on every mail.
+'   This module switches it off again, unless the item already carries
+'   Bcc recipients (then the field is left visible on purpose).
+' Mecanique : Outlook expose le bouton "Cci" du ruban comme controle
+'   idMso "ShowBcc". CommandBars.GetPressedMso lit son etat, ExecuteMso le
+'   bascule. Le ruban n'est pas toujours pret au moment de NewInspector :
+'   une passe immediate + passes differees via modDefer ("HideBcc").
+' Config : HideBccOnCompose=1 (defaut vrai ; 0 pour desactiver).
+' Contexte : Outlook Classic Desktop, VBA 64-bit, sans UserForm.
+'=============================================================================
+
+Private Const MOD_NAME As String = "HideBcc"
+Private Const MOD_VERSION As String = "v1.0 - 2026-08-18"
+
+Private Const OC_MAIL As Long = 43      ' olMail
+Private Const MSO_SHOW_BCC As String = "ShowBcc"
+Private Const KEY_INLINE As String = "inline"
+
+' Inspecteurs en attente de passe differee, indexes par cle de sequence.
+
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+'-----------------------------------------------------------------------------
+' Relais NewInspector (appele par clsAppEvents).
+'-----------------------------------------------------------------------------
+Public Sub OnNewInspector(ByVal Inspector As Object)
+    On Error Resume Next
+
+    If Inspector Is Nothing Then Exit Sub
+    If Not modConfig.CfgB("HideBccOnCompose", True) Then Exit Sub
+    If Not IsComposeMail(Inspector.CurrentItem) Then Exit Sub
+
+    modDebugLog.DTrace MOD_NAME, "OnNewInspector : composition detectee"
+
+    ' Passe immediate (fonctionne parfois, selon l'etat du ruban).
+    HideOnBars Inspector.CommandBars
+
+    ' Passes differees : le ruban se peuple apres l'affichage.
+    ' Pack v3 (C12) : file partagee modInspectorQueue, 2 passes.
+    Dim key As String
+    key = modInspectorQueue.Register(Inspector, "bcc", 2)
+    If Len(key) = 0 Then Exit Sub
+
+    modDefer.ArmMs "HideBcc", 700, key
+    modDefer.Arm "HideBcc", 2, key
+
+    On Error GoTo 0
+End Sub
+
+'-----------------------------------------------------------------------------
+' Relais InlineResponse (reponse redigee dans le volet de lecture).
+' Le ruban est celui de l'Explorer actif : pas d'objet a memoriser.
+'-----------------------------------------------------------------------------
+Public Sub OnInlineResponse(ByVal Item As Object)
+    On Error Resume Next
+
+    If Item Is Nothing Then Exit Sub
+    If Not modConfig.CfgB("HideBccOnCompose", True) Then Exit Sub
+    If Not IsComposeMail(Item) Then Exit Sub
+
+    modDebugLog.DTrace MOD_NAME, "OnInlineResponse : reponse en ligne detectee"
+    modDefer.ArmUniqueMs "HideBcc", 700, KEY_INLINE
+
+    On Error GoTo 0
+End Sub
+
+'-----------------------------------------------------------------------------
+' Passe differee (cible modDefer "HideBcc"). key = "inline" -> Explorer actif,
+' sinon Inspector memorise. La derniere passe libere l'entree ; une fenetre
+' deja fermee leve une erreur absorbee par OERN.
+'-----------------------------------------------------------------------------
+Public Sub HideBccPass(ByVal key As String)
+    On Error Resume Next
+
+    If key = KEY_INLINE Then
+        Dim expl As Object
+        Set expl = Application.ActiveExplorer
+        If Not expl Is Nothing Then HideOnBars expl.CommandBars
+        Exit Sub
+    End If
+
+    ' Pack v3 (C12) : Take decremente les passes (2 armees) et libere a la
+    ' seconde ; plus de compteur Static local.
+    Dim insp As Object
+    Set insp = modInspectorQueue.Take(key)
+    If Not insp Is Nothing Then
+        ' Ne pas masquer si l'utilisateur a deja saisi un Cci entre-temps.
+        If IsComposeMail(insp.CurrentItem) Then HideOnBars insp.CommandBars
+    End If
+
+    On Error GoTo 0
+End Sub
+
+'-----------------------------------------------------------------------------
+' Si le bouton Cci est enfonce, le bascule (= masque le champ).
+'-----------------------------------------------------------------------------
+Private Sub HideOnBars(ByVal bars As Object)
+    On Error Resume Next
+    If bars Is Nothing Then Exit Sub
+
+    Dim pressed As Boolean
+    Err.Clear
+    pressed = bars.GetPressedMso(MSO_SHOW_BCC)
+    If Err.Number <> 0 Then
+        ' Controle absent du ruban (mail recu, item non mail) : rien a faire.
+        modDebugLog.DTrace MOD_NAME, "ShowBcc indisponible (err " & Err.Number & ")"
+        Exit Sub
+    End If
+
+    If pressed Then
+        bars.ExecuteMso MSO_SHOW_BCC
+        If Err.Number = 0 Then
+            modDebugLog.DInfo MOD_NAME, "Champ Cci masque"
+        Else
+            modDebugLog.DError MOD_NAME, "ExecuteMso ShowBcc err " & Err.Number & " - " & Err.Description
+        End If
+    End If
+End Sub
+
+'-----------------------------------------------------------------------------
+' Vrai si mail en cours de composition (non envoye) SANS destinataire Cci.
+'-----------------------------------------------------------------------------
+Private Function IsComposeMail(ByVal itm As Object) As Boolean
+    On Error Resume Next
+    IsComposeMail = False
+    If itm Is Nothing Then Exit Function
+    If itm.Class <> OC_MAIL Then Exit Function
+    If itm.Sent Then Exit Function
+    If Len(Trim$(itm.BCC)) > 0 Then Exit Function
+    IsComposeMail = True
+End Function
+

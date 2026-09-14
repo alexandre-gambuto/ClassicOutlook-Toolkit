@@ -1,0 +1,153 @@
+Option Explicit
+
+'=============================================================================
+' modMaximizeWindow v8
+' Purpose (EN): forces each new mail Inspector window to a maximized state.
+'   v6 drops the Win32 path (GetForegroundWindow/ShowWindow) entirely and
+'   uses the Outlook object model instead: Inspector.WindowState = olMaximized,
+'   replayed in a burst (+1s/+2s/+4s) because Outlook re-applies its
+'   remembered window size shortly after the window opens.
+'
+' Force l'etat MAXIMISE sur chaque nouvelle fenetre de mail (Inspector).
+'
+' v6 (2026-06-10) - ROBUSTIFICATION (remplace la voie Win32) :
+'   AVANT : Inspector.Activate puis GetForegroundWindow() pour capturer un
+'   HWND, puis ShowWindow(hwnd, SW_MAXIMIZE) rejoue en rafale.
+'   PROBLEMES de l'ancienne voie :
+'     - course de focus : si une autre fenetre prenait le premier plan
+'       entre Activate et GetForegroundWindow (clic utilisateur, pop-up),
+'       on maximisait LA MAUVAISE FENETRE ;
+'     - Activate volait le focus par effet de bord ;
+'     - 3 Declare Win32 pour un besoin couvert par le modele objet.
+'   APRES : Inspector.WindowState = olMaximized, directement sur l'objet
+'   Inspector (aucune ambiguite de cible, aucun vol de focus, zero Declare,
+'   plus discret vis-a-vis de l'EDR). Le dictionnaire de rejeu stocke
+'   desormais l'objet Inspector lui-meme - pattern strictement identique a
+'   modNewMeetingDefault.DelayedAdjust (g_PendingInspectors), eprouve.
+'
+'   CONSERVE de la v5 (partie validee empiriquement) :
+'     - la RAFALE +1s/+2s/+4s : Outlook reapplique sa taille memorisee
+'       apres l'ouverture, il faut etre le dernier a maximiser ;
+'     - une cle de sequence par inspector + compteur de passes (pas
+'       d'ecrasement entre ouvertures simultanees) ;
+'     - cible MailItem uniquement (Class 43).
+'   Mode degrade si WindowState etait bloque : fenetre non maximisee,
+'   aucune erreur visible (OERN partout) - identique au symptome v5.
+'
+' Greffe : clsAppEvents.m_Inspectors_NewInspector. Cible : MailItem (43).
+'
+' v7 (2026-06-14) - La rafale passait par Application.OnTime, qui N'EXISTE
+'   PAS dans Outlook (erreur 438 avalee) : elle ne s'executait jamais, donc
+'   Outlook re-imposait sa taille memorisee et la fenetre restait non
+'   maximisee. Remplacee par modDefer.Arm "MaxWindow" (meme mecanique que
+'   les autres differes du projet). Module oublie lors de la conversion
+'   vers modDefer de la session precedente.
+' v8 (2026-07-10) : RAFALE ENCORE MORTE apres v7 - OnNewInspector stockait
+' l'inspecteur par affectation Let (g_PendingInspectors(key) = Inspector,
+' sans Set) : erreur 438 avalee -> cle jamais stockee -> MaximizePass
+' sortait sur Exists=False. Seule la passe immediate agissait. Correctif :
+' g_PendingInspectors.Add key, Inspector. (Meme bug que
+' modNewMeetingDefault v7 - le pattern "eprouve" copie etait le meme
+' pattern casse.) Les compteurs g_PendingPassLeft (Long) ne sont pas
+' concernes : Let d'un scalaire dans un Dictionary est valide.
+' (Historique des versions -> CHANGELOG.)
+'=============================================================================
+
+Private Const MOD_NAME As String = "MaxWindow"
+Private Const MOD_VERSION As String = "v8 - 2026-07-10"
+Private Const OC_MAIL As Long = 43      ' olMail
+
+' Pack v3 (C12) : la file des inspecteurs (cle -> Inspector, compteur de
+' passes) vit dans modInspectorQueue ; Register(..., 3) = 3 passes.
+
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+
+'-----------------------------------------------------------------------------
+' DIAGNOSTIC : a lancer depuis Execution sur un mail DEJA OUVERT.
+' Log l'etat de fenetre avant/apres pose de olMaximized.
+'-----------------------------------------------------------------------------
+Public Sub DiagMaximize()
+    On Error Resume Next
+    Dim insp As Object
+    Set insp = Application.ActiveInspector
+    If insp Is Nothing Then
+        modDebugLog.DInfo MOD_NAME, "DiagMaximize : pas d'inspector actif"
+        Exit Sub
+    End If
+    modDebugLog.DInfo MOD_NAME, "DiagMaximize : WindowState avant = " & insp.WindowState
+    insp.WindowState = olMaximized
+    modDebugLog.DInfo MOD_NAME, "DiagMaximize : WindowState apres = " & insp.WindowState & _
+        " (0 = olMaximized attendu)"
+End Sub
+
+'-----------------------------------------------------------------------------
+' Point d'entree appele par clsAppEvents sur chaque nouvel Inspector.
+'-----------------------------------------------------------------------------
+Public Sub OnNewInspector(ByVal Inspector As Object)
+    On Error Resume Next
+
+    If Inspector Is Nothing Then Exit Sub
+
+    If Not IsMailInspector(Inspector) Then
+        modDebugLog.DTrace MOD_NAME, "OnNewInspector skip (non-mail)"
+        Exit Sub
+    End If
+
+    modDebugLog.DTrace MOD_NAME, "OnNewInspector mail detecte"
+
+    ' Passe immediate, directement sur l'objet (v6 : plus de HWND).
+    Inspector.WindowState = olMaximized
+
+    ' Enregistrer l'Inspector (3 passes differees) dans la file partagee.
+    Dim key As String
+    key = modInspectorQueue.Register(Inspector, "max", 3)
+    If Len(key) = 0 Then Exit Sub
+
+    ' RAFALE : Outlook reapplique sa taille memorisee apres l'ouverture.
+    ' On repasse plusieurs fois pour etre le dernier a maximiser.
+    ' v7 : Application.OnTime n'existe PAS dans Outlook (438 avalee) -> la
+    ' rafale ne s'executait jamais et Outlook re-imposait sa taille memorisee.
+    ' modDefer cree un timer independant par Arm (id unique), donc les 3
+    ' passes coexistent meme si plusieurs inspecteurs s'ouvrent en meme temps.
+    modDefer.Arm "MaxWindow", 1, key
+    modDefer.Arm "MaxWindow", 2, key
+    modDefer.Arm "MaxWindow", 4, key
+
+    On Error GoTo 0
+End Sub
+
+'-----------------------------------------------------------------------------
+' Passe differee : re-maximise l'Inspector associe a la cle, s'il est
+' toujours ouvert (fenetre fermee -> WindowState leve, absorbe par OERN).
+' Decremente le compteur de passes ; a 0, libere les entrees du Dictionary.
+'-----------------------------------------------------------------------------
+Public Sub MaximizePass(ByVal key As String)
+    On Error Resume Next
+
+    ' Pack v3 (C12) : Take decremente le compteur de passes et libere la
+    ' cle a la derniere.
+    Dim insp As Object
+    Set insp = modInspectorQueue.Take(key)
+    If insp Is Nothing Then Exit Sub
+
+    insp.WindowState = olMaximized
+    modDebugLog.DTrace MOD_NAME, "Re-maximise (cle " & key & ")"
+
+    On Error GoTo 0
+End Sub
+
+'-----------------------------------------------------------------------------
+' Vrai si l'Inspector porte un MailItem.
+'-----------------------------------------------------------------------------
+Private Function IsMailInspector(ByVal Inspector As Object) As Boolean
+    On Error Resume Next
+    Dim itm As Object
+    Set itm = Inspector.CurrentItem
+    If Not itm Is Nothing Then
+        IsMailInspector = (itm.Class = OC_MAIL)
+    End If
+    On Error GoTo 0
+End Function

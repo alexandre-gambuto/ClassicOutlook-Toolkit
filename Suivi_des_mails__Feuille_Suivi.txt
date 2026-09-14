@@ -1,0 +1,642 @@
+Option Explicit
+
+'=============================================================================
+' Code de la FEUILLE "Suivi" (classeur Suivi des mails.xlsm)
+' A coller dans le module de la FEUILLE (pas un module standard) :
+'   VBE Excel (Alt+F11) -> double-clic sur "Suivi" sous
+'   VBAProject(Suivi des mails.xlsm) -> coller ici (fenetre vide).
+'
+' v6 (2026-07-25) :
+'   * CORRECTION CRITIQUE - realignement des colonnes sur
+'     modMailResponseTracker v5.7. Cote Outlook, la v5.7 a insere la colonne
+'     "Valider reponse" en 15 et DECALE tout ce qui suit ; ce code etait reste
+'     sur l'ancien plan. Consequences en production :
+'       - un clic sur "Valider reponse" (col 15) declenchait DoDelete et
+'         SUPPRIMAIT la ligne de suivi ;
+'       - "Supprimer" (col 16) n'etait plus dans le Select Case et ne faisait
+'         RIEN ;
+'       - ResolveMail lisait l'EntryID en colonne 18, qui porte desormais le
+'         ConversationID : "Ouvrir" et "Relancer" resolvaient le mauvais
+'         identifiant.
+'   * DoValidate : le bouton "Valider reponse" existait cote Outlook depuis la
+'     v5.7 mais n'avait aucun gestionnaire ici. Il acquitte les reponses
+'     (AckCount = nb de reponses) et passe le statut de "Repondu ?" a
+'     "Repondu".
+'   * ARCHIVER : nouvelle action. La ligne quitte le suivi courant pour la
+'     feuille "Archives", creee a la premiere utilisation.
+'
+' Etape 3 : actions cliquables par ligne (clic simple) + recalcul instantane
+' de la date limite quand on edite le delai.
+'   Ouvrir     : ouvre le mail suivi dans Outlook (lecture seule).
+'   Relancer   : ouvre un brouillon "Repondre a tous" pre-rempli ; la ligne
+'                n'est comptee qu'a l'ENVOI reel (gere cote Outlook).
+'   Prolonger  : repousse l'echeance de X jours (ajuste le delai).
+'   Supprimer  : supprime la ligne de suivi (avec confirmation).
+' L'envoi AUTOMATIQUE de relance reste dans Outlook (FollowUpOverdue), seul
+' chemin d'envoi silencieux prouve sous l'EDR.
+'=============================================================================
+
+' Colonnes du gabarit (cf. modMailResponseTracker)
+' Pack v3 (A11) : les indices de colonnes sont LUS PAR NOM dans la feuille
+' masquee "_Schema" ecrite par modMailResponseTracker (Outlook) a chaque
+' ouverture du classeur. Les valeurs ci-dessous ne sont que le REPLI si la
+' feuille est absente (classeur jamais rouvert par Outlook depuis le pack
+' v3). Un decalage de colonne cote Outlook ne peut plus faire cliquer sur la
+' mauvaise action (incident v5.7 : "Valider" supprimait la ligne).
+Private COL_STATUS   As Long
+Private COL_ECHEANCE As Long
+Private COL_SUBJECT  As Long
+Private COL_RESPONSE As Long   ' nb de reponses recues
+Private COL_SENT     As Long
+Private COL_DELAY    As Long
+Private COL_DUE      As Long
+Private COL_LASTFU   As Long
+Private COL_NBFU     As Long
+Private COL_RELANCE  As Long
+Private COL_OPEN     As Long
+Private COL_EXTEND   As Long
+Private COL_VALIDATE As Long   ' v5.7 cote Outlook : "Valider reponse"
+Private COL_DELETE   As Long
+Private COL_ID       As Long
+Private COL_CONV     As Long
+Private COL_ENTRY    As Long
+Private COL_ACK      As Long   ' v5.7 : nb de reponses acquittees
+Private COL_ARCHIVE  As Long   ' v6 : action "Archiver"
+Private mSchemaLoaded As Boolean
+
+' Feuille d'archive
+Private Const SH_ARCHIVE   As String = "Archives"
+
+'=============================================================================
+' Clic simple sur une cellule-lien d'une colonne d'action.
+'=============================================================================
+'=============================================================================
+' EnsureSchema (pack v3 - A11) : charge les indices depuis _Schema (par nom),
+' repli sur les valeurs historiques si la feuille est absente.
+'=============================================================================
+Private Sub EnsureSchema()
+    If mSchemaLoaded Then Exit Sub
+    ' Repli = contrat v5.7 / v6
+    COL_STATUS = 1: COL_ECHEANCE = 2: COL_SUBJECT = 3: COL_RESPONSE = 5
+    COL_SENT = 7: COL_DELAY = 8: COL_DUE = 9: COL_LASTFU = 10: COL_NBFU = 11
+    COL_RELANCE = 12: COL_OPEN = 13: COL_EXTEND = 14: COL_VALIDATE = 15
+    COL_DELETE = 16: COL_ID = 17: COL_CONV = 18: COL_ENTRY = 19: COL_ACK = 20
+    COL_ARCHIVE = 21
+    mSchemaLoaded = True
+
+    On Error Resume Next
+    Dim ws As Worksheet
+    Set ws = Me.Parent.Worksheets("_Schema")
+    If ws Is Nothing Then Exit Sub
+    COL_STATUS = SchemaCol(ws, "STATUS", COL_STATUS)
+    COL_ECHEANCE = SchemaCol(ws, "DEADLINE", COL_ECHEANCE)
+    COL_SUBJECT = SchemaCol(ws, "SUBJECT", COL_SUBJECT)
+    COL_RESPONSE = SchemaCol(ws, "RESPONSE_COUNT", COL_RESPONSE)
+    COL_SENT = SchemaCol(ws, "SENT_DATE", COL_SENT)
+    COL_DELAY = SchemaCol(ws, "DELAY_DAYS", COL_DELAY)
+    COL_DUE = SchemaCol(ws, "DUE_DATE", COL_DUE)
+    COL_LASTFU = SchemaCol(ws, "LAST_FOLLOWUP", COL_LASTFU)
+    COL_NBFU = SchemaCol(ws, "FOLLOWUP_COUNT", COL_NBFU)
+    COL_RELANCE = SchemaCol(ws, "ACT_FOLLOWUP", COL_RELANCE)
+    COL_OPEN = SchemaCol(ws, "ACT_OPEN", COL_OPEN)
+    COL_EXTEND = SchemaCol(ws, "ACT_EXTEND", COL_EXTEND)
+    COL_VALIDATE = SchemaCol(ws, "ACT_VALIDATE", COL_VALIDATE)
+    COL_DELETE = SchemaCol(ws, "ACT_DELETE", COL_DELETE)
+    COL_ID = SchemaCol(ws, "ID", COL_ID)
+    COL_CONV = SchemaCol(ws, "CONV_ID", COL_CONV)
+    COL_ENTRY = SchemaCol(ws, "ENTRY_ID", COL_ENTRY)
+    COL_ACK = SchemaCol(ws, "ACK_COUNT", COL_ACK)
+    COL_ARCHIVE = SchemaCol(ws, "ARCHIVE", COL_ARCHIVE)
+End Sub
+
+Private Function SchemaCol(ByVal ws As Worksheet, ByVal keyName As String, ByVal fallback As Long) As Long
+    On Error Resume Next
+    SchemaCol = fallback
+    Dim f As Range
+    Set f = ws.Columns(1).Find(What:=keyName, LookIn:=xlValues, LookAt:=xlWhole, MatchCase:=False)
+    If f Is Nothing Then Exit Function
+    Dim v As Variant
+    v = f.Offset(0, 1).Value
+    If IsNumeric(v) Then
+        If CLng(v) >= 1 Then SchemaCol = CLng(v)
+    End If
+End Function
+
+Private Sub Worksheet_FollowHyperlink(ByVal Target As Hyperlink)
+    EnsureSchema
+    On Error GoTo Fin
+    Dim c As Range
+    Set c = Target.Range
+    If c Is Nothing Then Exit Sub
+    If c.Row < 2 Then Exit Sub
+
+    Select Case c.Column
+        Case COL_OPEN:     DoOpen c.Row
+        Case COL_RELANCE:  DoRelance c.Row
+        Case COL_EXTEND:   DoExtend c.Row
+        Case COL_VALIDATE: DoValidate c.Row
+        Case COL_ARCHIVE:  DoArchive c.Row
+        Case COL_DELETE:   DoDelete c.Row
+    End Select
+    Exit Sub
+Fin:
+    MsgBox "Action impossible : " & Err.Number & " - " & Err.Description, _
+           vbExclamation, "Suivi des mails"
+End Sub
+
+'=============================================================================
+' Edition du delai (colonne D~elai) -> recalcul instantane de la date limite,
+' de l'echeance et du statut (sans rouvrir le tableau de bord).
+'=============================================================================
+Private Sub Worksheet_Change(ByVal Target As Range)
+    EnsureSchema
+    On Error GoTo Fin
+    Dim isect As Range
+    Set isect = Application.Intersect(Target, Me.Columns(COL_DELAY))
+    If isect Is Nothing Then Exit Sub
+
+    Application.EnableEvents = False
+    Dim cell As Range
+    For Each cell In isect.Cells
+        If cell.Row >= 2 Then RecomputeRow cell.Row
+    Next cell
+Fin:
+    Application.EnableEvents = True
+End Sub
+
+'=============================================================================
+' (Re)pose les liens cliquables sur les 4 colonnes d'action de chaque ligne.
+' Idempotent (ne retouche pas une cellule deja liee) : appele a l'ouverture
+' du classeur pour que les lignes ajoutees par Outlook aient aussi les liens.
+'=============================================================================
+Public Sub StampActionCells()
+    EnsureSchema
+    On Error Resume Next
+    Dim lastRow As Long
+    lastRow = Me.Cells(Me.Rows.Count, COL_ID).End(xlUp).Row
+    Dim r As Long
+    For r = 2 To lastRow
+        If Len(CStr(Me.Cells(r, COL_ID).Value)) > 0 Then
+            StampCell r, COL_RELANCE, "Relancer"
+            StampCell r, COL_OPEN, "Ouvrir"
+            StampCell r, COL_EXTEND, "Prolonger"
+            StampCell r, COL_VALIDATE, "Valider reponse"
+            StampCell r, COL_ARCHIVE, "Archiver"
+            StampCell r, COL_DELETE, "Supprimer"
+        End If
+    Next r
+End Sub
+
+Private Sub StampCell(ByVal r As Long, ByVal col As Long, ByVal label As String)
+    On Error Resume Next
+    Dim c As Range
+    Set c = Me.Cells(r, col)
+    If c.Hyperlinks.Count > 0 Then Exit Sub
+    Me.Hyperlinks.Add Anchor:=c, Address:="", _
+        SubAddress:=Me.Name & "!" & c.Address(False, False), TextToDisplay:=label
+    c.Font.Underline = xlUnderlineStyleSingle
+    c.Font.Color = RGB(5, 99, 193)
+End Sub
+
+'=============================================================================
+' ACTIONS
+'=============================================================================
+Private Sub DoOpen(ByVal r As Long)
+    On Error GoTo Fin
+    Dim ol As Object
+    Set ol = GetOutlook()
+    If ol Is Nothing Then Exit Sub
+
+    Dim itm As Object
+    Set itm = ResolveMail(ol, r)
+    If itm Is Nothing Then Exit Sub
+
+    itm.Display
+    On Error Resume Next
+    ol.ActiveWindow.Activate
+    Exit Sub
+Fin:
+    MsgBox "Ouverture impossible : " & Err.Number & " - " & Err.Description, _
+           vbExclamation, "Ouvrir le mail"
+End Sub
+
+Private Sub DoRelance(ByVal r As Long)
+    On Error GoTo Fin
+    Dim ol As Object
+    Set ol = GetOutlook()
+    If ol Is Nothing Then Exit Sub
+
+    Dim src As Object
+    Set src = ResolveMail(ol, r)
+    If src Is Nothing Then Exit Sub
+
+    Dim fu As Object
+    Set fu = src.ReplyAll
+    fu.htmlBody = InsertAfterBody(fu.htmlBody, BuildRelanceHtml())
+
+    ' Tag : la ligne ne sera mise a jour qu'a l'ENVOI reel (hook Outlook
+    ' Application_ItemSend -> RegisterFollowupSent).
+    Dim convID As String
+    convID = CStr(Me.Cells(r, COL_CONV).Value)
+    On Error Resume Next
+    Dim up As Object
+    Set up = fu.UserProperties.Find("FollowupConvID")
+    If up Is Nothing Then Set up = fu.UserProperties.Add("FollowupConvID", 1)
+    up.Value = convID
+    On Error GoTo Fin
+
+    fu.Display
+    On Error Resume Next
+    ol.ActiveWindow.Activate
+    Exit Sub
+Fin:
+    MsgBox "Relance impossible : " & Err.Number & " - " & Err.Description, _
+           vbExclamation, "Relancer"
+End Sub
+
+Private Sub DoExtend(ByVal r As Long)
+    On Error GoTo Fin
+    Dim s As String
+    s = InputBox("Prolonger de combien de jours ?", "Prolonger", "7")
+    If Len(s) = 0 Then Exit Sub
+    Dim x As Long
+    x = 0
+    x = CLng(Val(s))
+    If x <= 0 Then Exit Sub
+
+    Application.EnableEvents = False
+    Dim t0 As Date
+    t0 = RowFloor(r)
+    Dim newDelay As Long
+    newDelay = DateDiff("d", Int(t0), Int(Now)) + x
+    If newDelay < 1 Then newDelay = x
+    Me.Cells(r, COL_DELAY).Value = newDelay
+    RecomputeRow r
+    Application.EnableEvents = True
+    Exit Sub
+Fin:
+    Application.EnableEvents = True
+    MsgBox "Prolongation impossible : " & Err.Number & " - " & Err.Description, _
+           vbExclamation, "Prolonger"
+End Sub
+
+Private Sub DoDelete(ByVal r As Long)
+    On Error GoTo Fin
+    Dim subj As String
+    subj = CStr(Me.Cells(r, COL_SUBJECT).Value)
+    If MsgBox("Supprimer ce suivi ?" & vbCrLf & subj, _
+              vbQuestion + vbYesNo + vbDefaultButton2, "Suivi des mails") <> vbYes Then Exit Sub
+    Application.EnableEvents = False
+    Me.Rows(r).Delete
+    Application.EnableEvents = True
+    Exit Sub
+Fin:
+    Application.EnableEvents = True
+    MsgBox "Suppression impossible : " & Err.Number & " - " & Err.Description, _
+           vbExclamation, "Supprimer"
+End Sub
+
+'=============================================================================
+' RECALCUL (date limite derivee du delai + echeance + statut binaire)
+'=============================================================================
+Private Sub DoValidate(ByVal r As Long)
+    On Error GoTo Fin
+
+    Dim st As String
+    st = Trim$(CStr(Me.Cells(r, COL_STATUS).Value))
+
+    If InStr(1, st, "Repondu ?", vbTextCompare) = 0 Then
+        MsgBox "Rien a valider sur cette ligne : le statut est """ & st & """." & vbCrLf & vbCrLf & _
+               "Le bouton Valider ne sert qu'aux lignes marquees ""Repondu ?"", " & _
+               "c'est-a-dire une reponse recue mais pas encore acquittee.", _
+               vbInformation, "Valider"
+        Exit Sub
+    End If
+
+    ' Acquitter : le nb de reponses acquittees rejoint le nb de reponses recues.
+    ' Cote Outlook, une reponse SUPPLEMENTAIRE re-signalera la ligne.
+    Me.Cells(r, COL_ACK).Value = Me.Cells(r, COL_RESPONSE).Value
+    Me.Cells(r, COL_STATUS).Value = "Repondu"
+    StyleStatus r, "Repondu"
+    Exit Sub
+Fin:
+    MsgBox "Validation impossible : " & Err.Description, vbExclamation, "Valider"
+End Sub
+
+'=============================================================================
+' ARCHIVER (v6)
+'
+' Deplace la ligne vers la feuille "Archives" : le suivi courant ne montre
+' plus que ce qui est en cours. Les liens d'action sont retires a l'archivage
+' - le gestionnaire de clic vit dans le module de CETTE feuille, un lien
+' conserve dans "Archives" ne declencherait rien et donnerait l'illusion d'un
+' bouton mort.
+'
+' Les colonnes techniques (identifiant, ConversationID, EntryID) sont
+' conservees : elles permettront de rouvrir un mail archive si on ajoute plus
+' tard un gestionnaire sur la feuille "Archives".
+'
+' A NOTER : cote Outlook, FindRowByConv ne cherche que dans "Suivi". Un
+' nouveau mail sur une conversation archivee cree donc une ligne NEUVE au
+' lieu de reveiller l'ancienne. C'est le comportement voulu - on archive
+' quand le sujet est clos, une reprise repart a zero.
+'=============================================================================
+Private Sub DoArchive(ByVal r As Long)
+    On Error GoTo Fin
+
+    Dim subj As String
+    subj = CStr(Me.Cells(r, COL_SUBJECT).Value)
+    If Len(subj) = 0 Then Exit Sub
+
+    If MsgBox("Archiver ce suivi ?" & vbCrLf & vbCrLf & subj & vbCrLf & vbCrLf & _
+              "La ligne quitte le suivi courant et rejoint la feuille """ & SH_ARCHIVE & """.", _
+              vbQuestion + vbYesNo, "Archiver") <> vbYes Then Exit Sub
+
+    Dim wsA As Object
+    Set wsA = EnsureArchiveSheet()
+    If wsA Is Nothing Then Exit Sub
+
+    Dim destRow As Long
+    destRow = wsA.Cells(wsA.Rows.Count, COL_SUBJECT).End(xlUp).Row + 1
+    If destRow < 2 Then destRow = 2
+
+    Application.EnableEvents = False
+    Application.ScreenUpdating = False
+
+    Me.Rows(r).Copy
+    wsA.Rows(destRow).PasteSpecial Paste:=xlPasteValues
+    wsA.Rows(destRow).PasteSpecial Paste:=xlPasteFormats
+    Application.CutCopyMode = False
+
+    ' Retrait des liens d'action : inertes hors de cette feuille.
+    On Error Resume Next
+    wsA.Range(wsA.Cells(destRow, COL_RELANCE), wsA.Cells(destRow, COL_ARCHIVE)).Hyperlinks.Delete
+    Dim col As Long
+    For col = COL_RELANCE To COL_ARCHIVE
+        Select Case col
+            Case COL_RELANCE, COL_OPEN, COL_EXTEND, COL_VALIDATE, COL_DELETE, COL_ARCHIVE
+                wsA.Cells(destRow, col).ClearContents
+                wsA.Cells(destRow, col).Font.Underline = xlUnderlineStyleNone
+                wsA.Cells(destRow, col).Font.Color = RGB(0, 0, 0)
+        End Select
+    Next col
+    wsA.Cells(destRow, COL_ARCHIVE).Value = Format$(Now, "dd/mm/yyyy hh:nn")
+    On Error GoTo Fin
+
+    Me.Rows(r).Delete
+
+    Application.ScreenUpdating = True
+    Application.EnableEvents = True
+    Exit Sub
+Fin:
+    Application.CutCopyMode = False
+    Application.ScreenUpdating = True
+    Application.EnableEvents = True
+    MsgBox "Archivage impossible : " & Err.Description, vbExclamation, "Archiver"
+End Sub
+
+'=============================================================================
+' EnsureArchiveSheet - cree la feuille "Archives" a la premiere utilisation,
+' avec la meme ligne d'en-tete que le suivi et les memes colonnes masquees.
+'=============================================================================
+Private Function EnsureArchiveSheet() As Object
+    On Error Resume Next
+    Dim wsA As Object
+    Set wsA = Me.Parent.Worksheets(SH_ARCHIVE)
+    If Not wsA Is Nothing Then
+        Set EnsureArchiveSheet = wsA
+        Exit Function
+    End If
+
+    Err.Clear
+    Set wsA = Me.Parent.Worksheets.Add(After:=Me)
+    If wsA Is Nothing Then Exit Function
+    wsA.Name = SH_ARCHIVE
+
+    ' En-tete identique, plus la date d'archivage a la place du bouton.
+    Me.Rows(1).Copy
+    wsA.Rows(1).PasteSpecial Paste:=xlPasteValues
+    wsA.Rows(1).PasteSpecial Paste:=xlPasteFormats
+    Application.CutCopyMode = False
+
+    Dim col As Long
+    For col = COL_RELANCE To COL_DELETE
+        wsA.Cells(1, col).ClearContents
+    Next col
+    wsA.Cells(1, COL_ARCHIVE).Value = "Archive le"
+    wsA.Columns(COL_ARCHIVE).ColumnWidth = 16
+
+    ' Memes colonnes techniques masquees que dans le suivi.
+    wsA.Columns(COL_ID).Hidden = True
+    wsA.Columns(COL_CONV).Hidden = True
+    wsA.Columns(COL_ENTRY).Hidden = True
+    wsA.Columns(COL_ACK).Hidden = True
+    For col = COL_RELANCE To COL_DELETE
+        wsA.Columns(col).Hidden = True
+    Next col
+
+    wsA.Rows(1).Font.Bold = True
+    wsA.Activate
+    wsA.Cells(2, 1).Select
+    ActiveWindow.FreezePanes = True
+    Me.Activate
+
+    Set EnsureArchiveSheet = wsA
+End Function
+
+Private Sub RecomputeRow(ByVal r As Long)
+    On Error Resume Next
+    Dim delayDays As Long
+    delayDays = 0
+    delayDays = CLng(Me.Cells(r, COL_DELAY).Value)
+
+    Dim t0 As Date
+    t0 = RowFloor(r)
+    Dim due As Date
+    due = DateAdd("d", delayDays, t0)
+    Me.Cells(r, COL_DUE).Value = due
+    Me.Cells(r, COL_DUE).NumberFormat = "dd/mm/yyyy"
+    UpdateEcheance r, due
+
+    ' Statuts terminaux : on ne touche pas (Outlook gere "Repondu"/"Traite").
+    Dim st As String
+    st = CStr(Me.Cells(r, COL_STATUS).Value)
+    If st = "R" & Chr(233) & "pondu" Then Exit Sub
+    If st = "Trait" & Chr(233) Then Exit Sub
+
+    Dim fc As Long
+    fc = 0
+    fc = CLng(Me.Cells(r, COL_NBFU).Value)
+
+    Dim ns As String
+    If Now > due Then
+        ns = "En retard"
+    ElseIf fc > 0 Then
+        ns = "Relanc" & Chr(233)
+    Else
+        ns = "En attente"
+    End If
+    Me.Cells(r, COL_STATUS).Value = ns
+    StyleStatus r, ns
+End Sub
+
+Private Function RowFloor(ByVal r As Long) As Date
+    On Error Resume Next
+    Dim lf As Date, sd As Date
+    lf = 0: sd = 0
+    sd = CDate(Me.Cells(r, COL_SENT).Value)
+    If Len(CStr(Me.Cells(r, COL_LASTFU).Value)) > 0 Then lf = CDate(Me.Cells(r, COL_LASTFU).Value)
+    If lf > sd Then RowFloor = lf Else RowFloor = sd
+End Function
+
+Private Sub UpdateEcheance(ByVal r As Long, ByVal due As Date)
+    If due = 0 Then
+        Me.Cells(r, COL_ECHEANCE).Value = ""
+        Exit Sub
+    End If
+    Dim d As Long
+    d = DateDiff("d", Int(Now), Int(due))
+    If d > 0 Then
+        Me.Cells(r, COL_ECHEANCE).Value = "J-" & d
+    ElseIf d = 0 Then
+        Me.Cells(r, COL_ECHEANCE).Value = "Aujourd'hui"
+    Else
+        Me.Cells(r, COL_ECHEANCE).Value = "Retard " & (-d) & " j"
+    End If
+End Sub
+
+Private Sub StyleStatus(ByVal r As Long, ByVal status As String)
+    Dim c As Range
+    Set c = Me.Cells(r, COL_STATUS)
+    c.Font.Bold = True
+    Select Case status
+        Case "R" & Chr(233) & "pondu"
+            c.Interior.Color = RGB(198, 239, 206): c.Font.Color = RGB(0, 97, 0)
+        Case "En retard"
+            c.Interior.Color = RGB(255, 174, 174): c.Font.Color = RGB(156, 0, 0)
+        Case "Relanc" & Chr(233)
+            c.Interior.Color = RGB(197, 217, 241): c.Font.Color = RGB(31, 73, 125)
+        Case "Trait" & Chr(233)
+            c.Interior.Color = RGB(217, 217, 217): c.Font.Color = RGB(64, 64, 64)
+        Case Else
+            c.Interior.Color = RGB(230, 230, 230): c.Font.Color = RGB(89, 89, 89)
+    End Select
+End Sub
+
+'=============================================================================
+' OUTILS Outlook + corps de relance
+'=============================================================================
+Private Function GetOutlook() As Object
+    On Error Resume Next
+    Set GetOutlook = GetObject(, "Outlook.Application")
+    On Error GoTo 0
+    If GetOutlook Is Nothing Then
+        MsgBox "Outlook n'est pas ouvert. Ouvrez Outlook, puis recommencez.", _
+               vbExclamation, "Suivi des mails"
+    End If
+End Function
+
+' Retrouve le mail suivi via son EntryID. Nothing + message si introuvable.
+Private Function ResolveMail(ByVal ol As Object, ByVal r As Long) As Object
+    On Error Resume Next
+    Set ResolveMail = Nothing
+    Dim entryID As String
+    entryID = CStr(Me.Cells(r, COL_ENTRY).Value)
+    If Len(entryID) > 0 Then Set ResolveMail = ol.Session.GetItemFromID(entryID)
+    On Error GoTo 0
+    If ResolveMail Is Nothing Then
+        MsgBox "Mail introuvable. Ouvrez le tableau de bord pour actualiser " & _
+               "les identifiants, puis recommencez.", vbExclamation, "Suivi des mails"
+    End If
+End Function
+
+' Texte de relance (FR) + mention "relance generee automatiquement".
+' NB : la version Outlook "Personnaliser" (modMailResponseTracker.FollowupBodyHtml,
+' autoSend=False) ne porte PAS la mention. Ici on l'ajoute volontairement pour
+' les relances lancees depuis le tableau Excel.
+Private Function BuildRelanceHtml() As String
+    Dim s As String
+    s = "Bonjour," & vbCrLf & _
+        "Je me permets de revenir vers vous au sujet de ce message, rest" & Chr(233) & _
+        " sans retour " & Chr(224) & " ce jour. Auriez-vous pu en prendre connaissance, " & _
+        "ou avez-vous besoin d'un compl" & Chr(233) & "ment de ma part ?" & vbCrLf & _
+        "Je reste " & Chr(224) & " votre disposition et vous remercie par avance." & vbCrLf & _
+        "Bien cordialement,"
+
+    Dim html As String
+    html = "<div>" & Replace(EncodeHtml(s), vbCrLf, "<br>") & "</div>"
+
+    ' --- Mention automatique : SEULE LIGNE A MODIFIER pour changer le texte ---
+    ' Le brouillon s'ouvre puis est envoye a la main, donc on ecrit "generee"
+    ' (et non "envoyee") pour rester exact. Variantes possibles :
+    '   "Courriel de relance envoy" & Chr(233) & " automatiquement."  (parite Outlook)
+    '   "R" & Chr(233) & "ponse automatique."                          (court)
+    Dim mention As String
+    mention = "Relance g" & Chr(233) & "n" & Chr(233) & "r" & Chr(233) & "e automatiquement."
+    ' -------------------------------------------------------------------------
+
+    html = html & "<div style=""color:#888888;font-size:9pt;font-style:italic;margin-top:2px"">" & _
+                  EncodeHtml(mention) & "</div>"
+
+    BuildRelanceHtml = html
+End Function
+
+Private Function InsertAfterBody(ByVal htmlBody As String, ByVal fragment As String) As String
+    Dim posBody As Long, posEnd As Long
+    posBody = InStr(1, htmlBody, "<body", vbTextCompare)
+    If posBody > 0 Then
+        posEnd = InStr(posBody, htmlBody, ">")
+        If posEnd > 0 Then
+            InsertAfterBody = Left$(htmlBody, posEnd) & fragment & _
+                              StripLeadingBlanks(Mid$(htmlBody, posEnd + 1))
+            Exit Function
+        End If
+    End If
+    InsertAfterBody = fragment & StripLeadingBlanks(htmlBody)
+End Function
+
+Private Function StripLeadingBlanks(ByVal s As String) As String
+    Dim pats() As String
+    pats = Split("<p class=MsoNormal><o:p>&nbsp;</o:p></p>|" & _
+                 "<p class=MsoNormal><o:p></o:p></p>|" & _
+                 "<p class=MsoNormal>&nbsp;</p>|<p class=MsoNormal></p>|" & _
+                 "<o:p>&nbsp;</o:p>|<o:p></o:p>|" & _
+                 "<div>&nbsp;</div>|<div><br></div>|<div><br/></div>|<div></div>|" & _
+                 "<p>&nbsp;</p>|<p></p>|&nbsp;|<br>|<br/>|<br />", "|")
+    Dim changed As Boolean
+    Do
+        changed = False
+        s = LTrimWS(s)
+        Dim i As Long
+        For i = LBound(pats) To UBound(pats)
+            Do While Len(s) >= Len(pats(i)) And _
+                     StrComp(Left$(s, Len(pats(i))), pats(i), vbTextCompare) = 0
+                s = Mid$(s, Len(pats(i)) + 1)
+                s = LTrimWS(s)
+                changed = True
+            Loop
+        Next i
+    Loop While changed
+    StripLeadingBlanks = s
+End Function
+
+Private Function LTrimWS(ByVal s As String) As String
+    Do While Len(s) > 0
+        Dim ch As String
+        ch = Left$(s, 1)
+        If ch = " " Or ch = vbCr Or ch = vbLf Or ch = vbTab Then
+            s = Mid$(s, 2)
+        Else
+            Exit Do
+        End If
+    Loop
+    LTrimWS = s
+End Function
+
+Private Function EncodeHtml(ByVal s As String) As String
+    s = Replace(s, "&", "&amp;")
+    s = Replace(s, "<", "&lt;")
+    s = Replace(s, ">", "&gt;")
+    EncodeHtml = s
+End Function
+

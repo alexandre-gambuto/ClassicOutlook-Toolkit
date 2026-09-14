@@ -1,0 +1,174 @@
+Option Explicit
+
+' =====================================================================
+' modSearch v3
+' Purpose (EN): native Outlook keyword searches on the active Explorer
+'   (this week's sent / received mail, and reset). The localized
+'   "received" keyword is rebuilt at runtime via Chr() so the source
+'   file encoding cannot corrupt it on import.
+'
+' Recherches Outlook par mot-cle natif sur l'Explorer actif.
+' Le mot-cle "recu" (c-cedille) est reconstruit a l'execution via
+' Chr(231) pour resister au transcodage du fichier source.
+'
+' v3 (2026-06-10) :
+'   - fix B7 : variable locale "T" renommee "t0" dans les deux attentes
+'     (masquait le wrapper global T(fr,en), VBA etant insensible a la
+'     casse : tout futur appel T() dans ces procedures aurait casse la
+'     compilation - "Declaration existante dans la portee").
+'   - fix B8 : noms de vues Outlook externalises dans config.ini (cles
+'     ViewCompact / ViewPreview, defauts "Compacter" / "Apercu" cedille).
+'     Les noms de vues sont propres au profil (langue, renommages) : en
+'     dur, la bascule devenait un no-op silencieux. Dependance : modConfig.
+' (Historique des versions -> CHANGELOG.)
+' =====================================================================
+
+Private Const MOD_NAME As String = "Search"
+Private Const MOD_VERSION As String = "v3 - 2026-06-10"
+
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+' Mot-cle Outlook : "recu" en francais (c-cedille).
+' Outlook accepte aussi "received" en anglais selon la langue du client,
+' mais sur un poste FR le mot-cle FR est obligatoire. Reconstruit a
+' l'execution pour eviter tout risque de transcodage du fichier source.
+Private Function ReceivedKeyword() As String
+    ReceivedKeyword = "re" & Chr(231) & "u"
+End Function
+
+'=============================================================================
+' Noms de vues Outlook (v3 - B8) : externalises dans config.ini.
+' Defauts du code : "Compacter" / "Apercu" (c-cedille via Chr(231), comme
+' ReceivedKeyword). Surcharger via ViewCompact= / ViewPreview= si les vues
+' sont renommees ou si le client Outlook est en anglais.
+'=============================================================================
+Private Function ViewCompactName() As String
+    ViewCompactName = modConfig.Cfg("ViewCompact", "Compacter")
+End Function
+
+Private Function ViewPreviewName() As String
+    ViewPreviewName = modConfig.Cfg("ViewPreview", "Aper" & Chr(231) & "u")
+End Function
+
+Public Sub SentMailsThisWeek()
+    On Error GoTo ErrH
+
+    Dim monday As Date
+    monday = Date - (Weekday(Date, vbMonday) - 1)
+
+    Dim myEmail As String
+    myEmail = GetMyEmailAlias()
+
+    ' D'abord remettre la vue Compacter pour repartir proprement
+    On Error Resume Next
+    Application.ActiveExplorer.CurrentView = ViewCompactName()
+    On Error GoTo ErrH
+
+    ' Lancer la recherche
+    Dim filter As String
+    filter = "de:" & myEmail & " " & ReceivedKeyword() & ":>=" & _
+             Format(monday, "DD/MM/YYYY") & " kind:email"
+
+    modDebugLog.DInfo MOD_NAME, "SentMailsThisWeek filter='" & filter & "'"
+    Application.ActiveExplorer.Search filter, 1
+
+    ' Attendre qu'Outlook traite la recherche.
+    ' v3 (B7) : "Dim T" masquait le wrapper global T(fr,en) ici.
+    Dim t0 As Double
+    t0 = Timer
+    Do While Timer < t0 + 1
+        DoEvents
+    Loop
+
+    ' Maintenant basculer en Apercu
+    On Error Resume Next
+    Application.ActiveExplorer.CurrentView = ViewPreviewName()
+    On Error GoTo ErrH
+    Exit Sub
+
+ErrH:
+    modDebugLog.DError MOD_NAME, "SentMailsThisWeek err " & Err.Number & _
+        " - " & Err.Description
+End Sub
+
+Public Sub ReceivedMailsThisWeek()
+    On Error GoTo ErrH
+
+    Dim monday As Date
+    monday = Date - (Weekday(Date, vbMonday) - 1)
+
+    Dim myEmail As String
+    myEmail = GetMyEmailAlias()
+
+    ' D'abord remettre la vue Compacter
+    On Error Resume Next
+    Application.ActiveExplorer.CurrentView = ViewCompactName()
+    On Error GoTo ErrH
+
+    ' Lancer la recherche
+    Dim filter As String
+    filter = ReceivedKeyword() & ":>=" & Format(monday, "DD/MM/YYYY") & _
+             " kind:email -de:" & myEmail
+
+    modDebugLog.DInfo MOD_NAME, "ReceivedMailsThisWeek filter='" & filter & "'"
+    Application.ActiveExplorer.Search filter, 1
+
+    ' Attendre qu'Outlook traite la recherche.
+    ' v3 (B7) : "Dim T" masquait le wrapper global T(fr,en) ici.
+    Dim t0 As Double
+    t0 = Timer
+    Do While Timer < t0 + 1
+        DoEvents
+    Loop
+
+    ' Forcer la vue Compacter sur les resultats
+    On Error Resume Next
+    Application.ActiveExplorer.CurrentView = ViewCompactName()
+    On Error GoTo ErrH
+    Exit Sub
+
+ErrH:
+    modDebugLog.DError MOD_NAME, "ReceivedMailsThisWeek err " & Err.Number & _
+        " - " & Err.Description
+End Sub
+
+Public Sub ResetSearch()
+    On Error GoTo ErrH
+
+    Dim inboxFolder As Object
+    Set inboxFolder = Application.GetNamespace("MAPI").GetDefaultFolder(olFolderInbox)
+    Set Application.ActiveExplorer.CurrentFolder = inboxFolder
+
+    On Error Resume Next
+    Application.ActiveExplorer.CurrentView = ViewCompactName()
+    Application.ActiveExplorer.CurrentView.filter = ""
+    Application.ActiveExplorer.CurrentView.Apply
+    On Error GoTo ErrH
+
+    modDebugLog.DInfo MOD_NAME, "ResetSearch OK"
+    Exit Sub
+
+ErrH:
+    modDebugLog.DError MOD_NAME, "ResetSearch err " & Err.Number & _
+        " - " & Err.Description
+End Sub
+
+'=============================================================================
+' Helper : alias mail (partie avant @) de l'utilisateur courant.
+' Fallback en dur si la resolution Exchange echoue.
+'=============================================================================
+Private Function GetMyEmailAlias() As String
+    On Error Resume Next
+    Dim addr As String
+    addr = Application.GetNamespace("MAPI").CurrentUser. _
+           AddressEntry.GetExchangeUser.PrimarySmtpAddress
+    On Error GoTo 0
+
+    If InStr(addr, "@") > 0 Then
+        GetMyEmailAlias = Left(addr, InStr(addr, "@") - 1)
+    Else
+        GetMyEmailAlias = "your.account"
+    End If
+End Function

@@ -1,0 +1,100 @@
+Option Explicit
+
+'=============================================================================
+' modInspectorQueue  (v1.0 - 2026-09-02)  [PACK v3 - C12]
+' Purpose (EN): keeps Inspector objects alive between a NewInspector event and
+'   a deferred modDefer pass, under a short text key (modDefer only carries a
+'   string argument). One place instead of four private copies of the same
+'   dictionary + sequence pattern (NewMeetingDefault, MaximizeWindow, HideBcc,
+'   MeetingToAppointment).
+'
+' File d'inspecteurs en attente d'un traitement DIFFERE. modDefer ne
+' transporte qu'un texte : on enregistre l'objet Inspector ici sous une cle
+' courte ("max_12"), la cible differee le reprend par Take(key).
+'
+'   Register(insp, tag, passes) -> cle. passes = nombre de reprises prevues
+'                                  (MaxWindow rejoue 3 fois, HideBcc 2, ...).
+'   Take(key)                   -> Inspector (Nothing si inconnu / expire) ;
+'                                  decremente les passes, libere a zero.
+'   Release(key)                -> liberation anticipee.
+'   PendingCount                -> diagnostic.
+'
+' Rappel historique : deux modules ont perdu leurs differes pendant des mois
+' parce que l'inspecteur etait stocke par Let (dict(key) = Inspector) au lieu
+' de Set -> erreur 438 avalee, cle jamais stockee (modMaximizeWindow v8,
+' modNewMeetingDefault v7). Ici l'ajout se fait une seule fois, avec .Add.
+' Un Ctrl+S VBE vide la file (variables module-level) : les differes en cours
+' sortent proprement sur Take = Nothing, comme avant.
+' DEPENDANCES : modDebugLog.
+'=============================================================================
+
+Private Const MOD_NAME As String = "InspQueue"
+Private Const MOD_VERSION As String = "v1.0 - 2026-09-02"
+
+Private mInspectors As Object     ' Scripting.Dictionary : cle -> Inspector
+Private mPasses As Object         ' Scripting.Dictionary : cle -> passes restantes
+Private mSeq As Long
+
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+Private Sub EnsureDicts()
+    If mInspectors Is Nothing Then Set mInspectors = CreateObject("Scripting.Dictionary")
+    If mPasses Is Nothing Then Set mPasses = CreateObject("Scripting.Dictionary")
+End Sub
+
+'=============================================================================
+' Register : memorise l'inspecteur, renvoie la cle a passer a modDefer.
+'=============================================================================
+Public Function Register(ByVal insp As Object, ByVal tag As String, _
+                         Optional ByVal passes As Long = 1) As String
+    On Error Resume Next
+    Register = ""
+    If insp Is Nothing Then Exit Function
+    EnsureDicts
+    mSeq = mSeq + 1
+    Dim key As String
+    key = tag & "_" & mSeq
+    mInspectors.Add key, insp
+    If passes < 1 Then passes = 1
+    mPasses(key) = passes
+    Register = key
+    modDebugLog.DTrace MOD_NAME, "Register " & key & " (passes=" & passes & ", total " & mInspectors.Count & ")"
+End Function
+
+'=============================================================================
+' Take : renvoie l'inspecteur associe (ou Nothing), decremente le compteur de
+' passes et libere l'entree quand il atteint zero.
+'=============================================================================
+Public Function Take(ByVal key As String) As Object
+    On Error Resume Next
+    Set Take = Nothing
+    If mInspectors Is Nothing Then Exit Function
+    If Not mInspectors.Exists(key) Then Exit Function
+    Set Take = mInspectors(key)
+    Dim remaining As Long
+    remaining = 1
+    If mPasses.Exists(key) Then remaining = CLng(mPasses(key))
+    remaining = remaining - 1
+    If remaining <= 0 Then
+        Release key
+    Else
+        mPasses(key) = remaining
+    End If
+End Function
+
+Public Sub Release(ByVal key As String)
+    On Error Resume Next
+    If mInspectors Is Nothing Then Exit Sub
+    If mInspectors.Exists(key) Then mInspectors.Remove key
+    If Not mPasses Is Nothing Then
+        If mPasses.Exists(key) Then mPasses.Remove key
+    End If
+End Sub
+
+Public Function PendingCount() As Long
+    On Error Resume Next
+    PendingCount = 0
+    If Not mInspectors Is Nothing Then PendingCount = mInspectors.Count
+End Function

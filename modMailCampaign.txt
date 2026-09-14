@@ -1,0 +1,2081 @@
+Option Explicit
+
+'=============================================================================
+' modMailCampaign  (v11.1 - 2026-08-22)  [COTE OUTLOOK]
+'
+' v11.1 (2026-08-22) : revue traduction + UX pop-ups.
+'   (a) TRADUCTION des zones restees francaises hors T() : le menu de
+'       creation de feuille (ChoisirCibleCreation), TOUT le rapport de
+'       CampaignDiagnostic, les avertissements du recapitulatif d'envoi
+'       (lignes ignorees, doublons d'adresses), le recapitulatif de
+'       brouillons et les 8 messages d'anomalie de ValiderLigne affiches
+'       par CampaignCheck.
+'   (b) NE SONT PAS TRADUITS, VOLONTAIREMENT - ce sont des CONTRATS DE
+'       DONNEES, pas de l'interface :
+'         - les valeurs ecrites dans la colonne Statut ("Envoye le ",
+'           "Brouillon cree le ", "Envoye manuellement le ") : elles sont
+'           RELUES par le module (test LCase$(Left$(st, 9)) = "brouillon"
+'           dans le rapprochement manuel) et par l'utilisateur d'un
+'           classeur a l'autre. Les traduire casserait le rapprochement
+'           sur tout classeur cree avant le basculement de langue ;
+'         - les en-tetes de colonnes ("Destinataires (A)", "Copies (Cc)"...)
+'           qui pilotent la detection des roles.
+'       Meme regle que les noms de feuilles Excel et les categories
+'       Outlook comparees.
+'   (c) Les noms de classeur, de feuille et de modele affiches dans le
+'       diagnostic restent hors T() : donnees, et A() alterait un nom
+'       contenant "~e" ou "~a".
+'   MOD_VERSION / ModVersion ajoutes (le module n'en avait pas ; il
+'   figurait deja dans MODULES_DEFAULT sous "Campaign" mais sans Case dans
+'   modMaintenance.ModuleVersionOf, donc affiche "non instrumente").
+'
+' v11.0 (2026-08-21) : MULTIBOITE. La boite cible est DEDUITE du dossier
+'   selectionne dans Outlook au moment du lancement (snapshot une fois par
+'   commande, via modStoreContext ; NOUVELLE DEPENDANCE). Effets :
+'   (a) COMPTE D'ENVOI : brouillons ET envois directs portent le compte de
+'   la boite cible (SendUsingAccount, pose AVANT .Display pour que le From
+'   et les addons de signature lies au compte suivent la bonne boite).
+'   Boite partagee SANS compte propre -> SentOnBehalfOfName (droits
+'   Exchange "de la part de" requis, sinon NDR). Boite par defaut ->
+'   comportement historique inchange.
+'   (b) BROUILLONS : le lot (.Save) atterrit dans les Brouillons de la
+'   boite cible (Save puis Move ; l'EntryID change, la UserProperty de
+'   campagne survit ; echec du Move -> reste en boite par defaut, loggue).
+'   Le test d'une ligne (.Display) ne sauvegarde toujours pas.
+'   (c) NETTOYAGE : comptage et purge des brouillons de campagne balaient
+'   desormais les Brouillons de TOUTES les boites du profil.
+'   (d) UI : la boite cible est affichee dans les confirmations de lot et
+'   d'envoi, et dans le diagnostic (deduction silencieuse rendue visible).
+'
+' v10.5 (2026-07-15) : (a) CHEMINS RELATIFS pour les PJ et la colonne
+'   Modele : un chemin sans lettre de lecteur ni prefixe UNC est resolu
+'   par rapport au DOSSIER DU CLASSEUR d'emailing (ResoudreCheminRel).
+'   "DV4370.pdf" ou "PJ\\fiche.pdf" a cote du .xlsx suffit desormais.
+'   Limite : classeur ouvert depuis le DISQUE (un classeur ouvert depuis
+'   SharePoint/URL n'a pas de dossier local -> chemin laisse tel quel).
+'   (b) SEPARATEUR PJ : les retours a la ligne DANS la cellule (Alt+Entree)
+'   sont acceptes comme separateurs, en plus du ";" (NormaliserSepPJ).
+'   (c) SUIVI DES ENVOIS MANUELS : chaque brouillon genere porte desormais,
+'   dans sa UserProperty de campagne, la reference de sa ligne Excel
+'   (classeur + feuille + ligne + cle destinataire/objet). A l'envoi MANUEL
+'   du brouillon, Application_ItemSend (ThisOutlookSession v12) appelle
+'   CampaignOnItemSend, qui memorise la reference et arme "CampaignSent"
+'   (+2 s, modDefer v1.10) : CampaignSentFlush ecrit alors "Envoye
+'   manuellement le ..." dans la colonne Statut (classeur rouvert en
+'   silence si necessaire). La ligne est retrouvee par sa cle si elle a
+'   ete triee/deplacee. Ne remplace JAMAIS un statut autre que vide ou
+'   "Brouillon cree...". Les tests d'existence de la UserProperty (purge,
+'   comptage) sont inchanges : seul le CONTENU de la valeur change.
+'
+' v10.4 (2026-07-05) : (a) cadence lue via les GETTERS modConfig
+'   (CampaignStepSec()...) : la lecture directe des g_Campaign* renvoyait
+'   0 apres un Ctrl+S VBE et le repli code (5 s) etait plus RAPIDE que le
+'   defaut config (20 s) -> cadence d'envoi x4 silencieuse. Replis alignes
+'   sur les defauts config. (b) ObtenirExcel valide l'instance GetObject
+'   par modCommon.ExcelAlive (EXCEL.EXE fantome : incident erreur 462 du
+'   2026-07-03 cote tracker ; ici la campagne echouait de la meme facon).
+'   (c) commentaires : anciennes cles FR Emaileur* remplacees par les
+'   cles reelles Campaign*.
+'
+' v10.3 (2026-06-10) : fix B6 - 11 occurrences (titres des MsgBox
+'   d'erreur, une ligne en portait deux) etaient en
+'   T("Emaileur", "Mail Campaign") imbrique. Mis a plat
+'   en T("Emaileur", "Mail Campaign"). L'imbrication etait fonctionnellement
+'   inoffensive ICI (aucun marqueur d'accent dans "Emaileur") mais appliquait
+'   le decodeur A() deux fois a la branche FR : piege latent des qu'un
+'   marqueur ~x apparait, et contraire a la convention "jamais de T() dans
+'   un T()".
+'
+' Emaileur Excel -> Outlook, heberge dans le projet VBA OUTLOOK (stable).
+' Pilote Excel a distance (late binding) : la cible est la FEUILLE ACTIVE de
+' l'instance Excel ouverte. Si aucun Excel n'est ouvert, un selecteur de
+' fichier demande le classeur d'emailing.
+'
+' Genere des brouillons Outlook a partir d'un modele .oft / .msg (signature
+' signature automatique deja capturee dans le modele : on n'ecrase JAMAIS le HTMLBody, on
+' insere le texte en haut, la signature reste en bas).
+'
+' COLONNES RECONNUES (par libelle, accents/casse/parentheses indifferents ;
+' l'ORDRE des colonnes est libre, la detection se fait sur le libelle) :
+'   Destinataires (A)        -> To   (obligatoire)   multi-adresses sep. ";"
+'   Copies (Cc)              -> Cc   (optionnel)      multi-adresses sep. ";"
+'   Caches (Cci)             -> Cci  (optionnel)      multi-adresses sep. ";"
+'   Objet                    -> Subject (obligatoire)
+'   Pieces jointes           -> Attachments (optionnel) multi-chemins sep. ";"
+'   Message (HTML)           -> corps injecte (obligatoire)  HTML brut
+'   Message (pour relecture) -> IGNOREE (relecture humaine uniquement)
+'   Modele                   -> modele .oft/.msg par ligne (optionnel ; sinon defaut)
+'   Statut                   -> ecrite par la macro (creee si absente)
+'
+' Ordre des en-tetes generes par CampaignCreateSheet (A..I) :
+'   A Destinataires (A) | B Copies (Cc) | C Caches (Cci) | D Objet |
+'   E Pieces jointes | F Message (HTML) | G Message (pour relecture) |
+'   H Modele | I Statut
+'
+' POINTS D'ENTREE (a binder au ruban / QAT OUTLOOK) :
+'   CampaignMenu          : HUB recommande. Popup explicatif des roles +
+'                           dispatch vers l'action choisie (1 a 8).
+'   CampaignCreateSheet  : cree la feuille d'emailing (9 en-tetes pre-formates)
+'                           dans un NOUVEAU classeur ou dans un classeur Excel
+'                           deja ouvert, au choix.
+'   CampaignGenerateRow  : la LIGNE COURANTE (cellule active Excel) seulement
+'                           -> .Display (fenetre ouverte, verif visuelle).
+'   CampaignGenerateBatch    : toutes les lignes de la feuille active -> .Save
+'                           dans Brouillons (pas de fenetres en rafale).
+'                           Confirmation unique de la feuille cible.
+'                           Idempotent : saute les lignes deja marquees.
+'   CampaignCheck      : pre-vol seul (controle), ne cree AUCUN brouillon.
+'   CampaignResetStatuses : efface la colonne Statut pour pouvoir regenerer.
+'   CampaignChangeTemplate : reinitialise et re-choisit le modele par defaut.
+'   CampaignOpenDrafts : ouvre le dossier Brouillons d'Outlook.
+'   CampaignDiagnostic    : etat Excel / feuille / en-tetes detectes / modele.
+'   CampaignSend       : ENVOI REEL des lignes validees (scenario A).
+'                           Regenere depuis Excel, .Send cadence par Sleep
+'                           synchrone (cadence et plafond lus depuis config.ini :
+'                           CampaignStepSec, CampaignBatchSize, CampaignPauseSec,
+'                           CampaignCap ; defauts 20/50/180/200). Confirmation
+'                           par saisie "ENVOYER". ATTENTION : Outlook est FIGE
+'                           pendant toute la duree de l'envoi (Sleep). Purge les
+'                           anciens brouillons de campagne au demarrage. Statut
+'                           -> "Envoye le ...".
+'   CampaignResetSend    : reinitialise l'etat d'envoi si une sequence a casse
+'                           (a lancer depuis la fenetre Execution du VBE).
+'   CampaignCleanDrafts : supprime les brouillons de campagne (marques
+'                           par UserProperty invisible), sans toucher aux autres.
+'
+' PRE-VOL : avant generation, scan complet (adresses plausibles, PJ presentes
+'   sur disque, objet/corps non vides, modele resolu existant). Tout OK ->
+'   rien ne s'affiche. Sinon -> recap unique, choix Continuer/Annuler.
+'
+' MODELE : cellule Modele vide (ou colonne absente) -> selecteur de fichier
+'   demande UNE SEULE FOIS le modele par defaut, applique aux lignes sans
+'   modele propre.
+'
+' CONTRAINTES : late binding integral (Excel + Outlook), pas de UserForm,
+'   chaines UI en ASCII. Bureau via WScript.Shell.SpecialFolders (jamais
+'   Environ USERPROFILE : redirect OneDrive). Traces via modDebugLog.
+'
+' DEPENDANCES : modDebugLog, modStoreContext (v11).
+'=============================================================================
+
+Private Const MOD_NAME As String = "Campaign"
+Private Const MOD_VERSION As String = "v11.1 - 2026-08-22"
+
+' --- Roles de colonnes -------------------------------------------------------
+Private Const R_TO As String = "TO"
+Private Const R_CC As String = "CC"
+Private Const R_BCC As String = "BCC"
+Private Const R_SUBJECT As String = "SUBJECT"
+Private Const R_ATTACH As String = "ATTACH"
+Private Const R_BODY As String = "BODY"
+Private Const R_TEMPLATE As String = "TEMPLATE"
+Private Const R_STATUS As String = "STATUS"
+
+' --- Constantes Excel (late binding : valeurs en dur) ------------------------
+Private Const XL_TOLEFT As Long = -4159
+Private Const XL_UP As Long = -4162
+
+' --- Constante Outlook -------------------------------------------------------
+Private Const OL_FOLDER_DRAFTS As Long = 16
+
+' --- Envoi cadence : valeurs lues depuis modConfig (config.ini) -------------
+' g_CampaignStepSec / g_CampaignBatchSize / g_CampaignPauseSec /
+' g_CampaignCap. Defauts si config absente : 5 / 50 / 180 / 200.
+
+' Nom de la UserProperty invisible marquant un brouillon de campagne.
+' v10.5 : sa VALEUR porte la reference de la ligne Excel (payload de suivi) ;
+' les detections existantes ne testent que sa PRESENCE (inchange).
+Private Const UPROP_CAMPAGNE As String = "EmaileurCampagne"
+
+' Cache du modele par defaut (resolu une fois par execution).
+Private gModeleDefaut As String
+Private gModeleDefautDemande As Boolean
+
+' Detail du dernier echec de CreerBrouillon (pour ecrire un statut explicite).
+Private gDernierEchec As String
+
+' --- Etat d'envoi (boucle directe + livraison differee) ----------------------
+Private gEnvWs As Object          ' feuille cible (pour ecrire les statuts)
+Private gEnvColStatut As Long     ' colonne Statut
+Private gEnvMap As Object         ' mapping colonnes (pour regenerer)
+Private gEnvOkCount As Long
+Private gEnvKoCount As Long
+Private gEnvEnCours As Boolean
+' Pack v3 (C7) : ENVOI ASYNCHRONE. La file des lignes a envoyer et la cadence
+' vivent au niveau module ; chaque echeance modDefer ("CampaignNext") envoie
+' UNE ligne puis re-arme le timer (pas normal, ou pause longue a la
+' frontiere de paquet). Outlook reste utilisable pendant toute la campagne.
+' Un Ctrl+S VBE pendant l'envoi vide cet etat : la campagne s'arrete, les
+' lignes deja envoyees portent leur statut, les autres restent vides.
+Private gSendRows() As Long        ' lignes Excel dans l'ordre d'envoi (1-based)
+Private gSendTotal As Long
+Private gSendPos As Long           ' prochaine position a envoyer
+Private gSendStepSec As Long
+Private gSendBatchSize As Long
+Private gSendPauseSec As Long
+Private gSendXlApp As Object       ' pour la barre d'etat Excel
+Private Const DEFER_SEND_KEY As String = "CampaignNext"
+
+' File des envois MANUELS en attente d'ecriture Excel (payloads de suivi
+' deposes par CampaignOnItemSend, draines par CampaignSentFlush via modDefer).
+Private gPendingSent As Collection
+
+' --- Multiboite (v11) --------------------------------------------------------
+' Boite cible de la commande en cours, deduite du dossier Outlook selectionne
+' au lancement (ResoudreBoiteCible). gTargetAccount = Nothing si la boite n'a
+' pas de compte propre (boite partagee).
+Private gTargetStore As Object     ' Outlook.Store
+Private gTargetAccount As Object   ' Outlook.Account (ou Nothing)
+
+
+'=============================================================================
+' POINTS D'ENTREE PUBLICS (ruban Outlook)
+'=============================================================================
+
+' HUB recommande : popup explicatif des roles + dispatch.
+'=============================================================================
+' ModVersion - version REELLEMENT chargee dans le VBE.
+'=============================================================================
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+Public Sub CampaignMenu()
+    Dim s As String
+    s = InputBox( _
+        T("EMAILEUR - tape un num~ero puis valide :", "MAIL CAMPAIGN - type a number then confirm:") & vbCrLf & vbCrLf & _
+        T("1 - Cr~eer feuille      : nouveau classeur, 9 en-tetes pre-formates.", "1 - Create sheet     : new workbook, 9 pre-formatted headers.") & vbCrLf & _
+        T("2 - Tester une ligne   : 1 brouillon depuis la cellule active, OUVERT pour relecture.", "2 - Test one row     : 1 draft from the active cell, OPENED for review.") & vbCrLf & _
+        T("3 - Lancer le lot      : tous les brouillons de la feuille active (dans Brouillons).", "3 - Run the batch    : all drafts from the active sheet (into Drafts).") & vbCrLf & _
+        T("4 - V~erifier seulement : contr~ole adresses/PJ/objet/corps/mod~fle, SANS rien cr~eer.", "4 - Check only       : checks addresses/attachment/subject/body/template, creates nothing.") & vbCrLf & _
+        T("5 - Reinit. statuts    : efface la colonne Statut pour pouvoir regenerer.", "5 - Reset statuses   : clears the Status column so you can regenerate.") & vbCrLf & _
+        T("6 - Changer le mod~fle  : choisir un autre mod~fle .oft/.msg par defaut.", "6 - Change template  : pick another default .oft/.msg template.") & vbCrLf & _
+        T("7 - Ouvrir Brouillons  : ouvre le dossier Brouillons d'Outlook.", "7 - Open Drafts      : opens Outlook's Drafts folder.") & vbCrLf & _
+        T("8 - Diagnostic         : ~etat Excel / feuille / en-tetes detectes / mod~fle.", "8 - Diagnostic       : Excel / sheet / detected headers / template state.") & vbCrLf & _
+        T("9 - ENVOYER            : envoi reel cadence des lignes validees (confirmation).", "9 - SEND             : real throttled send of validated rows (confirmation).") & vbCrLf & _
+        T("10 - Nettoyer brouillons: supprime les brouillons de campagne (invisibles aux autres).", "10 - Clean drafts    : deletes campaign drafts (invisible to others)."), _
+        T("Emaileur", "Mail Campaign"))
+
+    Select Case Trim$(s)
+        Case "1": CampaignCreateSheet
+        Case "2": CampaignGenerateRow
+        Case "3": CampaignGenerateBatch
+        Case "4": CampaignCheck
+        Case "5": CampaignResetStatuses
+        Case "6": CampaignChangeTemplate
+        Case "7": CampaignOpenDrafts
+        Case "8": CampaignDiagnostic
+        Case "9": CampaignSend
+        Case "10": CampaignCleanDrafts
+        Case Else: ' vide / annule / saisie inconnue -> rien
+    End Select
+End Sub
+
+
+Public Sub CampaignCreateSheet()
+    On Error GoTo ErrH
+    Dim xlApp As Object
+    Set xlApp = ObtenirExcel()
+
+    Dim wb As Object, ws As Object, nouveau As Boolean
+
+    If xlApp Is Nothing Then
+        ' Aucun Excel ouvert : seule option possible = nouveau classeur.
+        Set xlApp = CreateObject("Excel.Application")
+        xlApp.Visible = True
+        nouveau = True
+    Else
+        xlApp.Visible = True
+        Dim choix As Long
+        choix = ChoisirCibleCreation(xlApp, wb)   ' 1=nouveau ; 2=wb defini ; 0=annule
+        If choix = 0 Then Exit Sub
+        nouveau = (choix = 1)
+    End If
+
+    If nouveau Then
+        Set wb = xlApp.Workbooks.Add
+        Set ws = wb.Worksheets(1)
+    Else
+        Set ws = wb.Worksheets.Add
+    End If
+
+    On Error Resume Next
+    ws.Name = NomFeuilleUnique(wb, "Campagne email")
+    On Error GoTo ErrH
+
+    ConstruireFeuilleEmailing xlApp, ws
+
+    modDebugLog.DInfo MOD_NAME, "Feuille emailing creee (" & _
+        IIf(nouveau, "nouveau classeur", "classeur existant") & ") : " & ws.Name
+    MsgBox T("Feuille d'emailing '", "Mailing sheet '") & ws.Name & T("' cr~e~ee.", "' created.") & vbCrLf & vbCrLf & _
+           T("Remplis les lignes (en-tetes en ligne 1), enregistre le classeur,", "Fill the rows (headers on row 1), save the workbook,") & vbCrLf & _
+           T("garde-le ouvert et actif, puis lance la g~en~eration des brouillons.", "keep it open and active, then run draft generation."), _
+           vbInformation, T("Emaileur", "Mail Campaign")
+    Exit Sub
+ErrH:
+    modDebugLog.DError MOD_NAME, "CampaignCreateSheet " & Err.Number & " - " & Err.Description
+    MsgBox T("Erreur : ", "Error: ") & Err.Number & " - " & Err.Description, vbCritical, T("Emaileur", "Mail Campaign")
+End Sub
+
+
+' 1 = nouveau classeur ; 2 = wb defini (classeur ouvert choisi) ; 0 = annule.
+Private Function ChoisirCibleCreation(ByVal xlApp As Object, ByRef wb As Object) As Long
+    Dim nb As Long
+    nb = xlApp.Workbooks.Count
+    If nb = 0 Then ChoisirCibleCreation = 1: Exit Function   ' rien d'ouvert -> nouveau
+
+    Dim liste As String, i As Long
+    liste = T("Ou creer la feuille d'emailing ? Tape un numero :", _
+              "Where should the emailing sheet be created? Type a number:") & vbCrLf & vbCrLf & _
+            T("1 - Nouveau classeur", "1 - New workbook")
+    For i = 1 To nb
+        liste = liste & vbCrLf & (i + 1) & " - " & xlApp.Workbooks(i).Name
+    Next i
+    liste = liste & vbCrLf & vbCrLf & T("Numero :", "Number:")
+
+    Dim s As String
+    s = Trim$(InputBox(liste, T("Emaileur - cr~eer feuille", "Mail Campaign - create sheet")))
+    If Len(s) = 0 Or Not IsNumeric(s) Then ChoisirCibleCreation = 0: Exit Function
+
+    Dim c As Long
+    c = CLng(Val(s))
+    If c = 1 Then
+        ChoisirCibleCreation = 1
+    ElseIf c >= 2 And c <= nb + 1 Then
+        Set wb = xlApp.Workbooks(c - 1)
+        ChoisirCibleCreation = 2
+    Else
+        ChoisirCibleCreation = 0
+    End If
+End Function
+
+
+' Nom de feuille unique dans le classeur (Excel : 31 caracteres max).
+Private Function NomFeuilleUnique(ByVal wb As Object, ByVal base As String) As String
+    On Error Resume Next
+    Dim nom As String, k As Long, j As Long, existe As Boolean
+    nom = base
+    k = 1
+    Do
+        existe = False
+        For j = 1 To wb.Worksheets.Count
+            If LCase$(wb.Worksheets(j).Name) = LCase$(nom) Then existe = True: Exit For
+        Next j
+        If Not existe Then Exit Do
+        k = k + 1
+        nom = base & " " & k
+    Loop
+    NomFeuilleUnique = nom
+End Function
+
+
+' Ecrit les 9 en-tetes et applique la mise en forme (non bloquante).
+Private Sub ConstruireFeuilleEmailing(ByVal xlApp As Object, ByVal ws As Object)
+    ' Ordre : les deux colonnes message sont cote a cote (F = HTML injecte,
+    ' G = relecture humaine). Modele en H, Statut en I.
+    Dim entetes As Variant, i As Long
+    entetes = Array( _
+        "Destinataires (A)", _
+        "Copies (Cc)", _
+        "Cach" & Chr$(233) & "s (Cci)", _
+        "Objet", _
+        "Pi" & Chr$(232) & "ces jointes", _
+        "Message (HTML)", _
+        "Message (pour relecture)", _
+        "Mod" & Chr$(232) & "le", _
+        "Statut")
+    For i = 0 To UBound(entetes)
+        ws.Cells(1, i + 1).Value = entetes(i)
+    Next i
+
+    On Error Resume Next
+    ws.Rows(1).Font.Bold = True
+    ws.Columns(1).ColumnWidth = 28   ' Destinataires
+    ws.Columns(2).ColumnWidth = 28   ' Copies
+    ws.Columns(3).ColumnWidth = 28   ' Caches
+    ws.Columns(4).ColumnWidth = 40   ' Objet
+    ws.Columns(5).ColumnWidth = 40   ' Pieces jointes
+    ws.Columns(6).ColumnWidth = 55   ' Message (HTML)
+    ws.Columns(6).WrapText = True
+    ws.Columns(7).ColumnWidth = 55   ' Message (relecture)
+    ws.Columns(7).WrapText = True
+    ws.Columns(8).ColumnWidth = 40   ' Modele
+    ws.Columns(9).ColumnWidth = 24   ' Statut
+
+    ' Filtre automatique sur la ligne d'en-tete (9 colonnes : A..I).
+    ws.Range("A1:I1").AutoFilter
+
+    ws.Activate
+    ws.Range("A2").Select
+    xlApp.ActiveWindow.FreezePanes = True
+    On Error GoTo 0
+End Sub
+
+
+Public Sub CampaignGenerateRow()
+    On Error GoTo ErrH
+    ResoudreBoiteCible          ' v11 : snapshot au clic
+    Dim xlApp As Object, ws As Object
+    If Not CibleClasseur(xlApp, ws) Then Exit Sub
+
+    Dim lig As Long
+    On Error Resume Next
+    lig = xlApp.ActiveCell.Row
+    On Error GoTo ErrH
+    If lig < 2 Then
+        MsgBox T("Dans Excel, place le curseur sur une ligne de donn~ees (>= ligne 2)", "In Excel, put the cursor on a data row (>= row 2)") & vbCrLf & _
+               T("de la feuille d'emailing, puis relance.", "of the mailing sheet, then run again."), vbExclamation, T("Emaileur", "Mail Campaign")
+        Exit Sub
+    End If
+
+    GenererLot xlApp, ws, True, lig   ' True = .Display ; lig = ligne unique
+    Exit Sub
+ErrH:
+    modDebugLog.DError MOD_NAME, "CampaignGenerateRow " & Err.Number & " - " & Err.Description
+    MsgBox T("Erreur : ", "Error: ") & Err.Number & " - " & Err.Description, vbCritical, T("Emaileur", "Mail Campaign")
+End Sub
+
+
+Public Sub CampaignGenerateBatch()
+    On Error GoTo ErrH
+    ResoudreBoiteCible          ' v11 : snapshot au clic
+    Dim xlApp As Object, ws As Object
+    If Not CibleClasseur(xlApp, ws) Then Exit Sub
+
+    GenererLot xlApp, ws, False, 0    ' False = .Save ; 0 = tout le lot
+    Exit Sub
+ErrH:
+    modDebugLog.DError MOD_NAME, "CampaignGenerateBatch " & Err.Number & " - " & Err.Description
+    MsgBox T("Erreur : ", "Error: ") & Err.Number & " - " & Err.Description, vbCritical, T("Emaileur", "Mail Campaign")
+End Sub
+
+
+' Pre-vol seul : controle toutes les lignes, ne cree AUCUN brouillon.
+Public Sub CampaignCheck()
+    On Error GoTo ErrH
+    Dim xlApp As Object, ws As Object
+    If Not CibleClasseur(xlApp, ws) Then Exit Sub
+
+    Dim map As Object
+    Set map = ResoudreColonnes(ws)
+    If map Is Nothing Then Exit Sub
+
+    Dim colTo As Long: colTo = map(R_TO)
+    Dim derLig As Long: derLig = DerniereLigne(ws, colTo)
+    If derLig < 2 Then MsgBox T("Aucune ligne ~a v~erifier.", "No row to check."), vbInformation, T("Emaileur", "Mail Campaign"): Exit Sub
+
+    Dim cibles() As Long, n As Long, i As Long
+    n = 0
+    ReDim cibles(0 To derLig - 2)
+    For i = 2 To derLig
+        If Len(Trim$(CStr(ws.Cells(i, colTo).Value))) > 0 Then cibles(n) = i: n = n + 1
+    Next i
+    If n = 0 Then MsgBox T("Aucune ligne ~a v~erifier.", "No row to check."), vbInformation, T("Emaileur", "Mail Campaign"): Exit Sub
+    ReDim Preserve cibles(0 To n - 1)
+
+    PreparerModeleDefaut xlApp, ws, map, cibles
+
+    Dim okCount As Long, problemes As String, pb As String, lig As Long
+    For i = LBound(cibles) To UBound(cibles)
+        lig = cibles(i)
+        pb = ValiderLigne(ws, map, lig)
+        If Len(pb) = 0 Then
+            okCount = okCount + 1
+        Else
+            problemes = problemes & "Ligne " & lig & " : " & pb & vbCrLf
+        End If
+    Next i
+
+    Dim msg As String
+    msg = okCount & " ligne(s) OK sur " & n & "."
+    If Len(problemes) > 0 Then
+        msg = msg & vbCrLf & vbCrLf & "Problemes :" & vbCrLf & TronquerRecap(problemes)
+    Else
+        msg = msg & vbCrLf & T("Aucun probleme detecte.", "No problem detected.")
+    End If
+    MsgBox msg, vbInformation, T("Emaileur - v~erification", "Mail Campaign - check")
+    Exit Sub
+ErrH:
+    modDebugLog.DError MOD_NAME, "CampaignCheck " & Err.Number & " - " & Err.Description
+    MsgBox T("Erreur : ", "Error: ") & Err.Number & " - " & Err.Description, vbCritical, T("Emaileur", "Mail Campaign")
+End Sub
+
+
+' Efface la colonne Statut (action reversible mais on confirme).
+Public Sub CampaignResetStatuses()
+    On Error GoTo ErrH
+    Dim xlApp As Object, ws As Object
+    If Not CibleClasseur(xlApp, ws) Then Exit Sub
+
+    Dim colStatut As Long
+    colStatut = TrouverColonneRole(ws, R_STATUS)
+    If colStatut = 0 Then
+        MsgBox T("Aucune colonne Statut sur cette feuille.", "No Status column on this sheet."), vbInformation, T("Emaileur", "Mail Campaign")
+        Exit Sub
+    End If
+
+    Dim colTo As Long, derLig As Long
+    colTo = TrouverColonneRole(ws, R_TO)
+    If colTo = 0 Then colTo = colStatut
+    derLig = DerniereLigne(ws, colTo)
+    If derLig < 2 Then MsgBox T("Aucun statut a effacer.", "No status to clear."), vbInformation, T("Emaileur", "Mail Campaign"): Exit Sub
+
+    If MsgBox(T("Effacer la colonne Statut (lignes 2 a ", "Clear the Status column (rows 2 to ") & derLig & ") ?" & vbCrLf & _
+              T("Cela permet de regenerer les brouillons de ces lignes.", "This lets you regenerate the drafts for those rows."), _
+              vbExclamation + vbYesNo, T("Emaileur - reinit statuts", "Mail Campaign - reset statuses")) <> vbYes Then Exit Sub
+
+    ws.Range(ws.Cells(2, colStatut), ws.Cells(derLig, colStatut)).ClearContents
+    modDebugLog.DInfo MOD_NAME, "Statuts effaces (col " & colStatut & ", jusqu'a " & derLig & ")"
+    MsgBox T("Statuts effaces.", "Statuses cleared."), vbInformation, T("Emaileur", "Mail Campaign")
+    Exit Sub
+ErrH:
+    modDebugLog.DError MOD_NAME, "CampaignResetStatuses " & Err.Number & " - " & Err.Description
+    MsgBox T("Erreur : ", "Error: ") & Err.Number & " - " & Err.Description, vbCritical, T("Emaileur", "Mail Campaign")
+End Sub
+
+
+' Reinitialise et re-choisit le modele par defaut (.oft / .msg).
+Public Sub CampaignChangeTemplate()
+    On Error GoTo ErrH
+    Dim xlApp As Object
+    Set xlApp = ObtenirExcel()
+    If xlApp Is Nothing Then Set xlApp = CreateObject("Excel.Application")
+    xlApp.Visible = True
+
+    gModeleDefaut = ""
+    gModeleDefautDemande = False
+    DemanderModeleDefaut xlApp
+
+    If Len(gModeleDefaut) > 0 Then
+        MsgBox T("Mod~fle par defaut : ", "Default template: ") & gModeleDefaut, vbInformation, T("Emaileur", "Mail Campaign")
+    Else
+        MsgBox T("Aucun mod~fle par defaut s~electionn~e.", "No default template selected."), vbInformation, T("Emaileur", "Mail Campaign")
+    End If
+    Exit Sub
+ErrH:
+    modDebugLog.DError MOD_NAME, "CampaignChangeTemplate " & Err.Number & " - " & Err.Description
+    MsgBox T("Erreur : ", "Error: ") & Err.Number & " - " & Err.Description, vbCritical, T("Emaileur", "Mail Campaign")
+End Sub
+
+
+' Ouvre le dossier Brouillons de la boite courante (v11 : plus seulement
+' celui de la boite par defaut). Repli : boite par defaut.
+Public Sub CampaignOpenDrafts()
+    On Error GoTo ErrH
+    Dim f As Object
+    Set f = modStoreContext.SysFolder(modStoreContext.CurrentStore(), OL_FOLDER_DRAFTS)
+    If f Is Nothing Then Set f = Application.GetNamespace("MAPI").GetDefaultFolder(OL_FOLDER_DRAFTS)
+    f.Display
+    Exit Sub
+ErrH:
+    modDebugLog.DError MOD_NAME, "CampaignOpenDrafts " & Err.Number & " - " & Err.Description
+    MsgBox T("Erreur : ", "Error: ") & Err.Number & " - " & Err.Description, vbCritical, T("Emaileur", "Mail Campaign")
+End Sub
+
+
+' Etat de l'environnement (lecture seule, aucun effet de bord).
+Public Sub CampaignDiagnostic()
+    On Error GoTo ErrH
+    Dim rpt As String, xlApp As Object
+    Set xlApp = ObtenirExcel()
+    If xlApp Is Nothing Then
+        rpt = T("Excel en cours : NON (un selecteur s'ouvrira au lancement).", _
+                "Excel running: NO (a picker will open at launch).")
+    Else
+        rpt = T("Excel en cours : OUI", "Excel running: YES")
+        On Error Resume Next
+        Dim ws As Object
+        Set ws = xlApp.ActiveSheet
+        If Not ws Is Nothing Then
+            ' Noms de classeur/feuille : DONNEES, hors T().
+            rpt = rpt & vbCrLf & T("Classeur actif : ", "Active workbook: ") & ws.Parent.Name
+            rpt = rpt & vbCrLf & T("Feuille active : ", "Active sheet: ") & ws.Name
+            rpt = rpt & vbCrLf & T("Roles d'en-tete detectes : ", "Header roles detected: ") & ScanRolesPresents(ws)
+        Else
+            rpt = rpt & vbCrLf & T("(pas de feuille active)", "(no active sheet)")
+        End If
+        On Error GoTo ErrH
+    End If
+    rpt = rpt & vbCrLf & T("Modele par defaut (cache) : ", "Default template (cached): ") & _
+          IIf(Len(gModeleDefaut) > 0, gModeleDefaut, T("(non defini)", "(not set)"))
+    ResoudreBoiteCible          ' v11
+    rpt = rpt & vbCrLf & T("Boite cible (dossier courant) : ", "Target mailbox (current folder): ") & BoiteCibleLabel()
+    MsgBox rpt, vbInformation, T("Emaileur - diagnostic", "Mail Campaign - diagnostic")
+    Exit Sub
+ErrH:
+    modDebugLog.DError MOD_NAME, "CampaignDiagnostic " & Err.Number & " - " & Err.Description
+    MsgBox T("Erreur : ", "Error: ") & Err.Number & " - " & Err.Description, vbCritical, T("Emaileur", "Mail Campaign")
+End Sub
+
+
+'=============================================================================
+' ENVOI ECHELONNE (scenario A : regenere depuis Excel, .Send + livraison differee)
+'=============================================================================
+
+' ENVOYER : confirme, verifie qu'Outlook est en ligne, purge les anciens
+' brouillons de campagne, puis envoie les lignes valides avec une livraison
+' differee echelonnee (parametres config.ini : CampaignStepSec entre
+' livraisons, pause CampaignPauseSec tous les CampaignBatchSize, plafond
+' dur CampaignCap). Pas de timer VBA.
+Public Sub CampaignSend()
+    On Error GoTo ErrH
+
+    If gEnvEnCours Then
+        MsgBox T("Un envoi est d~ej~a en cours. Attends la fin ou relance Outlook.", "A send is already in progress. Wait for it to finish or restart Outlook."), _
+               vbExclamation, T("Emaileur - envoi", "Mail Campaign - send")
+        Exit Sub
+    End If
+
+    ResoudreBoiteCible          ' v11 : snapshot au clic
+
+    Dim xlApp As Object, ws As Object
+    If Not CibleClasseur(xlApp, ws) Then Exit Sub
+
+    ' v10.4 : parametres de cadence via les GETTERS modConfig (config
+    ' garantie chargee). La lecture directe des g_Campaign* renvoyait 0
+    ' apres un Ctrl+S VBE et le repli code (5 s) etait PLUS RAPIDE que le
+    ' defaut config (20 s) : cadence x4 silencieuse. Les gardes ci-dessous
+    ' ne couvrent plus que des valeurs config aberrantes.
+    Dim pasSec As Long, taillePaquet As Long, pauseSec As Long, plafond As Long
+    pasSec = modConfig.CampaignStepSec(): If pasSec <= 0 Then pasSec = 20
+    taillePaquet = modConfig.CampaignBatchSize(): If taillePaquet <= 0 Then taillePaquet = 50
+    pauseSec = modConfig.CampaignPauseSec(): If pauseSec < 0 Then pauseSec = 180
+    plafond = modConfig.CampaignCap(): If plafond <= 0 Then plafond = 200
+
+    Dim map As Object
+    Set map = ResoudreColonnes(ws)
+    If map Is Nothing Then Exit Sub
+
+    Dim colStatut As Long: colStatut = AssurerColonneStatut(ws, map)
+    Dim colTo As Long: colTo = map(R_TO)
+    Dim derLig As Long: derLig = DerniereLigne(ws, colTo)
+    If derLig < 2 Then MsgBox T("Aucune ligne a envoyer.", "No row to send."), vbInformation, T("Emaileur", "Mail Campaign"): Exit Sub
+
+    ' Outlook en ligne ? (sinon les .Send s'empilent sans partir)
+    If Not OutlookEnLigne() Then
+        If MsgBox(T("Outlook semble HORS CONNEXION. Les mails ne partiront pas tant", "Outlook seems OFFLINE. Mail will not go out as long") & vbCrLf & _
+                  T("que la connexion n'est pas retablie.", "as the connection is not restored.") & vbCrLf & vbCrLf & _
+                  T("Continuer quand m~xme ?", "Continue anyway?"), vbExclamation + vbYesNo, _
+                  T("Emaileur - hors connexion", "Mail Campaign - offline")) <> vbYes Then Exit Sub
+    End If
+
+    ' Lignes candidates : To non vide ET pas deja envoyees.
+    Dim cibles() As Long, n As Long, i As Long, st As String
+    Dim nbIgnores As Long
+    n = 0
+    nbIgnores = 0
+    ReDim cibles(0 To derLig - 2)
+    For i = 2 To derLig
+        If Len(Trim$(CStr(ws.Cells(i, colTo).Value))) > 0 Then
+            ' Regle : on n'envoie QUE si la case Statut est vide. Tout statut
+            ' non vide (envoye, programme, echec, note manuelle...) protege la
+            ' ligne contre un (re)envoi. Pour renvoyer une ligne : vider sa
+            ' cellule Statut (ou utiliser Reinitialiser Statuts).
+            st = Trim$(CStr(ws.Cells(i, colStatut).Value))
+            If Len(st) = 0 Then
+                cibles(n) = i: n = n + 1
+            Else
+                nbIgnores = nbIgnores + 1   ' statut non vide : exclue du lot
+            End If
+        End If
+    Next i
+    If n = 0 Then
+        MsgBox T("Aucune ligne ~a envoyer (toutes les lignes ont d~ej~a un statut).", "No row to send (every row already has a status).") & vbCrLf & _
+               T("Pour renvoyer : vide la colonne Statut (ou Reinitialiser Statuts).", "To resend: clear the Status column (or Reset Statuses)."), _
+               vbInformation, T("Emaileur", "Mail Campaign")
+        Exit Sub
+    End If
+    ReDim Preserve cibles(0 To n - 1)
+
+    PreparerModeleDefaut xlApp, ws, map, cibles
+
+    ' Pre-vol + detection de doublons d'adresses.
+    Dim problemes As String, doublons As String
+    Dim vues As Object: Set vues = CreateObject("Scripting.Dictionary")
+    Dim valides As Object: Set valides = CreateObject("Scripting.Dictionary")
+    Dim lig As Long, pb As String, adr As String
+    For i = LBound(cibles) To UBound(cibles)
+        lig = cibles(i)
+        pb = ValiderLigne(ws, map, lig)
+        If Len(pb) > 0 Then
+            problemes = problemes & "Ligne " & lig & " : " & pb & vbCrLf
+        Else
+            valides(lig) = True
+            adr = LCase$(Trim$(LireCell(ws, map, lig, R_TO)))
+            If vues.Exists(adr) Then
+                doublons = doublons & "Ligne " & lig & " : " & adr & " (deja ligne " & vues(adr) & ") " & vbCrLf
+            Else
+                vues(adr) = lig
+            End If
+        End If
+    Next i
+
+    If valides.Count = 0 Then
+        MsgBox T("Aucune ligne exploitable.", "No usable row.") & vbCrLf & vbCrLf & TronquerRecap(problemes), _
+               vbExclamation, T("Emaileur - envoi", "Mail Campaign - send")
+        Exit Sub
+    End If
+
+    ' Plafond dur.
+    If valides.Count > plafond Then
+        MsgBox valides.Count & T(" envois demandes : depasse le plafond de securite (", " sends requested: exceeds the safety cap (") & _
+               plafond & ")." & vbCrLf & _
+               T("Reduis le nombre de lignes (filtre / sous-ensemble) et relance.", "Reduce the number of rows (filter / subset) and run again."), _
+               vbCritical, T("Emaileur - plafond", "Mail Campaign - cap")
+        Exit Sub
+    End If
+
+    ' Estimation de duree.
+    Dim nbEnv As Long: nbEnv = valides.Count
+    Dim nbPauses As Long: nbPauses = (nbEnv - 1) \ taillePaquet
+    Dim dureeSec As Long
+    dureeSec = (nbEnv - 1) * pasSec + nbPauses * pauseSec
+    Dim dureeTxt As String
+    dureeTxt = (dureeSec \ 60) & " min " & (dureeSec Mod 60) & " s"
+
+    ' Recap + confirmation forte (taper ENVOYER).
+    Dim avert As String
+    If Len(problemes) > 0 Then avert = avert & vbCrLf & _
+        T("Lignes ignorees (erreurs) : voir debug.log.", "Skipped rows (errors): see debug.log.")
+    If Len(doublons) > 0 Then avert = avert & vbCrLf & _
+        T("ATTENTION doublons d'adresses :", "WARNING duplicate addresses:") & vbCrLf & TronquerRecap(doublons)
+
+    Dim saisie As String
+    saisie = InputBox( _
+        nbEnv & T(" mail(s) a envoyer, 1 destinataire chacun.", " mail(s) to send, 1 recipient each.") & vbCrLf & _
+        T("Envoi depuis : ", "Sending from: ") & BoiteCibleLabel() & vbCrLf & _
+        IIf(nbIgnores > 0, nbIgnores & T(" ligne(s) ignor~ee(s) (statut non vide).", " row(s) skipped (status not empty).") & vbCrLf, "") & _
+        T("Cadence : 1 toutes les ", "Throttle: 1 every ") & pasSec & " s, pause " & pauseSec & _
+        T(" s tous les ", " s every ") & taillePaquet & "." & vbCrLf & _
+        T("Duree estimee : ~", "Estimated time: ~") & dureeTxt & "." & vbCrLf & _
+        T("Outlook reste utilisable pendant l'envoi ; CampaignStop pour interrompre.", "Outlook stays usable during the send; CampaignStop to interrupt.") & avert & vbCrLf & vbCrLf & _
+        T("Pour confirmer l'ENVOI REEL, tape :  ENVOYER", "To confirm the REAL SEND, type:  SEND"), _
+        T("Emaileur - confirmation d'envoi", "Mail Campaign - send confirmation"))
+    If Trim$(UCase$(saisie)) <> UCase$(T("ENVOYER", "SEND")) Then
+        modDebugLog.DInfo MOD_NAME, "Envoi annule (confirmation non saisie)."
+        Exit Sub
+    End If
+
+    ' Purge des anciens brouillons de campagne (avant de regenerer).
+    Dim purges As Long
+    purges = PurgerBrouillonsCampagne()
+    modDebugLog.DInfo MOD_NAME, "Envoi : " & purges & " ancien(s) brouillon(s) de campagne purge(s)."
+
+    ' --- Pack v3 (C7) : ENVOI ASYNCHRONE via modDefer ----------------------
+    ' Avant : Sleep 1 s + DoEvents entre deux .Send, Outlook FIGE pendant toute
+    ' la campagne (50 mails x 20 s = 17 min inutilisables). Desormais : la
+    ' liste des lignes est memorisee, la premiere part tout de suite, chaque
+    ' suivante est armee a +pasSec (ou +pauseSec a la frontiere de paquet).
+    ' Commande CampaignStop pour interrompre.
+    gEnvEnCours = True
+    Set gEnvWs = ws
+    Set gEnvMap = map
+    Set gSendXlApp = xlApp
+    gEnvColStatut = colStatut
+    gEnvOkCount = 0
+    gEnvKoCount = 0
+    gSendStepSec = pasSec
+    gSendBatchSize = taillePaquet
+    gSendPauseSec = pauseSec
+
+    Dim cles2 As Variant: cles2 = valides.Keys
+    Dim k As Long
+    ReDim gSendRows(1 To UBound(cles2) + 1)
+    For k = 0 To UBound(cles2)
+        gSendRows(k + 1) = CLng(cles2(k))
+    Next k
+    gSendTotal = UBound(cles2) + 1
+    gSendPos = 1
+
+    modDebugLog.DInfo MOD_NAME, "Envoi demarre (asynchrone) : " & nbEnv & " mail(s), cadence " & pasSec & "s."
+    On Error Resume Next
+    xlApp.StatusBar = T("Emaileur : envoi de ", "Mail Campaign: sending ") & nbEnv & " mail(s)..."
+    On Error GoTo ErrH
+
+    modUi.Toast T("Envoi lanc~e : ", "Send started: ") & nbEnv & _
+                T(" mail(s), cadence ", " mail(s), throttle ") & pasSec & " s" & vbLf & _
+                T("Outlook reste utilisable. CampaignStop = interrompre.", _
+                  "Outlook stays usable. CampaignStop = interrupt."), uiInfo, True
+
+    CampaignSendNext
+    Exit Sub
+ErrH:
+    gEnvEnCours = False
+    On Error Resume Next
+    If Not xlApp Is Nothing Then xlApp.StatusBar = False
+    modDebugLog.DError MOD_NAME, "CampaignSend " & Err.Number & " - " & Err.Description
+    MsgBox T("Erreur : ", "Error: ") & Err.Number & " - " & Err.Description, vbCritical, T("Emaileur", "Mail Campaign")
+End Sub
+
+
+' Attente de n secondes, decoupee en tranches de 1 s avec DoEvents (limite
+
+' Reset manuel de l'etat d'envoi (a appeler depuis la fenetre Execution du VBE
+' si une sequence a ete interrompue : modMailCampaign.CampaignResetSend).
+Public Sub CampaignResetSend()
+    On Error Resume Next
+    modDefer.Cancel DEFER_SEND_KEY
+    gEnvEnCours = False
+    gSendTotal = 0
+    gSendPos = 0
+    Set gEnvWs = Nothing
+    Set gEnvMap = Nothing
+    If Not gSendXlApp Is Nothing Then gSendXlApp.StatusBar = False
+    Set gSendXlApp = Nothing
+    modDebugLog.DInfo MOD_NAME, "Etat d'envoi reinitialise (reset manuel)."
+    MsgBox T("~Etat d'envoi reinitialise. Tu peux relancer Envoyer.", "Send state reset. You can run Send again."), vbInformation, T("Emaileur", "Mail Campaign")
+End Sub
+
+
+'=============================================================================
+' PACK v3 (C7) - CampaignSendNext : cible modDefer "CampaignNext".
+' Envoie la ligne courante, ecrit son statut, puis arme la suivante.
+' Silencieux, jamais d'erreur visible (contexte differe).
+'=============================================================================
+Public Sub CampaignSendNext()
+    On Error Resume Next
+    If Not gEnvEnCours Then Exit Sub
+    If gSendPos < 1 Or gSendPos > gSendTotal Then
+        CampaignFinish
+        Exit Sub
+    End If
+    If gEnvWs Is Nothing Or gEnvMap Is Nothing Then
+        modDebugLog.DError MOD_NAME, "CampaignSendNext : feuille perdue (Excel ferme ?) - arret"
+        CampaignFinish
+        Exit Sub
+    End If
+
+    Dim lig As Long
+    lig = gSendRows(gSendPos)
+
+    Err.Clear
+    If EnvoyerLigneMaintenant(lig, ModeleResolu(gEnvWs, gEnvMap, lig)) Then
+        gEnvWs.Cells(lig, gEnvColStatut).Value = "Envoye le " & Format$(Now, "dd/mm/yyyy hh:nn:ss")
+        gEnvOkCount = gEnvOkCount + 1
+    Else
+        gEnvWs.Cells(lig, gEnvColStatut).Value = "ECHEC ENVOI " & Format$(Now, "dd/mm hh:nn") & _
+            IIf(Len(gDernierEchec) > 0, " - " & gDernierEchec, "")
+        gEnvKoCount = gEnvKoCount + 1
+    End If
+    If Err.Number <> 0 Then
+        modDebugLog.DError MOD_NAME, "CampaignSendNext ligne " & lig & " : err " & Err.Number & " - " & Err.Description
+        Err.Clear
+    End If
+
+    gSendPos = gSendPos + 1
+    If gSendPos > gSendTotal Then
+        CampaignFinish
+        Exit Sub
+    End If
+
+    ' Attente avant le PROCHAIN mail : pause longue a la frontiere de paquet.
+    Dim attente As Long
+    If ((gSendPos - 1) Mod gSendBatchSize) = 0 Then
+        attente = gSendPauseSec
+        modDebugLog.DInfo MOD_NAME, "Paquet de " & gSendBatchSize & " atteint, pause " & gSendPauseSec & "s."
+    Else
+        attente = gSendStepSec
+    End If
+    If attente < 1 Then attente = 1
+
+    If Not gSendXlApp Is Nothing Then
+        gSendXlApp.StatusBar = T("Emaileur : ", "Mail Campaign: ") & (gSendPos - 1) & "/" & gSendTotal & _
+                               T(" envoy~es, prochain dans ", " sent, next in ") & attente & " s"
+    End If
+    modDefer.ArmUnique DEFER_SEND_KEY, attente
+End Sub
+
+' Fin de campagne (normale ou apres arret) : etat remis a zero, recapitulatif.
+Private Sub CampaignFinish()
+    On Error Resume Next
+    Dim ok As Long, ko As Long, total As Long, done As Long
+    ok = gEnvOkCount
+    ko = gEnvKoCount
+    total = gSendTotal
+    done = gSendPos - 1
+    If done < 0 Then done = 0
+    gEnvEnCours = False
+    gSendTotal = 0
+    gSendPos = 0
+    If Not gSendXlApp Is Nothing Then gSendXlApp.StatusBar = False
+    Set gSendXlApp = Nothing
+    Set gEnvWs = Nothing
+    Set gEnvMap = Nothing
+    modDebugLog.DInfo MOD_NAME, "Envoi termine : ok=" & ok & " ko=" & ko & " (" & done & "/" & total & ")"
+    modUi.Inform T("Envoi termin~e.", "Send complete.") & vbCrLf & _
+           ok & T(" mail(s) envoy~e(s).", " mail(s) sent.") & _
+           IIf(ko > 0, vbCrLf & ko & T(" ~echec(s) (voir colonne Statut).", " failure(s) (see Status column)."), "") & _
+           IIf(done < total, vbCrLf & (total - done) & T(" non envoy~e(s) (arr~xt).", " not sent (stopped)."), ""), _
+           T("Emaileur", "Mail Campaign")
+End Sub
+
+'=============================================================================
+' PACK v3 (C7) - CampaignStop : interrompt une campagne en cours (a epingler
+' au ruban / QAT). Les lignes deja envoyees gardent leur statut.
+'=============================================================================
+Public Sub CampaignStop()
+    On Error Resume Next
+    If Not gEnvEnCours Then
+        MsgBox T("Aucun envoi en cours.", "No send in progress."), vbInformation, T("Emaileur", "Mail Campaign")
+        Exit Sub
+    End If
+    modDefer.Cancel DEFER_SEND_KEY
+    modDebugLog.DInfo MOD_NAME, "Arret demande apres " & (gSendPos - 1) & " envoi(s)"
+    CampaignFinish
+End Sub
+
+
+' Regenere un mail depuis Excel et .Send immediatement. Renvoie True si ok.
+Private Function EnvoyerLigneMaintenant(ByVal lig As Long, ByVal modele As String) As Boolean
+    On Error GoTo ErrH
+    gDernierEchec = ""
+
+    Dim mail As Object
+    Set mail = OuvrirDepuisModele(Application, modele)
+    If mail Is Nothing Then
+        gDernierEchec = T("modele non ouvert", "template not opened")
+        EnvoyerLigneMaintenant = False
+        Exit Function
+    End If
+
+    mail.To = NettoyerListeAdr(LireCell(gEnvWs, gEnvMap, lig, R_TO))
+    If gEnvMap.Exists(R_CC) Then mail.CC = NettoyerListeAdr(LireCell(gEnvWs, gEnvMap, lig, R_CC))
+    If gEnvMap.Exists(R_BCC) Then mail.BCC = NettoyerListeAdr(LireCell(gEnvWs, gEnvMap, lig, R_BCC))
+
+    mail.Subject = Trim$(LireCell(gEnvWs, gEnvMap, lig, R_SUBJECT))
+    mail.HTMLBody = InsererCorps(mail.HTMLBody, LireCell(gEnvWs, gEnvMap, lig, R_BODY))
+
+    ' Pieces jointes.
+    If gEnvMap.Exists(R_ATTACH) Then
+        Dim pj As String, parts() As String, j As Long, p As String
+        pj = NormaliserSepPJ(LireCell(gEnvWs, gEnvMap, lig, R_ATTACH))
+        If Len(Trim$(pj)) > 0 Then
+            parts = Split(pj, ";")
+            For j = LBound(parts) To UBound(parts)
+                p = ResoudreCheminRel(gEnvWs, NettoyerChemin(parts(j)))
+                If Len(p) > 0 Then
+                    If Len(Dir$(p)) > 0 Then mail.Attachments.Add p
+                End If
+            Next j
+        End If
+    End If
+
+    ' Resolution avant envoi.
+    Dim koAdr As String
+    koAdr = AdressesNonResolues(mail)
+    If Len(koAdr) > 0 Then
+        gDernierEchec = "adresse non resolue (" & koAdr & ")"
+        mail.Close 1
+        EnvoyerLigneMaintenant = False
+        Exit Function
+    End If
+
+    AppliquerCompteEnvoi mail   ' v11 : compte de la boite cible
+    mail.Send
+    modDebugLog.DInfo MOD_NAME, "Ligne " & lig & " : .Send effectue"
+    EnvoyerLigneMaintenant = True
+    Exit Function
+ErrH:
+    gDernierEchec = "err " & Err.Number
+    modDebugLog.DError MOD_NAME, "EnvoyerLigneMaintenant ligne " & lig & " : " & Err.Number & " - " & Err.Description
+    EnvoyerLigneMaintenant = False
+End Function
+
+
+' NETTOYER BROUILLONS DE CAMPAGNE : supprime du dossier Brouillons les seuls
+' items marques EmaileurCampagne (UserProperty invisible). Bouton manuel.
+Public Sub CampaignCleanDrafts()
+    On Error GoTo ErrH
+    Dim avant As Long
+    avant = CompterBrouillonsCampagne()
+    If avant = 0 Then
+        MsgBox T("Aucun brouillon de campagne a nettoyer.", "No campaign draft to clean."), vbInformation, T("Emaileur", "Mail Campaign")
+        Exit Sub
+    End If
+
+    If MsgBox(T("Supprimer ", "Delete ") & avant & T(" brouillon(s) de campagne des dossiers Brouillons (toutes bo~ites) ?", " campaign draft(s) from the Drafts folders (all mailboxes)?") & vbCrLf & _
+              T("(les autres brouillons ne sont pas touches)", "(other drafts are not affected)"), _
+              vbExclamation + vbYesNo, T("Emaileur - nettoyage", "Mail Campaign - cleanup")) <> vbYes Then Exit Sub
+
+    Dim sup As Long
+    sup = PurgerBrouillonsCampagne()
+    modDebugLog.DInfo MOD_NAME, "Nettoyage manuel : " & sup & " brouillon(s) supprime(s)."
+    MsgBox sup & T(" brouillon(s) de campagne supprime(s).", " campaign draft(s) deleted."), vbInformation, T("Emaileur", "Mail Campaign")
+    Exit Sub
+ErrH:
+    modDebugLog.DError MOD_NAME, "CampaignCleanDrafts " & Err.Number & " - " & Err.Description
+    MsgBox T("Erreur : ", "Error: ") & Err.Number & " - " & Err.Description, vbCritical, T("Emaileur", "Mail Campaign")
+End Sub
+
+
+' Compte les brouillons portant la UserProperty de campagne. v11 : balaie
+' les Brouillons de TOUTES les boites du profil (des brouillons peuvent
+' avoir ete generes vers des boites differentes). Tolerant : une boite sans
+' Brouillons (archive) est ignoree.
+Private Function CompterBrouillonsCampagne() As Long
+    On Error Resume Next
+    Dim st As Object, dossier As Object, itm As Object, up As Object
+    Dim c As Long, i As Long
+    For Each st In Application.Session.Stores
+        Set dossier = Nothing
+        Set dossier = st.GetDefaultFolder(OL_FOLDER_DRAFTS)
+        If Not dossier Is Nothing Then
+            Dim itms As Object          ' pack v3 (B7) : collection evaluee une fois
+            Set itms = dossier.Items
+            For i = itms.Count To 1 Step -1
+                Set itm = itms.Item(i)
+                Set up = Nothing
+                Set up = itm.UserProperties.Find(UPROP_CAMPAGNE)
+                If Not up Is Nothing Then c = c + 1
+            Next i
+        End If
+    Next st
+    CompterBrouillonsCampagne = c
+End Function
+
+
+' Supprime les brouillons de campagne ; renvoie le nombre supprime.
+' Iteration descendante (suppression pendant le parcours). v11 : balaie les
+' Brouillons de TOUTES les boites du profil.
+Private Function PurgerBrouillonsCampagne() As Long
+    On Error Resume Next
+    Dim st As Object, dossier As Object, itm As Object, up As Object
+    Dim c As Long, i As Long
+    For Each st In Application.Session.Stores
+        Set dossier = Nothing
+        Set dossier = st.GetDefaultFolder(OL_FOLDER_DRAFTS)
+        If Not dossier Is Nothing Then
+            Dim itms2 As Object         ' pack v3 (B7)
+            Set itms2 = dossier.Items
+            For i = itms2.Count To 1 Step -1
+                Set itm = itms2.Item(i)
+                Set up = Nothing
+                Set up = itm.UserProperties.Find(UPROP_CAMPAGNE)
+                If Not up Is Nothing Then
+                    itm.Delete
+                    c = c + 1
+                End If
+            Next i
+        End If
+    Next st
+    PurgerBrouillonsCampagne = c
+End Function
+
+
+' Outlook connecte au serveur ? (False si mode hors connexion force)
+Private Function OutlookEnLigne() As Boolean
+    On Error Resume Next
+    OutlookEnLigne = True
+    ' Namespace.Offline = True si "Travailler hors connexion" est actif.
+    Dim ns As Object
+    Set ns = Application.GetNamespace("MAPI")
+    If ns.Offline = True Then OutlookEnLigne = False
+End Function
+
+
+'=============================================================================
+' MULTIBOITE (v11)
+' La boite cible est deduite du dossier Outlook selectionne au moment du
+' lancement de la commande (meme convention que les modules contacts).
+' Elle determine le compte d'envoi et le dossier Brouillons du lot.
+' Snapshot UNE FOIS par commande : changer de dossier pendant la generation
+' ne change pas la cible. La deduction etant silencieuse, la boite retenue
+' est affichee dans les confirmations de lot et d'envoi.
+'=============================================================================
+
+Private Sub ResoudreBoiteCible()
+    On Error Resume Next
+    Set gTargetStore = Nothing
+    Set gTargetAccount = Nothing
+    Set gTargetStore = modStoreContext.CurrentStore()
+    Set gTargetAccount = modStoreContext.AccountForStore(gTargetStore)
+    modDebugLog.DInfo MOD_NAME, "Boite cible : " & BoiteCibleLabel()
+End Sub
+
+
+' Libelle lisible de la boite cible pour les recapitulatifs.
+Private Function BoiteCibleLabel() As String
+    On Error Resume Next
+    If gTargetStore Is Nothing Then
+        BoiteCibleLabel = T("(bo~ite par d~efaut)", "(default mailbox)")
+        Exit Function
+    End If
+    BoiteCibleLabel = gTargetStore.DisplayName
+    If gTargetAccount Is Nothing Then
+        If Not modStoreContext.IsDefaultStore(gTargetStore) Then
+            BoiteCibleLabel = BoiteCibleLabel & _
+                T(" (sans compte propre : envoi 'de la part de')", " (no own account: send 'on behalf of')")
+        End If
+    End If
+End Function
+
+
+' Applique le compte d'envoi de la boite cible au mail.
+' - Boite par defaut : aucun changement (comportement historique).
+' - Boite secondaire avec compte propre : SendUsingAccount.
+' - Boite partagee SANS compte propre : SentOnBehalfOfName = nom de la boite
+'   (necessite les droits Exchange "Envoyer de la part de" / "Envoyer en
+'   tant que" ; sans ces droits l'envoi part puis revient en NDR).
+Private Sub AppliquerCompteEnvoi(ByVal mail As Object)
+    On Error Resume Next
+    If gTargetStore Is Nothing Then Exit Sub
+    If modStoreContext.IsDefaultStore(gTargetStore) Then Exit Sub
+    If Not gTargetAccount Is Nothing Then
+        Set mail.SendUsingAccount = gTargetAccount
+        modDebugLog.DDebug MOD_NAME, "SendUsingAccount = " & gTargetAccount.DisplayName
+    Else
+        mail.SentOnBehalfOfName = gTargetStore.DisplayName
+        modDebugLog.DInfo MOD_NAME, "Pas de compte propre pour '" & gTargetStore.DisplayName & _
+            "' : SentOnBehalfOfName pose (droits Exchange requis)"
+    End If
+End Sub
+
+
+' Save du brouillon puis, si la boite cible n'est pas la boite par defaut,
+' Move vers SES Brouillons. Renvoie l'objet mail VALIDE (nouvel objet apres
+' Move : l'EntryID change, la UserProperty de campagne survit au Move).
+' Echec du Move -> le brouillon reste en boite par defaut (loggue, jamais
+' bloquant : le statut Excel reste correct, seul l'emplacement differe).
+Private Function EnregistrerDansBrouillonsCible(ByVal mail As Object) As Object
+    On Error Resume Next
+    mail.Save
+    Set EnregistrerDansBrouillonsCible = mail
+    If gTargetStore Is Nothing Then Exit Function
+    If modStoreContext.IsDefaultStore(gTargetStore) Then Exit Function
+
+    Dim cible As Object
+    Set cible = modStoreContext.SysFolder(gTargetStore, OL_FOLDER_DRAFTS)
+    If cible Is Nothing Then
+        modDebugLog.DError MOD_NAME, "Brouillons introuvables sur '" & _
+            gTargetStore.DisplayName & "' : brouillon laisse en boite par defaut"
+        Exit Function
+    End If
+
+    Dim deplace As Object
+    Set deplace = mail.Move(cible)
+    If Not deplace Is Nothing Then
+        Set EnregistrerDansBrouillonsCible = deplace
+    Else
+        modDebugLog.DError MOD_NAME, "Move vers Brouillons de '" & _
+            gTargetStore.DisplayName & "' refuse : brouillon laisse en boite par defaut"
+    End If
+End Function
+
+
+'=============================================================================
+' COEUR
+'=============================================================================
+
+' afficher=True -> .Display (verif). ligneUnique>0 -> cette ligne seule ;
+' ligneUnique=0 -> tout le lot (avec confirmation feuille cible).
+Private Sub GenererLot(ByVal xlApp As Object, ByVal ws As Object, _
+                       ByVal afficher As Boolean, ByVal ligneUnique As Long)
+    Dim map As Object
+    Set map = ResoudreColonnes(ws)
+    If map Is Nothing Then Exit Sub
+
+    Dim colStatut As Long
+    colStatut = AssurerColonneStatut(ws, map)
+
+    Dim colTo As Long
+    colTo = map(R_TO)
+
+    ' --- Determination des lignes cibles -------------------------------------
+    Dim cibles() As Long, n As Long, i As Long
+    If ligneUnique > 0 Then
+        ReDim cibles(0 To 0)
+        cibles(0) = ligneUnique
+    Else
+        Dim derLig As Long
+        derLig = DerniereLigne(ws, colTo)
+        If derLig < 2 Then
+            MsgBox T("Aucune ligne a traiter.", "No row to process."), vbInformation, T("Emaileur", "Mail Campaign")
+            Exit Sub
+        End If
+
+        ' Confirmation de la feuille cible (cible = feuille active, ambigue).
+        If MsgBox(T("Feuille cible : '", "Target sheet: '") & ws.Name & "'" & vbCrLf & _
+                  T("Classeur : ", "Workbook: ") & ws.Parent.Name & vbCrLf & _
+                  T("Bo~ite cible : ", "Target mailbox: ") & BoiteCibleLabel() & vbCrLf & _
+                  T("Lignes de donn~ees jusqu'a la ligne ", "Data rows up to row ") & derLig & "." & vbCrLf & vbCrLf & _
+                  T("G~en~erer les brouillons ?", "Generate the drafts?"), vbQuestion + vbYesNo, _
+                  T("Emaileur - confirmation", "Mail Campaign - confirmation")) <> vbYes Then
+            Exit Sub
+        End If
+
+        n = 0
+        ReDim cibles(0 To derLig - 2)
+        For i = 2 To derLig
+            If Len(Trim$(CStr(ws.Cells(i, colTo).Value))) > 0 Then
+                cibles(n) = i
+                n = n + 1
+            End If
+        Next i
+        If n = 0 Then
+            MsgBox T("Aucune ligne a traiter.", "No row to process."), vbInformation, T("Emaileur", "Mail Campaign")
+            Exit Sub
+        End If
+        ReDim Preserve cibles(0 To n - 1)
+    End If
+
+    ' Modele par defaut demande maintenant si au moins une cible en a besoin.
+    PreparerModeleDefaut xlApp, ws, map, cibles
+
+    ' --- PRE-VOL --------------------------------------------------------------
+    Dim problemes As String
+    Dim aTraiter As Object
+    Set aTraiter = CreateObject("Scripting.Dictionary")
+
+    Dim lig As Long, pb As String
+    For i = LBound(cibles) To UBound(cibles)
+        lig = cibles(i)
+
+        ' Idempotence (lot uniquement).
+        If Not afficher Then
+            If Len(Trim$(CStr(ws.Cells(lig, colStatut).Value))) > 0 Then GoTo SuiteCible
+        End If
+
+        pb = ValiderLigne(ws, map, lig)
+        If Len(pb) = 0 Then
+            aTraiter(lig) = True
+        Else
+            problemes = problemes & "Ligne " & lig & " : " & pb & vbCrLf
+        End If
+SuiteCible:
+    Next i
+
+    If aTraiter.Count = 0 Then
+        If Len(problemes) > 0 Then
+            MsgBox T("Aucune ligne exploitable.", "No usable row.") & vbCrLf & vbCrLf & _
+                   TronquerRecap(problemes), vbExclamation, T("Emaileur - pre-vol", "Mail Campaign - preflight")
+        Else
+            MsgBox T("Rien ~a g~en~erer (lignes d~ej~a traitees ?).", "Nothing to generate (rows already processed?)."), vbInformation, T("Emaileur", "Mail Campaign")
+        End If
+        Exit Sub
+    End If
+
+    If Len(problemes) > 0 Then
+        If MsgBox(aTraiter.Count & T(" ligne(s) prete(s), mais probl~fme(s) d~etect~e(s) :", " row(s) ready, but problem(s) detected:") & _
+                  vbCrLf & vbCrLf & TronquerRecap(problemes) & vbCrLf & _
+                  T("Continuer en sautant les lignes en erreur ?", "Continue, skipping rows in error?") & vbCrLf & _
+                  T("(Oui = continuer / Non = annuler pour corriger)", "(Yes = continue / No = cancel to fix)"), _
+                  vbQuestion + vbYesNo, T("Emaileur - pre-vol", "Mail Campaign - preflight")) <> vbYes Then
+            modDebugLog.DInfo MOD_NAME, "Lot annule par l'utilisateur (pre-vol)."
+            Exit Sub
+        End If
+    End If
+
+    ' --- GENERATION -----------------------------------------------------------
+    Dim olApp As Object
+    Set olApp = Application   ' Outlook.Application (module standard cote Outlook)
+
+    Dim okCount As Long, koCount As Long
+    Dim cles As Variant
+    cles = aTraiter.Keys
+
+    For i = LBound(cles) To UBound(cles)
+        lig = CLng(cles(i))
+        On Error Resume Next
+        xlApp.StatusBar = T("Emaileur : ligne ", "Mail Campaign: row ") & lig & " (" & (i + 1) & "/" & (UBound(cles) + 1) & ")..."
+        On Error GoTo 0
+
+        If CreerBrouillon(olApp, ws, map, lig, afficher) Then
+            ws.Cells(lig, colStatut).Value = "Brouillon cree le " & Format$(Now, "dd/mm/yyyy hh:nn")
+            okCount = okCount + 1
+        Else
+            ws.Cells(lig, colStatut).Value = "ECHEC " & Format$(Now, "dd/mm hh:nn") & _
+                IIf(Len(gDernierEchec) > 0, " - " & gDernierEchec, "")
+            koCount = koCount + 1
+        End If
+    Next i
+
+    On Error Resume Next
+    xlApp.StatusBar = False
+    On Error GoTo 0
+
+    Dim msg As String
+    If afficher Then
+        msg = okCount & T(" brouillon(s) ouvert(s) pour verification.", " draft(s) opened for review.")
+    Else
+        msg = okCount & " brouillon(s) cree(s) dans le dossier Brouillons d'Outlook."
+    End If
+    If koCount > 0 Then msg = msg & vbCrLf & koCount & A(" ~echec(s) (voir colonne Statut + debug.log).")
+    MsgBox msg, vbInformation, T("Emaileur", "Mail Campaign")
+    modDebugLog.DInfo MOD_NAME, "Termine : ok=" & okCount & " ko=" & koCount
+End Sub
+
+
+'=============================================================================
+' CREATION D'UN BROUILLON
+'=============================================================================
+
+Private Function CreerBrouillon(ByVal olApp As Object, ByVal ws As Object, _
+                                ByVal map As Object, ByVal lig As Long, _
+                                ByVal afficher As Boolean) As Boolean
+    On Error GoTo ErrH
+    gDernierEchec = ""
+    Dim modele As String
+    modele = ModeleResolu(ws, map, lig)
+
+    Dim mail As Object
+    Set mail = OuvrirDepuisModele(olApp, modele)
+    If mail Is Nothing Then
+        modDebugLog.DError MOD_NAME, "Ligne " & lig & " : modele non ouvert (" & modele & ")"
+        CreerBrouillon = False
+        Exit Function
+    End If
+
+    mail.To = NettoyerListeAdr(LireCell(ws, map, lig, R_TO))
+    If map.Exists(R_CC) Then mail.CC = NettoyerListeAdr(LireCell(ws, map, lig, R_CC))
+    If map.Exists(R_BCC) Then mail.BCC = NettoyerListeAdr(LireCell(ws, map, lig, R_BCC))
+
+    mail.Subject = Trim$(LireCell(ws, map, lig, R_SUBJECT))
+    mail.HTMLBody = InsererCorps(mail.HTMLBody, LireCell(ws, map, lig, R_BODY))
+
+    ' Resolution des destinataires : detecte les adresses inexistantes /
+    ' non resolubles (ex: domaine errone, TLD tronque) que la validation
+    ' syntaxique du pre-vol ne peut pas voir. N'affecte PAS les TLD valides
+    ' (.co, .eu, .no...) : seule l'echec de resolution Outlook compte.
+    Dim nonResolus As String
+    nonResolus = AdressesNonResolues(mail)
+    If Len(nonResolus) > 0 Then
+        modDebugLog.DError MOD_NAME, "Ligne " & lig & " : adresse(s) non resolue(s) " & nonResolus
+        gDernierEchec = "adresse non resolue (" & nonResolus & ")"
+        mail.Close 1   ' olDiscard : ne pas laisser trainer un item incomplet
+        CreerBrouillon = False
+        Exit Function
+    End If
+
+    ' Pieces jointes.
+    If map.Exists(R_ATTACH) Then
+        Dim pj As String, parts() As String, j As Long, p As String
+        pj = NormaliserSepPJ(LireCell(ws, map, lig, R_ATTACH))
+        If Len(Trim$(pj)) > 0 Then
+            parts = Split(pj, ";")
+            For j = LBound(parts) To UBound(parts)
+                p = ResoudreCheminRel(ws, NettoyerChemin(parts(j)))
+                If Len(p) > 0 Then
+                    If Len(Dir$(p)) > 0 Then
+                        mail.Attachments.Add p
+                    Else
+                        modDebugLog.DError MOD_NAME, "Ligne " & lig & " : PJ introuvable " & p
+                    End If
+                End If
+            Next j
+        End If
+    End If
+
+    ' Marquage invisible (UserProperty, non affiche dans l'interface) : permet
+    ' la purge ciblee des brouillons de campagne sans toucher aux autres.
+    On Error Resume Next
+    Dim up As Object
+    Set up = mail.UserProperties.Add(UPROP_CAMPAGNE, 1)   ' 1 = olText
+    up.Value = PayloadSuivi(ws, map, lig)   ' v10.5 : reference de ligne Excel
+    On Error GoTo ErrH
+
+    ' v11 : compte d'envoi de la boite cible, pose AVANT Display (From et
+    ' addons signature lies au compte suivent alors la bonne boite).
+    AppliquerCompteEnvoi mail
+
+    If afficher Then
+        ' Test d'une ligne : pas de Save (semantique inchangee, l'utilisateur
+        ' decide). S'il enregistre lui-meme sans envoyer, le brouillon
+        ' atterrit dans les Brouillons de la boite par defaut (cas marginal).
+        mail.Display
+    Else
+        Set mail = EnregistrerDansBrouillonsCible(mail)   ' Save (+ Move si autre boite)
+    End If
+
+    modDebugLog.DInfo MOD_NAME, "Ligne " & lig & " : brouillon ok"
+    CreerBrouillon = True
+    Exit Function
+ErrH:
+    modDebugLog.DError MOD_NAME, "CreerBrouillon ligne " & lig & " : " & Err.Number & " - " & Err.Description
+    CreerBrouillon = False
+End Function
+
+
+' .oft -> CreateItemFromTemplate (vrai brouillon, source preservee).
+' .msg -> on lit le corps (signature incluse) puis on cree un mail NEUF :
+'         un .msg issu d'un mail recu, copie via OpenSharedItem.Copy, atterrit
+'         dans la Boite de reception (semantique "item recu"). Le mail neuf,
+'         lui, se sauvegarde toujours dans Brouillons. Le .msg source n'est
+'         jamais altere (ouverture en lecture, fermeture olDiscard).
+Private Function OuvrirDepuisModele(ByVal olApp As Object, ByVal chemin As String) As Object
+    On Error GoTo ErrH
+    Dim ext As String
+    ext = LCase$(Right$(chemin, 4))
+
+    If ext = ".oft" Then
+        Set OuvrirDepuisModele = olApp.CreateItemFromTemplate(chemin)
+    ElseIf ext = ".msg" Then
+        Dim src As Object, corpsHtml As String
+        Set src = olApp.Session.OpenSharedItem(chemin)
+        corpsHtml = src.HTMLBody
+        src.Close 1   ' olDiscard : le .msg source reste intact
+        Dim mail As Object
+        Set mail = olApp.CreateItem(0)   ' olMailItem -> vrai brouillon
+        mail.HTMLBody = corpsHtml
+        Set OuvrirDepuisModele = mail
+    Else
+        modDebugLog.DError MOD_NAME, "Extension modele non geree : " & chemin
+        Set OuvrirDepuisModele = Nothing
+    End If
+    Exit Function
+ErrH:
+    modDebugLog.DError MOD_NAME, "OuvrirDepuisModele " & Err.Number & " - " & Err.Description & " (" & chemin & ")"
+    Set OuvrirDepuisModele = Nothing
+End Function
+
+
+' Tente de resoudre tous les destinataires (To/Cc/Cci) du mail. Renvoie la
+' liste ";" des adresses NON resolues, ou "" si tout est resolu. Une adresse
+' externe valide (SMTP bien forme, TLD reel) se resout en general en elle-meme ;
+' une adresse inexistante / mal formee (domaine errone, TLD tronque) ne se
+' resout pas. Ne juge PAS le TLD : c'est Outlook qui tranche.
+Private Function AdressesNonResolues(ByVal mail As Object) As String
+    On Error Resume Next
+    Dim recips As Object, r As Object, i As Long, ko As String
+    Set recips = mail.Recipients
+    recips.ResolveAll
+    For i = 1 To recips.Count
+        Set r = recips.Item(i)
+        If Not r.Resolved Then
+            If Len(ko) > 0 Then ko = ko & "; "
+            ko = ko & r.Name
+        End If
+    Next i
+    AdressesNonResolues = ko
+End Function
+
+
+' Insere le corps utilisateur juste apres <body...> ; la signature (deja dans
+' le HTMLBody du modele) reste en dessous. Fallback : prepend.
+Private Function InsererCorps(ByVal htmlModele As String, ByVal corps As String) As String
+    Dim posBody As Long, posFin As Long
+    posBody = InStr(1, htmlModele, "<body", vbTextCompare)
+    If posBody > 0 Then
+        posFin = InStr(posBody, htmlModele, ">")
+        If posFin > 0 Then
+            InsererCorps = Left$(htmlModele, posFin) & corps & Mid$(htmlModele, posFin + 1)
+            Exit Function
+        End If
+    End If
+    InsererCorps = corps & htmlModele
+End Function
+
+
+'=============================================================================
+' ACCES EXCEL
+'=============================================================================
+
+' Instance Excel en cours d'execution, ou Nothing.
+Private Function ObtenirExcel() As Object
+    ' Pack v3 (C1) : instance Excel existante VALIDEE (fantome ecarte) via
+    ' modExcelBridge ; Nothing si aucune instance ou instance morte (l'appelant
+    ' cree alors la sienne, comportement inchange). Une instance invisible
+    ' adoptee est laissee vivante : CibleClasseur affiche Excel a l'utilisateur.
+    On Error Resume Next
+    Dim createdByUs As Boolean
+    Set ObtenirExcel = Nothing
+    Set ObtenirExcel = GetObject(, "Excel.Application")
+    If Not ObtenirExcel Is Nothing Then
+        If Not modCommon.ExcelAlive(ObtenirExcel) Then
+            Set ObtenirExcel = Nothing
+            modDebugLog.DInfo MOD_NAME, "ObtenirExcel : instance fantome ignoree"
+        End If
+    End If
+    On Error GoTo 0
+End Function
+
+
+' Resout xlApp + ws cible (feuille active). Si aucun Excel/aucun classeur :
+' selecteur de fichier. Renvoie False si abandon.
+Private Function CibleClasseur(ByRef xlApp As Object, ByRef ws As Object) As Boolean
+    On Error GoTo ErrH
+    Dim cree As Boolean
+    Set xlApp = ObtenirExcel()
+    If xlApp Is Nothing Then
+        Set xlApp = CreateObject("Excel.Application")
+        cree = True
+    End If
+    xlApp.Visible = True
+
+    If xlApp.Workbooks.Count = 0 Then
+        Dim f As Variant
+        f = xlApp.GetOpenFilename("Classeurs Excel (*.xls; *.xlsx; *.xlsm),*.xls;*.xlsx;*.xlsm", _
+                                  , "Choisir la feuille d'emailing")
+        If VarType(f) = vbBoolean Then
+            If cree Then xlApp.Quit
+            CibleClasseur = False
+            Exit Function
+        End If
+        xlApp.Workbooks.Open CStr(f)
+        xlApp.Visible = True
+    End If
+
+    Set ws = xlApp.ActiveSheet
+    CibleClasseur = Not (ws Is Nothing)
+    Exit Function
+ErrH:
+    modDebugLog.DError MOD_NAME, "CibleClasseur " & Err.Number & " - " & Err.Description
+    CibleClasseur = False
+End Function
+
+
+'=============================================================================
+' DETECTION DES COLONNES
+'=============================================================================
+
+' Dictionnaire role -> index de colonne. InputBox de secours pour les
+' obligatoires manquantes. Nothing si abandon.
+Private Function ResoudreColonnes(ByVal ws As Object) As Object
+    On Error GoTo ErrH
+    Dim map As Object
+    Set map = CreateObject("Scripting.Dictionary")
+
+    Dim derCol As Long, c As Long, libelle As String, nrm As String, role As String
+    derCol = ws.Cells(1, ws.Columns.Count).End(XL_TOLEFT).Column
+
+    For c = 1 To derCol
+        libelle = CStr(ws.Cells(1, c).Value)
+        If Len(Trim$(libelle)) > 0 Then
+            nrm = NormaliserEntete(libelle)
+            role = RoleDepuisEntete(nrm)
+            If Len(role) > 0 Then
+                If Not map.Exists(role) Then map(role) = c
+            End If
+        End If
+    Next c
+
+    If Not map.Exists(R_TO) Then map(R_TO) = DemanderColonne(ws, "Destinataires (A)")
+    If map(R_TO) = 0 Then Set ResoudreColonnes = Nothing: Exit Function
+
+    If Not map.Exists(R_SUBJECT) Then map(R_SUBJECT) = DemanderColonne(ws, "Objet")
+    If map(R_SUBJECT) = 0 Then Set ResoudreColonnes = Nothing: Exit Function
+
+    If Not map.Exists(R_BODY) Then map(R_BODY) = DemanderColonne(ws, "Message (HTML)")
+    If map(R_BODY) = 0 Then Set ResoudreColonnes = Nothing: Exit Function
+
+    Set ResoudreColonnes = map
+    Exit Function
+ErrH:
+    modDebugLog.DError MOD_NAME, "ResoudreColonnes " & Err.Number & " - " & Err.Description
+    Set ResoudreColonnes = Nothing
+End Function
+
+
+' minuscules, sans accents, sans non-alphanumeriques. "Caches (Cci)"->"cachescci".
+Private Function NormaliserEntete(ByVal s As String) As String
+    Dim t As String
+    t = LCase$(Trim$(s))
+    t = Replace(t, Chr$(233), "e"): t = Replace(t, Chr$(232), "e")
+    t = Replace(t, Chr$(234), "e"): t = Replace(t, Chr$(235), "e")
+    t = Replace(t, Chr$(224), "a"): t = Replace(t, Chr$(226), "a")
+    t = Replace(t, Chr$(238), "i"): t = Replace(t, Chr$(239), "i")
+    t = Replace(t, Chr$(244), "o"): t = Replace(t, Chr$(249), "u")
+    t = Replace(t, Chr$(251), "u"): t = Replace(t, Chr$(231), "c")
+
+    Dim i As Long, ch As String, out As String
+    For i = 1 To Len(t)
+        ch = Mid$(t, i, 1)
+        If (ch >= "a" And ch <= "z") Or (ch >= "0" And ch <= "9") Then out = out & ch
+    Next i
+    NormaliserEntete = out
+End Function
+
+
+' Ordre des tests = priorite (relecture avant html generique).
+Private Function RoleDepuisEntete(ByVal n As String) As String
+    If InStr(n, "relecture") > 0 Then
+        RoleDepuisEntete = ""              ' Message (pour relecture) -> ignoree
+    ElseIf InStr(n, "html") > 0 Then
+        RoleDepuisEntete = R_BODY
+    ElseIf InStr(n, "destinatair") > 0 Then
+        RoleDepuisEntete = R_TO
+    ElseIf InStr(n, "copie") > 0 Then
+        RoleDepuisEntete = R_CC
+    ElseIf InStr(n, "cache") > 0 Or InStr(n, "cci") > 0 Then
+        RoleDepuisEntete = R_BCC
+    ElseIf InStr(n, "objet") > 0 Then
+        RoleDepuisEntete = R_SUBJECT
+    ElseIf InStr(n, "piece") > 0 Or InStr(n, "jointe") > 0 Then
+        RoleDepuisEntete = R_ATTACH
+    ElseIf InStr(n, "modele") > 0 Or InStr(n, "oft") > 0 Then
+        RoleDepuisEntete = R_TEMPLATE
+    ElseIf InStr(n, "statut") > 0 Then
+        RoleDepuisEntete = R_STATUS
+    Else
+        RoleDepuisEntete = ""
+    End If
+End Function
+
+
+Private Function DemanderColonne(ByVal ws As Object, ByVal nomChamp As String) As Long
+    Dim s As String
+    s = Trim$(InputBox(T("Colonne introuvable pour : ", "Column not found for: ") & nomChamp & vbCrLf & _
+                       T("Saisir la lettre de colonne (ex: A) :", "Enter the column letter (e.g. A):"), T("Emaileur - colonne manquante", "Mail Campaign - missing column")))
+    If Len(s) = 0 Then DemanderColonne = 0: Exit Function
+    On Error Resume Next
+    DemanderColonne = ws.Range(s & "1").Column
+    On Error GoTo 0
+End Function
+
+
+' Cree la colonne Statut si absente ; renvoie son index.
+Private Function AssurerColonneStatut(ByVal ws As Object, ByVal map As Object) As Long
+    If map.Exists(R_STATUS) Then AssurerColonneStatut = map(R_STATUS): Exit Function
+    Dim derCol As Long
+    derCol = ws.Cells(1, ws.Columns.Count).End(XL_TOLEFT).Column
+    ws.Cells(1, derCol + 1).Value = "Statut"
+    map(R_STATUS) = derCol + 1
+    AssurerColonneStatut = derCol + 1
+    modDebugLog.DInfo MOD_NAME, "Colonne Statut creee en " & (derCol + 1)
+End Function
+
+
+' Index de la 1ere colonne portant ce role, ou 0. Ne prompte pas.
+Private Function TrouverColonneRole(ByVal ws As Object, ByVal role As String) As Long
+    On Error Resume Next
+    Dim derCol As Long, c As Long
+    derCol = ws.Cells(1, ws.Columns.Count).End(XL_TOLEFT).Column
+    For c = 1 To derCol
+        If RoleDepuisEntete(NormaliserEntete(CStr(ws.Cells(1, c).Value))) = role Then
+            TrouverColonneRole = c
+            Exit Function
+        End If
+    Next c
+End Function
+
+
+' Liste lisible des roles reconnus dans la ligne d'en-tete (diagnostic).
+Private Function ScanRolesPresents(ByVal ws As Object) As String
+    On Error Resume Next
+    Dim derCol As Long, c As Long, role As String, out As String
+    derCol = ws.Cells(1, ws.Columns.Count).End(XL_TOLEFT).Column
+    For c = 1 To derCol
+        role = RoleDepuisEntete(NormaliserEntete(CStr(ws.Cells(1, c).Value)))
+        If Len(role) > 0 Then
+            If InStr(out, role) = 0 Then out = out & role & " "
+        End If
+    Next c
+    If Len(out) = 0 Then out = "(aucun reconnu)"
+    ScanRolesPresents = Trim$(out)
+End Function
+
+
+'=============================================================================
+' MODELE PAR DEFAUT
+'=============================================================================
+
+Private Sub PreparerModeleDefaut(ByVal xlApp As Object, ByVal ws As Object, _
+                                 ByVal map As Object, ByRef cibles() As Long)
+    Dim besoin As Boolean, i As Long, lig As Long
+    If Not map.Exists(R_TEMPLATE) Then
+        besoin = True
+    Else
+        For i = LBound(cibles) To UBound(cibles)
+            lig = cibles(i)
+            If Len(Trim$(LireCell(ws, map, lig, R_TEMPLATE))) = 0 Then besoin = True: Exit For
+        Next i
+    End If
+    If besoin Then DemanderModeleDefaut xlApp
+End Sub
+
+
+Private Sub DemanderModeleDefaut(ByVal xlApp As Object)
+    If gModeleDefautDemande Then Exit Sub
+    gModeleDefautDemande = True
+    Dim f As Variant
+    f = xlApp.GetOpenFilename("Modeles Outlook (*.oft; *.msg),*.oft;*.msg", _
+                              , "Choisir le modele par defaut (signature)")
+    If VarType(f) = vbBoolean Then
+        gModeleDefaut = ""
+    Else
+        gModeleDefaut = CStr(f)
+    End If
+    modDebugLog.DInfo MOD_NAME, "Modele defaut = " & gModeleDefaut
+End Sub
+
+
+Private Function ModeleResolu(ByVal ws As Object, ByVal map As Object, ByVal lig As Long) As String
+    Dim m As String
+    If map.Exists(R_TEMPLATE) Then m = NettoyerChemin(LireCell(ws, map, lig, R_TEMPLATE))
+    If Len(m) = 0 Then m = gModeleDefaut
+    ' v10.5 : chemin relatif -> resolu par rapport au dossier du classeur.
+    ModeleResolu = ResoudreCheminRel(ws, m)
+End Function
+
+
+'=============================================================================
+' VALIDATION (PRE-VOL)
+'=============================================================================
+
+Private Function ValiderLigne(ByVal ws As Object, ByVal map As Object, ByVal lig As Long) As String
+    Dim pb As String
+
+    Dim dest As String
+    dest = Trim$(LireCell(ws, map, lig, R_TO))
+    If Len(dest) = 0 Then
+        pb = pb & T("destinataire manquant ; ", "missing recipient; ")
+    ElseIf Not AdressesPlausibles(dest) Then
+        pb = pb & T("adresse(s) To douteuse(s) ; ", "suspicious To address(es); ")
+    End If
+    If map.Exists(R_CC) Then
+        Dim cc As String: cc = Trim$(LireCell(ws, map, lig, R_CC))
+        If Len(cc) > 0 Then If Not AdressesPlausibles(cc) Then pb = pb & T("adresse(s) Cc douteuse(s) ; ", "suspicious Cc address(es); ")
+    End If
+    If map.Exists(R_BCC) Then
+        Dim bc As String: bc = Trim$(LireCell(ws, map, lig, R_BCC))
+        If Len(bc) > 0 Then If Not AdressesPlausibles(bc) Then pb = pb & T("adresse(s) Cci douteuse(s) ; ", "suspicious Bcc address(es); ")
+    End If
+
+    If Len(Trim$(LireCell(ws, map, lig, R_SUBJECT))) = 0 Then pb = pb & T("objet vide ; ", "empty subject; ")
+    If Len(Trim$(LireCell(ws, map, lig, R_BODY))) = 0 Then pb = pb & T("message vide ; ", "empty message; ")
+
+    Dim m As String
+    m = ModeleResolu(ws, map, lig)
+    If Len(m) = 0 Then
+        pb = pb & T("aucun modele ; ", "no template; ")
+    ElseIf Len(Dir$(m)) = 0 Then
+        pb = pb & T("modele introuvable ; ", "template not found; ")
+    End If
+
+    If map.Exists(R_ATTACH) Then
+        Dim pj As String, parts() As String, j As Long, p As String
+        pj = NormaliserSepPJ(LireCell(ws, map, lig, R_ATTACH))
+        If Len(Trim$(pj)) > 0 Then
+            parts = Split(pj, ";")
+            For j = LBound(parts) To UBound(parts)
+                p = ResoudreCheminRel(ws, NettoyerChemin(parts(j)))
+                If Len(p) > 0 Then
+                    If Len(Dir$(p)) = 0 Then pb = pb & "PJ introuvable (" & p & ") ; "
+                End If
+            Next j
+        End If
+    End If
+
+    ValiderLigne = pb
+End Function
+
+
+Private Function AdressesPlausibles(ByVal liste As String) As Boolean
+    Dim parts() As String, i As Long, a As String
+    parts = Split(liste, ";")
+    For i = LBound(parts) To UBound(parts)
+        a = Trim$(parts(i))
+        If Len(a) > 0 Then
+            If Not AdrUnePlausible(a) Then AdressesPlausibles = False: Exit Function
+        End If
+    Next i
+    AdressesPlausibles = True
+End Function
+
+
+Private Function AdrUnePlausible(ByVal a As String) As Boolean
+    Dim pos As Long
+    pos = InStr(a, "@")
+    If pos < 2 Then Exit Function
+    If InStr(a, " ") > 0 Then Exit Function
+    If InStr(pos + 1, a, ".") = 0 Then Exit Function
+    AdrUnePlausible = True
+End Function
+
+
+'=============================================================================
+' SUIVI DES ENVOIS MANUELS (v10.5)
+' Un brouillon genere porte, dans sa UserProperty de campagne, la reference
+' de sa ligne Excel. A l'envoi manuel, ThisOutlookSession.Application_ItemSend
+' appelle CampaignOnItemSend (memorisation + differe) ; CampaignSentFlush
+' (cible modDefer "CampaignSent") ecrit ensuite le statut dans le classeur.
+'=============================================================================
+
+' Payload de suivi : classeur TAB feuille TAB ligne TAB cle-destinataire TAB
+' objet. La cle (To + objet, tels que dans la FEUILLE) permet de retrouver la
+' ligne meme si elle a ete triee/deplacee apres generation.
+Private Function PayloadSuivi(ByVal ws As Object, ByVal map As Object, _
+                              ByVal lig As Long) As String
+    On Error Resume Next
+    Dim wbFull As String, toKey As String, subjKey As String
+    wbFull = CStr(ws.Parent.FullName)
+    toKey = LCase$(Trim$(NettoyerListeAdr(LireCell(ws, map, lig, R_TO))))
+    subjKey = Trim$(LireCell(ws, map, lig, R_SUBJECT))
+    PayloadSuivi = wbFull & vbTab & CStr(ws.Name) & vbTab & CStr(lig) & _
+                   vbTab & toKey & vbTab & subjKey
+End Function
+
+
+' Appele par Application_ItemSend (ThisOutlookSession) pour TOUT mail sortant.
+' Silencieux et sans effet si le mail n'est pas un brouillon de campagne, si
+' un envoi automatique est en cours (CampaignSend ecrit ses statuts lui-meme)
+' ou si le payload est illisible (ancien brouillon v10.4 : valeur "1").
+Public Sub CampaignOnItemSend(ByVal itm As Object)
+    On Error Resume Next
+    If gEnvEnCours Then Exit Sub
+
+    Dim up As Object
+    Set up = itm.UserProperties.Find(UPROP_CAMPAGNE)
+    If up Is Nothing Then Exit Sub
+
+    Dim payload As String
+    payload = CStr(up.Value)
+    If InStr(payload, vbTab) = 0 Then
+        modDebugLog.DTrace MOD_NAME, "Envoi manuel : payload ancien format, ignore"
+        Exit Sub
+    End If
+
+    If gPendingSent Is Nothing Then Set gPendingSent = New Collection
+    gPendingSent.Add payload
+    modDefer.Arm "CampaignSent", 2
+    modDebugLog.DInfo MOD_NAME, "Envoi manuel detecte, statut Excel differe (+2s)"
+End Sub
+
+
+' Cible modDefer "CampaignSent" : draine la file et ecrit les statuts.
+' Jamais d'erreur visible (contexte callback timer).
+Public Sub CampaignSentFlush()
+    On Error Resume Next
+    If gPendingSent Is Nothing Then Exit Sub
+    If gPendingSent.Count = 0 Then Exit Sub
+
+    Dim lot As Collection
+    Set lot = gPendingSent
+    Set gPendingSent = New Collection
+
+    Dim i As Long
+    For i = 1 To lot.Count
+        EcrireStatutManuel CStr(lot.Item(i))
+    Next i
+End Sub
+
+
+' Ecrit "Envoye manuellement le ..." dans la colonne Statut de la ligne
+' referencee par le payload. Rouvre le classeur EN SILENCE (macros et
+' evenements desactives) s'il n'est pas deja ouvert ; dans ce cas il est
+' enregistre puis referme. S'il etait deja ouvert dans la session Excel de
+' l'utilisateur : la cellule est ecrite mais l'ENREGISTREMENT lui est laisse
+' (pas de sauvegarde a son insu). Ne remplace jamais un statut autre que
+' vide ou "Brouillon cree...". Echec -> debug.log (rattrapage manuel).
+Private Sub EcrireStatutManuel(ByVal payload As String)
+    On Error Resume Next
+
+    ' --- Decodage du payload (l'objet est le DERNIER champ : re-assemble) ---
+    Dim champs() As String
+    champs = Split(payload, vbTab)
+    If UBound(champs) < 4 Then
+        modDebugLog.DError MOD_NAME, "EcrireStatutManuel : payload incomplet"
+        Exit Sub
+    End If
+    Dim wbFull As String, shName As String, ligHint As Long
+    Dim toKey As String, subjKey As String, j As Long
+    wbFull = champs(0)
+    shName = champs(1)
+    ligHint = CLng(Val(champs(2)))
+    toKey = champs(3)
+    subjKey = champs(4)
+    For j = 5 To UBound(champs)
+        subjKey = subjKey & vbTab & champs(j)
+    Next j
+
+    ' --- Excel : instance existante validee, sinon instance neuve CACHEE ----
+    Dim xlApp As Object, creee As Boolean
+    Set xlApp = ObtenirExcel()
+    If xlApp Is Nothing Then
+        Set xlApp = CreateObject("Excel.Application")
+        If xlApp Is Nothing Then
+            modDebugLog.DError MOD_NAME, "EcrireStatutManuel : Excel indisponible - " & payload
+            Exit Sub
+        End If
+        creee = True   ' reste invisible : simple ecriture de statut
+    End If
+
+    ' --- Classeur : deja ouvert (FullName puis nom seul), sinon ouverture ---
+    Dim wb As Object, w As Object, ouvertParNous As Boolean
+    For Each w In xlApp.Workbooks
+        If LCase$(CStr(w.FullName)) = LCase$(wbFull) Then Set wb = w: Exit For
+    Next w
+    If wb Is Nothing Then
+        Dim nomSeul As String
+        nomSeul = wbFull
+        If InStrRev(nomSeul, "\") > 0 Then nomSeul = Mid$(nomSeul, InStrRev(nomSeul, "\") + 1)
+        For Each w In xlApp.Workbooks
+            If LCase$(CStr(w.Name)) = LCase$(nomSeul) Then Set wb = w: Exit For
+        Next w
+    End If
+    If wb Is Nothing Then
+        ' Ouverture silencieuse : macros et evenements du classeur bloques.
+        Dim oldSecu As Long, oldEvt As Boolean
+        oldSecu = xlApp.AutomationSecurity
+        oldEvt = xlApp.EnableEvents
+        xlApp.AutomationSecurity = 3   ' msoAutomationSecurityForceDisable
+        xlApp.EnableEvents = False
+        Set wb = xlApp.Workbooks.Open(wbFull)
+        xlApp.AutomationSecurity = oldSecu
+        xlApp.EnableEvents = oldEvt
+        If wb Is Nothing Then
+            modDebugLog.DError MOD_NAME, "EcrireStatutManuel : classeur inaccessible - " & payload
+            If creee Then xlApp.Quit
+            Exit Sub
+        End If
+        ouvertParNous = True
+    End If
+
+    ' --- Feuille + colonnes --------------------------------------------------
+    Dim ws As Object
+    Set ws = wb.Worksheets(shName)
+    If ws Is Nothing Then
+        modDebugLog.DError MOD_NAME, "EcrireStatutManuel : feuille absente - " & payload
+        GoTo Nettoyage
+    End If
+
+    Dim colTo As Long, colSubj As Long, colStat As Long
+    colTo = TrouverColonneRole(ws, R_TO)
+    colSubj = TrouverColonneRole(ws, R_SUBJECT)
+    colStat = TrouverColonneRole(ws, R_STATUS)
+    If colTo = 0 Or colSubj = 0 Then
+        modDebugLog.DError MOD_NAME, "EcrireStatutManuel : colonnes To/Objet introuvables - " & payload
+        GoTo Nettoyage
+    End If
+    If colStat = 0 Then
+        Dim derCol As Long
+        derCol = ws.Cells(1, ws.Columns.Count).End(XL_TOLEFT).Column
+        ws.Cells(1, derCol + 1).Value = "Statut"
+        colStat = derCol + 1
+    End If
+
+    ' --- Localisation de la ligne : indice d'abord, sinon balayage par cle --
+    Dim lig As Long
+    lig = 0
+    If ligHint >= 2 Then
+        If LigneCorrespond(ws, ligHint, colTo, colSubj, toKey, subjKey) Then lig = ligHint
+    End If
+    If lig = 0 Then
+        Dim derLig As Long, i As Long
+        derLig = DerniereLigne(ws, colTo)
+        For i = 2 To derLig
+            If LigneCorrespond(ws, i, colTo, colSubj, toKey, subjKey) Then lig = i: Exit For
+        Next i
+    End If
+    If lig = 0 Then
+        modDebugLog.DError MOD_NAME, "EcrireStatutManuel : ligne introuvable (cle modifiee ?) - " & payload
+        GoTo Nettoyage
+    End If
+
+    ' --- Ecriture (protection : ne pas ecraser un statut significatif) ------
+    Dim st As String
+    st = Trim$(CStr(ws.Cells(lig, colStat).Value))
+    If Len(st) = 0 Or LCase$(Left$(st, 9)) = "brouillon" Then
+        ws.Cells(lig, colStat).Value = "Envoye manuellement le " & Format$(Now, "dd/mm/yyyy hh:nn")
+        modDebugLog.DInfo MOD_NAME, "Statut manuel ecrit : ligne " & lig & " (" & toKey & ")"
+    Else
+        modDebugLog.DInfo MOD_NAME, "Statut manuel NON ecrit (statut existant '" & st & "') ligne " & lig
+    End If
+
+Nettoyage:
+    If ouvertParNous Then
+        wb.Save
+        wb.Close False
+    End If
+    If creee Then
+        If xlApp.Workbooks.Count = 0 Then xlApp.Quit
+    End If
+    If Err.Number <> 0 Then
+        modDebugLog.DError MOD_NAME, "EcrireStatutManuel " & Err.Number & " - " & Err.Description
+    End If
+End Sub
+
+
+' Ligne = cle ? (destinataire ET objet, comparaison insensible a la casse)
+Private Function LigneCorrespond(ByVal ws As Object, ByVal lig As Long, _
+                                 ByVal colTo As Long, ByVal colSubj As Long, _
+                                 ByVal toKey As String, ByVal subjKey As String) As Boolean
+    On Error Resume Next
+    Dim vTo As String, vSubj As String
+    vTo = LCase$(Trim$(CStr(ws.Cells(lig, colTo).Value)))
+    vSubj = Trim$(CStr(ws.Cells(lig, colSubj).Value))
+    LigneCorrespond = (vTo = toKey) And (LCase$(vSubj) = LCase$(subjKey))
+End Function
+
+
+'=============================================================================
+' UTILITAIRES
+'=============================================================================
+
+Private Function LireCell(ByVal ws As Object, ByVal map As Object, _
+                          ByVal lig As Long, ByVal role As String) As String
+    If Not map.Exists(role) Then Exit Function
+    LireCell = CStr(ws.Cells(lig, map(role)).Value)
+End Function
+
+
+Private Function NettoyerListeAdr(ByVal liste As String) As String
+    Dim parts() As String, i As Long, a As String, out As String
+    parts = Split(liste, ";")
+    For i = LBound(parts) To UBound(parts)
+        a = Trim$(parts(i))
+        If Len(a) > 0 Then
+            If Len(out) > 0 Then out = out & "; "
+            out = out & a
+        End If
+    Next i
+    NettoyerListeAdr = out
+End Function
+
+
+Private Function NettoyerChemin(ByVal s As String) As String
+    Dim t As String
+    t = Trim$(s)
+    If Len(t) >= 2 Then
+        If Left$(t, 1) = """" Then t = Mid$(t, 2)
+        If Right$(t, 1) = """" Then t = Left$(t, Len(t) - 1)
+    End If
+    NettoyerChemin = Trim$(t)
+End Function
+
+
+' v10.5 : chemin relatif -> prefixe par le dossier du classeur d'emailing.
+' Est considere ABSOLU (laisse tel quel) : lettre de lecteur (":") ou
+' prefixe UNC ("\\"). Classeur jamais enregistre ou ouvert depuis une URL
+' SharePoint (dossier en http...) : chemin laisse tel quel (le pre-vol
+' signalera alors "introuvable" avec le chemin en clair).
+Private Function ResoudreCheminRel(ByVal ws As Object, ByVal chemin As String) As String
+    On Error Resume Next
+    ResoudreCheminRel = chemin
+    If Len(chemin) = 0 Then Exit Function
+    If InStr(chemin, ":") > 0 Then Exit Function          ' C:\... (ou URL)
+    If Left$(chemin, 2) = "\\" Then Exit Function          ' \\serveur\part
+
+    Dim base As String
+    base = CStr(ws.Parent.Path)
+    If Len(base) = 0 Then Exit Function                    ' classeur non enregistre
+    If LCase$(Left$(base, 4)) = "http" Then Exit Function  ' classeur SharePoint
+
+    If Right$(base, 1) <> "\" Then base = base & "\"
+    ResoudreCheminRel = base & chemin
+End Function
+
+
+' v10.5 : accepte les retours a la ligne DANS la cellule PJ (Alt+Entree)
+' comme separateurs, en plus du ";" historique.
+Private Function NormaliserSepPJ(ByVal s As String) As String
+    Dim res As String
+    res = Replace(s, vbCrLf, ";")
+    res = Replace(res, vbCr, ";")
+    res = Replace(res, vbLf, ";")
+    NormaliserSepPJ = res
+End Function
+
+
+Private Function DerniereLigne(ByVal ws As Object, ByVal col As Long) As Long
+    DerniereLigne = ws.Cells(ws.Rows.Count, col).End(XL_UP).Row
+End Function
+
+
+Private Function TronquerRecap(ByVal s As String) As String
+    Const MAXLEN As Long = 1200
+    If Len(s) <= MAXLEN Then
+        TronquerRecap = s
+    Else
+        TronquerRecap = Left$(s, MAXLEN) & vbCrLf & "... (recap tronque, voir debug.log)"
+    End If
+End Function

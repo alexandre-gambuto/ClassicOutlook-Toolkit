@@ -1,0 +1,625 @@
+Option Explicit
+
+'=============================================================================
+' modOneNoteProbe - Diagnostic avance de la chaine COM OneNote
+' Purpose (EN): Advanced standalone probe for the OneNote COM chain. Reads the
+'   TypeLib registration in TRIPLE view (HKLM machine / HKCU user override /
+'   HKCR merged COM view), resolves ProgID -> CLSID -> LocalServer32 ->
+'   TypeLib GUID + version, checks ONENOTE.EXE presence/build, runs the staged
+'   COM calls (CreateObject, GetSpecialLocation, GetHierarchy), loads the
+'   typelib DIRECTLY from the EXE via oleaut32.LoadTypeLibEx (registry
+'   bypassed) to tell a wrong registration from an unloadable file, parses the
+'   notebooks XML, and prints a verdict with the recommended next step.
+'   Report goes to MsgBox + debug log + clipboard (paste-ready for analysis).
+'
+' Contexte : modOneNote.RunReorganization est bloque sur le PREMIER appel
+'   IDispatch (GetHierarchy) :
+'     - d'abord 0x8002801D TYPE_E_LIBNOTREGISTERED (cle win64 absente en HKLM)
+'     - puis, apres modOneNote.FixTypeLibWin64_HKCU, 0x80029C4A
+'       TYPE_E_CANTLOADLIBRARY (cle presente mais typelib inchargeable).
+'   Office vient d'une mise a jour : cette sonde dit si la registration
+'   machine est revenue, et si l'override HKCU pose par l'ancien correctif
+'   MASQUE desormais une registration machine saine (HKCU prime sur HKLM
+'   dans la vue fusionnee HKCR).
+'
+' Macros a lancer depuis Outlook (Alt+F8) :
+'   * ProbeOneNote              -> diagnostic complet, verdict + rapport
+'   * RemoveOneNoteHKCUOverride -> purge l'override HKCU (action inverse de
+'                                  modOneNote.FixTypeLibWin64_HKCU), avec
+'                                  confirmation ; redemarrer Outlook ensuite
+'
+' Prerequis / contraintes :
+'   - LATE BINDING partout, aucun UserForm, aucun droit admin
+'   - Seule API Win32 : oleaut32.LoadTypeLibEx en LECTURE SEULE (REGKIND_NONE)
+'   - Lectures registre : WScript.Shell.RegRead + reg.exe query (lecture)
+'   - Suppression HKCU : regedit /s + directive [-HKEY...] (pattern valide
+'     de modOneNote.CleanHKCUKey)
+'=============================================================================
+
+Private Const MOD_NAME As String = "ONProbe"
+Private Const MOD_VERSION As String = "v1 - 2026-06-07"
+
+' ---- Identite COM OneNote (replis si la resolution registre echoue) ----
+Private Const PROGID_ONENOTE    As String = "OneNote.Application"
+Private Const TLB_GUID_FALLBACK As String = "{0EA692EE-BB50-4E3C-AEF0-356D91732725}"
+Private Const TLB_VER_FALLBACK  As String = "1.1"
+Private Const EXE_FALLBACK      As String = _
+    "C:\Program Files\Microsoft Office\root\Office16\ONENOTE.EXE"
+
+' ---- Erreurs decodees (decimal ; hex en commentaire) ----
+Private Const HR_LIBNOTREG     As Long = -2147319779 ' 0x8002801D TYPE_E_LIBNOTREGISTERED
+Private Const HR_CANTLOADLIB   As Long = -2147312566 ' 0x80029C4A TYPE_E_CANTLOADLIBRARY
+Private Const HR_CLASSNOTREG   As Long = -2147221164 ' 0x80040154 REGDB_E_CLASSNOTREG
+Private Const HR_SERVEREXEC    As Long = -2146959355 ' 0x80080005 CO_E_SERVER_EXEC_FAILURE
+Private Const VBERR_CANTCREATE As Long = 429         ' Composant ActiveX introuvable
+Private Const VBERR_NOMETHOD   As Long = 438         ' Methode inconnue (IDispatch)
+
+' ---- Enums OneNote (late binding -> redeclarees ; valeurs interop) ----
+Private Const HS_NOTEBOOKS         As Long = 2 ' HierarchyScope.hsNotebooks
+' NB : modOneNote declare hsNotebooks=1 (= hsChildren officiel). Depuis la
+' racine "" le resultat est identique ; la valeur interop est conservee ici.
+Private Const SL_DEFAULT_NB_FOLDER As Long = 2 ' SpecialLocation.slDefaultNotebookFolder
+
+' ---- LoadTypeLibEx : chargement direct, SANS (re)enregistrement ----
+Private Const REGKIND_NONE As Long = 2
+
+Private Declare PtrSafe Function LoadTypeLibEx Lib "oleaut32" ( _
+    ByVal szFile As LongPtr, ByVal regkind As Long, _
+    ppTLib As IUnknown) As Long
+
+' ---- Etat du diagnostic ----
+Private m_Report          As String
+Private m_HKLM64          As String  ' win64 cote machine (HKLM)
+Private m_HKCU64          As String  ' win64 cote utilisateur (override)
+Private m_HKCR64          As String  ' win64 vue fusionnee COM (HKCR)
+Private m_OverridePresent As Boolean
+Private m_FirstCallErr    As Long
+
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+'=============================================================================
+' SONDE PRINCIPALE
+'=============================================================================
+Public Sub ProbeOneNote()
+    Dim sClsid As String, sExe As String
+    Dim sTlbGuid As String, sTlbVer As String
+    Dim oApp As Object
+    Dim sSpecial As String, sXml As String
+    Dim bApiOk As Boolean, bXmlOk As Boolean
+    Dim sShow As String
+
+    m_Report = ""
+    m_HKLM64 = "": m_HKCU64 = "": m_HKCR64 = ""
+    m_OverridePresent = False
+    m_FirstCallErr = 0
+
+    Rep "=== SONDE ONENOTE - " & Format(Now, "yyyy-mm-dd hh:nn:ss") & " ==="
+    Rep "Outlook : " & Application.Version
+
+    ' --- R : registre (triple vue) ---
+    StageRegistry sClsid, sExe, sTlbGuid, sTlbVer
+
+    ' --- C : CreateObject ---
+    Set oApp = StageCreate()
+
+    ' --- M : premiers appels IDispatch (la typelib se charge ICI) ---
+    If Not oApp Is Nothing Then
+        StageFirstCalls oApp, sSpecial, sXml
+        bApiOk = (m_FirstCallErr = 0)
+    End If
+
+    ' --- L : LoadTypeLibEx direct (hors registre) ---
+    StageLoadTypeLib sExe
+
+    ' --- X : parse XML blocs-notes ---
+    If bApiOk And Len(sXml) > 0 Then bXmlOk = StageParseXml(sXml)
+
+    ' --- Verdict ---
+    Rep String(46, "-")
+    BuildVerdict bApiOk, bXmlOk
+
+    Set oApp = Nothing
+
+    PutReportInClipboard m_Report
+
+    sShow = m_Report
+    If Len(sShow) > 1800 Then
+        sShow = Left$(sShow, 1800) & vbCrLf & "..." & vbCrLf & _
+                T("(rapport complet dans le presse-papiers)", _
+                  "(full report in the clipboard)")
+    End If
+    MsgBox sShow, vbInformation, T("Sonde OneNote (rapport copi~e)", _
+                                   "OneNote probe (report copied)")
+End Sub
+
+'-----------------------------------------------------------------------------
+' Etape R : lecture registre en triple vue (HKLM / HKCU / HKCR)
+'-----------------------------------------------------------------------------
+Private Sub StageRegistry(ByRef sClsid As String, ByRef sExe As String, _
+                          ByRef sTlbGuid As String, ByRef sTlbVer As String)
+    Dim sRaw As String, sSuffix As String
+
+    Rep String(46, "-")
+    Rep "[R] Registre"
+
+    ' R1 : ProgID -> CLSID (vue fusionnee HKCR, puis repli HKCU)
+    sClsid = RegReadSafe("HKCR\" & PROGID_ONENOTE & "\CLSID\")
+    If Len(sClsid) = 0 Then sClsid = _
+        RegReadSafe("HKCU\Software\Classes\" & PROGID_ONENOTE & "\CLSID\")
+    Rep "R1 CLSID : " & ValueOrMissing(sClsid)
+
+    ' R2 : CLSID -> LocalServer32 (chemin du serveur COM)
+    If Len(sClsid) > 0 Then
+        sRaw = RegReadSafe("HKCR\CLSID\" & sClsid & "\LocalServer32\")
+        sExe = CleanExePath(sRaw)
+    End If
+    If Len(sExe) = 0 Then sExe = EXE_FALLBACK
+    Rep "R2 LocalServer32 : " & ValueOrMissing(sRaw)
+    Rep "R2 ONENOTE.EXE : " & IIf(FileExistsSafe(sExe), _
+        "present, build " & FileVersionSafe(sExe), "INTROUVABLE - " & sExe)
+
+    ' R3 : CLSID -> TypeLib GUID + Version
+    If Len(sClsid) > 0 Then
+        sTlbGuid = RegReadSafe("HKCR\CLSID\" & sClsid & "\TypeLib\")
+        sTlbVer = RegReadSafe("HKCR\CLSID\" & sClsid & "\Version\")
+    End If
+    If Len(sTlbGuid) = 0 Then sTlbGuid = TLB_GUID_FALLBACK
+    If Len(sTlbVer) = 0 Then sTlbVer = TLB_VER_FALLBACK
+    Rep "R3 TypeLib : " & sTlbGuid & " v" & sTlbVer
+
+    ' R4 : TRIPLE lecture de ...\TypeLib\{guid}\{ver}\0\win64
+    sSuffix = "\TypeLib\" & sTlbGuid & "\" & sTlbVer & "\0\win64\"
+    m_HKLM64 = RegReadSafe("HKLM\Software\Classes" & sSuffix)
+    m_HKCU64 = RegReadSafe("HKCU\Software\Classes" & sSuffix)
+    m_HKCR64 = RegReadSafe("HKCR" & sSuffix)
+    Rep "R4 win64 HKLM (machine)  : " & ValueOrMissing(m_HKLM64)
+    Rep "R4 win64 HKCU (override) : " & ValueOrMissing(m_HKCU64)
+    Rep "R4 win64 HKCR (vue COM)  : " & ValueOrMissing(m_HKCR64)
+
+    ' R5 : win32 (un suffixe \N revele l'index de ressource attendu)
+    Rep "R5 win32 HKLM : " & ValueOrMissing(RegReadSafe( _
+        "HKLM\Software\Classes\TypeLib\" & sTlbGuid & "\" & sTlbVer & _
+        "\0\win32\"))
+
+    ' R6 : presence d'un override HKCU (cle, meme sans valeur par defaut)
+    m_OverridePresent = (Len(m_HKCU64) > 0)
+    If Not m_OverridePresent Then m_OverridePresent = _
+        RegKeyExists("HKCU\Software\Classes\TypeLib\" & sTlbGuid)
+    Rep "R6 Override HKCU TypeLib : " & _
+        IIf(m_OverridePresent, "PRESENT", "absent")
+End Sub
+
+'-----------------------------------------------------------------------------
+' Etape C : creation de l'objet COM
+'-----------------------------------------------------------------------------
+Private Function StageCreate() As Object
+    Dim t0 As Single
+    Rep String(46, "-")
+    Rep "[C] CreateObject(""" & PROGID_ONENOTE & """)"
+    On Error Resume Next
+    t0 = Timer
+    Set StageCreate = CreateObject(PROGID_ONENOTE)
+    If Err.Number <> 0 Then
+        Rep "C ECHEC : " & DecodeHr(Err.Number) & " - " & Err.Description
+        Set StageCreate = Nothing
+    Else
+        Rep "C OK en " & Format(Timer - t0, "0.0") & " s"
+    End If
+    On Error GoTo 0
+End Function
+
+'-----------------------------------------------------------------------------
+' Etape M : premiers appels IDispatch. La typelib enregistree se charge au
+' PREMIER appel de methode (pas au CreateObject) : c'est l'etape qui revele
+' TYPE_E_LIBNOTREGISTERED / TYPE_E_CANTLOADLIBRARY.
+'-----------------------------------------------------------------------------
+Private Sub StageFirstCalls(ByVal oApp As Object, _
+                            ByRef sSpecial As String, ByRef sXml As String)
+    Rep String(46, "-")
+    Rep "[M] Premiers appels IDispatch"
+
+    On Error Resume Next
+    ' M1 : GetSpecialLocation (le plus leger : aucune donnee, juste un chemin)
+    oApp.GetSpecialLocation SL_DEFAULT_NB_FOLDER, sSpecial
+    If Err.Number <> 0 Then
+        m_FirstCallErr = Err.Number
+        Rep "M1 GetSpecialLocation ECHEC : " & DecodeHr(Err.Number)
+        On Error GoTo 0
+        Exit Sub
+    End If
+    Rep "M1 GetSpecialLocation OK : " & sSpecial
+
+    ' M2 : GetHierarchy (blocs-notes) - l'appel qui bloque modOneNote
+    Err.Clear
+    oApp.GetHierarchy "", HS_NOTEBOOKS, sXml
+    If Err.Number <> 0 Then
+        m_FirstCallErr = Err.Number
+        Rep "M2 GetHierarchy ECHEC : " & DecodeHr(Err.Number)
+    Else
+        Rep "M2 GetHierarchy OK : " & Len(sXml) & " caracteres XML"
+    End If
+    On Error GoTo 0
+End Sub
+
+'-----------------------------------------------------------------------------
+' Etape L : LoadTypeLibEx DIRECT sur le fichier, hors registre.
+' Distingue "registration fausse" (L OK mais M KO) de "fichier / typelib
+' inchargeable" (L KO aussi). Supporte la forme "chemin\index".
+'-----------------------------------------------------------------------------
+Private Sub StageLoadTypeLib(ByVal sExe As String)
+    Dim sMerged As String
+    Rep String(46, "-")
+    Rep "[L] LoadTypeLibEx direct (hors registre)"
+    TryLoadTypeLib "EXE nu          ", sExe
+    sMerged = Trim$(m_HKCR64)
+    If Len(sMerged) > 0 Then
+        If StrComp(sMerged, sExe, vbTextCompare) <> 0 Then
+            TryLoadTypeLib "valeur HKCR brute", sMerged
+        End If
+    End If
+End Sub
+
+Private Sub TryLoadTypeLib(ByVal sLabel As String, ByVal sFile As String)
+    Dim hr As Long
+    Dim tlb As IUnknown
+    If Len(Trim$(sFile)) = 0 Then
+        Rep "L " & Trim$(sLabel) & " : chemin vide, ignore"
+        Exit Sub
+    End If
+    hr = LoadTypeLibEx(StrPtr(sFile), REGKIND_NONE, tlb)
+    If hr = 0 Then
+        Rep "L " & sLabel & " : OK (typelib chargeable) - " & sFile
+        Set tlb = Nothing
+    Else
+        Rep "L " & sLabel & " : ECHEC " & DecodeHr(hr) & " - " & sFile
+    End If
+End Sub
+
+'-----------------------------------------------------------------------------
+' Etape X : analyse du XML blocs-notes (MSXML 6.0 + repli comptage brut)
+'-----------------------------------------------------------------------------
+Private Function StageParseXml(ByVal sXml As String) As Boolean
+    Dim doc As Object, nodes As Object, nd As Object
+    Dim n As Long, i As Long
+    Dim sNames As String, sNm As String
+
+    Rep String(46, "-")
+    Rep "[X] Analyse XML"
+
+    On Error Resume Next
+    Set doc = CreateObject("MSXML2.DOMDocument.6.0")
+    If doc Is Nothing Then
+        Rep "X MSXML 6.0 indisponible"
+        On Error GoTo 0
+        Exit Function
+    End If
+    doc.async = False
+    doc.setProperty "SelectionLanguage", "XPath"
+    doc.setProperty "SelectionNamespaces", "xmlns:one='" & _
+        "http://schemas.microsoft.com/office/onenote/2013/onenote'"
+    If Not doc.LoadXML(sXml) Then
+        Rep "X parse ECHEC : " & doc.parseError.reason
+        On Error GoTo 0
+        Exit Function
+    End If
+
+    Set nodes = doc.SelectNodes("//one:Notebook")
+    n = nodes.Length
+    If n = 0 Then
+        ' Repli : autre namespace -> comptage brut des balises
+        n = (Len(sXml) - Len(Replace(sXml, "<one:Notebook", ""))) \ _
+            Len("<one:Notebook")
+        Rep "X XPath vide, comptage brut : " & n & " bloc(s)-notes"
+    Else
+        For i = 0 To n - 1
+            If i >= 5 Then Exit For
+            Set nd = nodes.Item(i)
+            sNm = nd.getAttribute("nickname") & ""
+            If Len(sNm) = 0 Then sNm = nd.getAttribute("name") & ""
+            sNames = sNames & IIf(Len(sNames) > 0, ", ", "") & sNm
+        Next i
+        Rep "X " & n & " bloc(s)-notes : " & sNames & IIf(n > 5, " ...", "")
+    End If
+    StageParseXml = (n > 0)
+
+    Set nd = Nothing: Set nodes = Nothing: Set doc = Nothing
+    On Error GoTo 0
+End Function
+
+'-----------------------------------------------------------------------------
+' Verdict + action recommandee
+'-----------------------------------------------------------------------------
+Private Sub BuildVerdict(ByVal bApiOk As Boolean, ByVal bXmlOk As Boolean)
+    If bApiOk And bXmlOk Then
+        If m_OverridePresent Then
+            Rep T("VERDICT : API OK, mais VIA l'override HKCU.", _
+                  "VERDICT: API OK, but THROUGH the HKCU override.")
+            Rep T("Action : RemoveOneNoteHKCUOverride, red~emarrer Outlook " & _
+                  "(VBE ferm~e), relancer ProbeOneNote pour valider la " & _
+                  "registration machine seule.", _
+                  "Action: RemoveOneNoteHKCUOverride, restart Outlook " & _
+                  "(VBE closed), re-run ProbeOneNote to validate the " & _
+                  "machine registration alone.")
+        Else
+            Rep T("VERDICT : API OneNote FONCTIONNELLE sur la registration " & _
+                  "machine. modOneNote est de nouveau exploitable.", _
+                  "VERDICT: OneNote API WORKING on the machine " & _
+                  "registration. modOneNote is usable again.")
+            Rep T("Action : TestEnvironment puis RunReorganization.", _
+                  "Action: TestEnvironment then RunReorganization.")
+        End If
+    ElseIf bApiOk And Not bXmlOk Then
+        Rep T("VERDICT : appels COM OK mais XML vide ou non analysable " & _
+              "(0 bloc-notes ?). API d~ebloqu~ee ; v~erifier le contenu " & _
+              "OneNote.", _
+              "VERDICT: COM calls OK but XML empty or unparseable (0 " & _
+              "notebooks?). API unblocked; check OneNote content.")
+    ElseIf m_FirstCallErr <> 0 Then
+        If m_OverridePresent And Len(m_HKLM64) > 0 Then
+            Rep T("VERDICT : registration machine PRESENTE mais MASQU~EE " & _
+                  "par l'override HKCU (HKCU prime sur HKLM dans HKCR).", _
+                  "VERDICT: machine registration PRESENT but SHADOWED by " & _
+                  "the HKCU override (HKCU wins over HKLM in HKCR).")
+            Rep T("Action : RemoveOneNoteHKCUOverride, red~emarrer Outlook " & _
+                  "(VBE ferm~e), relancer ProbeOneNote.", _
+                  "Action: RemoveOneNoteHKCUOverride, restart Outlook " & _
+                  "(VBE closed), re-run ProbeOneNote.")
+        ElseIf Len(m_HKLM64) = 0 Then
+            Rep T("VERDICT : registration machine toujours incompl~fte " & _
+                  "(win64 absent en HKLM) : la mise ~a jour n'a rien " & _
+                  "r~epar~e.", _
+                  "VERDICT: machine registration still incomplete (win64 " & _
+                  "missing in HKLM): the update repaired nothing.")
+            Rep T("Action : IT -> R~eparation rapide d'Office, puis " & _
+                  "R~eparation en ligne si insuffisant.", _
+                  "Action: IT -> Office Quick Repair, then Online Repair " & _
+                  "if not enough.")
+        Else
+            ' v- 2026-08-22 : DecodeHr() sort de T(). Un code HRESULT
+            ' decode peut contenir n'importe quelle sequence : le passer
+            ' dans A() falsifierait le verdict meme du diagnostic.
+            Rep T("VERDICT : typelib enregistr~ee mais inchargeable (", _
+                  "VERDICT: typelib registered but not loadable (") & _
+                DecodeHr(m_FirstCallErr) & _
+                T("). Voir l'~etape L : si le chargement direct passe, la " & _
+                  "VALEUR enregistr~ee est fausse (suffixe d'index de " & _
+                  "ressource ?).", _
+                  "). See step L: if the direct load works, the REGISTERED " & _
+                  "value is wrong (resource index suffix?).")
+            Rep T("Action : comparer R4/R5 (suffixe \N ?) ; purge " & _
+                  "RemoveOneNoteHKCUOverride si override ; sinon IT -> " & _
+                  "R~eparation d'Office.", _
+                  "Action: compare R4/R5 (\N suffix?); run " & _
+                  "RemoveOneNoteHKCUOverride if override; else IT -> " & _
+                  "Office Repair.")
+        End If
+    Else
+        Rep T("VERDICT : CreateObject a ~echou~e : OneNote Desktop absent " & _
+              "ou d~esenregistr~e (la mise ~a jour a pu retirer le " & _
+              "composant).", _
+              "VERDICT: CreateObject failed: OneNote Desktop missing or " & _
+              "unregistered (the update may have removed the component).")
+        Rep T("Action : v~erifier ONENOTE.EXE (~etape R2) ; sinon IT -> " & _
+              "r~einstallation / R~eparation d'Office.", _
+              "Action: check ONENOTE.EXE (step R2); else IT -> Office " & _
+              "reinstall / Repair.")
+    End If
+End Sub
+
+'=============================================================================
+' PURGE DE L'OVERRIDE HKCU (action inverse de modOneNote.FixTypeLibWin64_HKCU)
+'=============================================================================
+Public Sub RemoveOneNoteHKCUOverride()
+    Dim sClsid As String, sTlbGuid As String
+    Dim cKeys As Collection
+    Dim v As Variant
+    Dim sList As String
+    Dim nGone As Long
+
+    ' Resolution (memes replis que la sonde)
+    sClsid = RegReadSafe("HKCR\" & PROGID_ONENOTE & "\CLSID\")
+    If Len(sClsid) = 0 Then sClsid = _
+        RegReadSafe("HKCU\Software\Classes\" & PROGID_ONENOTE & "\CLSID\")
+    If Len(sClsid) > 0 Then sTlbGuid = _
+        RegReadSafe("HKCR\CLSID\" & sClsid & "\TypeLib\")
+    If Len(sTlbGuid) = 0 Then sTlbGuid = TLB_GUID_FALLBACK
+
+    ' Cles candidates sous HKCU\Software\Classes
+    Set cKeys = New Collection
+    AddIfExists cKeys, "Software\Classes\TypeLib\" & sTlbGuid
+    AddIfExists cKeys, "Software\Classes\" & PROGID_ONENOTE
+    If Len(sClsid) > 0 Then AddIfExists cKeys, _
+        "Software\Classes\CLSID\" & sClsid
+
+    If cKeys.Count = 0 Then
+        MsgBox T("Aucun override HKCU OneNote d~etect~e : rien ~a purger.", _
+                 "No OneNote HKCU override detected: nothing to remove."), _
+               vbInformation, T("Purge des overrides HKCU", "HKCU override cleanup")
+        Exit Sub
+    End If
+
+    For Each v In cKeys
+        sList = sList & "HKCU\" & v & vbCrLf
+    Next v
+
+    If MsgBox(T("Supprimer ces cl~es HKCU (r~eversible via " & _
+                "modOneNote.FixTypeLibWin64_HKCU) ?", _
+                "Delete these HKCU keys (reversible via " & _
+                "modOneNote.FixTypeLibWin64_HKCU)?") & _
+              vbCrLf & vbCrLf & sList, _
+              vbYesNo + vbExclamation, _
+              T("Purge des overrides HKCU", "HKCU override cleanup")) <> vbYes Then Exit Sub
+
+    For Each v In cKeys
+        DeleteHKCUKeyTree CStr(v)
+        If Not RegKeyExists("HKCU\" & CStr(v)) Then nGone = nGone + 1
+    Next v
+
+    modDebugLog.DInfo MOD_NAME, "Override HKCU purge : " & nGone & "/" & _
+        cKeys.Count & " cle(s) supprimee(s)"
+
+    ' v- 2026-08-22 : compteurs sortis de T(). Titre en phrase (convention
+    ' du 2026-08-22) au lieu du nom de procedure.
+    modUi.Inform CStr(nGone) & "/" & CStr(cKeys.Count) & _
+           T(" cl~e(s) supprim~ee(s).", " key(s) deleted.") & vbCrLf & _
+           T("Red~emarrer Outlook (VBE ferm~e) puis relancer ProbeOneNote.", _
+             "Restart Outlook (VBE closed) then re-run ProbeOneNote."), _
+           T("Purge des overrides HKCU", "HKCU override cleanup")
+End Sub
+
+Private Sub AddIfExists(ByVal cKeys As Collection, ByVal sSubKey As String)
+    If RegKeyExists("HKCU\" & sSubKey) Then cKeys.Add sSubKey
+End Sub
+
+' Supprime un arbre de cles HKCU via regedit /s + directive [-HKEY...]
+' (pattern valide : modOneNote.CleanHKCUKey ; RegDelete ne supprime pas
+' les arbres non vides).
+Private Sub DeleteHKCUKeyTree(ByVal sSubKey As String)
+    Dim sh As Object
+    Dim sRegPath As String
+    Dim sContent As String
+
+    On Error Resume Next
+    Randomize
+    Set sh = CreateObject("WScript.Shell")
+    sRegPath = sh.ExpandEnvironmentStrings("%TEMP%") & "\onprobe_del_" & _
+        Format(Now, "yyyymmdd_hhnnss") & "_" & _
+        CStr(Int(Rnd * 100000)) & ".reg"
+    sContent = "Windows Registry Editor Version 5.00" & vbCrLf & vbCrLf & _
+        "[-HKEY_CURRENT_USER\" & sSubKey & "]" & vbCrLf
+    WriteUnicodeTextFile sRegPath, sContent
+    sh.Run "regedit.exe /s " & Chr(34) & sRegPath & Chr(34), 0, True
+    Kill sRegPath
+    On Error GoTo 0
+End Sub
+
+'=============================================================================
+' HELPERS
+'=============================================================================
+' Ajoute une ligne au rapport + trace DInfo (log ASCII : les lignes T()
+' du verdict sont l'exception assumee de ce module de diagnostic).
+Private Sub Rep(ByVal sLine As String)
+    m_Report = m_Report & sLine & vbCrLf
+    modDebugLog.DInfo MOD_NAME, sLine
+End Sub
+
+Private Function ValueOrMissing(ByVal s As String) As String
+    ValueOrMissing = IIf(Len(s) > 0, s, "(absent)")
+End Function
+
+' Lecture registre tolerante (RegRead ; "" si cle/valeur absente).
+' Abreviations HKCR / HKCU / HKLM supportees ; "\" final = valeur par defaut.
+Private Function RegReadSafe(ByVal sKey As String) As String
+    Dim sh As Object
+    On Error Resume Next
+    Set sh = CreateObject("WScript.Shell")
+    RegReadSafe = CStr(sh.RegRead(sKey))
+    If Err.Number <> 0 Then RegReadSafe = ""
+    On Error GoTo 0
+End Function
+
+' Existence d'une cle (meme sans valeur par defaut) via reg.exe query
+Private Function RegKeyExists(ByVal sKey As String) As Boolean
+    RegKeyExists = (ShellRunWait("reg.exe query " & Chr(34) & sKey & _
+                                 Chr(34) & " >nul 2>&1") = 0)
+End Function
+
+' Execute une commande cachee et attend le code retour
+Private Function ShellRunWait(ByVal sCmd As String) As Long
+    Dim sh As Object
+    On Error Resume Next
+    ShellRunWait = -1
+    Set sh = CreateObject("WScript.Shell")
+    ShellRunWait = sh.Run("cmd.exe /c " & sCmd, 0, True)
+    On Error GoTo 0
+End Function
+
+' Nettoie une valeur LocalServer32 : retire guillemets et arguments,
+' coupe apres ".exe" (gere aussi un eventuel suffixe "\N" d'index).
+Private Function CleanExePath(ByVal sRaw As String) As String
+    Dim s As String
+    Dim p As Long
+    s = Trim$(sRaw)
+    If Len(s) = 0 Then Exit Function
+    If Left$(s, 1) = Chr(34) Then
+        p = InStr(2, s, Chr(34))
+        If p > 0 Then s = Mid$(s, 2, p - 2)
+    End If
+    p = InStr(1, LCase$(s), ".exe")
+    If p > 0 Then s = Left$(s, p + 3)
+    CleanExePath = s
+End Function
+
+Private Function FileExistsSafe(ByVal sPath As String) As Boolean
+    On Error Resume Next
+    If Len(Trim$(sPath)) = 0 Then Exit Function
+    FileExistsSafe = (Len(Dir$(sPath)) > 0)
+    On Error GoTo 0
+End Function
+
+Private Function FileVersionSafe(ByVal sPath As String) As String
+    Dim fso As Object
+    On Error Resume Next
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    FileVersionSafe = CStr(fso.GetFileVersion(sPath))
+    If Err.Number <> 0 Or Len(FileVersionSafe) = 0 Then FileVersionSafe = "?"
+    On Error GoTo 0
+End Function
+
+' Decode les erreurs COM/VBA courantes de la chaine typelib
+Private Function DecodeHr(ByVal nErr As Long) As String
+    Dim s As String
+    Select Case nErr
+        Case HR_LIBNOTREG
+            s = "TYPE_E_LIBNOTREGISTERED (0x8002801D, cle TypeLib " & _
+                "win64/win32 absente)"
+        Case HR_CANTLOADLIB
+            s = "TYPE_E_CANTLOADLIBRARY (0x80029C4A, cle presente mais " & _
+                "typelib inchargeable)"
+        Case HR_CLASSNOTREG
+            s = "REGDB_E_CLASSNOTREG (0x80040154, classe COM non " & _
+                "enregistree)"
+        Case HR_SERVEREXEC
+            s = "CO_E_SERVER_EXEC_FAILURE (0x80080005, le serveur COM " & _
+                "n'a pas demarre)"
+        Case VBERR_CANTCREATE
+            s = "VBA 429 (composant ActiveX introuvable / non enregistre)"
+        Case VBERR_NOMETHOD
+            s = "VBA 438 (methode inconnue de l'objet)"
+        Case Else
+            s = CStr(nErr) & " (0x" & Hex$(nErr) & ")"
+    End Select
+    DecodeHr = s
+End Function
+
+' Copie le rapport au presse-papiers via clip.exe (pattern valide de
+' modSendToLLM.PutInClipboard : fichier temp UTF-16LE + "clip < fichier").
+Private Sub PutReportInClipboard(ByVal sText As String)
+    Dim sh As Object
+    Dim sTmp As String
+    On Error Resume Next
+    Randomize
+    Set sh = CreateObject("WScript.Shell")
+    sTmp = sh.ExpandEnvironmentStrings("%TEMP%") & "\onprobe_clip_" & _
+        Format(Now, "yyyymmdd_hhnnss") & "_" & _
+        CStr(Int(Rnd * 100000)) & ".txt"
+    WriteUnicodeTextFile sTmp, sText
+    sh.Run "cmd /c clip < " & Chr(34) & sTmp & Chr(34), 0, True
+    Kill sTmp
+    On Error GoTo 0
+End Sub
+
+' Ecrit une chaine en UTF-16LE avec BOM via ADODB.Stream (late binding)
+Private Sub WriteUnicodeTextFile(ByVal sPath As String, ByVal sText As String)
+    Dim stm As Object
+    Set stm = CreateObject("ADODB.Stream")
+    stm.Type = 2                 ' adTypeText
+    stm.Charset = "unicode"      ' UTF-16LE + BOM
+    stm.Open
+    stm.WriteText sText
+    stm.SaveToFile sPath, 2      ' adSaveCreateOverWrite
+    stm.Close
+    Set stm = Nothing
+End Sub

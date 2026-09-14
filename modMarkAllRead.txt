@@ -1,0 +1,202 @@
+Option Explicit
+
+'=============================================================================
+' modMarkAllRead v4  (2026-08-22)
+' Purpose (EN): marks every unread mail in the current store (root +
+'   recursive) as read. Uses Restrict("[UnRead] = True") and skips the
+'   per-item .Save (Outlook persists UnRead on its own -> major speedup on
+'   stores with thousands of unread items).
+'
+' Marque tous les mails non lus de la boite courante (racine + recursif)
+' comme lus.
+'
+' Point d'entree public : MarkAllRead
+'
+' v4 (2026-08-22) : revue UX pop-ups.
+'   (a) CONFIRMATION AJOUTEE (manquait) : l'action balaie TOUTE la boite,
+'       tous dossiers confondus, et n'est PAS annulable - aucune trace de
+'       l'etat lu/non lu anterieur n'est conservee. Le compte de non-lus est
+'       affiche AVANT, pour que la confirmation porte sur un chiffre reel et
+'       non sur une intention vague. vbDefaultButton2 : le bouton par defaut
+'       est "Non".
+'   (b) Le recapitulatif de fin passe en TOAST (modUi.Toast) : il n'appelle
+'       aucune decision, il n'a pas a bloquer le fil. Le detail chiffre reste
+'       dans debug.log.
+'   (c) Dialogues via modUi (garantie de premier plan) ; erreurs via
+'       modUi.Fail. Titre de fenetre passe par T() (il restait en dur).
+'   Dependances ajoutees : modUi (Ask / Fail / Toast).
+'
+' v3 (2026-07-25) : MOD_NAME (le module etait invisible du filtre de log de
+'   modDebugLog) + instrumentation de version (MOD_VERSION / ModVersion).
+'   Les erreurs de ProcessFolder, jusqu'ici avalees en silence, sont
+'   desormais tracees.
+' (Historique des versions -> CHANGELOG.)
+'=============================================================================
+
+Private Const MOD_NAME As String = "MarkRead"
+Private Const MOD_VERSION As String = "v4 - 2026-08-22"
+
+'=============================================================================
+' ModVersion - version REELLEMENT chargee dans le VBE.
+'=============================================================================
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+'=============================================================================
+' UiTitle - titre de fenetre localise (etait en dur "MarkAllRead").
+'=============================================================================
+Private Function UiTitle() As String
+    UiTitle = T("Marquer tout comme lu", "Mark all as read")
+End Function
+
+'=============================================================================
+' MarkAllRead - point d'entree.
+'=============================================================================
+Public Sub MarkAllRead()
+    Dim olNS As Outlook.NameSpace
+    Dim olRootFolder As Outlook.folder
+    Dim lngCount As Long
+
+    On Error GoTo ErrHandler
+
+    Set olNS = Application.GetNamespace("MAPI")
+    Set olRootFolder = olNS.defaultStore.GetRootFolder
+
+    ' --- v4 : comptage prealable, puis confirmation -----------------------
+    ' Le comptage est un simple Restrict par dossier (pas d'ecriture) : il
+    ' coute un balayage, mais il transforme une confirmation abstraite en
+    ' chiffre verifiable. Sur une boite deja propre (0 non-lu), on sort
+    ' sans rien demander ni rien ecrire.
+    Dim unreadCount As Long
+    unreadCount = 0
+    modDebugLog.DInfo MOD_NAME, "MarkAllRead : comptage prealable sur " & _
+        olRootFolder.Name
+    CountFolder olRootFolder, unreadCount
+    modDebugLog.DInfo MOD_NAME, "MarkAllRead : " & unreadCount & " non-lu(s) trouve(s)"
+
+    If unreadCount = 0 Then
+        modUi.Toast T("Aucun message non lu.", "No unread message."), uiInfo
+        GoTo CleanExit
+    End If
+
+    Dim rep As VbMsgBoxResult
+    rep = modUi.Ask( _
+        unreadCount & T(" message(s) non lu(s) dans la bo~ite ", _
+                        " unread message(s) in mailbox ") & _
+        olRootFolder.Name & "." & vbCrLf & vbCrLf & _
+        T("TOUS les dossiers sont concern~es, y compris les archives et " & _
+          "les sous-dossiers.", _
+          "EVERY folder is affected, including archives and subfolders.") & vbCrLf & _
+        T("Cette action n'est PAS annulable : l'~etat lu/non lu ant~erieur " & _
+          "n'est pas conserv~e.", _
+          "This action canNOT be undone: the previous read/unread state is " & _
+          "not kept.") & vbCrLf & vbCrLf & _
+        T("Continuer ?", "Continue?"), _
+        UiTitle(), _
+        vbYesNo + vbExclamation + vbDefaultButton2)
+
+    If rep <> vbYes Then
+        modDebugLog.DInfo MOD_NAME, "MarkAllRead : annule par l'utilisateur"
+        GoTo CleanExit
+    End If
+
+    ' --- Traitement -------------------------------------------------------
+    lngCount = 0
+    modDebugLog.DInfo MOD_NAME, "MarkAllRead : debut sur " & olRootFolder.Name
+    ProcessFolder olRootFolder, lngCount
+    modDebugLog.DInfo MOD_NAME, "MarkAllRead : " & lngCount & " item(s) marque(s)"
+
+    ' v4 : toast au lieu d'une MsgBox captive. Le detail est dans le log.
+    modUi.Toast lngCount & T(" message(s) marqu~e(s) comme lu(s).", _
+                             " message(s) marked as read."), uiSuccess
+
+CleanExit:
+    Set olRootFolder = Nothing
+    Set olNS = Nothing
+    Exit Sub
+
+ErrHandler:
+    modDebugLog.DError MOD_NAME, "MarkAllRead err " & Err.Number & " - " & Err.Description
+    modUi.Fail T("Erreur : ", "Error: ") & Err.Number & " - " & Err.Description, _
+               UiTitle()
+    Set olRootFolder = Nothing
+    Set olNS = Nothing
+End Sub
+
+'=============================================================================
+' CountFolder - compte les non-lus, recursif. Lecture seule.
+' v4 : separe de ProcessFolder pour que la confirmation porte sur un chiffre.
+'=============================================================================
+Private Sub CountFolder(ByVal objFolder As Outlook.folder, ByRef lngCount As Long)
+    Dim objItems As Outlook.items
+    Dim objSubFolder As Outlook.folder
+
+    On Error Resume Next
+
+    Set objItems = objFolder.items.Restrict("[UnRead] = True")
+    If Not objItems Is Nothing Then
+        lngCount = lngCount + objItems.count
+    End If
+
+    If Err.Number <> 0 Then
+        modDebugLog.DDebug MOD_NAME, "CountFolder '" & objFolder.Name & _
+            "' err " & Err.Number & " - " & Err.Description
+    End If
+    Err.Clear
+    On Error GoTo 0
+
+    For Each objSubFolder In objFolder.Folders
+        DoEvents
+        CountFolder objSubFolder, lngCount
+    Next objSubFolder
+
+    Set objItems = Nothing
+    Set objSubFolder = Nothing
+End Sub
+
+'=============================================================================
+' ProcessFolder - marque les non-lus, recursif.
+'=============================================================================
+Private Sub ProcessFolder(ByVal objFolder As Outlook.folder, ByRef lngCount As Long)
+    Dim objItems As Outlook.items
+    Dim objItem As Object
+    Dim objSubFolder As Outlook.folder
+    Dim i As Long
+
+    On Error Resume Next
+
+    ' Filtrer sur non-lus uniquement
+    Set objItems = objFolder.items.Restrict("[UnRead] = True")
+
+    If Not objItems Is Nothing Then
+        ' Boucle inverse : si UnRead=False modifie la collection filtree,
+        ' on evite de sauter des elements.
+        For i = objItems.count To 1 Step -1
+            Set objItem = objItems(i)
+            If Not objItem Is Nothing Then
+                ' Pas de .Save : Outlook persiste UnRead automatiquement
+                ' (evite un aller-retour MAPI par item, gain massif).
+                objItem.UnRead = False
+                lngCount = lngCount + 1
+            End If
+            Set objItem = Nothing
+        Next i
+    End If
+
+    If Err.Number <> 0 Then
+        modDebugLog.DDebug MOD_NAME, "ProcessFolder '" & objFolder.Name & _
+            "' err " & Err.Number & " - " & Err.Description
+    End If
+    Err.Clear
+    On Error GoTo 0
+
+    ' Recursion sur les sous-dossiers
+    For Each objSubFolder In objFolder.Folders
+        DoEvents
+        ProcessFolder objSubFolder, lngCount
+    Next objSubFolder
+
+    Set objItems = Nothing
+    Set objSubFolder = Nothing
+End Sub

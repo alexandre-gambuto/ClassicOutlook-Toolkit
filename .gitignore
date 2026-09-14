@@ -1,0 +1,17 @@
+# Environment-specific configuration (contains paths, domains, API key)
+config.ini
+# Referential and tracking workbooks (personal data)
+*.xlsm
+*.xlsx
+# ... except the empty templates shipped with the project
+!Time-tracking-template.xlsm
+!Mail-tracker-template.xlsm
+# Runtime artefacts
+debug.log
+debug.log.old
+*.cache
+# Windows / editors
+Thumbs.db
+desktop.ini
+*.bak
+__pycache__/

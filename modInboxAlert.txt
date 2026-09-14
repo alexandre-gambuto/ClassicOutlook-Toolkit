@@ -1,0 +1,832 @@
+Option Explicit
+
+'=============================================================================
+' modInboxAlert v1.4  (2026-08-22)
+' v1.4 (2026-08-22) : revue traduction. InboxAlertSoundProbe etait
+'   INTEGRALEMENT en francais hors T() - libelles, verdicts OUI/NON,
+'   diagnostics de format WAV/MP3 - et son titre de fenetre en dur
+'   ("InboxAlertSoundProbe") a trois endroits, factorise dans ProbeTitle().
+'   InboxAlertStatus portait un titre technique brut ; les NOMS DE CLES de
+'   config.ini qu'il affiche (InboxAlertEnabled, GroupMs, DefaultColor...)
+'   restent volontairement NON traduits : ce sont les cles exactes a
+'   chercher dans config.ini, les traduire rendrait le diagnostic
+'   inutilisable. Dialogues via modUi (Inform / Fail).
+'   Dependance ajoutee : modUi.
+'
+' v1.3 : le son est joue PAR LE TOAST (mshta, balise <bgsound>) via
+'   modNotify.NotifyEx soundPath, plus par PlaySound depuis Outlook :
+'   la sortie audio du processus Outlook restait muette sur le poste
+'   (PlaySound retour 1, aucun son). PlaySound n'est plus utilise qu'en
+'   sonde (InboxAlertSoundProbe). Meme mode pour InboxAlertTest.
+' v1.2 : lecture du son - suppression de l'appel SND_PURGE prealable (sur
+'   certains pilotes il annule la lecture asynchrone lancee juste apres) ;
+'   le retour de PlaySound est logue (0 = echec, en ERROR) ; en cas d'echec
+'   asynchrone, repli SYNCHRONE (bloque Outlook le temps du son, ~1 s).
+' v1.1 : InboxAlertSoundProbe - sonde de diagnostic du son (existence du
+'   fichier, en-tete WAV : RIFF/WAVE + code format, 1 = PCM seul format lu
+'   par PlaySound ; lecture synchrone avec bip systeme autorise ; essai via
+'   le moteur Windows Media Player, qui lit aussi MP3 / WAV compresses).
+' Purpose (EN): per-mailbox new-mail alerts, fully VBA (no Outlook rule, no
+'   native desktop alert). One clsInboxWatcher per configured mailbox listens to
+'   the Inbox ItemAdd event; arrivals are grouped over a short window (like the
+'   native alert), shown as ONE mshta toast (modNotify) with a per-mailbox colour,
+'   and an optional local .wav is played ONCE per burst. Everything is driven by
+'   config.ini (InboxAlert* keys) and can be switched off with InboxAlertEnabled=0.
+'
+' Alertes "nouveau mail" PAR BOITE, 100 % VBA : ni regle Outlook, ni alerte
+' native. Un clsInboxWatcher par boite configuree ecoute l'ItemAdd de sa
+' boite de reception ; les arrivees sont REGROUPEES sur une courte fenetre
+' (comme l'alerte native), affichees en UN SEUL toast mshta (modNotify) avec
+' une couleur par boite, et un fichier .wav local optionnel est joue UNE fois
+' par rafale. Tout est pilote par config.ini et se coupe d'un seul
+' interrupteur : InboxAlertEnabled=0.
+'
+' POURQUOI PAS LES REGLES OUTLOOK : l'alerte native n'est pas pilotable
+' depuis VBA (pas exposee dans le modele objet), les regles creees par code
+' sont des objets serveur a maintenir/nettoyer, et les boites partagees
+' simplement "ouvertes" dans le profil ne declenchent pas d'alerte native.
+' Le toast mshta est le seul canal non modal valide sur le poste (voir
+' modNotify).
+'
+' CONFIG (config.ini, section INBOX ALERT) :
+'   InboxAlertEnabled=1            interrupteur ON/OFF de TOUTE la fonction
+'   InboxAlertUnreadOnly=1         ignorer les mails deja lus a l'arrivee
+'                                  (regles serveur, mails deplaces a la main)
+'   InboxAlertSkipIfForeground=0   1 = pas de toast quand Outlook est deja
+'                                  la fenetre au premier plan
+'   InboxAlertGroupMs=1500         fenetre de regroupement d'une rafale
+'   InboxAlertDurationMs=5000      duree d'affichage du toast
+'   InboxAlertDefaultColor=#RRGGBB couleur si la boite n'a pas la sienne
+'   InboxAlertDefaultSound=chemin  .wav de repli (vide = pas de son)
+'   InboxAlertStoreN=Nom affiche   boite N (nom EXACT du volet de navigation,
+'                                  ou * = toutes les boites du profil)
+'   InboxAlertColorN=#RRGGBB       couleur de bordure du toast pour la boite N
+'   InboxAlertSoundN=chemin .wav   son de la boite N (vide = DefaultSound ;
+'                                  "none" = silence pour cette boite)
+'   Aucune cle InboxAlertStoreN -> la boite par defaut du profil est
+'   surveillee (index 0 : DefaultColor / DefaultSound).
+'   NB : ToastEnabled=0 (interrupteur GENERAL des toasts, modNotify) coupe
+'   aussi ces alertes.
+'
+' RAFALES : premier ItemAdd -> file d'attente + timer modDefer "InboxFlush"
+' (InboxAlertGroupMs). A l'echeance : 1 mail = toast detaille (boite /
+' expediteur / sujet) ; N mails = toast "N nouveaux mails" par boite avec
+' les 2 premiers expediteurs. Si un toast est encore a l'ecran, le suivant
+' ATTEND sa fermeture (pas d'empilement). Son joue une seule fois par toast.
+'
+' ALERTE NATIVE : InboxAlertStart verifie la cle HKCU NewmailDesktopAlerts.
+' Si l'alerte native est encore active, une MsgBox UNIQUE (memorisee via
+' SaveSetting) propose de la couper (prise en compte au prochain demarrage
+' d'Outlook). InboxAlertNativeToggle permet de la remettre / couper a la main.
+'
+' LIMITES CONNUES : ItemAdd n'est pas emis si >16 elements arrivent d'un
+' bloc (limite Outlook) ; le toast n'est pas cliquable et ne persiste pas
+' dans le centre de notifications Windows.
+'
+' POINTS D'ENTREE (a epingler au ruban si utile) :
+'   InboxAlertListStores  liste les boites du profil et la ligne config a copier
+'   InboxAlertTest        toast + son de test avec la config courante
+'   InboxAlertStatus      etat des watchers / config chargee
+'   InboxAlertNativeToggle  active/desactive l'alerte native Outlook (HKCU)
+'   InboxAlertStart       (re)armement, appele par ThisOutlookSession
+'
+' DEPENDANCES : clsInboxWatcher, modNotify (NotifyEx, v4.4+), modDefer
+' (cle "InboxFlush", v1.13+), modConfig (getters InboxAlert*), modDebugLog.
+'=============================================================================
+
+Private Const MOD_NAME As String = "InboxAlert"
+
+Private Const MOD_VERSION As String = "v1.4 - 2026-08-22"
+
+' Cle modDefer (Dispatch) et cle registre de l'alerte native Outlook.
+Private Const DEFER_KEY As String = "InboxFlush"
+Private Const NATIVE_REG_KEY As String = _
+    "HKCU\Software\Microsoft\Office\16.0\Outlook\Preferences\NewmailDesktopAlerts"
+
+' Constantes Outlook (late binding, valeurs en dur).
+Private Const OL_MAIL_CLASS As Long = 43        ' olMail
+Private Const OL_FOLDER_INBOX As Long = 6       ' olFolderInbox
+
+' Bornes de lecture des cles numerotees et de mise en page du toast.
+Private Const MAX_STORE_KEYS As Long = 30
+Private Const SUBJECT_MAX_LEN As Long = 60
+Private Const SENDER_MAX_LEN As Long = 40
+Private Const GROUP_DETAIL_LINES As Long = 2    ' expediteurs montres par boite
+Private Const TOAST_LINE_PX As Long = 18
+Private Const TOAST_WIDTH_PX As Long = 420
+Private Const TOAST_BASE_PX As Long = 30
+Private Const TOAST_MAX_LINES As Long = 9
+
+' PlaySound (winmm) : lecture asynchrone d'un .wav local, non bloquante.
+Private Const SND_ASYNC As Long = &H1
+Private Const SND_NODEFAULT As Long = &H2
+Private Const SND_FILENAME As Long = &H20000
+Private Const SND_PURGE As Long = &H40
+Private Const SND_SYNC As Long = &H0
+
+Private Declare PtrSafe Function PlaySoundA Lib "winmm.dll" ( _
+    ByVal lpszName As String, ByVal hModule As LongPtr, ByVal dwFlags As Long) As Long
+Private Declare PtrSafe Function GetForegroundWindow Lib "user32" () As LongPtr
+Private Declare PtrSafe Function GetWindowThreadProcessId Lib "user32" ( _
+    ByVal hWnd As LongPtr, ByRef lpdwProcessId As Long) As Long
+Private Declare PtrSafe Function GetCurrentProcessId Lib "kernel32" () As Long
+Private Declare PtrSafe Function GetTickCount Lib "kernel32" () As Long
+
+' Etat module (perdu a chaque Ctrl+S VBE : InboxAlertStart le reconstruit).
+Private mWatchers As Collection        ' clsInboxWatcher (1 par boite surveillee)
+Private mPending As Collection         ' "idx|store|sender|subject" en attente
+Private mBusyUntilTick As Long         ' un toast est a l'ecran jusqu'a ce tick
+Private mSoundWarned As Object         ' Scripting.Dictionary : chemins deja signales
+
+'=============================================================================
+' ModVersion - version REELLEMENT chargee dans le VBE.
+'=============================================================================
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+'=============================================================================
+' ProbeTitle - titre localise de la sonde son (etait en dur 3 fois).
+' NOTE D'ORDRE : cette fonction, comme toute procedure, doit rester APRES le
+' bloc de declarations ci-dessus (Const, Declare, variables module). VBA
+' refuse toute declaration situee apres une procedure et signale l'erreur
+' sur la PREMIERE declaration rencontree - ici PlaySoundA, qui n'y est pour
+' rien. Incident du 2026-08-22.
+'=============================================================================
+Private Function ProbeTitle() As String
+    ProbeTitle = modConfig.T("Sonde son - alertes bo~ite", "Sound probe - mailbox alerts")
+End Function
+
+'=============================================================================
+' InboxAlertStart - (re)armement des watchers. Appele par
+' ThisOutlookSession.Application_Startup et RebindEvents. Idempotent :
+' detruit les watchers precedents avant de reconstruire.
+'=============================================================================
+Public Sub InboxAlertStart()
+    On Error GoTo ErrH
+
+    Set mWatchers = New Collection
+    Set mPending = New Collection
+    mBusyUntilTick = 0
+
+    If Not modConfig.InboxAlertEnabled() Then
+        modDebugLog.DInfo MOD_NAME, "Desactive (InboxAlertEnabled=0) : aucun watcher"
+        Exit Sub
+    End If
+
+    Dim ns As Object
+    Set ns = Application.GetNamespace("MAPI")
+
+    Dim nbCfg As Long, i As Long
+    Dim storeName As String
+    nbCfg = 0
+
+    For i = 1 To MAX_STORE_KEYS
+        storeName = Trim$(modConfig.Cfg("InboxAlertStore" & i, ""))
+        If Len(storeName) = 0 Then Exit For
+        nbCfg = nbCfg + 1
+        If storeName = "*" Then
+            ArmAllStores ns, i
+        Else
+            ArmStoreByName ns, storeName, i
+        End If
+    Next i
+
+    ' Aucune cle : boite par defaut du profil (index 0).
+    If nbCfg = 0 Then
+        Dim inbox As Object
+        Set inbox = ns.GetDefaultFolder(OL_FOLDER_INBOX)
+        ArmFolder inbox, inbox.Store.DisplayName, 0
+    End If
+
+    modDebugLog.DInfo MOD_NAME, "Demarre : " & mWatchers.Count & " boite(s) surveillee(s), " & _
+        nbCfg & " cle(s) config"
+
+    CheckNativeAlertOnce
+    Exit Sub
+
+ErrH:
+    modDebugLog.DError MOD_NAME, "InboxAlertStart err " & Err.Number & " - " & Err.Description
+End Sub
+
+'-----------------------------------------------------------------------------
+' ArmStoreByName : trouve le store par nom affiche (insensible a la casse).
+'-----------------------------------------------------------------------------
+Private Sub ArmStoreByName(ByVal ns As Object, ByVal storeName As String, ByVal cfgIndex As Long)
+    On Error Resume Next
+    Dim st As Object
+    Dim found As Boolean
+    found = False
+    For Each st In ns.Stores
+        If StrComp(Trim$(st.DisplayName), storeName, vbTextCompare) = 0 Then
+            found = True
+            ArmStore st, cfgIndex
+            Exit For
+        End If
+    Next st
+    If Not found Then
+        modDebugLog.DError MOD_NAME, "Boite introuvable dans le profil : '" & storeName & _
+            "' (InboxAlertStore" & cfgIndex & ") - verifier le nom via InboxAlertListStores"
+    End If
+End Sub
+
+'-----------------------------------------------------------------------------
+' ArmAllStores : joker * = toutes les boites du profil (celles qui ont une
+' boite de reception ; dossiers publics / archives sans Inbox ignores).
+'-----------------------------------------------------------------------------
+Private Sub ArmAllStores(ByVal ns As Object, ByVal cfgIndex As Long)
+    On Error Resume Next
+    Dim st As Object
+    For Each st In ns.Stores
+        ArmStore st, cfgIndex
+    Next st
+End Sub
+
+Private Sub ArmStore(ByVal st As Object, ByVal cfgIndex As Long)
+    On Error Resume Next
+    Dim inbox As Object
+    Set inbox = st.GetDefaultFolder(OL_FOLDER_INBOX)
+    If inbox Is Nothing Then
+        modDebugLog.DDebug MOD_NAME, "Pas de boite de reception sur '" & st.DisplayName & "' : ignore"
+        Exit Sub
+    End If
+    ArmFolder inbox, st.DisplayName, cfgIndex
+End Sub
+
+Private Sub ArmFolder(ByVal inbox As Object, ByVal storeName As String, ByVal cfgIndex As Long)
+    On Error Resume Next
+    ' Anti-doublon : une boite deja surveillee (ex. * puis nom explicite).
+    Dim w As clsInboxWatcher
+    For Each w In mWatchers
+        If StrComp(w.FolderPath, inbox.FolderPath, vbTextCompare) = 0 Then Exit Sub
+    Next w
+    Set w = New clsInboxWatcher
+    If w.Init(inbox, storeName, cfgIndex) Then mWatchers.Add w
+End Sub
+
+'=============================================================================
+' OnInboxItemAdd - relais des watchers. Filtre puis met en file d'attente ;
+' le toast part a l'echeance du timer de regroupement.
+'=============================================================================
+Public Sub OnInboxItemAdd(ByVal Item As Object, ByVal storeName As String, ByVal cfgIndex As Long)
+    On Error Resume Next
+    If Not modConfig.InboxAlertEnabled() Then Exit Sub
+    If Item Is Nothing Then Exit Sub
+
+    ' Mails uniquement (pas d'accuse, d'invitation, de rapport...).
+    If Item.Class <> OL_MAIL_CLASS Then Exit Sub
+
+    If modConfig.InboxAlertUnreadOnly() Then
+        If Not Item.UnRead Then
+            modDebugLog.DTrace MOD_NAME, "Mail deja lu ignore ('" & storeName & "')"
+            Exit Sub
+        End If
+    End If
+
+    If modConfig.InboxAlertSkipIfForeground() Then
+        If OutlookIsForeground() Then
+            modDebugLog.DTrace MOD_NAME, "Outlook au premier plan : alerte sautee"
+            Exit Sub
+        End If
+    End If
+
+    Dim senderTxt As String, subjectTxt As String
+    senderTxt = Trim$(Item.SenderName)
+    If Len(senderTxt) = 0 Then senderTxt = Trim$(Item.SenderEmailAddress)
+    subjectTxt = Trim$(Item.Subject)
+    If Len(subjectTxt) = 0 Then subjectTxt = modConfig.T("(sans objet)", "(no subject)")
+
+    If mPending Is Nothing Then Set mPending = New Collection
+    mPending.Add cfgIndex & "|" & CleanField(storeName) & "|" & _
+                 CleanField(Left$(senderTxt, SENDER_MAX_LEN)) & "|" & _
+                 CleanField(Left$(subjectTxt, SUBJECT_MAX_LEN))
+
+    modDebugLog.DDebug MOD_NAME, "Nouveau mail en attente ('" & storeName & "'), file=" & mPending.Count
+
+    ' Regroupement : un seul timer, reamorce a chaque arrivee (rafale).
+    modDefer.ArmUniqueMs DEFER_KEY, modConfig.InboxAlertGroupMs()
+End Sub
+
+'=============================================================================
+' InboxAlertFlush - echeance du timer (modDefer Dispatch "InboxFlush").
+' Construit UN toast pour tout ce qui attend ; si un toast est encore
+' affiche, se reporte a sa fermeture (pas d'empilement).
+'=============================================================================
+Public Sub InboxAlertFlush()
+    On Error GoTo ErrH
+    If mPending Is Nothing Then Exit Sub
+    If mPending.Count = 0 Then Exit Sub
+
+    ' Toast precedent encore a l'ecran ? On attend sa fin (+ marge).
+    Dim remainMs As Long
+    remainMs = mBusyUntilTick - GetTickCount()
+    If remainMs > 0 Then
+        modDefer.ArmUniqueMs DEFER_KEY, remainMs + 200
+        modDebugLog.DTrace MOD_NAME, "Toast en cours : flush reporte de " & (remainMs + 200) & " ms"
+        Exit Sub
+    End If
+
+    ' Copie locale puis vidage : une arrivee pendant la construction
+    ' repart dans une nouvelle rafale.
+    Dim batch As Collection
+    Set batch = mPending
+    Set mPending = New Collection
+
+    Dim total As Long
+    total = batch.Count
+
+    ' --- Regroupement par boite (ordre d'arrivee) ---
+    Dim storeNames As Collection, storeCounts As Object, storeIdx As Object, storeLines As Object
+    Set storeNames = New Collection
+    Set storeCounts = CreateObject("Scripting.Dictionary")
+    Set storeIdx = CreateObject("Scripting.Dictionary")
+    Set storeLines = CreateObject("Scripting.Dictionary")
+
+    Dim packed As Variant, parts() As String
+    Dim sName As String
+    For Each packed In batch
+        parts = Split(CStr(packed), "|")
+        If UBound(parts) >= 3 Then
+            sName = parts(1)
+            If Not storeCounts.Exists(sName) Then
+                storeNames.Add sName
+                storeCounts(sName) = 0
+                storeIdx(sName) = CLng(Val(parts(0)))
+                storeLines(sName) = ""
+            End If
+            storeCounts(sName) = storeCounts(sName) + 1
+            If storeCounts(sName) <= GROUP_DETAIL_LINES Then
+                storeLines(sName) = storeLines(sName) & parts(2) & " - " & parts(3) & vbLf
+            End If
+        End If
+    Next packed
+
+    ' --- Texte du toast ---
+    Dim msg As String
+    Dim nbLines As Long
+    Dim firstIdx As Long
+    firstIdx = -1
+
+    If total = 1 Then
+        parts = Split(CStr(batch(1)), "|")
+        msg = parts(1) & vbLf & parts(2) & vbLf & parts(3)
+        nbLines = 3
+        firstIdx = CLng(Val(parts(0)))
+    Else
+        Dim k As Variant, cnt As Long, extra As Long
+        For Each k In storeNames
+            sName = CStr(k)
+            cnt = storeCounts(sName)
+            If firstIdx < 0 Then firstIdx = storeIdx(sName)
+            If Len(msg) > 0 Then msg = msg & vbLf
+            msg = msg & cnt & " " & modConfig.T("nouveaux mails - ", "new mails - ") & sName & vbLf
+            nbLines = nbLines + 1
+            msg = msg & storeLines(sName)
+            nbLines = nbLines + IIf(cnt < GROUP_DETAIL_LINES, cnt, GROUP_DETAIL_LINES)
+            extra = cnt - GROUP_DETAIL_LINES
+            If extra > 0 Then
+                msg = msg & "+ " & extra & modConfig.T(" autre(s)", " more") & vbLf
+                nbLines = nbLines + 1
+            End If
+        Next k
+        ' Retirer le vbLf final.
+        If Right$(msg, 1) = vbLf Then msg = Left$(msg, Len(msg) - 1)
+    End If
+
+    ' --- Couleur : celle de la boite si une seule boite, sinon defaut ---
+    Dim borderColor As String
+    If storeNames.Count = 1 Then
+        borderColor = StoreColor(firstIdx)
+    Else
+        borderColor = modConfig.InboxAlertDefaultColor()
+    End If
+
+    ' --- Hauteur : proportionnelle au nombre de lignes, plafonnee ---
+    If nbLines > TOAST_MAX_LINES Then nbLines = TOAST_MAX_LINES
+    Dim heightPx As Long
+    heightPx = TOAST_BASE_PX + nbLines * TOAST_LINE_PX
+
+    Dim durationMs As Long
+    durationMs = modConfig.InboxAlertDurationMs()
+    If durationMs <= 0 Then durationMs = 5000
+
+    ' --- Son : UNE fois par toast, fichier de la premiere boite, joue par
+    ' le HTA du toast (v1.3) ---
+    Dim wav As String
+    wav = ResolveStoreSound(firstIdx)
+
+    modNotify.NotifyEx msg, borderColor, durationMs, heightPx, True, TOAST_WIDTH_PX, wav
+    mBusyUntilTick = GetTickCount() + durationMs
+    If Len(wav) > 0 Then modDebugLog.DInfo MOD_NAME, "Son confie au toast : " & wav
+
+    modDebugLog.DInfo MOD_NAME, "Toast nouveau(x) mail(s) : " & total & " mail(s), " & _
+        storeNames.Count & " boite(s)"
+    Exit Sub
+
+ErrH:
+    modDebugLog.DError MOD_NAME, "InboxAlertFlush err " & Err.Number & " - " & Err.Description
+End Sub
+
+'=============================================================================
+' Config par boite (cles numerotees lues via modConfig.Cfg, EnsureLoaded-safe)
+'=============================================================================
+Private Function StoreColor(ByVal cfgIndex As Long) As String
+    Dim c As String
+    If cfgIndex > 0 Then c = Trim$(modConfig.Cfg("InboxAlertColor" & cfgIndex, ""))
+    If Len(c) = 0 Then c = modConfig.InboxAlertDefaultColor()
+    StoreColor = c
+End Function
+
+' Renvoie le chemin du .wav a jouer pour la boite, "" si silence.
+Private Function StoreSound(ByVal cfgIndex As Long) As String
+    Dim s As String
+    If cfgIndex > 0 Then s = Trim$(modConfig.Cfg("InboxAlertSound" & cfgIndex, ""))
+    If StrComp(s, "none", vbTextCompare) = 0 Then
+        StoreSound = ""
+        Exit Function
+    End If
+    If Len(s) = 0 Then s = modConfig.InboxAlertDefaultSound()
+    StoreSound = s
+End Function
+
+'-----------------------------------------------------------------------------
+' ResolveStoreSound : chemin du .wav de la boite, VERIFIE sur disque.
+' Renvoie "" si silence ou fichier absent (logue UNE fois par chemin).
+'-----------------------------------------------------------------------------
+Private Function ResolveStoreSound(ByVal cfgIndex As Long) As String
+    On Error Resume Next
+    ResolveStoreSound = ""
+    Dim wav As String
+    wav = StoreSound(cfgIndex)
+    If Len(wav) = 0 Then Exit Function
+
+    If Dir(wav) = "" Then
+        If mSoundWarned Is Nothing Then Set mSoundWarned = CreateObject("Scripting.Dictionary")
+        If Not mSoundWarned.Exists(LCase$(wav)) Then
+            mSoundWarned(LCase$(wav)) = True
+            modDebugLog.DError MOD_NAME, "Fichier son introuvable : " & wav
+        End If
+        Exit Function
+    End If
+    ResolveStoreSound = wav
+End Function
+
+'-----------------------------------------------------------------------------
+' OutlookIsForeground : la fenetre au premier plan appartient-elle a ce
+' processus Outlook ?
+'-----------------------------------------------------------------------------
+Private Function OutlookIsForeground() As Boolean
+    On Error Resume Next
+    Dim hWnd As LongPtr
+    Dim pid As Long
+    OutlookIsForeground = False
+    hWnd = GetForegroundWindow()
+    If hWnd = 0 Then Exit Function
+    GetWindowThreadProcessId hWnd, pid
+    OutlookIsForeground = (pid = GetCurrentProcessId())
+End Function
+
+' Nettoie un champ avant empaquetage (le separateur | est reserve).
+Private Function CleanField(ByVal s As String) As String
+    s = Replace(s, "|", "/")
+    s = Replace(s, vbCr, " ")
+    s = Replace(s, vbLf, " ")
+    CleanField = s
+End Function
+
+'=============================================================================
+' ALERTE NATIVE OUTLOOK (cle HKCU NewmailDesktopAlerts)
+'=============================================================================
+
+' Etat de l'alerte native : 1 = active, 0 = coupee, -1 = cle absente
+' (defaut Outlook = active), -2 = lecture impossible.
+Private Function NativeAlertState() As Long
+    On Error Resume Next
+    Dim sh As Object
+    Set sh = CreateObject("WScript.Shell")
+    Dim v As Variant
+    Err.Clear
+    v = sh.RegRead(NATIVE_REG_KEY)
+    If Err.Number <> 0 Then
+        Err.Clear
+        NativeAlertState = -1
+        Exit Function
+    End If
+    If IsNumeric(v) Then
+        NativeAlertState = IIf(CLng(v) <> 0, 1, 0)
+    Else
+        NativeAlertState = -2
+    End If
+End Function
+
+Private Function SetNativeAlert(ByVal enabled As Boolean) As Boolean
+    On Error Resume Next
+    Dim sh As Object
+    Set sh = CreateObject("WScript.Shell")
+    Err.Clear
+    sh.RegWrite NATIVE_REG_KEY, IIf(enabled, 1, 0), "REG_DWORD"
+    SetNativeAlert = (Err.Number = 0)
+    If Err.Number <> 0 Then
+        modDebugLog.DError MOD_NAME, "RegWrite NewmailDesktopAlerts KO : " & Err.Number & " - " & Err.Description
+    Else
+        modDebugLog.DInfo MOD_NAME, "Alerte native Outlook mise a " & IIf(enabled, "1 (active)", "0 (coupee)") & _
+            " - effet au prochain demarrage"
+    End If
+End Function
+
+'-----------------------------------------------------------------------------
+' CheckNativeAlertOnce : au demarrage, si l'alerte native est encore active
+' alors que le systeme VBA est actif, propose UNE fois de la couper.
+'-----------------------------------------------------------------------------
+Private Sub CheckNativeAlertOnce()
+    On Error Resume Next
+    Dim st As Long
+    st = NativeAlertState()
+    If st = 0 Then Exit Sub                       ' deja coupee : rien a dire
+    modDebugLog.DInfo MOD_NAME, "Alerte native Outlook : etat " & st & _
+        " (1=active, -1=cle absente=defaut actif)"
+
+    If GetSetting("Toolkit", "InboxAlert", "NativeWarned", "0") = "1" Then Exit Sub
+    SaveSetting "Toolkit", "InboxAlert", "NativeWarned", "1"
+
+    Dim rc As VbMsgBoxResult
+    rc = MsgBox(modConfig.T( _
+        "Les alertes VBA par bo~ite sont actives, mais l'alerte native d'Outlook " & _
+        "(""Afficher une alerte sur le Bureau"") semble encore activ~ee : vous " & _
+        "recevrez deux notifications par mail." & vbCrLf & vbCrLf & _
+        "La couper maintenant ? (prise en compte au prochain d~emarrage d'Outlook)", _
+        "VBA per-mailbox alerts are on, but Outlook's native desktop alert still " & _
+        "looks enabled: you would get two notifications per mail." & vbCrLf & vbCrLf & _
+        "Turn it off now? (applies at next Outlook start)"), _
+        vbYesNo + vbQuestion, modConfig.T("Alertes nouveau mail", "New mail alerts"))
+    If rc = vbYes Then
+        If SetNativeAlert(False) Then
+            MsgBox modConfig.T("Alerte native coup~ee. Red~emarrez Outlook pour appliquer.", _
+                               "Native alert turned off. Restart Outlook to apply."), _
+                   vbInformation, modConfig.T("Alertes nouveau mail", "New mail alerts")
+        End If
+    End If
+End Sub
+
+'=============================================================================
+' InboxAlertNativeToggle - POINT D'ENTREE : bascule l'alerte native Outlook.
+'=============================================================================
+Public Sub InboxAlertNativeToggle()
+    On Error GoTo ErrH
+    Dim st As Long
+    st = NativeAlertState()
+    Dim etat As String
+    Select Case st
+        Case 1:  etat = modConfig.T("ACTIVE", "ON")
+        Case 0:  etat = modConfig.T("COUP~EE", "OFF")
+        Case -1: etat = modConfig.T("cl~e absente (d~efaut = active)", "key missing (default = on)")
+        Case Else: etat = modConfig.T("illisible", "unreadable")
+    End Select
+    Dim wantOn As Boolean
+    wantOn = (st = 0)
+    Dim rc As VbMsgBoxResult
+    rc = MsgBox(modConfig.T("Alerte native Outlook : ", "Outlook native alert: ") & etat & vbCrLf & vbCrLf & _
+        IIf(wantOn, modConfig.T("La r~eactiver ?", "Turn it back on?"), _
+                    modConfig.T("La couper ?", "Turn it off?")) & vbCrLf & _
+        modConfig.T("(effet au prochain d~emarrage d'Outlook)", "(applies at next Outlook start)"), _
+        vbYesNo + vbQuestion, modConfig.T("Alertes nouveau mail", "New mail alerts"))
+    If rc <> vbYes Then Exit Sub
+    If SetNativeAlert(wantOn) Then
+        MsgBox modConfig.T("Fait. Red~emarrez Outlook pour appliquer.", "Done. Restart Outlook to apply."), _
+               vbInformation, modConfig.T("Alertes nouveau mail", "New mail alerts")
+    Else
+        MsgBox modConfig.T("~Ecriture registre refus~ee (voir debug.log).", "Registry write refused (see debug.log)."), _
+               vbExclamation, modConfig.T("Alertes nouveau mail", "New mail alerts")
+    End If
+    Exit Sub
+ErrH:
+    modDebugLog.DError MOD_NAME, "InboxAlertNativeToggle err " & Err.Number & " - " & Err.Description
+End Sub
+
+'=============================================================================
+' InboxAlertListStores - POINT D'ENTREE : liste les boites du profil (nom
+' exact a copier dans config.ini) et signale celles deja surveillees.
+' Ctrl+C sur la MsgBox copie tout le texte.
+'=============================================================================
+Public Sub InboxAlertListStores()
+    On Error GoTo ErrH
+    Dim ns As Object
+    Set ns = Application.GetNamespace("MAPI")
+
+    Dim txt As String, i As Long
+    Dim st As Object, watched As String
+    i = 0
+    For Each st In ns.Stores
+        i = i + 1
+        watched = ""
+        If IsWatched(st.DisplayName) Then watched = "   " & modConfig.T("[surveill~ee]", "[watched]")
+        txt = txt & i & ". " & st.DisplayName & watched & vbCrLf
+    Next st
+
+    txt = modConfig.T("Bo~ites du profil (nom exact ~a copier) :", "Mailboxes in this profile (exact name to copy):") & _
+          vbCrLf & vbCrLf & txt & vbCrLf & _
+          modConfig.T("Dans config.ini (section INBOX ALERT) :", "In config.ini (INBOX ALERT section):") & vbCrLf & _
+          modConfig.T("InboxAlertStore1=<nom ci-dessus>   (ou * = toutes)", _
+                      "InboxAlertStore1=<name above>   (or * = all)") & vbCrLf & _
+          "InboxAlertColor1=#RRGGBB" & vbCrLf & _
+          modConfig.T("InboxAlertSound1=C:\...\son.wav   (vide = son par d~efaut, none = silence)", _
+                      "InboxAlertSound1=C:\...\sound.wav   (empty = default sound, none = silent)") & vbCrLf & vbCrLf & _
+          modConfig.T("Puis Maintenance > Recharger config, ou red~emarrer Outlook." & vbCrLf & _
+                      "Ctrl+C sur cette fen~xtre copie le texte.", _
+                      "Then Maintenance > Reload config, or restart Outlook." & vbCrLf & _
+                      "Ctrl+C on this window copies the text.")
+    MsgBox modConfig.A(txt), vbInformation, modConfig.T("Alertes nouveau mail", "New mail alerts")
+    Exit Sub
+ErrH:
+    modDebugLog.DError MOD_NAME, "InboxAlertListStores err " & Err.Number & " - " & Err.Description
+End Sub
+
+Private Function IsWatched(ByVal storeName As String) As Boolean
+    On Error Resume Next
+    IsWatched = False
+    If mWatchers Is Nothing Then Exit Function
+    Dim w As clsInboxWatcher
+    For Each w In mWatchers
+        If StrComp(w.StoreName, storeName, vbTextCompare) = 0 Then
+            IsWatched = True
+            Exit Function
+        End If
+    Next w
+End Function
+
+'=============================================================================
+' InboxAlertTest - POINT D'ENTREE : toast + son de test (config courante).
+' Simule 1 mail sur la premiere boite surveillee (ou la boite par defaut).
+'=============================================================================
+Public Sub InboxAlertTest()
+    On Error GoTo ErrH
+    If Not modConfig.InboxAlertEnabled() Then
+        MsgBox modConfig.T("InboxAlertEnabled=0 : la fonction est d~esactiv~ee dans config.ini.", _
+                           "InboxAlertEnabled=0: the feature is disabled in config.ini."), _
+               vbExclamation, modConfig.T("Alertes nouveau mail", "New mail alerts")
+        Exit Sub
+    End If
+    Dim storeName As String, cfgIndex As Long
+    storeName = modConfig.T("Bo~ite de test", "Test mailbox")
+    cfgIndex = 0
+    If Not mWatchers Is Nothing Then
+        If mWatchers.Count > 0 Then
+            storeName = mWatchers(1).StoreName
+            cfgIndex = mWatchers(1).CfgIndex
+        End If
+    End If
+    If mPending Is Nothing Then Set mPending = New Collection
+    mPending.Add cfgIndex & "|" & CleanField(storeName) & "|" & _
+                 modConfig.T("Exp~editeur de test", "Test sender") & "|" & _
+                 modConfig.T("Sujet de test - alerte VBA", "Test subject - VBA alert")
+    mBusyUntilTick = 0
+    InboxAlertFlush
+    Exit Sub
+ErrH:
+    modDebugLog.DError MOD_NAME, "InboxAlertTest err " & Err.Number & " - " & Err.Description
+End Sub
+
+'=============================================================================
+' InboxAlertStatus - POINT D'ENTREE : etat courant (diagnostic).
+'=============================================================================
+Public Sub InboxAlertStatus()
+    On Error GoTo ErrH
+    Dim txt As String
+    txt = "InboxAlertEnabled = " & IIf(modConfig.InboxAlertEnabled(), "1", "0") & vbCrLf & _
+          "ToastEnabled (global) = " & IIf(modConfig.ToastEnabled(), "1", "0") & vbCrLf & _
+          "UnreadOnly = " & IIf(modConfig.InboxAlertUnreadOnly(), "1", "0") & _
+          "   SkipIfForeground = " & IIf(modConfig.InboxAlertSkipIfForeground(), "1", "0") & vbCrLf & _
+          "GroupMs = " & modConfig.InboxAlertGroupMs() & "   DurationMs = " & modConfig.InboxAlertDurationMs() & vbCrLf & _
+          "DefaultColor = " & modConfig.InboxAlertDefaultColor() & vbCrLf & _
+          "DefaultSound = " & IIf(Len(modConfig.InboxAlertDefaultSound()) = 0, modConfig.T("(aucun)", "(none)"), modConfig.InboxAlertDefaultSound()) & vbCrLf & _
+          modConfig.T("Alerte native Outlook : ", "Outlook native alert: ") & NativeAlertState() & _
+          " (1=on, 0=off, -1=" & modConfig.T("cl~e absente", "key missing") & ")" & vbCrLf & vbCrLf
+
+    Dim nb As Long
+    If mWatchers Is Nothing Then
+        txt = txt & modConfig.T("Aucun watcher (non d~emarr~e ou ~etat perdu apr~fs Ctrl+S VBE : ", _
+                                "No watcher (not started, or state lost after a VBE Ctrl+S: ") & _
+              "InboxAlertStart)"
+    Else
+        txt = txt & modConfig.T("Watchers : ", "Watchers: ") & mWatchers.Count & vbCrLf
+        Dim w As clsInboxWatcher
+        For Each w In mWatchers
+            nb = nb + 1
+            txt = txt & "  " & nb & ". " & w.StoreName & "  [" & w.CfgIndex & "]  " & _
+                  IIf(w.IsBound, "OK", "KO") & "  son=" & _
+                  IIf(Len(StoreSound(w.CfgIndex)) = 0, "-", StoreSound(w.CfgIndex)) & vbCrLf
+        Next w
+    End If
+    If Not mPending Is Nothing Then
+        txt = txt & vbCrLf & modConfig.T("En attente : ", "Pending: ") & mPending.Count
+    End If
+    modUi.Inform modConfig.A(txt), modConfig.T("Alertes bo~ite - ~etat", "Mailbox alerts - status") & " " & MOD_VERSION
+    Exit Sub
+ErrH:
+    modDebugLog.DError MOD_NAME, "InboxAlertStatus err " & Err.Number & " - " & Err.Description
+End Sub
+
+'=============================================================================
+' InboxAlertSoundProbe - POINT D'ENTREE (v1.1) : diagnostic du son.
+' Teste le fichier de la boite 1 (InboxAlertSound1) ou, a defaut, le son par
+' defaut. Affiche : existence, taille, en-tete WAV (RIFF/WAVE, code format :
+' 1 = PCM = seul format lu par PlaySound), resultat de PlaySound SYNCHRONE
+' avec bip systeme autorise (si le fichier est illisible, on ENTEND le bip
+' Windows), puis essai via Windows Media Player (late binding).
+'=============================================================================
+Public Sub InboxAlertSoundProbe()
+    On Error Resume Next
+    Dim wav As String
+    wav = Trim$(modConfig.Cfg("InboxAlertSound1", ""))
+    If Len(wav) = 0 Or StrComp(wav, "none", vbTextCompare) = 0 Then wav = modConfig.InboxAlertDefaultSound()
+
+    Dim txt As String
+    txt = modConfig.T("Fichier : ", "File: ") & wav & vbCrLf
+    If Len(wav) = 0 Then
+        modUi.Fail modConfig.A(txt) & modConfig.T("(aucun chemin configur~e)", "(no path configured)"), ProbeTitle()
+        Exit Sub
+    End If
+
+    Dim exists As Boolean
+    exists = (Dir(wav) <> "")
+    txt = txt & modConfig.T("Existe (Dir) : ", "Exists (Dir): ") & IIf(exists, modConfig.T("OUI", "YES"), modConfig.T("NON", "NO")) & vbCrLf
+    If Not exists Then
+        modUi.Fail modConfig.A(txt), ProbeTitle()
+        Exit Sub
+    End If
+    txt = txt & modConfig.T("Taille : ", "Size: ") & FileLen(wav) & modConfig.T(" octets", " bytes") & vbCrLf
+
+    ' --- En-tete : RIFF....WAVEfmt + code format (octets 21-22) ---
+    Dim f As Integer, hdr As String
+    f = FreeFile
+    Open wav For Binary Access Read As #f
+    hdr = String$(44, vbNullChar)
+    Get #f, 1, hdr
+    Close #f
+    Dim tag1 As String, tag2 As String, fmtCode As Long, channels As Long, rate As Long, bits As Long
+    tag1 = Left$(hdr, 4)
+    tag2 = Mid$(hdr, 9, 4)
+    fmtCode = Asc(Mid$(hdr, 21, 1)) + 256 * Asc(Mid$(hdr, 22, 1))
+    channels = Asc(Mid$(hdr, 23, 1))
+    rate = Asc(Mid$(hdr, 25, 1)) + 256 * (Asc(Mid$(hdr, 26, 1)) + 256 * Asc(Mid$(hdr, 27, 1)))
+    bits = Asc(Mid$(hdr, 35, 1)) + 256 * Asc(Mid$(hdr, 36, 1))
+    txt = txt & modConfig.T("En-t~xte : '", "Header: '") & tag1 & "' / '" & tag2 & modConfig.T("'  (attendu RIFF / WAVE)", "'  (expected RIFF / WAVE)") & vbCrLf
+    If tag1 = "RIFF" And tag2 = "WAVE" Then
+        txt = txt & modConfig.T("Format : code ", "Format: code ") & fmtCode & _
+              IIf(fmtCode = 1, modConfig.T(" = PCM (OK PlaySound)", " = PCM (PlaySound OK)"), _
+                               modConfig.T(" = COMPRESSE (PlaySound KO)", " = COMPRESSED (PlaySound KO)")) & _
+              ", " & channels & modConfig.T(" canal/canaux, ", " channel(s), ") & rate & " Hz, " & bits & " bits" & vbCrLf
+    ElseIf tag1 = "ID3" Or (Asc(Left$(hdr, 1)) = 255) Then
+        txt = txt & modConfig.T("=> Ce n'est PAS un WAV : signature MP3 (PlaySound ne peut pas le lire)", _
+                           "=> This is NOT a WAV: MP3 signature (PlaySound cannot read it)") & vbCrLf
+    Else
+        txt = txt & modConfig.T("=> Signature inconnue (pas un WAV standard)", _
+                           "=> Unknown signature (not a standard WAV)") & vbCrLf
+    End If
+
+    ' --- PlaySound synchrone, bip systeme autorise ---
+    Dim rc As Long
+    rc = PlaySoundA(wav, 0, SND_FILENAME Or SND_SYNC)
+    txt = txt & "PlaySound sync : retour " & rc & IIf(rc <> 0, " (succes)", " (echec)") & vbCrLf
+
+    ' --- Essai Windows Media Player (late binding) ---
+    Dim wmp As Object
+    Err.Clear
+    Set wmp = CreateObject("WMPlayer.OCX")
+    If Err.Number <> 0 Or wmp Is Nothing Then
+        txt = txt & "WMPlayer.OCX : indisponible (" & Err.Number & ")" & vbCrLf
+        Err.Clear
+    Else
+        wmp.settings.volume = 80
+        wmp.URL = wav
+        wmp.controls.play
+        Dim t0 As Single
+        t0 = Timer
+        Do While Timer - t0 < 4
+            DoEvents
+        Loop
+        txt = txt & "WMPlayer.OCX : etat " & wmp.playState & " (3=en lecture, 1=arrete, 8=fini, 10=pret)" & vbCrLf
+        wmp.controls.stop
+        wmp.close
+        Set wmp = Nothing
+    End If
+
+    modDebugLog.DInfo MOD_NAME, "SoundProbe : " & Replace(txt, vbCrLf, " | ")
+    modUi.Inform modConfig.A(txt), ProbeTitle()
+End Sub
+
+'=============================================================================
+' InboxAlertBound - True si au moins un watcher vivant (health-check).
+'=============================================================================
+Public Function InboxAlertBound() As Boolean
+    On Error Resume Next
+    InboxAlertBound = False
+    If mWatchers Is Nothing Then Exit Function
+    Dim w As clsInboxWatcher
+    For Each w In mWatchers
+        If w.IsBound Then
+            InboxAlertBound = True
+            Exit Function
+        End If
+    Next w
+End Function

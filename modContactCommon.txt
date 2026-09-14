@@ -1,0 +1,188 @@
+Option Explicit
+
+'=============================================================================
+' modContactCommon  (v1.0 - 2026-09-02)  [PACK v3 - C3]
+' Purpose (EN): stateless helpers shared by the six contact modules
+'   (Birthday, Export, FromMail, Import, Normalize, Relation): folder skip
+'   rules (patterns / hidden / Deleted Items subtree), accent stripping,
+'   whitespace normalization, name keys, small safe conversions.
+'
+' Helpers SANS ETAT partages par les 6 modules contacts. Avant le pack v3,
+' IsSkippedFolder / IsInDeletedItems existaient en 6 copies, StripAccents /
+' CollapseSpaces en 4 (deux variantes chacune), NormKey en 3. Les copies
+' locales sont devenues des delegations d'une ligne : signatures et
+' comportements des modules consommateurs inchanges.
+'
+' REGLES :
+'   - Fonctions pures, aucune variable module-level.
+'   - Les motifs d'exclusion (ContactSkipFolders) sont PASSES en argument :
+'     chaque module garde sa propre lecture de config (LoadSettings).
+'   - StripAccents = variante ETENDUE (latin-1 + latin etendu A) : superset
+'     des deux variantes historiques ; CollapseSpaces neutralise aussi les
+'     tabulations et les espaces insecables (superset).
+' DEPENDANCES : aucune applicative (Outlook uniquement).
+'=============================================================================
+
+Private Const MOD_NAME As String = "ContCommon"
+Private Const MOD_VERSION As String = "v1.0 - 2026-09-02"
+
+Private Const PROPTAG_HIDDEN As String = "http://schemas.microsoft.com/mapi/proptag/0x10F4000B"
+
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+'=============================================================================
+' Dossiers
+'=============================================================================
+
+' True si le dossier est masque (PR_ATTR_HIDDEN).
+Public Function IsHiddenFolder(ByVal fld As Outlook.MAPIFolder) As Boolean
+    On Error Resume Next
+    Dim hiddenFlag As Variant
+    hiddenFlag = fld.PropertyAccessor.GetProperty(PROPTAG_HIDDEN)
+    If Err.Number = 0 Then IsHiddenFolder = CBool(hiddenFlag)
+    Err.Clear
+End Function
+
+' True si le dossier est (ou descend de) "Elements supprimes" de sa boite.
+Public Function IsInDeletedItems(ByVal fld As Outlook.MAPIFolder) As Boolean
+    On Error Resume Next
+    Dim delId As String, cur As Outlook.MAPIFolder, guard As Long
+    delId = fld.Store.GetDefaultFolder(olFolderDeletedItems).EntryID
+    If Err.Number <> 0 Or Len(delId) = 0 Then Err.Clear: Exit Function
+    Set cur = fld
+    Do While Not cur Is Nothing And guard < 32
+        If cur.EntryID = delId Then
+            IsInDeletedItems = True
+            Exit Function
+        End If
+        Set cur = cur.Parent
+        If Err.Number <> 0 Then Err.Clear: Exit Do
+        If TypeName(cur) <> "MAPIFolder" And TypeName(cur) <> "Folder" Then Exit Do
+        guard = guard + 1
+    Loop
+    Err.Clear
+End Function
+
+' True si le dossier doit etre ignore : nom correspondant a l'un des motifs
+' Like (separes par |, insensible a la casse), dossier masque, ou situe
+' dans la corbeille.
+Public Function IsSkippedFolder(ByVal fld As Outlook.MAPIFolder, ByVal skipPatterns As String) As Boolean
+    On Error Resume Next
+    Dim nm As String, pats() As String, idx As Long
+    nm = LCase$(fld.Name)
+    If Len(skipPatterns) > 0 Then
+        pats = Split(skipPatterns, "|")
+        For idx = LBound(pats) To UBound(pats)
+            If Len(Trim$(pats(idx))) > 0 Then
+                If nm Like LCase$(Trim$(pats(idx))) Then
+                    IsSkippedFolder = True
+                    Exit Function
+                End If
+            End If
+        Next idx
+    End If
+    IsSkippedFolder = IsHiddenFolder(fld)
+    If Not IsSkippedFolder Then IsSkippedFolder = IsInDeletedItems(fld)
+End Function
+
+'=============================================================================
+' Texte
+'=============================================================================
+
+' Retire les accents (latin-1 + latin etendu A) ; ligatures et eszett
+' developpes (AE, OE, ss).
+Public Function StripAccents(ByVal s As String) As String
+    Dim idx As Long, code As Long, out As String, ch As String
+    For idx = 1 To Len(s)
+        ch = Mid$(s, idx, 1)
+        code = AscW(ch)
+        If code < 0 Then code = code + 65536
+        Select Case code
+            Case 192 To 197, 256, 258, 260: ch = "A"
+            Case 198: ch = "AE"
+            Case 199, 262, 268: ch = "C"
+            Case 200 To 203, 274, 278, 280, 282: ch = "E"
+            Case 204 To 207, 296, 298, 302: ch = "I"
+            Case 208, 272: ch = "D"
+            Case 209, 323, 327: ch = "N"
+            Case 210 To 214, 216, 332, 336: ch = "O"
+            Case 338: ch = "OE"
+            Case 217 To 220, 362, 366, 368: ch = "U"
+            Case 221, 376: ch = "Y"
+            Case 223: ch = "ss"
+            Case 224 To 229, 257, 259, 261: ch = "a"
+            Case 230: ch = "ae"
+            Case 231, 263, 269: ch = "c"
+            Case 232 To 235, 275, 279, 281, 283: ch = "e"
+            Case 236 To 239, 297, 299, 303: ch = "i"
+            Case 240, 273: ch = "d"
+            Case 241, 324, 328: ch = "n"
+            Case 242 To 246, 248, 333, 337: ch = "o"
+            Case 339: ch = "oe"
+            Case 249 To 252, 363, 367, 369: ch = "u"
+            Case 253, 255: ch = "y"
+            Case 352: ch = "S"
+            Case 353: ch = "s"
+            Case 381: ch = "Z"
+            Case 382: ch = "z"
+        End Select
+        out = out & ch
+    Next idx
+    StripAccents = out
+End Function
+
+' Tabulations et espaces insecables -> espace ; espaces multiples compactes.
+Public Function CollapseSpaces(ByVal s As String) As String
+    s = Replace(s, vbTab, " ")
+    s = Replace(s, ChrW$(160), " ")
+    Do While InStr(s, "  ") > 0
+        s = Replace(s, "  ", " ")
+    Loop
+    CollapseSpaces = s
+End Function
+
+' Cle de comparaison : majuscules, sans accents, alphanumerique + espaces.
+Public Function NormKey(ByVal s As String) As String
+    Dim src As String, idx As Long, ch As String, out As String
+    src = UCase$(StripAccents(s))
+    For idx = 1 To Len(src)
+        ch = Mid$(src, idx, 1)
+        Select Case ch
+            Case "A" To "Z", "0" To "9": out = out & ch
+            Case Else: out = out & " "
+        End Select
+    Next idx
+    NormKey = CollapseSpaces(Trim$(out))
+End Function
+
+' Sans retours a la ligne, trimme.
+Public Function FlatText(ByVal s As String) As String
+    FlatText = Trim$(Replace(Replace(s, vbCr, ""), vbLf, ""))
+End Function
+
+Public Function SafeStr(ByVal v As Variant) As String
+    On Error Resume Next
+    SafeStr = ""
+    SafeStr = CStr(v)
+    Err.Clear
+End Function
+
+Public Function HasDigit(ByVal s As String) As Boolean
+    Dim idx As Long
+    For idx = 1 To Len(s)
+        If Mid$(s, idx, 1) Like "#" Then
+            HasDigit = True
+            Exit Function
+        End If
+    Next idx
+End Function
+
+Public Function DigitsOnly(ByVal s As String) As String
+    Dim idx As Long, ch As String
+    For idx = 1 To Len(s)
+        ch = Mid$(s, idx, 1)
+        If ch Like "#" Then DigitsOnly = DigitsOnly & ch
+    Next idx
+End Function

@@ -1,0 +1,538 @@
+Option Explicit
+
+' modUi v1.3  (2026-08-22)
+'=============================================================================
+' Purpose (EN): single entry point for user-facing dialogs (MsgBox / InputBox)
+'   with a FOREGROUND GUARANTEE. Fixes the class of bugs where a dialog opened
+'   from an event handler or a deferred timer appears BEHIND Outlook (or on
+'   the other monitor), is never seen, and silently blocks a queue.
+'
+' Point d'entree unique pour les dialogues utilisateur, avec garantie de
+' premier plan.
+'
+' CONSTAT (revue 2026-08-22) : sur ~350 boites du projet, UNE SEULE utilisait
+' vbMsgBoxSetForeground (modMailResponseTracker.RemindOverdue). Toute boite
+' ouverte depuis un handler d'evenement (ItemAdd/ItemChange) ou un differe
+' modDefer pouvait apparaitre derriere la fenetre au premier plan. Pire :
+' InputBox n'a AUCUN drapeau de premier plan -> le prompt de classement des
+' mails envoyes (PromptForSentItem, differe +1s) s'ouvrait derriere des que
+' l'utilisateur avait bascule sur une autre application, et la file
+' mQuickMovePromptBusy restait bloquee.
+'
+' STRATEGIE, en deux regimes distincts :
+'
+'   1. MsgBox (Ask / Inform / Fail) : PAS de vol de focus. On ajoute
+'      systematiquement vbMsgBoxSetForeground, plus vbSystemModal par defaut
+'      (topMost:=True) : la BOITE passe au-dessus de toutes les fenetres,
+'      Outlook lui-meme reste ou il est. C'est le correctif historique deja
+'      applique ponctuellement (cf. commentaire v2 de mSentItems_ItemAdd) ;
+'      il devient ici la regle.
+'
+'   2. InputBox (AskText) : aucun drapeau possible -> il FAUT que le thread
+'      Outlook soit au premier plan AVANT d'afficher. BringOutlookToFront
+'      tente SetForegroundWindow, puis le pontage AttachThreadInput si
+'      Windows refuse (regle anti-vol de focus), puis verifie le resultat.
+'      Si le vol echoue malgre tout (verrouillage strict) :
+'        a) la barre des taches d'Outlook clignote (FlashWindowEx) ;
+'        b) un toast modNotify est emis (processus mshta separe : il est
+'           TOUJOURS visible, meme quand Outlook est derriere) pour dire
+'           qu'une saisie attend. Best-effort, jamais bloquant.
+'
+' EDR / SentinelOne : uniquement des appels user32 de gestion de fenetres.
+' Pas de synthese de frappe (keybd_event / SendInput volontairement ecartes),
+' pas de processus lance, pas de hook. AttachThreadInput est un pontage de
+' files de messages, pas une injection.
+'
+' PERIMETRE / COMPLEMENTARITE :
+'   - modMsgBoxCustom (MsgBoxC/Confirm3/Choose3) garde son role : boutons
+'     renommes + auto-fermeture. modUi couvre le placement/la visibilite.
+'     Le branchement de MsgBoxC sur OutlookIsForeground (ne pas decompter
+'     un timeout tant que la boite n'est pas visible) = lot ulterieur.
+'   - Les chaines recues sont DEJA localisees par l'appelant (T() cote
+'     appelant). modUi n'utilise T() que pour ses propres textes (toast).
+'   - Les logs restent ASCII-FR, jamais le CORPS des prompts (titres OK).
+'
+' MIGRATION (lots suivants, Opus) : remplacer en priorite les appels issus
+' d'evenements/differes : PromptForSentItem, CheckAssignment, CheckReTag,
+' ProposeDeferredFollowup, RemindOverdue, RunMonthlyBackupIfNeeded. Les
+' appels declenches par clic ruban peuvent suivre au fil de l'eau.
+'
+' DEPENDANCES : modConfig (T), modDebugLog, modNotify, modCommon.
+' Zero dependance entrante : coller ce module ne change rien tant que
+' personne ne l'appelle.
+'
+' v1.3 (2026-08-22) : NIVEAUX DE TOAST. Toast() prend desormais un niveau
+'   (uiSuccess / uiInfo / uiWarn / uiError) et non une couleur : l'appelant
+'   declare ce que son message EST, la correspondance niveau -> couleur vit
+'   dans modUi et config.ini. Sans cela, changer une teinte imposerait de
+'   repasser sur quinze modules. Quatre nouvelles cles : ToastColorSuccess,
+'   ToastColorInfo, ToastColorWarn, ToastColorError.
+'   La couleur n'est JAMAIS le seul signal - le texte du toast dit deja
+'   "termine" ou "echec" -, ce qui rend l'ensemble lisible en cas de
+'   deficience de perception des couleurs (le vert et le rouge sont les
+'   deux teintes les plus souvent confondues).
+'
+' v1.2 (2026-08-22) : deux corrections issues de l'audit validate.py.
+'   - AnnounceHiddenPrompt passait par modNotify EN DIRECT, court-circuitant
+'     le test ToastEnabled : chez qui a coupe les toasts, l'annonce "une
+'     saisie attend" devenait muette - or c'est le filet de securite du cas
+'     ou la fenetre de saisie est invisible. Elle passe par Toast().
+'   - bloc d'en-tete v1.1 duplique (defaut de la livraison precedente).
+'
+' v1.1 (2026-08-22) : Toast() - notification non bloquante AVEC REPLI.
+'   modNotify.NotifyEx ne signale jamais un echec (tout est avale par son
+'   propre gestionnaire) et ne fait RIEN si ToastEnabled=0 dans config.ini.
+'   Un recapitulatif de fin bascule en toast devenait donc silencieux chez
+'   qui a coupe les toasts. Toast() teste ToastEnabled AVANT et retombe sur
+'   la barre d'etat Outlook (modCommon.SetStatus) : discret, non bloquant,
+'   jamais muet. Dependance ajoutee : modCommon.
+'
+' v1.0 (2026-08-22) : creation. Ask / Inform / Fail / AskText,
+'   BringOutlookToFront, OutlookIsForeground (version publique canonique du
+'   helper prive de modInboxAlert, qui pourra deleguer plus tard),
+'   UiSelfTest.
+'=============================================================================
+
+'=============================================================================
+' NIVEAUX DE TOAST
+' L'appelant declare CE QUE SON MESSAGE EST, pas de quelle couleur il doit
+' etre : la correspondance niveau -> couleur vit ici et dans config.ini.
+' Sans cela, changer le vert imposerait de repasser sur quinze modules.
+'
+' uiSuccess : une action a abouti (classement, snooze, backup OK)
+' uiInfo    : information de service (recapitulatif de fin de traitement)
+' uiWarn    : action partielle, doublons, point d'attention
+' uiError   : echec non bloquant
+'
+' NB : les alertes de RECEPTION de mail (modInboxAlert) n'utilisent PAS ces
+' niveaux. Elles ont une couleur PAR BOITE, ce qui vaut mieux qu'une teinte
+' unique : sur du multiboite, on identifie la boite d'un coup d'oeil.
+' ToastColorFiled / ToastColorKept restent de meme propres a
+' modReplyInPlace (classe dans un dossier vs conserve dans les envoyes).
+'=============================================================================
+Public Enum UiToastLevel
+    uiSuccess = 0
+    uiInfo = 1
+    uiWarn = 2
+    uiError = 3
+End Enum
+
+Private Const MOD_NAME As String = "Ui"
+' NOTE : plus court que la consigne 6-10 chars, assume : le filtre de log
+' par module s'aligne sur le nom du module sans le prefixe "mod" (comme
+' Campaign, Notify, Defer). "UiCore" aurait desynchronise les deux.
+
+Private Const MOD_VERSION As String = "v1.3 - 2026-08-22"
+
+' Classe de fenetre des fenetres principales Outlook (explorers/inspectors).
+Private Const OUTLOOK_WND_CLASS As String = "rctrl_renwnd32"
+
+' --- API Win32 (64-bit only : PtrSafe + LongPtr, cf. conventions projet) ---
+Private Declare PtrSafe Function GetForegroundWindow Lib "user32" () As LongPtr
+Private Declare PtrSafe Function SetForegroundWindow Lib "user32" ( _
+    ByVal hWnd As LongPtr) As Long
+Private Declare PtrSafe Function BringWindowToTop Lib "user32" ( _
+    ByVal hWnd As LongPtr) As Long
+Private Declare PtrSafe Function GetWindowThreadProcessId Lib "user32" ( _
+    ByVal hWnd As LongPtr, ByRef lpdwProcessId As Long) As Long
+Private Declare PtrSafe Function AttachThreadInput Lib "user32" ( _
+    ByVal idAttach As Long, ByVal idAttachTo As Long, _
+    ByVal fAttach As Long) As Long
+Private Declare PtrSafe Function FindWindowW Lib "user32" ( _
+    ByVal lpClassName As LongPtr, ByVal lpWindowName As LongPtr) As LongPtr
+Private Declare PtrSafe Function FlashWindowEx Lib "user32" ( _
+    ByRef pfwi As FLASHWINFO) As Long
+Private Declare PtrSafe Function GetCurrentProcessId Lib "kernel32" () As Long
+Private Declare PtrSafe Function GetCurrentThreadId Lib "kernel32" () As Long
+
+Private Type FLASHWINFO
+    cbSize As Long
+    hWnd As LongPtr
+    dwFlags As Long
+    uCount As Long
+    dwTimeout As Long
+End Type
+
+Private Const FLASHW_ALL As Long = 3        ' titre + barre des taches
+Private Const FLASH_COUNT As Long = 5
+
+'=============================================================================
+' ModVersion - version REELLEMENT chargee dans le VBE (constante du module,
+' pas config.ini). Lue par modMaintenance.MaintModuleVersions.
+'=============================================================================
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+'=============================================================================
+' === API PUBLIQUE - DIALOGUES ===============================================
+'=============================================================================
+
+'=============================================================================
+' Ask - question a l'utilisateur (decision). Remplace MsgBox vbYesNo & co.
+'
+'   prompt  : texte DEJA localise par l'appelant (T() cote appelant).
+'   title   : titre DEJA localise.
+'   buttons : style natif complet (boutons + icone + bouton par defaut),
+'             ex. vbYesNo + vbQuestion + vbDefaultButton2. Defaut Oui/Non.
+'   topMost : True (defaut) = vbSystemModal, la boite passe au-dessus de
+'             TOUTES les applications. Mettre False pour un contexte ou
+'             l'utilisateur vient de cliquer (ruban) et ou l'ecrasement
+'             systeme serait excessif.
+'
+' Retour : VbMsgBoxResult standard. La boite porte TOUJOURS
+' vbMsgBoxSetForeground. Outlook n'est PAS remonte au premier plan :
+' seule la boite l'est (pas de vol de focus applicatif).
+'=============================================================================
+Public Function Ask(ByVal prompt As String, ByVal title As String, _
+                    Optional ByVal buttons As VbMsgBoxStyle = vbYesNo + vbQuestion, _
+                    Optional ByVal topMost As Boolean = True) As VbMsgBoxResult
+    On Error GoTo Fallback
+
+    Dim style As VbMsgBoxStyle
+    style = buttons Or vbMsgBoxSetForeground
+    If topMost Then style = style Or vbSystemModal
+
+    modDebugLog.DDebug MOD_NAME, "Ask '" & title & "' (fg=" & _
+        OutlookIsForeground() & ")"
+
+    Ask = MsgBox(prompt, style, title)
+    modDebugLog.DDebug MOD_NAME, "Ask '" & title & "' ret=" & Ask
+    Exit Function
+
+Fallback:
+    ' Ne JAMAIS perdre un dialogue : repli natif brut.
+    modDebugLog.DError MOD_NAME, "Ask err " & Err.Number & " - " & _
+        Err.Description & " -> repli MsgBox natif"
+    On Error Resume Next
+    Ask = MsgBox(prompt, buttons, title)
+End Function
+
+'=============================================================================
+' Inform - information sans decision (vbOKOnly). Remplace les MsgBox
+' informatives. Memes garanties de placement que Ask.
+'   icon : vbInformation (defaut) ou vbExclamation.
+'=============================================================================
+Public Sub Inform(ByVal prompt As String, ByVal title As String, _
+                  Optional ByVal icon As VbMsgBoxStyle = vbInformation, _
+                  Optional ByVal topMost As Boolean = True)
+    On Error GoTo Fallback
+
+    Dim style As VbMsgBoxStyle
+    style = vbOKOnly Or icon Or vbMsgBoxSetForeground
+    If topMost Then style = style Or vbSystemModal
+
+    modDebugLog.DDebug MOD_NAME, "Inform '" & title & "'"
+    MsgBox prompt, style, title
+    Exit Sub
+
+Fallback:
+    modDebugLog.DError MOD_NAME, "Inform err " & Err.Number & " - " & _
+        Err.Description & " -> repli MsgBox natif"
+    On Error Resume Next
+    MsgBox prompt, vbOKOnly Or icon, title
+End Sub
+
+'=============================================================================
+' Fail - erreur visible (vbCritical/vbExclamation, toujours topMost).
+' Variante dediee pour que les handlers d'erreur restent sur une ligne.
+'=============================================================================
+Public Sub Fail(ByVal prompt As String, ByVal title As String, _
+                Optional ByVal icon As VbMsgBoxStyle = vbExclamation)
+    Inform prompt, title, icon, True
+End Sub
+
+'=============================================================================
+' AskText - saisie utilisateur. Remplace InputBox pour tout appel issu d'un
+' evenement ou d'un differe.
+'
+' InputBox n'a pas de drapeau de premier plan : on remonte donc le thread
+' Outlook AVANT d'afficher. Si le vol de focus echoue (protection Windows),
+' on clignote la barre des taches ET on emet un toast d'annonce (processus
+' mshta separe, visible meme Outlook derriere), puis on affiche quand meme :
+' la fenetre existe, l'utilisateur sait qu'elle l'attend.
+'
+'   defaultValue     : pre-remplissage (comportement InputBox natif).
+'   announceIfHidden : True (defaut) = toast si le premier plan est refuse.
+'
+' Retour : la saisie ; "" = vide OU Annuler (semantique InputBox native,
+' identique aux usages existants du projet : vide/Annuler -> abandon).
+'=============================================================================
+Public Function AskText(ByVal prompt As String, ByVal title As String, _
+                        Optional ByVal defaultValue As String = "", _
+                        Optional ByVal announceIfHidden As Boolean = True) As String
+    On Error GoTo Fallback
+
+    Dim gotFront As Boolean
+    gotFront = BringOutlookToFront()
+
+    If Not gotFront Then
+        modDebugLog.DInfo MOD_NAME, "AskText '" & title & _
+            "' : premier plan refuse -> flash + toast"
+        If announceIfHidden Then AnnounceHiddenPrompt
+    Else
+        modDebugLog.DDebug MOD_NAME, "AskText '" & title & "' (fg OK)"
+    End If
+
+    AskText = InputBox(prompt, title, defaultValue)
+    modDebugLog.DDebug MOD_NAME, "AskText '" & title & "' -> " & _
+        Len(AskText) & " char(s)"
+    Exit Function
+
+Fallback:
+    modDebugLog.DError MOD_NAME, "AskText err " & Err.Number & " - " & _
+        Err.Description & " -> repli InputBox natif"
+    On Error Resume Next
+    AskText = InputBox(prompt, title, defaultValue)
+End Function
+
+'=============================================================================
+' Toast - notification non bloquante, avec repli garanti.
+'
+' Remplace les MsgBox de RECAPITULATIF (fin de traitement, compte-rendu
+' d'action) : elles n'appellent aucune decision, elles n'ont pas a bloquer
+' le fil. A ne PAS utiliser pour une erreur qui exige une reaction : voir
+' Fail.
+'
+' Pourquoi ce wrapper plutot qu'un appel direct a modNotify.NotifyEx :
+'   - NotifyEx sort SANS RIEN FAIRE si ToastEnabled=0 (config.ini) ;
+'   - NotifyEx absorbe toutes ses erreurs dans son propre gestionnaire,
+'     donc l'appelant ne peut pas savoir que rien ne s'est affiche.
+' Consequence : un recapitulatif bascule en toast devenait invisible. Ici on
+' teste ToastEnabled EN AMONT et on retombe sur la barre d'etat Outlook -
+' discret, non bloquant, mais jamais muet.
+'
+'   message       : texte DEJA localise (T() cote appelant).
+'   boldFirstLine : premiere ligne en gras (multi-lignes via vbLf).
+'=============================================================================
+Public Sub Toast(ByVal message As String, _
+                 Optional ByVal level As UiToastLevel = uiInfo, _
+                 Optional ByVal boldFirstLine As Boolean = False)
+    On Error Resume Next
+
+    If modConfig.ToastEnabled() Then
+        modNotify.NotifyEx message, ToastColorFor(level), 0, 0, boldFirstLine
+        modDebugLog.DDebug MOD_NAME, "Toast emis (niveau " & level & ")"
+    Else
+        ' Repli : barre d'etat Outlook. Une seule ligne, on aplatit.
+        Dim flat As String
+        flat = Replace(Replace(message, vbCrLf, " - "), vbLf, " - ")
+        modCommon.SetStatus MOD_NAME, flat
+        modDebugLog.DDebug MOD_NAME, "Toast desactive -> repli barre d'etat"
+    End If
+End Sub
+
+'=============================================================================
+' ToastColorFor - couleur de bordure d'un niveau, lue dans config.ini.
+' Chaine vide = bordure par defaut de modNotify (aucune cle configuree).
+'=============================================================================
+Private Function ToastColorFor(ByVal level As UiToastLevel) As String
+    On Error Resume Next
+    Select Case level
+        Case uiSuccess: ToastColorFor = modConfig.ToastColorSuccess()
+        Case uiWarn:    ToastColorFor = modConfig.ToastColorWarn()
+        Case uiError:   ToastColorFor = modConfig.ToastColorError()
+        Case Else:      ToastColorFor = modConfig.ToastColorInfo()
+    End Select
+End Function
+
+'=============================================================================
+' === API PUBLIQUE - PREMIER PLAN ============================================
+'=============================================================================
+
+'=============================================================================
+' OutlookIsForeground - la fenetre au premier plan appartient-elle a CE
+' processus Outlook ? Version publique canonique (modInboxAlert porte une
+' copie privee anterieure qui pourra deleguer ici).
+' Best-effort : False en cas de doute.
+'=============================================================================
+Public Function OutlookIsForeground() As Boolean
+    On Error Resume Next
+    OutlookIsForeground = False
+
+    Dim hWnd As LongPtr
+    hWnd = GetForegroundWindow()
+    If hWnd = 0 Then Exit Function
+
+    Dim pid As Long
+    GetWindowThreadProcessId hWnd, pid
+    OutlookIsForeground = (pid = GetCurrentProcessId())
+End Function
+
+'=============================================================================
+' BringOutlookToFront - remonte une fenetre Outlook au premier plan.
+'
+' Ordre des tentatives :
+'   0. Deja au premier plan -> True immediat (cas de loin le plus frequent
+'      pour les appels declenches par clic : cout quasi nul).
+'   1. SetForegroundWindow direct (autorise si Outlook a des droits de
+'      premier plan, ex. l'utilisateur vient d'interagir avec lui).
+'   2. Pontage AttachThreadInput avec le thread proprietaire du premier
+'      plan actuel, puis BringWindowToTop + SetForegroundWindow, puis
+'      detachement. Contournement standard de la protection anti-vol de
+'      focus de Windows.
+'   3. Echec confirme -> FlashWindowEx (5 clignotements barre des taches)
+'      et retour False. L'appelant decide de la suite (AskText emet en
+'      plus un toast).
+'
+' Cible : la fenetre au premier plan si elle est deja a nous (cas 0),
+' sinon la premiere fenetre de classe rctrl_renwnd32 du processus
+' (explorer OU inspector : peu importe laquelle, il s'agit de rendre le
+' THREAD proprietaire du premier plan pour que la fenetre modale qui suit
+' s'affiche au-dessus).
+'
+' Retour : True si le premier plan est acquis (verifie, pas suppose).
+'=============================================================================
+Public Function BringOutlookToFront() As Boolean
+    On Error Resume Next
+    BringOutlookToFront = False
+
+    ' 0. Deja devant.
+    If OutlookIsForeground() Then
+        BringOutlookToFront = True
+        Exit Function
+    End If
+
+    Dim hTarget As LongPtr
+    hTarget = ResolveOutlookHwnd()
+    If hTarget = 0 Then
+        modDebugLog.DError MOD_NAME, "BringOutlookToFront : HWND introuvable"
+        Exit Function
+    End If
+
+    ' 1. Tentative directe.
+    SetForegroundWindow hTarget
+    If OutlookIsForeground() Then
+        BringOutlookToFront = True
+        Exit Function
+    End If
+
+    ' 2. Pontage AttachThreadInput.
+    Dim fgWnd As LongPtr, fgThread As Long, myThread As Long, dummyPid As Long
+    fgWnd = GetForegroundWindow()
+    fgThread = GetWindowThreadProcessId(fgWnd, dummyPid)
+    myThread = GetCurrentThreadId()
+
+    If fgThread <> 0 And fgThread <> myThread Then
+        If AttachThreadInput(myThread, fgThread, 1) <> 0 Then
+            BringWindowToTop hTarget
+            SetForegroundWindow hTarget
+            AttachThreadInput myThread, fgThread, 0
+        End If
+    End If
+
+    If OutlookIsForeground() Then
+        BringOutlookToFront = True
+        modDebugLog.DDebug MOD_NAME, "BringOutlookToFront : OK via AttachThreadInput"
+        Exit Function
+    End If
+
+    ' 3. Echec : signal visuel, l'appelant est prevenu par le retour False.
+    FlashOutlookTaskbar hTarget
+    modDebugLog.DInfo MOD_NAME, "BringOutlookToFront : refuse par Windows (flash emis)"
+End Function
+
+'=============================================================================
+' === PRIVE ==================================================================
+'=============================================================================
+
+'=============================================================================
+' ResolveOutlookHwnd - HWND d'une fenetre principale Outlook.
+' Premier plan si c'est deja nous, sinon FindWindowW sur la classe
+' rctrl_renwnd32 (meme classe pour explorers et inspectors).
+'=============================================================================
+Private Function ResolveOutlookHwnd() As LongPtr
+    On Error Resume Next
+    ResolveOutlookHwnd = 0
+
+    Dim hWnd As LongPtr, pid As Long
+    hWnd = GetForegroundWindow()
+    If hWnd <> 0 Then
+        GetWindowThreadProcessId hWnd, pid
+        If pid = GetCurrentProcessId() Then
+            ResolveOutlookHwnd = hWnd
+            Exit Function
+        End If
+    End If
+
+    ResolveOutlookHwnd = FindWindowW(StrPtr(OUTLOOK_WND_CLASS), 0)
+End Function
+
+'=============================================================================
+' FlashOutlookTaskbar - clignote titre + bouton barre des taches (5 fois).
+' Best-effort, silencieux en cas d'echec.
+'=============================================================================
+Private Sub FlashOutlookTaskbar(ByVal hWnd As LongPtr)
+    On Error Resume Next
+    If hWnd = 0 Then Exit Sub
+
+    Dim fw As FLASHWINFO
+    fw.cbSize = LenB(fw)
+    fw.hWnd = hWnd
+    fw.dwFlags = FLASHW_ALL
+    fw.uCount = FLASH_COUNT
+    fw.dwTimeout = 0
+    FlashWindowEx fw
+End Sub
+
+'=============================================================================
+' AnnounceHiddenPrompt - toast "une saisie attend dans Outlook".
+' Processus mshta separe : visible meme quand Outlook est derriere.
+' Best-effort : ne doit JAMAIS empecher l'affichage du prompt.
+'=============================================================================
+Private Sub AnnounceHiddenPrompt()
+    On Error Resume Next
+    ' v1.2 : passe par Toast() et non par modNotify en direct. L'appel
+    ' direct court-circuitait le test ToastEnabled : chez qui a coupe les
+    ' toasts, l'annonce devenait muette - or c'est precisement le filet de
+    ' securite du cas ou la fenetre de saisie est invisible. Toast() retombe
+    ' sur la barre d'etat Outlook, discret mais jamais silencieux.
+    Toast T("Une fen~xtre de saisie attend dans Outlook", _
+            "An input window is waiting in Outlook"), uiWarn, True
+End Sub
+
+'=============================================================================
+' === SONDE ==================================================================
+'=============================================================================
+
+'=============================================================================
+' UiSelfTest - a lancer depuis la fenetre Execution du VBE.
+' Valide la chaine complete SANS dependre d'un contexte differe :
+'   1. etat premier plan initial (VBE actif -> Outlook n'est PAS foreground
+'      au sens strict si le VBE est une fenetre a part : le log le dira) ;
+'   2. Inform topMost ;
+'   3. Ask Oui/Non ;
+'   4. AskText avec vol de focus prealable.
+' Pour tester le cas reel "prompt en arriere-plan" : lancer
+' modDefer.Arm "..." n'est pas necessaire - executer UiSelfTest puis
+' basculer IMMEDIATEMENT sur une autre application pendant les boites.
+'=============================================================================
+Public Sub UiSelfTest()
+    On Error Resume Next
+
+    modDebugLog.DInfo MOD_NAME, "SelfTest : fg initial=" & OutlookIsForeground()
+
+    Inform T("Boite d'information topMost." & vbCrLf & _
+             "Elle doit appara~ytre AU-DESSUS de toutes les fen~xtres.", _
+             "TopMost information box." & vbCrLf & _
+             "It must appear ON TOP of every window."), _
+           "modUi - SelfTest 1/3"
+
+    Dim rep As VbMsgBoxResult
+    rep = Ask(T("Question Oui/Non topMost. R~epondre Oui.", _
+                "TopMost Yes/No question. Answer Yes."), _
+              "modUi - SelfTest 2/3")
+    modDebugLog.DInfo MOD_NAME, "SelfTest : Ask ret=" & rep
+
+    Dim saisie As String
+    saisie = AskText(T("Saisie avec remont~ee au premier plan." & vbCrLf & _
+                       "Taper un mot puis OK.", _
+                       "Input with foreground takeover." & vbCrLf & _
+                       "Type a word then OK."), _
+                     "modUi - SelfTest 3/3")
+    modDebugLog.DInfo MOD_NAME, "SelfTest : AskText len=" & Len(saisie) & _
+        ", fg final=" & OutlookIsForeground()
+
+    Inform T("SelfTest termin~e. D~etail dans debug.log.", _
+             "SelfTest done. Details in debug.log."), "modUi - SelfTest"
+End Sub

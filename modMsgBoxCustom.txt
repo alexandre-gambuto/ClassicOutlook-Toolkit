@@ -1,0 +1,491 @@
+Option Explicit
+
+' =====================================================================
+' modMsgBoxCustom v2
+' MsgBox a boutons renommes, avec auto-fermeture (timer) optionnelle,
+' pour environnement SANS UserForm (VBA Project Object Model bloque).
+'
+' Valide empiriquement (sondes modProbeMsgBox/Timer/Map) sous Outlook
+' Classic 64-bit + SentinelOne EDR :
+'   - Hook WH_CBT thread-local (pas de DLL globale, pas de cross-process)
+'     pour renommer les boutons -> passe l'EDR, stable.
+'   - SetTimer "sans fenetre" pompe par le dialog modal -> auto-fermeture
+'     sur un bouton par defaut. Passe l'EDR.
+'
+' Cartographie des IDs de boutons CONFIRMEE dans cet environnement :
+'   vbYesNo        -> #1 id=6 (Oui)  #2 id=7 (Non)
+'   vbYesNoCancel  -> #1 id=6 (Oui)  #2 id=7 (Non)  #3 id=2 (Annuler)
+'   vbOKCancel     -> #1 id=1 (OK)   #2 id=2 (Annuler)
+'   vbOKOnly       -> #1 id=1 (OK)
+'   vbAbortRetryIgnore -> id 3/4/5    vbRetryCancel -> id 4/2
+'   vbYesNo accelerateurs '&' presents : on pose nos propres '&'.
+'
+' DESIGN :
+'   - API unique MsgBoxC(...). Retour = VbMsgBoxResult standard, donc
+'     les appelants testent vbYes/vbNo/vbCancel/vbOK comme d'habitude.
+'   - Libelles optionnels : un libelle vide => bouton garde son texte
+'     natif (retro-compatible avec un MsgBox normal).
+'   - Timer optionnel : timeoutMs > 0 => fermeture auto apres ce delai
+'     en simulant un clic sur defaultButtonPos (1..3). Renvoie alors la
+'     valeur de ce bouton.
+'   - Garde de reentrance : un seul MsgBoxC actif a la fois. Si un appel
+'     imbrique survient, on retombe sur un MsgBox natif (sans hook).
+'   - REPLI SILENCIEUX : si SetWindowsHookEx echoue (ex. MAJ EDR), on
+'     affiche un MsgBox NATIF (libelles standards). Jamais de blocage.
+'
+' PIEGE TIMING (observe sonde v1) : au tout premier SetTimer apres
+' chargement, le WM_COMMAND peut arriver avant stabilisation du dialog.
+' Mitigation : delai minimum plancher (TIMER_MIN_MS) sous lequel on ne
+' descend pas, le dialog a le temps de finaliser ses boutons.
+'
+' NB : ASCII strict dans les libelles passes ici (accents via A() cote
+' appelant). Le '&' interne est l'accelerateur clavier.
+'
+' v2 (2026-06-10) :
+'   - COMPTE A REBOURS visible : avec timeoutMs > 0, le bouton par defaut
+'     affiche "Libelle (N)" decremente chaque seconde (timer repetitif 1 s
+'     + SetDlgItemText). Desactivable via showCountdown:=False. Resolution
+'     effective du timeout : 1 s (arrondi superieur).
+'   - LastResultWasTimeout() : True si le DERNIER MsgBoxC s'est ferme par
+'     timeout (et non par clic). Permet a l'appelant de traiter le timeout
+'     comme une annulation quel que soit le bouton par defaut.
+'   - Choose3() : choix d'ACTION a 3 branches sur vbAbortRetryIgnore
+'     (ids 3/4/5). Natif ARI = PAS d'Echap ni de croix : a reserver aux
+'     cas ou les 3 libelles couvrent toutes les issues. Retour 1/2/3.
+'   - Confirm3() etendu (timeoutMs / defaultPos optionnels, defaut = 3
+'     soit Annuler : l'auto-fermeture retombe sur la branche inoffensive).
+' =====================================================================
+
+Private Const MOD_NAME As String = "MsgBoxC"
+Private Const MOD_VERSION As String = "v2 - 2026-06-10"
+
+' --- Hook ---
+Private Declare PtrSafe Function SetWindowsHookEx Lib "user32" _
+    Alias "SetWindowsHookExA" _
+    (ByVal idHook As Long, ByVal lpfn As LongPtr, _
+     ByVal hmod As LongPtr, ByVal dwThreadId As Long) As LongPtr
+Private Declare PtrSafe Function CallNextHookEx Lib "user32" _
+    (ByVal hHook As LongPtr, ByVal nCode As Long, _
+     ByVal wParam As LongPtr, ByVal lParam As LongPtr) As LongPtr
+Private Declare PtrSafe Function UnhookWindowsHookEx Lib "user32" _
+    (ByVal hHook As LongPtr) As Long
+Private Declare PtrSafe Function GetCurrentThreadId Lib "kernel32" () As Long
+
+' --- Enumeration boutons (pour fiabilite : on lit les IDs reels) ---
+Private Declare PtrSafe Function EnumChildWindows Lib "user32" _
+    (ByVal hWndParent As LongPtr, ByVal lpEnumFunc As LongPtr, _
+     ByVal lParam As LongPtr) As Long
+Private Declare PtrSafe Function GetClassName Lib "user32" _
+    Alias "GetClassNameA" _
+    (ByVal hWnd As LongPtr, ByVal lpClassName As String, _
+     ByVal nMaxCount As Long) As Long
+Private Declare PtrSafe Function GetDlgCtrlID Lib "user32" _
+    (ByVal hWnd As LongPtr) As Long
+Private Declare PtrSafe Function SetDlgItemText Lib "user32" _
+    Alias "SetDlgItemTextA" _
+    (ByVal hDlg As LongPtr, ByVal nIDDlgItem As Long, _
+     ByVal lpString As String) As Long
+Private Declare PtrSafe Function GetDlgItemText Lib "user32" _
+    Alias "GetDlgItemTextA" _
+    (ByVal hDlg As LongPtr, ByVal nIDDlgItem As Long, _
+     ByVal lpString As String, ByVal nMaxCount As Long) As Long
+
+' --- Timer + fermeture ---
+Private Declare PtrSafe Function SetTimer Lib "user32" _
+    (ByVal hWnd As LongPtr, ByVal nIDEvent As LongPtr, _
+     ByVal uElapse As Long, ByVal lpTimerFunc As LongPtr) As LongPtr
+Private Declare PtrSafe Function KillTimer Lib "user32" _
+    (ByVal hWnd As LongPtr, ByVal nIDEvent As LongPtr) As Long
+Private Declare PtrSafe Function PostMessage Lib "user32" _
+    Alias "PostMessageA" _
+    (ByVal hWnd As LongPtr, ByVal wMsg As Long, _
+     ByVal wParam As LongPtr, ByVal lParam As LongPtr) As Long
+Private Declare PtrSafe Function IsWindow Lib "user32" _
+    (ByVal hWnd As LongPtr) As Long
+
+Private Const WH_CBT As Long = 5
+Private Const HCBT_ACTIVATE As Long = 5
+Private Const WM_COMMAND As Long = &H111
+Private Const TIMER_MIN_MS As Long = 800     ' plancher anti-course
+
+' Etat module-level (DOIT preceder toute procedure)
+Private m_hHook As LongPtr
+Private m_hDlg As LongPtr
+Private m_TimerId As LongPtr
+Private m_Active As Boolean          ' garde de reentrance
+
+' Libelles a appliquer par position (1..3), "" = garder natif
+Private m_Label(1 To 3) As String
+' Boutons reels enumeres
+Private m_BtnCount As Long
+Private m_BtnId(1 To 8) As Long
+' Timer
+Private m_TimeoutMs As Long
+Private m_DefaultPos As Long         ' position du bouton ferme par timer
+Private m_CloseId As Long
+' v2 - compte a rebours + distinction timeout/clic
+Private m_TimedOut As Boolean        ' dernier MsgBoxC ferme par timeout ?
+Private m_TicksLeft As Long          ' secondes restantes (timer 1 s)
+Private m_CountBase As String        ' libelle de base du bouton par defaut
+Private m_ShowCount As Boolean       ' afficher le compte a rebours ?
+
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+' ---------------------------------------------------------------------
+' API PUBLIQUE
+'   prompt        : texte (ASCII strict, accents via A() chez l'appelant)
+'   buttons       : style VB standard (vbYesNoCancel + vbQuestion, etc.)
+'   title         : titre fenetre
+'   label1/2/3    : libelles boutons par position ("" = natif). Mettre
+'                   un '&' pour l'accelerateur clavier (ex "&Classer").
+'   timeoutMs     : 0 = pas d'auto-fermeture ; >0 = ferme apres ce delai
+'                   (resolution effective 1 s, arrondi superieur)
+'   defaultPos    : position (1..3) du bouton clique par le timer
+'   showCountdown : True (defaut) = "Libelle (N)" decremente sur le bouton
+'                   par defaut quand timeoutMs > 0
+' Retour : VbMsgBoxResult standard. Apres retour, LastResultWasTimeout()
+' indique si la fermeture vient du timer (et non d'un clic).
+' ---------------------------------------------------------------------
+Public Function MsgBoxC(ByVal prompt As String, _
+                        ByVal buttons As VbMsgBoxStyle, _
+                        ByVal title As String, _
+                        Optional ByVal label1 As String = "", _
+                        Optional ByVal label2 As String = "", _
+                        Optional ByVal label3 As String = "", _
+                        Optional ByVal timeoutMs As Long = 0, _
+                        Optional ByVal defaultPos As Long = 1, _
+                        Optional ByVal showCountdown As Boolean = True) As VbMsgBoxResult
+    On Error GoTo ErrH
+
+    ' Pack v3 (C16) : memes garanties de premier plan que modUi (drapeau
+    ' vbMsgBoxSetForeground pose sur tous les MsgBox de ce module). Le
+    ' compte a rebours est en outre SUSPENDU tant qu'Outlook n'est pas au
+    ' premier plan (TimerProc) : une boite ouverte derriere une autre
+    ' application ne se ferme plus toute seule sans avoir ete vue.
+
+    ' Reentrance : un MsgBoxC imbrique retombe sur un MsgBox natif.
+    If m_Active Then
+        modDebugLog.DDebug MOD_NAME, "Reentrance -> MsgBox natif"
+        MsgBoxC = MsgBox(prompt, buttons Or vbMsgBoxSetForeground, title)
+        Exit Function
+    End If
+
+    ' Rien a personnaliser ? -> MsgBox natif direct.
+    If Len(label1) = 0 And Len(label2) = 0 And Len(label3) = 0 _
+       And timeoutMs <= 0 Then
+        MsgBoxC = MsgBox(prompt, buttons Or vbMsgBoxSetForeground, title)
+        Exit Function
+    End If
+
+    m_Active = True
+    m_Label(1) = label1
+    m_Label(2) = label2
+    m_Label(3) = label3
+    m_hDlg = 0
+    m_TimerId = 0
+    m_BtnCount = 0
+    m_CloseId = 0
+    m_DefaultPos = defaultPos
+    ' v2
+    m_TimedOut = False
+    m_TicksLeft = 0
+    m_CountBase = ""
+    m_ShowCount = showCountdown
+    If timeoutMs > 0 And timeoutMs < TIMER_MIN_MS Then
+        m_TimeoutMs = TIMER_MIN_MS
+    Else
+        m_TimeoutMs = timeoutMs
+    End If
+
+    m_hHook = SetWindowsHookEx(WH_CBT, AddressOf HookProc, 0, GetCurrentThreadId)
+
+    If m_hHook = 0 Then
+        ' REPLI SILENCIEUX : hook refuse -> MsgBox natif standard.
+        modDebugLog.DError MOD_NAME, "SetWindowsHookEx=0 -> repli MsgBox natif"
+        m_Active = False
+        MsgBoxC = MsgBox(prompt, buttons Or vbMsgBoxSetForeground, title)
+        Exit Function
+    End If
+
+    MsgBoxC = MsgBox(prompt, buttons Or vbMsgBoxSetForeground, title)
+
+    Cleanup
+    modDebugLog.DInfo MOD_NAME, "MsgBoxC ret=" & MsgBoxC & _
+        IIf(m_TimeoutMs > 0, " (timeout=" & m_TimeoutMs & ")", "")
+    Exit Function
+
+ErrH:
+    modDebugLog.DError MOD_NAME, "MsgBoxC error " & Err.Number & " - " & Err.Description
+    Cleanup
+    ' Dernier filet : repli natif.
+    MsgBoxC = MsgBox(prompt, buttons Or vbMsgBoxSetForeground, title)
+End Function
+
+' ---------------------------------------------------------------------
+' Helper pratique : confirmation a 3 branches, libelles obligatoires.
+' Retourne vbYes/vbNo/vbCancel. vbYesNoCancel : Echap et croix renvoient
+' vbCancel -> mettre l'issue INOFFENSIVE en 3e position.
+' v2 : timeoutMs / defaultPos optionnels (defaut 3 = Annuler, l'auto-
+' fermeture retombe sur la branche inoffensive ; l'appelant peut ignorer
+' le resultat d'un timeout via LastResultWasTimeout()).
+' ---------------------------------------------------------------------
+' ---------------------------------------------------------------------
+' EffectiveTimeout (v3) : neutralise un compte a rebours quand Outlook
+' n'est PAS au premier plan.
+'
+' Sans cela, une boite a timeout ouverte derriere une autre application se
+' ferme toute seule sans avoir jamais ete vue, et la decision qu'elle
+' portait disparait en silence. C'est le pire mode de defaillance possible
+' pour un timeout : il ne laisse aucune trace visible.
+' On tente d'abord modUi.BringOutlookToFront ; si Windows refuse le premier
+' plan, le timeout est RETIRE et la boite attend un clic. Mieux vaut une
+' boite qui patiente qu'une decision evaporee.
+'
+' Correctif generalise depuis modReplySuspicion v5, ou le probleme avait
+' ete constate en usage reel (proposition de suivi perdue apres 8 s).
+' ---------------------------------------------------------------------
+Public Function EffectiveTimeout(ByVal wantedMs As Long) As Long
+    On Error Resume Next
+    If wantedMs <= 0 Then
+        EffectiveTimeout = 0
+        Exit Function
+    End If
+    If modUi.BringOutlookToFront() Then
+        EffectiveTimeout = wantedMs
+    Else
+        EffectiveTimeout = 0
+        modDebugLog.DInfo MOD_NAME, _
+            "Premier plan refuse -> timeout " & wantedMs & " ms neutralise"
+    End If
+End Function
+
+Public Function Confirm3(ByVal prompt As String, ByVal title As String, _
+                         ByVal labYes As String, ByVal labNo As String, _
+                         ByVal labCancel As String, _
+                         Optional ByVal icon As VbMsgBoxStyle = vbQuestion, _
+                         Optional ByVal timeoutMs As Long = 0, _
+                         Optional ByVal defaultPos As Long = 3) As VbMsgBoxResult
+    Confirm3 = MsgBoxC(prompt, vbYesNoCancel + icon, title, _
+                       labYes, labNo, labCancel, _
+                       EffectiveTimeout(timeoutMs), defaultPos)
+End Function
+
+' ---------------------------------------------------------------------
+' Choose3 (v2) : choix d'ACTION a 3 branches sur vbAbortRetryIgnore
+' (ids 3/4/5, cf. cartographie en tete). Difference avec Confirm3 :
+' comportement natif ARI = PAS d'Echap ni de croix -> a reserver aux cas
+' ou les 3 libelles couvrent TOUTES les issues (ex. "PDF / DOCX / Les
+' deux") ; l'annulation eventuelle se joue a l'etape suivante du flux.
+' Retour : 1/2/3 = position du bouton ; 0 = repli imprevu.
+' timeoutMs > 0 : auto-fermeture sur defaultPos (timeout detectable via
+' LastResultWasTimeout()). Pour le bouton actif a Entree, passer
+' vbDefaultButton2/3 dans icon.
+' ---------------------------------------------------------------------
+Public Function Choose3(ByVal prompt As String, ByVal title As String, _
+                        ByVal label1 As String, ByVal label2 As String, _
+                        ByVal label3 As String, _
+                        Optional ByVal icon As VbMsgBoxStyle = vbQuestion, _
+                        Optional ByVal timeoutMs As Long = 0, _
+                        Optional ByVal defaultPos As Long = 1) As Long
+    ' v3 : timeout neutralise si la boite ne peut pas passer devant.
+    ' ATTENTION APPELANTS : vbAbortRetryIgnore n'a PAS de bouton Annuler et
+    ' la croix de fermeture est desactivee - l'utilisateur ne peut donc PAS
+    ' sortir sans choisir. N'utiliser Choose3 que pour trois actions
+    ' reellement equivalentes et toutes acceptables. Des qu'une branche est
+    ' destructive, ou qu'"aucune des trois" est une reponse legitime,
+    ' utiliser Confirm3 et placer la sortie en 3e position.
+    Select Case MsgBoxC(prompt, vbAbortRetryIgnore + icon, title, _
+                        label1, label2, label3, _
+                        EffectiveTimeout(timeoutMs), defaultPos)
+        Case vbAbort:  Choose3 = 1
+        Case vbRetry:  Choose3 = 2
+        Case vbIgnore: Choose3 = 3
+        Case Else:     Choose3 = 0
+    End Select
+End Function
+
+' ---------------------------------------------------------------------
+' Hook : enumere boutons, renomme par position sur ID reel, arme timer.
+' ---------------------------------------------------------------------
+Private Function HookProc(ByVal nCode As Long, _
+                          ByVal wParam As LongPtr, _
+                          ByVal lParam As LongPtr) As LongPtr
+    On Error Resume Next
+    If nCode = HCBT_ACTIVATE Then
+        m_hDlg = wParam
+        m_BtnCount = 0
+        EnumChildWindows m_hDlg, AddressOf EnumProc, 0
+
+        ' Renommage par position, sur l'ID reellement lu.
+        Dim i As Long
+        For i = 1 To m_BtnCount
+            If i <= 3 Then
+                If Len(m_Label(i)) > 0 Then
+                    SetDlgItemText m_hDlg, m_BtnId(i), m_Label(i)
+                End If
+            End If
+        Next i
+
+        ' Timer optionnel : ferme le bouton a la position demandee.
+        ' v2 : timer REPETITIF 1 s + compte a rebours sur le libelle du
+        ' bouton par defaut ("Libelle (N)"). Le plancher TIMER_MIN_MS est
+        ' respecte de fait : la premiere echeance possible est a 1 s.
+        If m_TimeoutMs > 0 And m_BtnCount > 0 Then
+            Dim pos As Long
+            pos = m_DefaultPos
+            If pos < 1 Then pos = 1
+            If pos > m_BtnCount Then pos = m_BtnCount
+            m_CloseId = m_BtnId(pos)
+
+            ' Libelle de base : libelle custom si fourni, sinon texte natif lu.
+            m_CountBase = ""
+            If m_ShowCount Then
+                If pos <= 3 Then
+                    If Len(m_Label(pos)) > 0 Then m_CountBase = m_Label(pos)
+                End If
+                If Len(m_CountBase) = 0 Then
+                    Dim buf As String, nLen As Long
+                    buf = String$(64, vbNullChar)
+                    nLen = GetDlgItemText(m_hDlg, m_CloseId, buf, 64)
+                    If nLen > 0 Then m_CountBase = Left$(buf, nLen)
+                End If
+                If Len(m_CountBase) = 0 Then m_ShowCount = False
+            End If
+
+            m_TicksLeft = (m_TimeoutMs + 999) \ 1000
+            If m_TicksLeft < 1 Then m_TicksLeft = 1
+            If m_ShowCount Then
+                SetDlgItemText m_hDlg, m_CloseId, m_CountBase & " (" & m_TicksLeft & ")"
+            End If
+            m_TimerId = SetTimer(0, 0, 1000, AddressOf TimerProc)
+        End If
+
+        ' Retrait immediat du hook (le timer reste arme).
+        If m_hHook <> 0 Then
+            UnhookWindowsHookEx m_hHook
+            m_hHook = 0
+        End If
+    End If
+    HookProc = CallNextHookEx(m_hHook, nCode, wParam, lParam)
+End Function
+
+' ---------------------------------------------------------------------
+' Enumere les controles classe "Button" dans l'ordre. Renvoie 1.
+' ---------------------------------------------------------------------
+Private Function EnumProc(ByVal hChild As LongPtr, _
+                          ByVal lParam As LongPtr) As Long
+    On Error Resume Next
+    Dim cls As String, n As Long
+    cls = String$(32, vbNullChar)
+    n = GetClassName(hChild, cls, 32)
+    cls = Left$(cls, n)
+    If StrComp(cls, "Button", vbTextCompare) = 0 Then
+        If m_BtnCount < 8 Then
+            m_BtnCount = m_BtnCount + 1
+            m_BtnId(m_BtnCount) = GetDlgCtrlID(hChild)
+        End If
+    End If
+    EnumProc = 1
+End Function
+
+' ---------------------------------------------------------------------
+' Timer repetitif 1 s (v2) : decremente le compte a rebours, met a jour
+' le libelle du bouton par defaut, et ferme a echeance (m_TimedOut=True).
+' Si le dialog a deja ete ferme par l'utilisateur, on coupe le timer.
+' ---------------------------------------------------------------------
+Private Sub TimerProc(ByVal hWnd As LongPtr, ByVal uMsg As Long, _
+                      ByVal idEvent As LongPtr, ByVal dwTime As Long)
+    On Error Resume Next
+
+    If m_hDlg = 0 Then
+        SafeKillTimer
+        Exit Sub
+    End If
+    If IsWindow(m_hDlg) = 0 Then
+        SafeKillTimer
+        Exit Sub
+    End If
+
+    ' Pack v3 (C16) : pas de decompte tant qu'Outlook n'est pas au premier
+    ' plan (la boite est alors invisible ou derriere une autre application).
+    If Not modUi.OutlookIsForeground() Then Exit Sub
+
+    m_TicksLeft = m_TicksLeft - 1
+
+    If m_TicksLeft > 0 Then
+        If m_ShowCount And Len(m_CountBase) > 0 Then
+            SetDlgItemText m_hDlg, m_CloseId, m_CountBase & " (" & m_TicksLeft & ")"
+        End If
+        Exit Sub                ' prochain tick dans 1 s
+    End If
+
+    ' Echeance : fermer sur le bouton par defaut.
+    SafeKillTimer
+    If m_CloseId <> 0 Then
+        m_TimedOut = True       ' v2 : distinguer timeout / clic
+        PostMessage m_hDlg, WM_COMMAND, m_CloseId, 0
+    End If
+End Sub
+
+' ---------------------------------------------------------------------
+' LastResultWasTimeout (v2)
+' True si le DERNIER MsgBoxC (avec hook) s'est ferme par timeout.
+' A lire juste apres le retour de MsgBoxC/Confirm3/Choose3 : permet de
+' traiter "personne n'a repondu" comme une annulation, quel que soit le
+' bouton par defaut clique par le timer.
+' ---------------------------------------------------------------------
+Public Function LastResultWasTimeout() As Boolean
+    LastResultWasTimeout = m_TimedOut
+End Function
+
+' ---------------------------------------------------------------------
+Private Sub Cleanup()
+    SafeUnhook
+    SafeKillTimer
+    m_hDlg = 0
+    m_Active = False
+End Sub
+
+Private Sub SafeUnhook()
+    On Error Resume Next
+    If m_hHook <> 0 Then
+        UnhookWindowsHookEx m_hHook
+        m_hHook = 0
+    End If
+End Sub
+
+Private Sub SafeKillTimer()
+    On Error Resume Next
+    If m_TimerId <> 0 Then
+        KillTimer 0, m_TimerId
+        m_TimerId = 0
+    End If
+End Sub
+
+' ---------------------------------------------------------------------
+' Test rapide (Ctrl+G) : MsgBoxC_SelfTest
+' ---------------------------------------------------------------------
+Public Sub MsgBoxC_SelfTest()
+    Dim r As VbMsgBoxResult
+    modDebugLog.SetGlobalLevel modDebugLog.LOG_INFO
+
+    r = Confirm3("Test 3 boutons renommes.", "MsgBoxC - test", _
+                 "&Classer", "&Ignorer", "&Annuler")
+    modDebugLog.DInfo MOD_NAME, "SelfTest Confirm3 ret=" & r
+
+    r = MsgBoxC("Test auto-fermeture dans 3s sur Reporter (pos 2)," & vbCrLf & _
+                "avec compte a rebours sur le bouton.", _
+                vbYesNo + vbQuestion, "MsgBoxC - timer", _
+                "&Relancer", "&Reporter", "", 3000, 2)
+    modDebugLog.DInfo MOD_NAME, "SelfTest timer ret=" & r & _
+        " timeout=" & LastResultWasTimeout()
+
+    Dim c As Long
+    c = Choose3("Test Choose3 (ARI, pas d'Echap) : choisir une action.", _
+                "MsgBoxC - Choose3", "&Premiere", "&Deuxieme", "&Troisieme", _
+                vbQuestion, 8000, 3)
+    modDebugLog.DInfo MOD_NAME, "SelfTest Choose3 ret=" & c & _
+        " timeout=" & LastResultWasTimeout()
+End Sub

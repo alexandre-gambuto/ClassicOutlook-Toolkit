@@ -1,0 +1,1827 @@
+Option Explicit
+
+'=============================================================================
+' ThisOutlookSession v10.11  (2026-08-28)
+'
+' v10.11 (2026-08-28) : classement des ENVOYES - creation de dossier a la
+'   volee. Apres un tour "Aucun dossier pour X", la fenetre unique accepte
+'   la commande "+" : modQuickMove.CreateFolderInteractive (code DV ou
+'   contrat + nom + partenaire, dossier Outlook cree sous le parent
+'   config.ini, entree ajoutee a l'index, ligne garantie dans Suivi de
+'   temps.xlsm), puis le mail est classe dans le dossier cree (toast).
+'   Si la creation est annulee, retour a la saisie avec le texte initial.
+'
+' v10.9 (2026-08-22) : revue UX pop-ups - CORRECTION DU BLOCAGE DE FILE.
+'   (a) CAUSE RACINE. PromptForSentItem s'affiche via une InputBox, armee
+'       +1 s apres l'envoi par modDefer. A cet instant l'utilisateur a
+'       typiquement deja bascule sur une autre application. Or InputBox n'a
+'       AUCUN drapeau de premier plan - contrairement a MsgBox, qui accepte
+'       vbMsgBoxSetForeground. La fenetre s'ouvrait donc DERRIERE, jamais
+'       vue, jamais fermee. Le commentaire de la v2 ci-dessous annonce
+'       encore "prompt avec flag vbMsgBoxSetForeground + vbSystemModal" :
+'       c'etait vrai tant que le prompt etait une MsgBox, la v10.8 est
+'       passee a InputBox et les drapeaux ont disparu avec le refactor.
+'       Le prompt passe desormais par modUi.AskText, qui remonte Outlook au
+'       premier plan avant d'afficher et, si Windows refuse, fait clignoter
+'       la barre des taches + emet un toast d'annonce.
+'   (b) CONSEQUENCE EN CASCADE, corrigee aussi. Tant que cette fenetre
+'       invisible restait ouverte, mQuickMovePromptBusy restait a True :
+'       ProcessNextSentPrompt sortait immediatement et TOUS les mails
+'       envoyes ensuite s'empilaient dans la file sans jamais etre proposes
+'       au classement, jusqu'au redemarrage d'Outlook ou a un appel manuel
+'       a ResetQuickMoveSentQueue. La garde est maintenant HORODATEE
+'       (mQuickMovePromptSince) et levee automatiquement au-dela de
+'       QM_PROMPT_STALE_MIN minutes, avec une trace ERROR dans debug.log.
+'       Ce garde-fou couvre aussi le cas d'une garde survivante apres un
+'       Ctrl+S VBE.
+'   (c) La confirmation "bandeau Urgent sans date" d'Application_ItemSend
+'       passe par modUi.Ask : elle s'ouvre pendant la fermeture de la
+'       fenetre de redaction, et un "Non" jamais vu annulait un envoi sans
+'       que l'utilisateur comprenne pourquoi.
+'   Dependance ajoutee : modUi.
+'
+' Purpose (EN): central session module. Wires WithEvents listeners at startup
+'   (Inspectors/Explorer via clsAppEvents, calendar items, sent items) and
+'   routes events to the feature modules: calendar coloring, anti-overlap,
+'   auto project-tagging, sent-mail filing (QuickMove) and reply tracking. Also
+'   holds the calendar-position memory and the asynchronous sent-mail prompt
+'   queue. No UserForm.
+'
+' v4 (2026-06-10) : accesseurs publics d'etat des bindings WithEvents
+'   (SentItemsEventsBound / CalendarEventsBound / MainExplorerEventsBound,
+'   lus par modMaintenance.AssertBindings) + health-check silencieux en fin
+'   d'Application_Startup. Un WithEvents remis a Nothing (Ctrl+S VBE) =
+'   plus aucun evenement, silencieusement : desormais detecte.
+'
+' v5 (2026-06-10) : AutoArchiveMove differe a +2 min via Application.OnTime
+'   (P1) - le demarrage n'est plus bloque par le scan d'archivage.
+'
+' v6 (2026-06-13) : (a) FIX DIFFERES MORTS - Application.OnTime n'existe pas
+'   dans Outlook (methode Excel/Word ; chaque appel levait l'erreur 438,
+'   avalee par On Error Resume Next) : aucun differe ne s'executait. Tous
+'   les sites passent par le nouveau modDefer (SetTimer Win32, one-shot).
+'   (b) WATCHDOG bindings : Application_ItemSend / _NewMailEx / _Reminder
+'   (evenements intrinseques du module, cables par l'hote VBA, survivent au
+'   reset d'etat) verifient les liaisons critiques et declenchent
+'   modDevTools.ReinitSilent + toast si elles sont mortes.
+'
+' v7 (2026-06-13) : Application_ItemSend detecte le tag "FollowupConvID" pose
+'   par modMailResponseTracker sur un brouillon de relance "Personnaliser" ;
+'   si present, programme (differe modDefer) la mise a jour de la ligne de
+'   suivi A L'ENVOI REEL. Une relance personnalisee non envoyee ne compte
+'   donc plus.
+'
+' v8 (2026-06-14) : (a) Toast sur le classement AUTOMATIQUE par code dans
+'   ItemAdd (avant, seul le rangement "reponse dans le fil" notifiait, ce
+'   classement par code restait silencieux). (b) Au demarrage, rattrapage
+'   +25s des courriels ENVOYES depuis iOS pendant qu'Outlook etait ferme
+'   (aucun ItemAdd emis a la synchro differee) via
+'   modReplyInPlace.CatchUpRecentSent.
+'
+' v9 (2026-06-16) : (Trou C) toast sur le classement MANUEL depuis le prompt
+'   differe (PromptForSentItem). C'etait la derniere branche de deplacement
+'   d'un mail envoye qui restait silencieuse : quand le prefill ne donnait
+'   pas de match unique, l'utilisateur choisissait le dossier mais aucun
+'   toast ne confirmait le rangement. NotifyFiled est desormais appele apres
+'   chaque Item.Move (branche match unique ET branche choix par numero).
+'
+' v10 (2026-06-16) : DEUX FENETRES A ROLE STABLE (courrier / calendrier).
+'   AVANT : un unique Explorer (olMainExplorer) fige au demarrage etait
+'   surveille ; la fenetre calendrier ouverte en parallele n'etait surveillee
+'   par PERSONNE. Consequence (bug signale) : un clic "Message" depuis la
+'   fenetre calendrier n'etait pas intercepte, Outlook la transformait en 2e
+'   fenetre courrier -> on perdait la fenetre calendrier. Plus generalement,
+'   des que plusieurs fenetres coexistaient, le binding unique ne couvrait
+'   pas la bonne fenetre.
+'   APRES : chaque fenetre a role est surveillee par une instance de
+'   clsExplorerWatcher (un WithEvents par fenetre). HandleExplorerSwitch
+'   rapatrie une fenetre qui derive hors de son role et active/cree la fenetre
+'   de l'autre role. Resultat : 1 fenetre porte toujours le courrier, 1
+'   toujours le calendrier, chacune libre sur son ecran. Les fenetres ouvertes
+'   manuellement (clic droit -> nouvelle fenetre) restent libres (pas de
+'   watcher). Position memorisee : calendrier uniquement (inchange). Le
+'   binding "MainExplorerEventsBound" (lu par AssertBindings) reflete
+'   desormais l'existence d'un watcher COURRIER vivant. NOUVELLE CLASSE :
+'   clsExplorerWatcher.
+'
+' v10.2 (2026-06-16) : anti-rebond robuste des fenetres a role. Le drapeau
+'   bSwitchBusy etait synchrone et ne couvrait pas les FolderSwitch de rebond
+'   emis par SelectFolder/Activate au cycle de message suivant : les deux
+'   fenetres se disputaient le focus (le courrier passait devant puis
+'   disparaissait). Remplace par une GARDE TEMPORELLE (GetTickCount, 1,5 s)
+'   et inversion de l'ordre des gestes (rapatrier la fenetre derivante
+'   d'ABORD, activer l'autre role EN DERNIER).
+'
+' v10.3 (2026-06-17) : toast "reponse rangee" sur le bon ecran. Dans la
+'   branche mail d'Application_ItemSend, appel a
+'   modNotify.RememberToastMonitorFromForeground : on epingle le moniteur de
+'   la fenetre d'envoi (encore au premier plan) pour le toast a venir, emis un
+'   instant plus tard quand le premier plan est devenu instable. Corrige le
+'   toast qui partait sur le mauvais ecran en config deux fenetres / deux
+'   moniteurs. Voir modNotify v4.1.
+'
+' v10.4 (2026-06-26) : fix "la fenetre ne passe pas au premier plan" sur un
+'   seul ecran. Explorer.Activate (qui "active" la fenetre au sens Outlook) ne
+'   garantit pas qu'elle remonte AU-DESSUS de l'autre fenetre Outlook quand les
+'   deux se superposent ; pire, si Outlook tient deja la fenetre cible pour
+'   active, Activate ne fait rien. En double ecran le defaut etait invisible
+'   (chaque fenetre vit sur son ecran). On force desormais la remontee au
+'   niveau Windows (BringWindowToTop + SetForegroundWindow) sur le HANDLE
+'   retrouve par le TITRE de la fenetre - jamais via GetForegroundWindow, qui
+'   est la course de focus qui avait piege modMaximizeWindow v6. Nouveau helper
+'   RaiseExplorerWindow, appele EN DERNIER dans ActivateRoleDeferred. Outlook
+'   etant deja l'application au premier plan et les deux fenetres partageant le
+'   meme thread, la remontee est autorisee sans vol de focus global. 3 Declare
+'   user32 passives (aucun process lance, rien que SentinelOne surveille).
+'
+' v10.5 (2026-07-02) : (a) ROLLBACK v10.4 - RaiseExplorerWindow retire.
+'   En prod, le resultat net etait PIRE : clic Courrier depuis Calendrier ->
+'   la fenetre Courrier ne s'affichait pas. Deux fragilites identifiees :
+'   FindWindowW exige le TITRE EXACT (compteur de non-lus / variation de
+'   suffixe => HWND introuvable => aucune remontee) et une fenetre reduite
+'   n'etait jamais restauree. Retour au comportement v10.3 (Ensure* +
+'   Explorer.Activate + garde anti-rebond). Une remontee robuste (classe
+'   rctrl_renwnd32 + titre PARTIEL + ShowWindow si minimisee) sera
+'   re-tentee apres sonde trace en prod. Les 3 Declare user32 retires.
+'   (b) PERF DEMARRAGE : CleanOldFlags (purge mensuelle des vieux drapeaux,
+'   parcours de TOUTE la boite de reception) n'est plus synchrone dans
+'   Application_Startup : differe a +180 s via modDefer (cle "CleanFlags").
+'
+' v10.6 (2026-07-05) : (a) PromptForSentItem - le sujet du mail etait
+'   concatene A L'INTERIEUR de T() : il traversait le decodeur d'accents
+'   A() (un sujet reel contenant "~e"/"~a" etait altere a l'affichage).
+'   Les donnees dynamiques sortent du T(). (b) commentaires : la cle de
+'   config du niveau de log est DefaultLogLevel (l'ancien nom FR restait
+'   cite) ; note "ProjectAsk volontairement fixe".
+'
+' v10.7 (2026-07-06) : FIX erreur 8004010F (MAPI_E_NOT_FOUND) dans
+'   IsTechnicalEvent. La fonction lisait .subject/.Categories SANS garde
+'   d'erreur, et elle est appelee AVANT le On Error GoTo des handlers
+'   ItemAdd/ItemChange : un item illisible (RDV technique QuickMove en
+'   cours de suppression, item mi-synchronise Exchange) faisait surgir la
+'   boite d'erreur VBE. Desormais : lecture sous On Error Resume Next ;
+'   item illisible => traite comme technique (skip silencieux + DInfo).
+'
+' v10.8 (2026-07-07) : (a) FENETRE UNIQUE pour le classement des envoyes.
+'   PromptForSentItem empilait jusqu'a 4+ fenetres (MsgBox par candidat du
+'   corps via ExtractPrefill INTERACTIF, MsgBox Oui/Non, InputBox de
+'   recherche, InputBox de resultats, MsgBox "Aucun dossier" separee).
+'   Desormais : UNE InputBox reutilisee en boucle, dont le texte porte
+'   l'etat du tour (liste numerotee des candidats du corps via
+'   modQuickMove.CollectBodyCandidates v10.1, resultats de recherche,
+'   "aucun dossier") ; vide ou Annuler = laisser dans Envoyes, a tout
+'   moment. Prefill via ExtractPrefillSilent (zero fenetre).
+'   (b) Property QuickMovePromptBusy : lue par modReplySuspicion v4.1
+'   pour ne plus ouvrir son pop-up PAR-DESSUS la chaine de classement.
+'   (c) Marqueurs de session dans debug.log : "SESSION START" au
+'   demarrage, "SESSION END" dans Application_Quit (nouveau handler).
+'   Un START sans END juste avant = la session precedente s'est
+'   terminee par un PLANTAGE (horodate par la ligne de log).
+' v10.11 (2026-08-17) : mise en place de la vue calendrier au PREMIER passage
+'   sur la fenetre calendrier de la session (SetupBirthdayCalendarView, appele
+'   depuis les DEUX branches d'EnsureCalendarExplorer : fenetre reactivee et
+'   fenetre creee). Delegue a modContactBirthday.ContactBirthdaySetupView, en
+'   lui passant mCalendarExplorer - avec deux fenetres a role, ActiveExplorer
+'   serait ambigu. NE PEUT PAS se faire dans Application_Startup :
+'   NavigationFolder.IsSelected n'est modifiable que si le module Calendrier
+'   est le module COURANT du volet de navigation (doc Microsoft). Le bloc
+'   modDefer.ArmUnique "BirthdayCalShow" ajoute puis abandonne le meme jour a
+'   ete retire de Application_Startup (cible retiree de modDefer v1.12).
+' v10.12 (2026-08-18) : alertes nouveau mail par boite (modInboxAlert).
+'   modInboxAlert.InboxAlertStart appele juste apres le binding de mSentItems
+'   dans Application_Startup ET dans RebindEvents (les watchers clsInboxWatcher
+'   sont des WithEvents : perdus a chaque Ctrl+S VBE, comme les autres).
+'   Inactif tant que InboxAlertEnabled=0 dans config.ini.
+' v10.13 (2026-08-19) : FIX vue anniversaires decochee au premier passage.
+'   SetupBirthdayCalendarView etait appele en SYNCHRONE juste apres
+'   Explorers.Add/Display : la fenetre calendrier n'etait pas construite, le
+'   coche partait sur le volet encore actif (flash visible cote courrier),
+'   puis la nouvelle fenetre finissait son rendu et rechargeait ses
+'   calendriers coches -> reglage ecrase. Desormais DIFFERE (modDefer cle
+'   "BirthdayView", BIRTHDAY_VIEW_DELAY_MS apres Ensure*) et VERIFIE : si
+'   modContactBirthday.ContactBirthdayViewPending reste True apres l'appel,
+'   on re-arme (jusqu'a 4 tentatives, cote modContactBirthday v1.9).
+'   SetupBirthdayCalendarView devient ArmBirthdayViewSetup (armement) +
+'   SetupBirthdayViewDeferred (cible publique appelee par modDefer).
+'=============================================================================
+
+Private WithEvents mSentItems As Outlook.items
+
+' === Projet : surveillance du calendrier ===
+Private WithEvents CalendarItems As Outlook.items
+Private bTaggingBusy As Boolean
+
+' === SUSPENSION VOLONTAIRE DES EVENTS CALENDAR ===
+' Pose a True par les batches modMeetingColor (ColorRecentItems,
+' CatchUpUncolored) pour empecher les ItemChange asynchrones
+' provoques par les a.Save de la boucle de declencher modProjectTag et
+' compagnie. Restauration imperative meme en erreur dans le module
+' appelant.
+' Les Property Get/Let publiques sont definies plus bas, apres toutes
+' les declarations de variables (contrainte VBA pour les modules de
+' classe : declarations groupees en haut, puis procedures).
+Private bCalendarEventsSuspended As Boolean
+
+' Anti-double-demande (session uniquement, reset au redemarrage)
+Private sLastRefusedEntryID As String
+
+' === COURRIER ET CALENDRIER DANS DEUX FENETRES A ROLE STABLE ===
+' Modele v10 (2026-06-16) : au lieu d'un unique Explorer fige au demarrage
+' (ancien olMainExplorer), on maintient DEUX fenetres a role :
+'   - mMailExplorer     : la fenetre dediee au courrier ;
+'   - mCalendarExplorer : la fenetre dediee au calendrier.
+' Chaque fenetre est surveillee par une instance de clsExplorerWatcher (un
+' WithEvents par fenetre - impossible avec un seul WithEvents module-level).
+' Les watchers sont gardes vivants dans mExplorerWatchers (sinon le GC VBA
+' detruit l'instance et le binding meurt en silence, cf. clsApptWatcher).
+' Quand une fenetre derive hors de son role, HandleExplorerSwitch la rapatrie
+' et active/cree la fenetre de l'autre role : 1 fenetre reste toujours le
+' courrier, 1 reste toujours le calendrier.
+Private mMailExplorer As Outlook.Explorer
+Private mCalendarExplorer As Outlook.Explorer
+Private mExplorerWatchers As Collection
+Private mSwitchGuardUntil As Long      ' v10.2 : tick (ms) jusqu'auquel tout FolderSwitch est ignore (anti-rebond)
+Private mExplWatchSeq As Long
+
+Private Declare PtrSafe Function GetTickCount Lib "kernel32" () As Long
+
+' (v10.5 : les 3 Declare user32 de v10.4 sont retires - rollback
+'  RaiseExplorerWindow, cf. en-tete.)
+
+Private Const CAL_SEPARATE_WINDOW_ENABLED As Long = 1
+Private Const ROLE_MAIL As String = "mail"
+Private Const ROLE_CALENDAR As String = "calendar"
+Private Const SWITCH_GUARD_MS As Long = 1500   ' v10.2 : duree (ms) de la garde anti-rebond
+Private Const BIRTHDAY_VIEW_DELAY_MS As Long = 1200   ' v10.13 : attente construction fenetre calendrier
+Private Const BIRTHDAY_VIEW_RETRY_MS As Long = 1500   ' v10.13 : espacement des tentatives suivantes
+Private Const MOD_NAME As String = "ThisOutlook"
+Private Const MOD_VERSION As String = "v10.11 - 2026-08-28"
+
+' === QUICKMOVE ENVOYES - prompt asynchrone ===
+' Garde de reentrance : un seul prompt ouvert a la fois.
+Private mQuickMovePromptBusy As Boolean
+' v10.9 : horodatage de la pose de la garde. Sans lui, un prompt reste
+' bloque indefiniment si l'InputBox s'est ouverte derriere une autre
+' application et n'a jamais ete vue : mQuickMovePromptBusy reste a True,
+' ProcessNextSentPrompt sort immediatement, et TOUS les mails envoyes
+' ensuite s'empilent dans la file sans jamais etre proposes au classement.
+' C'est le symptome "les pop-ups ne s'affichent plus" du terrain.
+Private mQuickMovePromptSince As Date
+' Au-dela de ce delai, la garde est consideree comme orpheline et levee.
+Private Const QM_PROMPT_STALE_MIN As Long = 10
+' File d'attente FIFO d'EntryIDs en attente de prompt.
+Private mPendingSentEntryIDs As Collection
+
+' === WATCHDOG BINDINGS (v6) ===
+' Garde de reentrance de l'auto-reparation (CheckBindingsWatchdog).
+Private bWatchdogBusy As Boolean
+
+' v10.10 : fermeture plus courte que ce seuil = "redemarrage rapide" ->
+' les rattrapages de demarrage (couleurs, envoyes, archivage) sont sautes.
+Private Const QUICK_RESTART_MIN As Long = 30
+
+'=============================================================================
+' Property d'acces au flag de suspension d'evenements calendar.
+' Appele par modMeetingColor.ColorRecentItems et
+' modMeetingColor.CatchUpUncolored pour empecher les ItemChange
+' asynchrones de declencher modProjectTag pendant les batches.
+'=============================================================================
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+Public Property Get SuspendCalendarEvents() As Boolean
+    SuspendCalendarEvents = bCalendarEventsSuspended
+End Property
+
+Public Property Let SuspendCalendarEvents(ByVal v As Boolean)
+    bCalendarEventsSuspended = v
+    modDebugLog.DInfo MOD_NAME, "SuspendCalendarEvents = " & v
+End Property
+
+'=============================================================================
+' Accesseurs d'etat des bindings WithEvents (health-check, v4 2026-06-10).
+' Lus par modMaintenance.AssertBindings. Lecture seule, sans effet de bord.
+'=============================================================================
+Public Property Get SentItemsEventsBound() As Boolean
+    SentItemsEventsBound = Not (mSentItems Is Nothing)
+End Property
+
+Public Property Get CalendarEventsBound() As Boolean
+    CalendarEventsBound = Not (CalendarItems Is Nothing)
+End Property
+
+Public Property Get MainExplorerEventsBound() As Boolean
+    ' v10 : reflete desormais l'existence d'un watcher de fenetre COURRIER
+    ' vivant (le role qui doit toujours exister tant qu'Outlook a une fenetre).
+    ' Conserve ce nom car lu par modMaintenance.AssertBindings (binding 3).
+    On Error Resume Next
+    Dim w As clsExplorerWatcher
+    Set w = WatcherForRole(ROLE_MAIL)
+    MainExplorerEventsBound = (Not w Is Nothing)
+    On Error GoTo 0
+End Property
+
+'=============================================================================
+' QuickMovePromptBusy (v10.8) - True tant que la fenetre unique de
+' classement des envoyes (PromptForSentItem) est ouverte. Lu par
+' modReplySuspicion.ProposeDeferredFollowup, qui se re-arme +5 s tant que
+' c'est occupe au lieu d'ouvrir son pop-up par-dessus.
+'=============================================================================
+Public Property Get QuickMovePromptBusy() As Boolean
+    QuickMovePromptBusy = mQuickMovePromptBusy
+End Property
+
+Private Sub Application_Startup()
+    ' Charge la configuration (config.ini -> variables globales modConfig.g_*)
+    ' AVANT tout module, car plusieurs en dependent (tag, coloration, etc.).
+    modConfig.LoadConfig
+
+    ' v10.8 : marqueur de session (apres LoadConfig : le niveau de log est
+    ' charge). Un "SESSION START" sans "SESSION END" juste avant = la
+    ' session precedente s'est terminee par un plantage (ou un kill).
+    modDebugLog.DLogSection "SESSION START"
+
+    ' v10.10 : detection REDEMARRAGE RAPIDE. Les rattrapages de demarrage
+    ' (couleurs +15 s, envoyes +25 s, archivage +120 s) ne servent qu'a
+    ' couvrir ce qui s'est synchronise pendant une VRAIE fermeture ; les
+    ' relancer a chaque redemarrage de la journee (VBE, mise a jour,
+    ' plantage) etait du travail a vide. Horodatage pose par
+    ' Application_Quit (Str$/Val : point decimal quelle que soit la
+    ' locale) ; apres un crash (pas de Quit), l'horodatage est ancien ->
+    ' les rattrapages tournent normalement.
+    Dim quickRestart As Boolean
+    quickRestart = False
+    On Error Resume Next
+    Dim lastEndSerial As Double
+    lastEndSerial = Val(GetSetting("Toolkit", "Session", "LastEnd", "0"))
+    If lastEndSerial > 0 Then
+        If DateDiff("n", CDate(lastEndSerial), Now) < QUICK_RESTART_MIN Then quickRestart = True
+    End If
+    On Error GoTo 0
+    If quickRestart Then
+        modDebugLog.DInfo "Session", "Redemarrage rapide (< " & _
+            QUICK_RESTART_MIN & " min) : rattrapages couleurs/envoyes/archivage sautes"
+    End If
+
+    Set mSentItems = Application.GetNamespace("MAPI").GetDefaultFolder(olFolderSentMail).items
+
+    ' v10.12 : alertes nouveau mail par boite (watchers ItemAdd sur les
+    ' boites de reception configurees). Sans effet si InboxAlertEnabled=0.
+    On Error Resume Next
+    modInboxAlert.InboxAlertStart
+    On Error GoTo 0
+
+    ' v5 (2026-06-10) : archivage differe a +2 min (P1). AutoArchiveMove
+    ' parcourait toute l'arborescence configuree de maniere SYNCHRONE au
+    ' demarrage (cout accru par la recursion v4 de FolderScan) : Outlook
+    ' est utilisable immediatement, l'archivage tourne 2 minutes plus tard
+    ' (meme mecanique modDefer que le rattrapage coloration +15 s).
+    If Not quickRestart Then
+        On Error Resume Next
+        modDefer.Arm "AutoArchive", 120
+        On Error GoTo 0
+    End If
+
+    ' Pack v3 (C6) : reindexation QuickMove HEBDOMADAIRE via modDefer (+120 s),
+    ' au premier demarrage de la semaine QUEL QUE SOIT LE JOUR (avant : lundi
+    ' seulement -> un lundi ferie sautait la semaine). Le RDV technique
+    ' "QuickMove_BackgroundReindex" + Application_Reminder est abandonne : il
+    ' polluait le calendrier (synchro telephone) et declenchait les
+    ' ItemAdd/ItemChange que 4 modules devaient filtrer.
+    Dim lastReindex As String
+    lastReindex = GetSetting("QuickMove", "Reindex", "LastWeek", "")
+    Dim thisWeek As String
+    thisWeek = Format(Now, "YYYY") & "-W" & Format(DatePart("ww", Now, vbMonday), "00")
+    If lastReindex <> thisWeek Then
+        On Error Resume Next
+        modDefer.Arm "Reindex", 120
+        On Error GoTo 0
+        SaveSetting "QuickMove", "Reindex", "LastWeek", thisWeek
+    End If
+
+    ' v10.5 : purge mensuelle des vieux drapeaux DIFFEREE (+180 s). Elle
+    ' parcourait TOUTE la boite de reception en SYNCHRONE : gel du premier
+    ' lancement du mois. Garde mensuelle interne inchangee (les autres
+    ' jours, l'appel differe ressort immediatement).
+    On Error Resume Next
+    modDefer.Arm "CleanFlags", 180
+    On Error GoTo 0
+
+    ' v10.9 : le prechargement du cache projets (InitProjectTag) ouvrait
+    ' Excel + le referentiel en SYNCHRONE a t=0, sur le chemin critique du
+    ' lancement (1-3 s). Differe a +45 s via modDefer ("TagPreload") ;
+    ' l'auto-ask reste actif immediatement (PROJECT_AUTO_ASK est Public).
+    ' Un tag dans les 45 premieres secondes charge le cache a la demande
+    ' (comportement pre-v8.4, une seule fois).
+    modProjectTag.PROJECT_AUTO_ASK = True
+    On Error Resume Next
+    modDefer.Arm "TagPreload", 45
+    On Error GoTo 0
+    Dim calFolder As Outlook.MAPIFolder
+    Set calFolder = Application.Session.GetDefaultFolder(olFolderCalendar)
+    Set CalendarItems = calFolder.items
+    bTaggingBusy = False
+    bCalendarEventsSuspended = False
+    sLastRefusedEntryID = ""
+
+    ' v10 : la fenetre active au demarrage est la fenetre COURRIER. On lui
+    ' attache un watcher de role "mail". La fenetre calendrier sera creee (et
+    ' surveillee) a la demande au premier basculement vers le calendrier.
+    Set mExplorerWatchers = New Collection
+    mExplWatchSeq = 0
+    Set mMailExplorer = Nothing
+    Set mCalendarExplorer = Nothing
+    AttachWatcher Application.ActiveExplorer, ROLE_MAIL
+    mSwitchGuardUntil = 0
+
+    modNewMeetingDefault.InitEvents
+    modReplyInPlace.EnsureInit
+
+    ' v10.9 : backup mensuel differe a +210 s (la 1re session du mois
+    ' copiait OTM + classeurs + registre en SYNCHRONE au demarrage). Garde
+    ' mensuelle interne inchangee : les autres jours, l'appel differe
+    ' ressort immediatement. 210 s : tous les timers de demarrage restent
+    ' sous la fenetre des 4 minutes de la regle d'edition VBE.
+    On Error Resume Next
+    modDefer.Arm "MonthlyBackup", 210
+    On Error GoTo 0
+
+    mQuickMovePromptBusy = False
+    mQuickMovePromptSince = 0
+    Set mPendingSentEntryIDs = New Collection
+
+    ' === NIVEAU DE LOG PILOTE PAR config.ini (cle DefaultLogLevel) ===
+    ' Le niveau est applique par modConfig.LoadConfig au demarrage
+    ' (defaut INFO = 1, pour conserver le comportement historique).
+    ' Pour changer durablement : editer DefaultLogLevel dans config.ini
+    ' puis Maintenance > Configuration > Recharger.
+    ' Pour un ajustement temporaire en session : fenetre Execution VBE ->
+    ' modDebugLog.LogDebugMode / LogTraceMode / LogOff (perdu au prochain
+    ' redemarrage si pas mis dans config.ini).
+    ' (Ancien appel en dur "modDebugLog.LogInfoMode" supprime : la valeur
+    '  vient desormais de la config.)
+
+    ' Rattrapage des RDV synchronises pendant qu'Outlook etait ferme :
+    ' acceptation iOS sans Outlook PC ouvert -> aucun ItemAdd/Change
+    ' n'est emis. On planifie un scan +15s pour laisser la synchro
+    ' initiale OST se terminer avant de balayer les RDV non colores.
+    If Not quickRestart Then
+        On Error Resume Next
+        modDefer.Arm "CatchUpColor", 15
+        On Error GoTo 0
+    End If
+
+    ' v3.1 (2026-05-28) : rappel des suivis de mail en retard, differe +20s
+    ' (apres le rattrapage coloration a +15s, pour ne pas empiler les
+    ' freezes au demarrage). Affiche une MsgBox UNIQUEMENT s'il y a des
+    ' retards ; garde-fou "une pop par jour" cote module. Echec silencieux
+    ' si tracker absent.
+    On Error Resume Next
+    modDefer.Arm "RemindOverdue", 20
+    On Error GoTo 0
+
+    ' v8 (2026-06-14) : rattrapage des courriels ENVOYES depuis iOS pendant
+    ' qu'Outlook etait ferme (la synchro differee n'emet aucun ItemAdd).
+    ' +25s : apres les autres rattrapages. Range ceux dont le fil est deja
+    ' classe ; un seul toast resume a la fin.
+    If Not quickRestart Then
+        On Error Resume Next
+        modDefer.Arm "SentCatchUp", 25
+        On Error GoTo 0
+    End If
+
+    ' v4 (2026-06-10) : health-check des bindings WithEvents. Silencieux si
+    ' tout est OK ; MsgBox d'alerte sinon (les bindings morts non detectes
+    ' etaient la 1re cause des regressions "la fonction ne marche plus").
+    On Error Resume Next
+    modMaintenance.AssertBindings True
+    On Error GoTo 0
+
+    ' v10.12 (2026-09-15) : guide de demarrage rapide, propose +8 s apres le
+    ' demarrage si aucun config.ini n'existe (conditions dans
+    ' modQuickStart.AutoWanted : marqueur registre "never" / "done" / "later
+    ' aujourd'hui" respectes). Jamais de boite depuis Application_Startup.
+    On Error Resume Next
+    If modQuickStart.AutoWanted() Then modDefer.Arm "QuickStart", 8
+    On Error GoTo 0
+
+    modDebugLog.DInfo MOD_NAME, "Application_Startup termine"
+End Sub
+
+'=============================================================================
+' Application_Quit (v10.8) - marqueur de fermeture PROPRE. Si ce marqueur
+' manque avant le prochain SESSION START dans debug.log, la session s'est
+' terminee par un plantage : l'heure du crash est celle de la derniere
+' ligne ecrite avant le START suivant.
+'=============================================================================
+Private Sub Application_Quit()
+    On Error Resume Next
+    ' v10.10 : horodatage de fin de session pour la detection de
+    ' redemarrage rapide (Str$ : point decimal independant de la locale).
+    SaveSetting "Toolkit", "Session", "LastEnd", Str$(CDbl(Now))
+    modDebugLog.DLogSection "SESSION END (fermeture propre)"
+End Sub
+
+'=============================================================================
+' RebindEvents - rejoue les WithEvents apres une sauvegarde VBE
+'=============================================================================
+Public Sub RebindEvents()
+    Set mSentItems = Application.GetNamespace("MAPI").GetDefaultFolder(olFolderSentMail).items
+
+    Dim calFolder As Outlook.MAPIFolder
+    Set calFolder = Application.Session.GetDefaultFolder(olFolderCalendar)
+    Set CalendarItems = calFolder.items
+    bTaggingBusy = False
+    bCalendarEventsSuspended = False
+
+    ' v10 : reconstruire les watchers de fenetres a role. Apres un reset
+    ' d'etat (Ctrl+S VBE) la collection et les WithEvents sont morts ; on
+    ' repart de la fenetre active comme fenetre courrier. La fenetre calendrier
+    ' sera re-surveillee au prochain basculement.
+    Set mExplorerWatchers = New Collection
+    mExplWatchSeq = 0
+    Set mMailExplorer = Nothing
+    Set mCalendarExplorer = Nothing
+    AttachWatcher Application.ActiveExplorer, ROLE_MAIL
+    mSwitchGuardUntil = 0
+    If mPendingSentEntryIDs Is Nothing Then Set mPendingSentEntryIDs = New Collection
+
+    ' v3 (2026-05-27) : invalider le cache des EntryID systeme dans
+    ' modReplyInPlace. Il sera repeuple au prochain appel d'EnsureInit.
+    On Error Resume Next
+    modReplyInPlace.InvalidateSysCache
+    On Error GoTo 0
+
+    ' v10.12 : rearmer les watchers d'alertes nouveau mail (WithEvents perdus).
+    On Error Resume Next
+    modInboxAlert.InboxAlertStart
+    On Error GoTo 0
+
+    modDebugLog.DInfo MOD_NAME, "RebindEvents OK"
+End Sub
+
+Private Sub Application_Reminder(ByVal Item As Object)
+    On Error Resume Next
+
+    ' v6 : point de passage watchdog.
+    CheckBindingsWatchdog
+
+    ' Pack v3 (C6) : un eventuel RDV technique "QuickMove_BackgroundReindex"
+    ' herite d'une version anterieure est simplement supprime (la
+    ' reindexation passe par modDefer "Reindex").
+    If TypeOf Item Is Outlook.AppointmentItem Then
+        If Item.subject = "QuickMove_BackgroundReindex" Then
+            Item.Delete
+            Exit Sub
+        End If
+    End If
+
+    If TypeOf Item Is Outlook.mailItem Then
+        Dim handled As Boolean
+        handled = modSnooze.HandleSnoozeReminder(Item)
+    End If
+
+    On Error GoTo 0
+End Sub
+
+'=============================================================================
+' COURRIER ET CALENDRIER DANS DEUX FENETRES A ROLE STABLE  (v10 - 2026-06-16)
+'
+' Principe : chaque fenetre a role (courrier / calendrier) est surveillee par
+' une instance de clsExplorerWatcher. Quand une fenetre derive hors de son
+' role (clic sur le module de l'autre type), HandleExplorerSwitch la rapatrie
+' sur son dossier et active/cree la fenetre de l'autre role. Bilan : une
+' fenetre porte toujours le courrier, une autre toujours le calendrier.
+'
+' Anti-rebond (v10.2) : SelectFolder ET Activate relancent chacun un
+' FolderSwitch, mais APRES la fin de cette procedure (au cycle de message
+' suivant). Un drapeau synchrone ne les couvre donc pas. On utilise une GARDE
+' TEMPORELLE : pendant SWITCH_GUARD_MS apres une intervention, tout
+' FolderSwitch est ignore, le temps qu'Outlook emette et epuise ses rebonds.
+'
+' Ordre des operations (v10.2) : on rapatrie d'ABORD la fenetre qui a derive
+' sur son propre dossier, et on active la fenetre de l'autre role EN DERNIER.
+' Ainsi le dernier geste de focus est le bon ; sinon les deux fenetres se
+' disputent le premier plan (symptome : le courrier passe devant puis
+' "disparait").
+'
+' Fenetres libres : une fenetre ouverte volontairement par l'utilisateur (clic
+' droit dossier -> "Ouvrir dans une nouvelle fenetre") n'a PAS de watcher,
+' donc n'est jamais interceptee.
+'=============================================================================
+
+'-----------------------------------------------------------------------------
+' HandleExplorerSwitch - appele par un watcher quand SA fenetre change de
+' dossier. role = role de la fenetre qui a switche ("mail" ou "calendar").
+'-----------------------------------------------------------------------------
+Public Sub HandleExplorerSwitch(ByVal exp As Outlook.Explorer, ByVal role As String)
+    If CAL_SEPARATE_WINDOW_ENABLED <> 1 Then Exit Sub
+    If exp Is Nothing Then Exit Sub
+
+    ' Garde temporelle : on ignore les FolderSwitch declenches par nos propres
+    ' SelectFolder/Activate (rebonds) pendant la fenetre de garde.
+    If SwitchGuardActive() Then Exit Sub
+
+    On Error GoTo CleanSwitch
+
+    Dim switchedFolder As Outlook.folder
+    Set switchedFolder = exp.CurrentFolder
+    If switchedFolder Is Nothing Then Exit Sub
+
+    Dim isCalendarFolder As Boolean
+    isCalendarFolder = (switchedFolder.DefaultItemType = olAppointmentItem)
+
+    If role = ROLE_MAIL Then
+        ' Fenetre courrier : on n'intervient QUE si elle derive vers le
+        ' calendrier. Toute autre navigation courrier (entre dossiers de mail)
+        ' est laissee libre.
+        If Not isCalendarFolder Then Exit Sub
+
+        ArmSwitchGuard                              ' couvre le rapatriement + rebonds
+        SendExplorerToMail exp                      ' rapatrie CETTE fenetre sur le courrier
+        ' Activation de la fenetre calendrier DIFFEREE (~300 ms) : si on
+        ' l'active en synchrone, le rapatriement ci-dessus (mis en file par
+        ' Outlook) reprend le focus juste apres et annule l'activation -
+        ' surtout en fenetres superposees sur le meme ecran. Differer garantit
+        ' que l'activation est le DERNIER geste, apres l'application du
+        ' rapatriement et des rebonds. Voir ActivateRoleDeferred.
+        modDefer.ArmMs "ActivateRole", 300, ROLE_CALENDAR
+        Exit Sub
+
+    ElseIf role = ROLE_CALENDAR Then
+        ' Fenetre calendrier : on n'intervient QUE si elle derive HORS du
+        ' calendrier (clic Message / Contacts / Taches...). Rester dans le
+        ' calendrier (changer de vue, de date) est laisse libre.
+        If isCalendarFolder Then Exit Sub
+
+        ArmSwitchGuard                              ' couvre le rapatriement + rebonds
+        SendExplorerToCalendar exp                  ' rapatrie CETTE fenetre sur le calendrier
+        ' Activation de la fenetre courrier DIFFEREE (cf. commentaire ci-dessus).
+        modDefer.ArmMs "ActivateRole", 300, ROLE_MAIL
+        Exit Sub
+    End If
+
+    Exit Sub
+
+CleanSwitch:
+End Sub
+
+'-----------------------------------------------------------------------------
+' ActivateRoleDeferred - appele par modDefer (cle "ActivateRole") ~300 ms
+' apres un rapatriement, pour activer (ou creer) la fenetre du role cible.
+' Differe expres : en synchrone, le rapatriement reprend le focus et annule
+' l'activation (fenetres superposees, meme ecran). Ici le rapatriement et les
+' rebonds sont deja appliques, donc cette activation est le dernier geste et
+' tient. On re-arme la garde car Activate peut declencher un FolderSwitch.
+' argText = ROLE_MAIL ou ROLE_CALENDAR.
+'-----------------------------------------------------------------------------
+Public Sub ActivateRoleDeferred(ByVal targetRole As String)
+    On Error Resume Next
+    ArmSwitchGuard
+
+    If targetRole = ROLE_MAIL Then
+        EnsureMailExplorer
+    ElseIf targetRole = ROLE_CALENDAR Then
+        EnsureCalendarExplorer
+    End If
+
+    ' v10.5 : rollback v10.4 - plus de remontee forcee par titre exact
+    ' (fragile : HWND introuvable des que le titre reel differe de
+    ' Explorer.Caption ; fenetre minimisee jamais restauree). Ensure* fait
+    ' deja Explorer.Activate ; on re-arme la garde car Activate peut
+    ' declencher un FolderSwitch.
+    ArmSwitchGuard
+    On Error GoTo 0
+End Sub
+
+'-----------------------------------------------------------------------------
+' Garde temporelle anti-rebond (v10.2).
+'-----------------------------------------------------------------------------
+Private Sub ArmSwitchGuard()
+    On Error Resume Next
+    mSwitchGuardUntil = GetTickCount() + SWITCH_GUARD_MS
+End Sub
+
+Private Function SwitchGuardActive() As Boolean
+    On Error Resume Next
+    ' GetTickCount repasse a 0 tous les ~49 jours : la comparaison signee
+    ' reste correcte sur une fenetre de 1,5 s sauf a cheval exact sur le
+    ' wrap (cas negligeable ; au pire un switch non filtre isole).
+    SwitchGuardActive = (GetTickCount() < mSwitchGuardUntil)
+End Function
+
+'-----------------------------------------------------------------------------
+' SendExplorerToMail - remet une fenetre sur la boite de reception et bascule
+' son volet de navigation sur le module Courrier.
+'-----------------------------------------------------------------------------
+Private Sub SendExplorerToMail(ByVal exp As Outlook.Explorer)
+    On Error Resume Next
+    exp.SelectFolder Application.Session.GetDefaultFolder(olFolderInbox)
+    Dim np As Outlook.NavigationPane
+    Set np = exp.NavigationPane
+    If Not np Is Nothing Then
+        Set np.CurrentModule = np.Modules.GetNavigationModule(olModuleMail)
+    End If
+    On Error GoTo 0
+End Sub
+
+'-----------------------------------------------------------------------------
+' SendExplorerToCalendar - remet une fenetre sur le calendrier par defaut et
+' bascule son volet de navigation sur le module Calendrier.
+'-----------------------------------------------------------------------------
+Private Sub SendExplorerToCalendar(ByVal exp As Outlook.Explorer)
+    On Error Resume Next
+    exp.SelectFolder Application.Session.GetDefaultFolder(olFolderCalendar)
+    Dim np As Outlook.NavigationPane
+    Set np = exp.NavigationPane
+    If Not np Is Nothing Then
+        Set np.CurrentModule = np.Modules.GetNavigationModule(olModuleCalendar)
+    End If
+    On Error GoTo 0
+End Sub
+
+'-----------------------------------------------------------------------------
+' EnsureCalendarExplorer - garantit une fenetre calendrier vivante :
+'   - si mCalendarExplorer existe encore, l'active (et reapplique sa position) ;
+'   - sinon en cree une, lui applique la position memorisee et l'attache a un
+'     watcher de role "calendar".
+'-----------------------------------------------------------------------------
+Private Sub EnsureCalendarExplorer()
+    On Error GoTo ErrCreate
+
+    If IsExplorerAlive(mCalendarExplorer) Then
+        mCalendarExplorer.Activate
+        ApplyRememberedPosition mCalendarExplorer
+        ArmBirthdayViewSetup
+        Exit Sub
+    End If
+
+    Set mCalendarExplorer = Nothing
+
+    Dim calFolder As Outlook.folder
+    Set calFolder = Application.Session.GetDefaultFolder(olFolderCalendar)
+
+    Set mCalendarExplorer = Application.Explorers.Add(calFolder, olFolderDisplayNormal)
+    mCalendarExplorer.Display
+    DoEvents
+    ApplyRememberedPosition mCalendarExplorer        ' position memorisee : calendrier UNIQUEMENT
+    mCalendarExplorer.Activate
+    AttachWatcher mCalendarExplorer, ROLE_CALENDAR
+    ArmBirthdayViewSetup
+    Exit Sub
+
+ErrCreate:
+    modDebugLog.DError MOD_NAME, "EnsureCalendarExplorer err " & Err.Number & " - " & Err.Description
+    Set mCalendarExplorer = Nothing
+End Sub
+
+'-----------------------------------------------------------------------------
+' ArmBirthdayViewSetup (v10.13) - arme la mise en place DIFFEREE de la vue
+' calendrier des anniversaires (calendrier dans "Mes calendriers", coche, en
+' superposition, les autres decoches, vue Semaine). Pilote par config.ini
+' (BirthdayCalendarAutoShow) ; garde cote modContactBirthday : sans effet une
+' fois la vue VERIFIEE. Pourquoi differer : juste apres Explorers.Add/Display
+' la fenetre n'est pas construite, son volet n'est pas le vrai, et Outlook
+' recharge ses calendriers coches apres coup (symptome : coche qui flashe
+' cote courrier puis fenetre calendrier decochee). ArmUniqueMs : un seul
+' timer en attente meme si Ensure* est appele plusieurs fois de suite.
+' NE PEUT PAS se faire dans Application_Startup : NavigationFolder.IsSelected
+' n'est modifiable que si le module Calendrier est le module COURANT du volet.
+'-----------------------------------------------------------------------------
+Private Sub ArmBirthdayViewSetup()
+    On Error Resume Next
+    If mCalendarExplorer Is Nothing Then Exit Sub
+    If Not modContactBirthday.ContactBirthdayViewPending() Then Exit Sub
+    modDefer.ArmUniqueMs "BirthdayView", BIRTHDAY_VIEW_DELAY_MS, "1"
+    On Error GoTo 0
+End Sub
+
+'-----------------------------------------------------------------------------
+' SetupBirthdayViewDeferred (v10.13) - cible modDefer (cle "BirthdayView").
+' Applique la vue sur mCalendarExplorer (deux fenetres a role : ActiveExplorer
+' serait ambigu), puis, si modContactBirthday n'a pas pu VERIFIER le coche,
+' re-arme une tentative +BIRTHDAY_VIEW_RETRY_MS (plafond cote module). La
+' garde anti-rebond est re-armee : CurrentModule peut emettre un FolderSwitch.
+' Silencieux, aucune erreur visible.
+'-----------------------------------------------------------------------------
+Public Sub SetupBirthdayViewDeferred(ByVal attemptText As String)
+    On Error Resume Next
+    If Not IsExplorerAlive(mCalendarExplorer) Then Exit Sub
+    If Not modContactBirthday.ContactBirthdayViewPending() Then Exit Sub
+
+    ArmSwitchGuard
+    modContactBirthday.ContactBirthdaySetupView mCalendarExplorer
+    If Err.Number <> 0 Then
+        modDebugLog.DDebug MOD_NAME, "SetupBirthdayViewDeferred err " & Err.Number
+        Err.Clear
+    End If
+    ArmSwitchGuard
+
+    If modContactBirthday.ContactBirthdayViewPending() Then
+        Dim nextAttempt As Long
+        nextAttempt = Val(attemptText) + 1
+        modDebugLog.DDebug MOD_NAME, "Vue anniversaires non confirmee, re-armement (tentative " & nextAttempt & ")"
+        modDefer.ArmUniqueMs "BirthdayView", BIRTHDAY_VIEW_RETRY_MS, CStr(nextAttempt)
+    End If
+    On Error GoTo 0
+End Sub
+
+'-----------------------------------------------------------------------------
+' EnsureMailExplorer - garantit une fenetre courrier vivante :
+'   - si mMailExplorer existe encore, l'active ;
+'   - sinon en cree une sur la boite de reception et l'attache a un watcher de
+'     role "mail". (Pas de position memorisee cote courrier : choix produit.)
+'-----------------------------------------------------------------------------
+Private Sub EnsureMailExplorer()
+    On Error GoTo ErrCreate
+
+    If IsExplorerAlive(mMailExplorer) Then
+        mMailExplorer.Activate
+        Exit Sub
+    End If
+
+    Set mMailExplorer = Nothing
+
+    Dim inboxFolder As Outlook.folder
+    Set inboxFolder = Application.Session.GetDefaultFolder(olFolderInbox)
+
+    Set mMailExplorer = Application.Explorers.Add(inboxFolder, olFolderDisplayNormal)
+    mMailExplorer.Display
+    DoEvents
+    mMailExplorer.Activate
+    AttachWatcher mMailExplorer, ROLE_MAIL
+    Exit Sub
+
+ErrCreate:
+    modDebugLog.DError MOD_NAME, "EnsureMailExplorer err " & Err.Number & " - " & Err.Description
+    Set mMailExplorer = Nothing
+End Sub
+
+'-----------------------------------------------------------------------------
+' AttachWatcher - cree un clsExplorerWatcher sur une fenetre, le memorise dans
+' mExplorerWatchers (sinon GC) et met a jour la reference de role.
+' Tolere exp = Nothing (cas demarrage sans fenetre active).
+'-----------------------------------------------------------------------------
+Private Sub AttachWatcher(ByVal exp As Outlook.Explorer, ByVal role As String)
+    On Error Resume Next
+    If exp Is Nothing Then
+        modDebugLog.DTrace MOD_NAME, "AttachWatcher : pas de fenetre (role=" & role & ")"
+        Exit Sub
+    End If
+    If mExplorerWatchers Is Nothing Then Set mExplorerWatchers = New Collection
+
+    mExplWatchSeq = mExplWatchSeq + 1
+    Dim key As String
+    key = "exp_" & mExplWatchSeq
+
+    Dim w As clsExplorerWatcher
+    Set w = New clsExplorerWatcher
+    w.Init exp, role, key
+    mExplorerWatchers.Add w, key
+
+    If role = ROLE_MAIL Then
+        Set mMailExplorer = exp
+        ' Pack v3 (A5) : clsAppEvents ecoutait l'InlineResponse de la SEULE
+        ' fenetre active a l'init. Une fenetre courrier fermee puis recreee
+        ' (EnsureMailExplorer) perdait ReplyInPlace inline, ReplyGreeting et
+        ' HideBcc jusqu'au prochain Reinit. On re-lie a chaque attache.
+        modNewMeetingDefault.RebindInlineExplorer exp
+    ElseIf role = ROLE_CALENDAR Then
+        Set mCalendarExplorer = exp
+    End If
+
+    modDebugLog.DTrace MOD_NAME, "Watcher attache (role=" & role & ", key=" & key & ")"
+    On Error GoTo 0
+End Sub
+
+'-----------------------------------------------------------------------------
+' OnExplorerWatcherClosed - appele par un watcher quand SA fenetre se ferme.
+' On retire le watcher de la collection et on oublie la reference de role.
+'-----------------------------------------------------------------------------
+Public Sub OnExplorerWatcherClosed(ByVal key As String, ByVal role As String)
+    On Error Resume Next
+    If Not mExplorerWatchers Is Nothing Then mExplorerWatchers.Remove key
+
+    If role = ROLE_MAIL Then
+        Set mMailExplorer = Nothing
+    ElseIf role = ROLE_CALENDAR Then
+        Set mCalendarExplorer = Nothing
+    End If
+
+    modDebugLog.DTrace MOD_NAME, "Watcher libere (role=" & role & ", key=" & key & ")"
+    On Error GoTo 0
+End Sub
+
+'-----------------------------------------------------------------------------
+' WatcherForRole - renvoie le watcher VIVANT du role demande, ou Nothing.
+' Nettoie au passage les watchers dont la fenetre est morte.
+'-----------------------------------------------------------------------------
+Private Function WatcherForRole(ByVal role As String) As clsExplorerWatcher
+    On Error Resume Next
+    Set WatcherForRole = Nothing
+    If mExplorerWatchers Is Nothing Then Exit Function
+
+    Dim w As clsExplorerWatcher
+    Dim i As Long
+    For i = mExplorerWatchers.count To 1 Step -1
+        Set w = mExplorerWatchers.Item(i)
+        If w Is Nothing Then
+            mExplorerWatchers.Remove i
+        ElseIf Not w.IsAlive Then
+            mExplorerWatchers.Remove i
+        ElseIf w.Role = role Then
+            Set WatcherForRole = w
+            Exit Function
+        End If
+    Next i
+    On Error GoTo 0
+End Function
+
+'-----------------------------------------------------------------------------
+' IsExplorerAlive - True si l'Explorer reference est encore ouvert (la lecture
+' d'une propriete sur une fenetre fermee leve une erreur).
+'-----------------------------------------------------------------------------
+Private Function IsExplorerAlive(ByVal exp As Outlook.Explorer) As Boolean
+    On Error Resume Next
+    IsExplorerAlive = False
+    If exp Is Nothing Then Exit Function
+    Dim dummy As Long
+    dummy = exp.Left
+    If Err.Number = 0 Then IsExplorerAlive = True
+    Err.Clear
+    On Error GoTo 0
+End Function
+
+
+Private Sub ApplyRememberedPosition(exp As Outlook.Explorer)
+    On Error GoTo ErrPos
+
+    Dim sL As String, sT As String, sW As String, sH As String
+    sL = GetSetting("Outlook_Calendrier", "Position", "Left", "")
+    sT = GetSetting("Outlook_Calendrier", "Position", "Top", "")
+    sW = GetSetting("Outlook_Calendrier", "Position", "Width", "")
+    sH = GetSetting("Outlook_Calendrier", "Position", "Height", "")
+
+    If Len(sL) = 0 Or Len(sT) = 0 Or Len(sW) = 0 Or Len(sH) = 0 Then Exit Sub
+
+    exp.WindowState = olNormalWindow
+    exp.Left = CLng(sL)
+    exp.Top = CLng(sT)
+    exp.Width = CLng(sW)
+    exp.Height = CLng(sH)
+    Exit Sub
+ErrPos:
+End Sub
+
+Public Sub RememberCalendarPosition()
+    On Error GoTo ErrMem
+
+    Dim expToSave As Outlook.Explorer
+    Set expToSave = Nothing
+
+    If Not mCalendarExplorer Is Nothing Then
+        On Error Resume Next
+        Dim testLeft As Long
+        testLeft = mCalendarExplorer.Left
+        If Err.Number = 0 Then Set expToSave = mCalendarExplorer
+        Err.Clear
+        On Error GoTo ErrMem
+    End If
+
+    If expToSave Is Nothing Then
+        Dim actExp As Outlook.Explorer
+        Set actExp = Application.ActiveExplorer
+        If Not actExp Is Nothing Then
+            If Not actExp.CurrentFolder Is Nothing Then
+                If actExp.CurrentFolder.DefaultItemType = olAppointmentItem Then
+                    Set expToSave = actExp
+                End If
+            End If
+        End If
+    End If
+
+    If expToSave Is Nothing Then
+        MsgBox T("Aucune fen~xtre calendrier active trouv~ee.", "No active calendar window found."), vbExclamation, T("Memorisation position", "Save position")
+        Exit Sub
+    End If
+
+    If expToSave.WindowState = olMaximized Then
+        MsgBox T("La fen~xtre calendrier est maximis~ee. Restaure-la d'abord.", "The calendar window is maximized. Restore it first."), _
+               vbInformation, T("Memorisation position", "Save position")
+        Exit Sub
+    End If
+
+    Dim leftV As Long, topV As Long, widthV As Long, heightV As Long
+    leftV = expToSave.Left
+    topV = expToSave.Top
+    widthV = expToSave.Width
+    heightV = expToSave.Height
+
+    SaveSetting "Outlook_Calendrier", "Position", "Left", CStr(leftV)
+    SaveSetting "Outlook_Calendrier", "Position", "Top", CStr(topV)
+    SaveSetting "Outlook_Calendrier", "Position", "Width", CStr(widthV)
+    SaveSetting "Outlook_Calendrier", "Position", "Height", CStr(heightV)
+
+    MsgBox T("Position memorisee.", "Position saved."), vbInformation, T("Memorisation position", "Save position")
+    Exit Sub
+ErrMem:
+    MsgBox T("Erreur : ", "Error: ") & Err.Number & " - " & Err.Description, vbExclamation, T("Memorisation position", "Save position")
+End Sub
+
+Public Sub ForgetCalendarPosition()
+    On Error Resume Next
+    DeleteSetting "Outlook_Calendrier", "Position"
+    On Error GoTo 0
+    MsgBox T("Position oubliee.", "Position cleared."), vbInformation, T("Position calendrier", "Calendar position")
+End Sub
+
+'=============================================================================
+' Projet
+'=============================================================================
+Private Function IsTechnicalEvent(ByVal Item As Object) As Boolean
+    IsTechnicalEvent = False
+    If Not TypeOf Item Is Outlook.AppointmentItem Then
+        IsTechnicalEvent = True
+        Exit Function
+    End If
+    Dim appt As Outlook.AppointmentItem
+    Set appt = Item
+
+    ' v10.7 : lecture des proprietes sous garde d'erreur. Un item en cours
+    ' de suppression ou de synchro Exchange (typiquement le RDV technique
+    ' QuickMove qui vient d'etre supprime) leve MAPI_E_NOT_FOUND (8004010F)
+    ' sur .subject ou .Categories. Comme cette fonction est appelee AVANT
+    ' le On Error GoTo des handlers, l'erreur remontait a l'utilisateur.
+    ' Un item illisible n'a rien a faire dans le pipeline => True (skip).
+    Dim subj As String, cats As String
+    On Error Resume Next
+    subj = appt.subject
+    cats = appt.Categories
+    If Err.Number <> 0 Then
+        modDebugLog.DInfo MOD_NAME, "IsTechnicalEvent: item illisible (err " & _
+            Err.Number & "), skip"
+        Err.Clear
+        On Error GoTo 0
+        IsTechnicalEvent = True
+        Exit Function
+    End If
+    On Error GoTo 0
+
+    If InStr(1, subj, "QuickMove_", vbTextCompare) > 0 Then
+        IsTechnicalEvent = True
+        Exit Function
+    End If
+    If InStr(1, cats, "QuickMove", vbTextCompare) > 0 Then
+        IsTechnicalEvent = True
+        Exit Function
+    End If
+End Function
+
+Private Function SubjectAlreadyTagged(ByVal subjectText As String) As Boolean
+    SubjectAlreadyTagged = False
+    Dim p1 As Long
+    p1 = InStr(subjectText, "[")
+    If p1 = 0 Then Exit Function
+    Dim p2 As Long
+    p2 = InStr(p1, subjectText, "]")
+    If p2 > p1 + 1 Then SubjectAlreadyTagged = True
+End Function
+
+' NB (v10.6) : "ProjectAsk" est une UserProperty FONCTIONNELLE volontairement
+' FIXE (hors config, contrairement a UpTag) : elle ne marque que "deja
+' propose" et n'a pas besoin d'etre configurable ni migrable.
+Private Function AlreadyProposed(ByVal appt As Outlook.AppointmentItem) As Boolean
+    AlreadyProposed = False
+    On Error Resume Next
+    Dim up As Outlook.UserProperty
+    Set up = appt.UserProperties.Find("ProjectAsk")
+    If Not up Is Nothing Then AlreadyProposed = True
+    On Error GoTo 0
+End Function
+
+Private Sub MarkProposed(ByVal appt As Outlook.AppointmentItem)
+    On Error Resume Next
+    Dim up As Outlook.UserProperty
+    Set up = appt.UserProperties.Find("ProjectAsk")
+    If up Is Nothing Then
+        Set up = appt.UserProperties.Add("ProjectAsk", olText, False)
+    End If
+    up.Value = "1"
+    appt.Save
+    On Error GoTo 0
+End Sub
+
+'=============================================================================
+' IsExternalSync - filtre les ItemAdd/ItemChange provoques par la synchro
+' MAPI/Exchange d'invitations deja acceptees ailleurs (ex : Outlook for iOS).
+'
+' Probleme : quand on accepte une invitation depuis iOS, l'evenement arrive
+' sur Exchange avec ResponseStatus=Accepted. Quand on ouvre Outlook Desktop
+' ensuite, MAPI synchronise l'item local, ce qui declenche un ItemAdd puis
+' tres souvent un ItemChange (propagation des proprietes body/MIME).
+' L'ItemChange franchissait le filtre ResponseStatus=olResponseAccepted et
+' declenchait la popup Projet d'affectation alors qu'il s'agit d'une simple
+' convergence d'etat serveur, pas d'une action utilisateur locale.
+'
+' Heuristique : un RDV NON-ORGANISE dont LastModificationTime est anterieur
+' de plus de 120 s au moment actuel est un sync, pas une action recente.
+'  - Un clic "Accepter" depuis Desktop produit un ItemChange dans la seconde
+'    qui suit, donc reste sous la marge.
+'  - Un RDV organise par moi-meme : Organized => retourne False, pas d'impact
+'    sur le flow normal de creation de RDV.
+'  - Coloration, anti-chevauchement, private-auto continuent a tourner :
+'    le filtre s'applique UNIQUEMENT autour de CheckAssignment.
+'=============================================================================
+Private Function IsExternalSync(ByVal appt As Outlook.AppointmentItem) As Boolean
+    IsExternalSync = False
+    On Error Resume Next
+    If appt.ResponseStatus = olResponseOrganized Then Exit Function
+    Dim ageSec As Long
+    ageSec = DateDiff("s", appt.LastModificationTime, Now)
+    If ageSec > 120 Then
+        IsExternalSync = True
+        modDebugLog.DInfo MOD_NAME, "Sync MAPI detectee (skip popup projet) '" & _
+            Left(appt.subject, 60) & "' age=" & ageSec & "s status=" & appt.ResponseStatus
+    End If
+    On Error GoTo 0
+End Function
+
+Private Sub CalendarItems_ItemAdd(ByVal Item As Object)
+    If bTaggingBusy Then Exit Sub
+    If bCalendarEventsSuspended Then Exit Sub
+    If IsTechnicalEvent(Item) Then Exit Sub
+
+    Dim appt As Outlook.AppointmentItem
+    Set appt = Item
+
+    modDebugLog.DTrace MOD_NAME, "CalendarItems_ItemAdd '" & appt.subject & _
+        "' responseStatus=" & appt.ResponseStatus
+
+    bTaggingBusy = True
+    On Error GoTo CleanupAdd
+
+    ' Garde anti-sync MAPI (cf. IsExternalSync) : si l'item arrive par
+    ' synchro Exchange (invitation deja acceptee ailleurs), on ne declenche
+    ' PAS la popup Projet. Le filtre olResponseOrganized ci-dessous l'attrape
+    ' deja dans le cas le plus courant, IsExternalSync est une securite
+    ' supplementaire pour les rares cas ou MAPI ferait remonter un add avec
+    ' un status non encore stabilise.
+    If Not IsExternalSync(appt) Then
+        If appt.ResponseStatus = olResponseOrganized Then
+            If appt.entryID <> sLastRefusedEntryID Then
+                Dim tague As Boolean
+                tague = modProjectTag.CheckAssignment(appt)
+                MarkProposed appt
+            End If
+        End If
+    End If
+
+    modMeetingColor.ApplyCategory appt
+    modAntiOverlap.TryShift appt
+    modAppointmentPrivacy.ApplyIfPersonal appt
+    modMeetingToAppointment.DemoteIfEmptyMeeting appt
+
+    bTaggingBusy = False
+    Exit Sub
+
+CleanupAdd:
+    modDebugLog.DError MOD_NAME, "ItemAdd handler err " & Err.Number & _
+        " - " & Err.Description
+    bTaggingBusy = False
+End Sub
+
+Private Sub CalendarItems_ItemChange(ByVal Item As Object)
+    If bTaggingBusy Then Exit Sub
+    If bCalendarEventsSuspended Then Exit Sub
+    If IsTechnicalEvent(Item) Then Exit Sub
+
+    Dim appt As Outlook.AppointmentItem
+    Set appt = Item
+
+    If appt.entryID = sLastRefusedEntryID Then Exit Sub
+
+    modDebugLog.DTrace MOD_NAME, "CalendarItems_ItemChange '" & appt.subject & "'"
+
+    bTaggingBusy = True
+    On Error GoTo Cleanup1
+
+    modProjectTag.CheckReTag appt
+
+    If Not SubjectAlreadyTagged(appt.subject) Then
+        If Not AlreadyProposed(appt) Then
+            If appt.ResponseStatus = olResponseAccepted Then
+                ' Garde anti-sync MAPI : un ItemChange provoque par la
+                ' synchro Exchange d'une invitation deja acceptee sur iOS
+                ' (ou autre client) ne doit PAS declencher la popup Projet.
+                ' Cf. IsExternalSync. C'est ICI le vrai point d'entree
+                ' du bug, le filtre olResponseAccepted laissait tout passer.
+                If Not IsExternalSync(appt) Then
+                    Dim tague As Boolean
+                    tague = modProjectTag.CheckAssignment(appt)
+                    MarkProposed appt
+                End If
+            End If
+        End If
+    End If
+
+    modMeetingColor.ApplyCategory appt
+    modAntiOverlap.TryShift appt
+    modAppointmentPrivacy.ApplyIfPersonal appt
+    modMeetingToAppointment.DemoteIfEmptyMeeting appt
+
+Cleanup1:
+    If Err.Number <> 0 Then
+        modDebugLog.DError MOD_NAME, "ItemChange handler err " & Err.Number & _
+            " - " & Err.Description
+    End If
+    bTaggingBusy = False
+End Sub
+
+Private Sub Application_ItemSend(ByVal Item As Object, Cancel As Boolean)
+    On Error Resume Next
+
+    ' v6 : point de passage watchdog (auto-reparation des liaisons mortes).
+    ' Rebinder ICI sauve le mail en cours : mSentItems est rebranche AVANT
+    ' que l'item n'arrive dans les Envoyes.
+    CheckBindingsWatchdog
+
+    If TypeOf Item Is Outlook.MeetingItem Then
+        Dim mi As Outlook.MeetingItem
+        Set mi = Item
+
+        Dim appt As Outlook.AppointmentItem
+        Set appt = mi.GetAssociatedAppointment(False)
+
+        If Not appt Is Nothing Then
+            If Not IsTechnicalEvent(appt) Then
+                mi.subject = appt.subject
+            End If
+        End If
+    ElseIf TypeOf Item Is Outlook.mailItem Then
+        ' v10.3 (2026-06-17) : epingler le moniteur de la fenetre d'envoi pour
+        ' le toast "reponse rangee" a venir. Ici, la fenetre de reponse
+        ' (Inspector) ou la fenetre courrier (volet de lecture) est ENCORE au
+        ' premier plan, donc GetForegroundWindow est fiable. Au moment ou le
+        ' toast part reellement (mSentItems_ItemAdd -> TryMoveSentItem), cette
+        ' fenetre s'est fermee et le premier plan est instable. Best-effort.
+        modNotify.RememberToastMonitorFromForeground
+
+        ' v3.1 (2026-05-28) : detection "attente de reponse" (systeme expert).
+        ' LECTURE SEULE ici : EvaluateAndStore ne fait que calculer un score
+        ' et, si suspicion, memoriser l'EntryID + armer un differe +2s. Le
+        ' pop-up est affiche PLUS TARD (apres le tri QuickMove et le
+        ' deplacement Envoye->dossier de modReplyInPlace), pour ne JAMAIS
+        ' s'intercaler dans la chaine critique d'envoi.
+        modReplySuspicion.EvaluateAndStore Item
+
+        ' v11 (2026-07-13) : niveau URGENT -> suivi automatique. Le bandeau
+        ' Urgent porte la date limite ; on la lit, on synchronise les deux
+        ' bandeaux dessus, et on PROGRAMME l'ecriture du suivi apres l'envoi
+        ' (differe "UrgentFlush" : pas de COM Excel synchrone dans ItemSend).
+        ' Date non renseignee -> garde-fou (annuler / envoyer sans suivi).
+        Dim urgentHandled As Boolean
+        urgentHandled = False
+        If modMailConfidentiality.HasUrgentBanner(Item) Then
+            Dim urgDue As Date
+            urgDue = modMailConfidentiality.UrgentBannerDate(Item)
+            If urgDue = 0 Then
+                ' v10.9 : via modUi.Ask. Boite ouverte depuis
+                ' Application_ItemSend, donc pendant la fermeture de la
+                ' fenetre de redaction : premier plan instable, et un
+                ' "Non" jamais vu annulerait un envoi sans que
+                ' l'utilisateur comprenne pourquoi.
+                If modUi.Ask(T("Le bandeau Urgent n'a pas de date (jour non renseign~e).", _
+                               "The Urgent banner has no date (day not filled).") & vbCrLf & _
+                             T("Envoyer sans suivi malgr~e tout ?", _
+                               "Send without tracking anyway?"), _
+                             T("Suivi Mails", "Mail Tracking"), _
+                             vbQuestion + vbYesNo + vbDefaultButton2) = vbNo Then
+                    Cancel = True
+                    On Error GoTo 0
+                    Exit Sub
+                End If
+                ' Oui : envoi sans suivi.
+                urgentHandled = True
+            Else
+                modMailConfidentiality.FinalizeUrgentBanner Item
+                modMailResponseTracker.EnqueueUrgentTracking Item, urgDue
+                modDefer.Arm "UrgentFlush", 2
+                urgentHandled = True
+            End If
+        End If
+
+        ' v7 : relance PERSONNALISEE reellement envoyee. Le brouillon ouvert
+        ' par modMailResponseTracker (mode Personnaliser) porte le tag
+        ' "FollowupConvID". Si present, on programme la mise a jour de la
+        ' ligne de suivi APRES l'envoi (differe : pas de COM Excel synchrone
+        ' dans ItemSend). Tant que le brouillon n'est pas envoye, rien.
+        If Not urgentHandled Then
+            Dim fuProp As Object
+            Set fuProp = Item.UserProperties.Find("FollowupConvID")
+            If Not fuProp Is Nothing Then
+                Dim fuCID As String
+                fuCID = CStr(fuProp.Value)
+                If Len(fuCID) > 0 Then modDefer.Arm "FollowupSent", 2, fuCID
+            End If
+        End If
+
+        ' v12 (2026-07-15) : brouillon de CAMPAGNE envoye MANUELLEMENT ->
+        ' mise a jour differee du statut Excel ("Envoye manuellement le...").
+        ' Pas de COM Excel synchrone dans ItemSend : modMailCampaign memorise
+        ' la reference de ligne portee par le brouillon et arme "CampaignSent"
+        ' (+2 s, modDefer). Silencieux pour tout mail hors campagne.
+        modMailCampaign.CampaignOnItemSend Item
+    End If
+
+    On Error GoTo 0
+End Sub
+
+'=============================================================================
+' WATCHDOG BINDINGS (v6)
+' Les evenements Application_* de CE module sont cables par l'hote VBA et
+' continuent de tomber apres un reset d'etat (Ctrl+S VBE) ; les WithEvents
+' DECLARES (mSentItems, CalendarItems, g_AppEvents...), eux, meurent.
+' Chaque envoi / reception / rappel devient donc un point de controle :
+' si une des 3 liaisons jamais legitimement mortes est tombee, on
+' rebranche tout en silence (ReinitSilent recharge AUSSI la config :
+' couvre les globales g_* remises a zero) et on previent par un toast.
+' Les watchers de fenetres a role (courrier/calendrier) et InlineResponse sont
+' exclus du DECLENCHEUR (ils peuvent etre legitimement absents sans fenetre
+' active) mais sont reconstruits au passage par le rebind.
+'=============================================================================
+Private Sub CheckBindingsWatchdog()
+    On Error Resume Next
+    If bWatchdogBusy Then Exit Sub
+
+    Dim dead As Boolean
+    dead = False
+    If mSentItems Is Nothing Then dead = True
+    If CalendarItems Is Nothing Then dead = True
+    If Not modNewMeetingDefault.InspectorEventsBound() Then dead = True
+    If Not dead Then Exit Sub
+
+    bWatchdogBusy = True
+    modDebugLog.DError MOD_NAME, "Watchdog : liaisons mortes detectees -> ReinitSilent"
+    modDevTools.ReinitSilent
+    modNotify.Notify T("Liaisons ~ev~enements r~epar~ees automatiquement", _
+                       "Event bindings repaired automatically")
+    bWatchdogBusy = False
+End Sub
+
+Private Sub Application_NewMailEx(ByVal EntryIDCollection As String)
+    ' v6 : handler dedie au watchdog (evenement intrinseque a forte
+    ' frequence : chaque mail recu est une occasion d'auto-reparation).
+    On Error Resume Next
+    CheckBindingsWatchdog
+End Sub
+
+'=============================================================================
+' QUICKMOVE + REPLY-IN-PLACE
+'-----------------------------------------------------------------------------
+' v2 (2026-05-11) : prompt asynchrone + garde de reentrance.
+'
+' Probleme corrige :
+'   mSentItems_ItemAdd affichait une MsgBox modale directement depuis le
+'   handler d'evenement. Si plusieurs mails sont envoyes en rafale (ou si
+'   l'utilisateur tarde a repondre), chaque ItemAdd empile une MsgBox derriere
+'   la precedente. Outlook se retrouve avec N MsgBox cachees, le thread UI
+'   bloque, et plus aucun clic n'arrive a destination.
+'
+' Solution :
+'   1. ItemAdd ne fait plus QUE l'auto-classement silencieux (match unique).
+'      Si pas de match unique, l'EntryID part dans une file FIFO et le
+'      handler rend la main immediatement.
+'   2. Un differe modDefer +1s declenche ProcessNextSentPrompt qui depile
+'      le premier EntryID, recharge l'Item via GetItemFromID, puis affiche
+'      le prompt avec flag vbMsgBoxSetForeground + vbSystemModal.
+'   3. mQuickMovePromptBusy garantit qu'un seul prompt est ouvert a la fois.
+'      Si un nouveau mail arrive pendant que le prompt est affiche, il est
+'      simplement ajoute a la file et traite apres.
+'=============================================================================
+Private Sub mSentItems_ItemAdd(ByVal Item As Object)
+    On Error Resume Next
+
+    If Not TypeOf Item Is Outlook.mailItem Then Exit Sub
+
+    ' 0. Suspicion attente reponse : capturer l'EntryID du mail envoye AVANT
+    '    tout deplacement (ReplyInPlace deplace hors des Envoyes). Sans effet
+    '    si le mail n'a pas ete juge suspect a l'ItemSend. Le pop-up de suivi
+    '    est affiche en differe +2s par modReplySuspicion.
+    modReplySuspicion.CaptureSentItem Item
+
+    ' 1. Reply-in-place : range automatiquement la reponse dans le dossier
+    '    du mail parent (v10 : post-it memorise au brouillon, sinon repli
+    '    sur le dossier du fil via l'index de conversations). Silencieux.
+    If modReplyInPlace.TryMoveSentItem(Item) Then Exit Sub
+
+    ' 2. Auto-classement silencieux si match unique sur le prefill
+    '    (codes DOSS / contrat / opportunite trouves dans sujet+corps).
+    '    IMPORTANT v3 (2026-05-27) : utiliser ExtractPrefillSilent et non
+    '    ExtractPrefill, sinon en cas de candidats multiples dans le corps,
+    '    une MsgBox interactive est affichee depuis ce handler ItemAdd,
+    '    bloquant le thread UI Outlook. ExtractPrefillSilent renvoie ""
+    '    si plusieurs candidats body et le mail part dans la file FIFO
+    '    pour prompt en differe via modDefer.
+    If Not modQuickMove.IsIndexLoaded() Then modQuickMove.SmartLoad
+
+    Dim prefill As String
+    prefill = modQuickMove.ExtractPrefillSilent(Item)
+
+    If Len(prefill) > 0 Then
+        Dim matchIndexes() As Long
+        Dim matchCount As Long
+        matchCount = modQuickMove.FindMatches(prefill, matchIndexes)
+
+        If matchCount = 1 Then
+            Dim targetFolder As Object
+            Set targetFolder = modQuickMove.IndexFolderObject(matchIndexes(1))
+            If Not targetFolder Is Nothing Then
+                Dim movedToName As String
+                movedToName = targetFolder.Name
+                Item.Move targetFolder
+                ' v8 : toast sur CE deplacement aussi (classement par code).
+                modNotify.NotifyFiled movedToName
+                modDebugLog.DInfo MOD_NAME, "ItemAdd auto-classe '" & _
+                    Left(Item.subject, 60) & "' -> " & _
+                    modQuickMove.IndexFolderPath(matchIndexes(1))
+                Exit Sub
+            End If
+        End If
+    End If
+
+    ' 3. Pas de match unique : empiler l'EntryID dans la file FIFO et
+    '    declencher le prompt en differe via modDefer.
+    If mPendingSentEntryIDs Is Nothing Then Set mPendingSentEntryIDs = New Collection
+
+    Dim eid As String
+    eid = Item.entryID
+    If Len(eid) = 0 Then Exit Sub
+
+    ' Eviter doublons dans la file
+    Dim k As Variant, dejaPresent As Boolean
+    dejaPresent = False
+    For Each k In mPendingSentEntryIDs
+        If CStr(k) = eid Then dejaPresent = True : Exit For
+    Next k
+    If Not dejaPresent Then mPendingSentEntryIDs.Add eid
+
+    modDebugLog.DDebug MOD_NAME, "ItemAdd queued (busy=" & mQuickMovePromptBusy & _
+        ", queue=" & mPendingSentEntryIDs.count & ")"
+
+    ' Declenche le traitement si pas deja en cours
+    If Not mQuickMovePromptBusy Then
+        modDefer.Arm "SentPrompt", 1
+    End If
+
+    On Error GoTo 0
+End Sub
+
+'=============================================================================
+' ProcessNextSentPrompt - depile et traite le prochain mail en attente
+'
+' Appele par modDefer (cle SentPrompt) depuis mSentItems_ItemAdd, ou re-appele
+' a la fin de PromptForSentItem pour vider la file.
+'=============================================================================
+Public Sub ProcessNextSentPrompt()
+    On Error Resume Next
+
+    If mPendingSentEntryIDs Is Nothing Then Exit Sub
+    If mPendingSentEntryIDs.count = 0 Then Exit Sub
+
+    ' v10.9 : garde-fou anti-blocage. Si la garde est posee depuis plus de
+    ' QM_PROMPT_STALE_MIN minutes, c'est qu'un prompt precedent n'a jamais
+    ' abouti (fenetre ouverte derriere, jamais vue, jamais fermee - ou
+    ' variable module-level survivante d'un Ctrl+S VBE). On la leve, sinon
+    ' la file ne redemarre plus jamais de la session.
+    If mQuickMovePromptBusy Then
+        If mQuickMovePromptSince > 0 And _
+           DateDiff("n", mQuickMovePromptSince, Now) >= QM_PROMPT_STALE_MIN Then
+            modDebugLog.DError MOD_NAME, "ProcessNextSentPrompt : garde orpheline depuis " & _
+                DateDiff("n", mQuickMovePromptSince, Now) & " min -> levee"
+            mQuickMovePromptBusy = False
+            mQuickMovePromptSince = 0
+        Else
+            Exit Sub
+        End If
+    End If
+
+    Dim eid As String
+    eid = CStr(mPendingSentEntryIDs.Item(1))
+    mPendingSentEntryIDs.Remove 1
+
+    Dim Item As Object
+    Set Item = Application.Session.GetItemFromID(eid)
+    If Item Is Nothing Then
+        modDebugLog.DDebug MOD_NAME, "ProcessNextSentPrompt : EntryID introuvable, on passe au suivant"
+        ' Reessayer le suivant
+        If mPendingSentEntryIDs.count > 0 Then
+            modDefer.Arm "SentPrompt", 1
+        End If
+        Exit Sub
+    End If
+
+    mQuickMovePromptBusy = True
+    mQuickMovePromptSince = Now
+    PromptForSentItem Item
+    mQuickMovePromptBusy = False
+    mQuickMovePromptSince = 0
+
+    ' Si d'autres mails sont en file, replanifier
+    If mPendingSentEntryIDs.count > 0 Then
+        modDefer.Arm "SentPrompt", 1
+    End If
+
+    On Error GoTo 0
+End Sub
+
+'=============================================================================
+' PromptForSentItem (v10.8) - FENETRE UNIQUE de classement d'un mail envoye.
+'
+' AVANT : jusqu'a 4+ fenetres en cascade pour un seul mail (une MsgBox PAR
+' candidat du corps via ExtractPrefill INTERACTIF, puis MsgBox Oui/Non, puis
+' InputBox de recherche, puis InputBox de resultats, plus une MsgBox
+' "Aucun dossier" separee) - et les candidats etaient demandes AVANT meme
+' de savoir si l'utilisateur voulait classer.
+'
+' APRES : une seule InputBox, reutilisee en boucle ; son TEXTE porte l'etat
+' du tour :
+'   - liste numerotee des candidats detectes dans le corps (collecte
+'     silencieuse via modQuickMove.CollectBodyCandidates, v10.1) ;
+'   - liste numerotee des dossiers trouves par la derniere recherche ;
+'   - mention "Aucun dossier pour X" integree (plus de MsgBox separee).
+' VIDE ou ANNULER = laisser dans Envoyes, a tout moment (plus de Oui/Non
+' prealable). Prefill initial : ExtractPrefillSilent (zero fenetre).
+' Interpretation des saisies numeriques :
+'   - liste de DOSSIERS affichee + saisie de 1-2 chiffres -> deplacement ;
+'   - liste de CANDIDATS affichee + saisie d'1 chiffre -> ce code devient
+'     le texte de recherche ;
+'   - tout autre nombre (ex. un code a 4 chiffres) = texte de recherche.
+' Toast de confirmation sur chaque deplacement (inchange, v9).
+'=============================================================================
+Private Sub PromptForSentItem(ByVal Item As Object)
+    On Error Resume Next
+
+    Const MAX_CAND As Long = 9        ' candidats du corps affiches (1 chiffre)
+
+    ' v10.6 - FIX conserve : le sujet reste HORS de T() (le decodeur
+    ' d'accents A() alterait un sujet reel contenant "~e"/"~a").
+    Dim subjPart As String
+    subjPart = Left(Item.subject, 80)
+
+    ' Prefill silencieux : sujet, puis noms de PJ, puis candidat UNIQUE corps.
+    Dim searchText As String
+    searchText = modQuickMove.ExtractPrefillSilent(Item)
+
+    ' Candidats multiples du corps : collectes SANS fenetre, listes une seule
+    ' fois, numerotes, dans la fenetre unique.
+    Dim cand() As String, candCtx() As String, nCand As Long
+    nCand = 0
+    If Len(searchText) = 0 Then
+        nCand = modQuickMove.CollectBodyCandidates(Item, cand, candCtx)
+    End If
+
+    Dim header As String              ' message d'etat du tour precedent
+    Dim fIdx() As Long, fCnt As Long  ' resultats dossiers affiches
+    Dim mIdx() As Long, mCnt As Long
+    Dim i As Long, n As Long
+    Dim choice As String, prompt As String
+    Dim targetFolder As Object
+    Dim tName As String
+    Dim lastZero As String            ' v10.11 : derniere recherche a zero resultat
+    Dim newIdx As Long                ' v10.11 : index du dossier cree (commande "+")
+
+    fCnt = 0
+    header = ""
+
+    Do
+        ' --- Construction du texte de la fenetre unique ---
+        prompt = T("Classer le mail envoy~e (vide ou Annuler = laisser dans Envoy~es)", _
+                   "File the sent mail (empty or Cancel = leave in Sent Items)") & vbCrLf
+        prompt = prompt & T("Sujet : ", "Subject: ") & subjPart & vbCrLf
+
+        If Len(header) > 0 Then prompt = prompt & vbCrLf & header
+
+        If fCnt > 0 Then
+            ' Resultats de la derniere recherche (numerotes)
+            For i = 1 To modQuickMove.MinVal(fCnt, 20)
+                prompt = prompt & "[" & i & "] " & modQuickMove.IndexFolderPath(fIdx(i)) & vbCrLf
+            Next i
+            If fCnt > 20 Then
+                prompt = prompt & T("... et ", "... and ") & (fCnt - 20) & T(" autres", " more") & vbCrLf
+            End If
+            prompt = prompt & vbCrLf & T("NUMERO pour d~eplacer, ou TEXTE pour affiner :", _
+                                         "NUMBER to move, or TEXT to refine:")
+        ElseIf nCand > 0 Then
+            ' Candidats du corps (une seule liste, un seul ecran)
+            prompt = prompt & T("Num~eros d~etect~es dans le corps :", _
+                                "Numbers detected in the body:") & vbCrLf
+            For i = 1 To modQuickMove.MinVal(nCand, MAX_CAND)
+                prompt = prompt & "[" & i & "] " & cand(i) & "   (..." & candCtx(i) & "...)" & vbCrLf
+            Next i
+            If nCand > MAX_CAND Then
+                prompt = prompt & T("... et ", "... and ") & (nCand - MAX_CAND) & T(" autres", " more") & vbCrLf
+            End If
+            prompt = prompt & vbCrLf & T("NUMERO de la liste, ou nom du dossier cible :", _
+                                         "NUMBER from the list, or target folder name:")
+        Else
+            prompt = prompt & vbCrLf & T("Tapez le nom du dossier cible :", _
+                                         "Type the target folder name:")
+        End If
+
+        ' v10.9 : modUi.AskText remonte Outlook au premier plan AVANT
+        ' d'afficher. InputBox n'a aucun drapeau de premier plan - c'est
+        ' structurel. Ce prompt part 1 s apres l'envoi via modDefer, donc
+        ' typiquement une fois l'utilisateur bascule sur une autre
+        ' application : la fenetre s'ouvrait derriere, invisible, et
+        ' bloquait toute la file (cf. garde horodatee ci-dessus). Si
+        ' Windows refuse le premier plan, AskText fait clignoter la barre
+        ' des taches et emet un toast d'annonce.
+        choice = modUi.AskText(prompt, T("QuickMove - Mail envoy~e", "QuickMove - Sent mail"), searchText)
+        If Len(Trim(choice)) = 0 Then Exit Sub      ' vide OU Annuler = laisser
+        choice = Trim(choice)
+
+        ' v10.11 : "+" apres un tour "Aucun dossier" = creer le dossier
+        ' manquant (modQuickMove.CreateFolderInteractive : code + nom +
+        ' partenaire, dossier Outlook + index + ligne Suivi de temps),
+        ' puis classer CE mail dedans.
+        If choice = "+" And Len(lastZero) > 0 Then
+            If modQuickMove.CreateFolderInteractive(lastZero, newIdx) Then
+                Set targetFolder = modQuickMove.IndexFolderObject(newIdx)
+                If Not targetFolder Is Nothing Then
+                    tName = targetFolder.Name
+                    Item.Move targetFolder
+                    modNotify.NotifyFiled tName
+                End If
+                Exit Sub
+            End If
+            ' Creation annulee ou en echec : on repart sur la recherche.
+            header = ""
+            searchText = lastZero
+            GoTo NextTurn
+        End If
+
+        ' --- Interpretation d'une saisie numerique courte ---
+        If IsNumeric(choice) Then
+            n = CLng(choice)
+            If fCnt > 0 And Len(choice) <= 2 Then
+                ' Liste de dossiers affichee : 1-2 chiffres = choix direct.
+                If n >= 1 And n <= modQuickMove.MinVal(fCnt, 20) Then
+                    Set targetFolder = modQuickMove.IndexFolderObject(fIdx(n))
+                    If Not targetFolder Is Nothing Then
+                        tName = targetFolder.Name
+                        Item.Move targetFolder
+                        ' v9 (Trou C) : toast sur le classement manuel.
+                        modNotify.NotifyFiled tName
+                    End If
+                    Exit Sub
+                End If
+                header = T("Num~ero invalide.", "Invalid number.") & vbCrLf
+                searchText = ""
+                GoTo NextTurn
+            ElseIf fCnt = 0 And nCand > 0 And Len(choice) = 1 _
+                   And n >= 1 And n <= modQuickMove.MinVal(nCand, MAX_CAND) Then
+                ' Liste de candidats affichee : 1 chiffre = ce code devient
+                ' le texte de recherche (les codes a 4 chiffres passent en
+                ' recherche normale ci-dessous).
+                choice = cand(n)
+            End If
+        End If
+
+        ' --- Recherche de dossiers ---
+        searchText = choice
+        mCnt = modQuickMove.FindMatches(searchText, mIdx)
+
+        If mCnt = 1 Then
+            Set targetFolder = modQuickMove.IndexFolderObject(mIdx(1))
+            If Not targetFolder Is Nothing Then
+                tName = targetFolder.Name
+                Item.Move targetFolder
+                ' v9 (Trou C) : toast sur le classement manuel (match unique).
+                modNotify.NotifyFiled tName
+            End If
+            Exit Sub
+        ElseIf mCnt = 0 Then
+            ' Integre a la fenetre du tour suivant (plus de MsgBox separee).
+            ' v10.11 : "+" propose la creation du dossier manquant.
+            header = T("Aucun dossier pour ", "No folder for ") & """" & searchText & """." & vbCrLf & _
+                     T("+ = cr~eer ce dossier", "+ = create this folder") & vbCrLf
+            lastZero = searchText
+            fCnt = 0
+        Else
+            fCnt = mCnt
+            fIdx = mIdx
+            header = mCnt & T(" dossier(s) pour ", " folder(s) for ") & """" & searchText & """ :" & vbCrLf
+            nCand = 0                 ' on masque les candidats du corps
+            searchText = ""           ' saisie suivante = numero ou nouveau texte
+        End If
+NextTurn:
+    Loop
+End Sub
+
+'=============================================================================
+' Outil de debug : vider la file et reinitialiser la garde
+' (a appeler depuis la fenetre Executions VBE si jamais coince)
+'=============================================================================
+Public Sub ResetQuickMoveSentQueue()
+    Set mPendingSentEntryIDs = New Collection
+    mQuickMovePromptBusy = False
+    mQuickMovePromptSince = 0
+    modDebugLog.DInfo MOD_NAME, "QuickMove sent queue reset"
+End Sub
+
+
+Sub CleanOldFlags()
+    Dim lastCleanMonth As String
+    Dim currentMonth As String
+    currentMonth = Format(Now, "YYYY-MM")
+
+    On Error Resume Next
+    lastCleanMonth = GetSetting("QuickMove", "Flags", "LastCleanMonth", "")
+    On Error GoTo 0
+
+    If lastCleanMonth = currentMonth Then Exit Sub
+
+    ' Pack v3 (B2) : filtre DASL cote MAPI (drapeau pose ET recu avant le
+    ' seuil) au lieu d'un parcours item par item de TOUTE la boite de
+    ' reception (3 lectures COM par mail). Date au format locale-proof.
+    Dim ns As Object, inbox As Object, inboxItems As Object, filtered As Object
+    Dim inboxItem As Object
+    Dim cutoff As Date, cleanCount As Long, dasl As String
+
+    On Error Resume Next
+    Set ns = Application.GetNamespace("MAPI")
+    Set inbox = ns.GetDefaultFolder(olFolderInbox)
+    Set inboxItems = inbox.items
+    cutoff = DateAdd("m", -1, Now)
+    cleanCount = 0
+
+    ' 1) Jet : FlagStatus + ReceivedTime ; 2) DASL PR_FLAG_STATUS ; 3) date seule
+    '    (le test FlagStatus de la boucle reste le filet).
+    Err.Clear
+    dasl = "[FlagStatus] = 2 AND [ReceivedTime] < '" & modCommon.FormatDaslDate(cutoff) & "'"
+    Set filtered = inboxItems.Restrict(dasl)
+    If Err.Number <> 0 Or filtered Is Nothing Then
+        Err.Clear
+        dasl = "@SQL=" & Chr(34) & "http://schemas.microsoft.com/mapi/proptag/0x10900003" & Chr(34) & _
+               " = 2 AND " & Chr(34) & "urn:schemas:httpmail:datereceived" & Chr(34) & _
+               " < '" & modCommon.FormatDaslDate(cutoff) & "'"
+        Set filtered = inboxItems.Restrict(dasl)
+    End If
+    If Err.Number <> 0 Or filtered Is Nothing Then
+        Err.Clear
+        dasl = "[ReceivedTime] < '" & modCommon.FormatDaslDate(cutoff) & "'"
+        Set filtered = inboxItems.Restrict(dasl)
+    End If
+    If Err.Number <> 0 Or filtered Is Nothing Then
+        modDebugLog.DError MOD_NAME, "CleanOldFlags : Restrict KO (" & Err.Number & ")"
+        Err.Clear
+        Exit Sub
+    End If
+
+    ' Iteration en marche arriere : chaque Save peut retirer l'item du filtre.
+    Dim j As Long, total As Long
+    total = filtered.count
+    For j = total To 1 Step -1
+        DoEvents
+        Set inboxItem = Nothing
+        Set inboxItem = filtered.Item(j)
+        If Not inboxItem Is Nothing Then
+            If TypeOf inboxItem Is Outlook.mailItem Then
+                If inboxItem.FlagStatus = olFlagMarked Then
+                    If inboxItem.FlagRequest <> "Snooze" Then
+                        inboxItem.FlagStatus = olNoFlag
+                        inboxItem.FlagRequest = ""
+                        inboxItem.ReminderSet = False
+                        inboxItem.Save
+                        If Err.Number = 0 Then cleanCount = cleanCount + 1
+                    End If
+                End If
+            End If
+        End If
+        Err.Clear
+    Next j
+
+    modDebugLog.DInfo MOD_NAME, "CleanOldFlags : " & cleanCount & " drapeau(x) purge(s) sur " & total & " candidat(s)"
+    SaveSetting "QuickMove", "Flags", "LastCleanMonth", currentMonth
+    On Error GoTo 0
+End Sub
+
+'=============================================================================
+' CONFIDENTIALITE
+'=============================================================================
+Sub Sensitivity_Normal()
+    modMailConfidentiality.SetSensitivity olNormal
+End Sub
+Sub Sensitivity_Personal()
+    modMailConfidentiality.ToggleSensitivity olPersonal
+End Sub
+Sub Sensitivity_Private()
+    modMailConfidentiality.ToggleSensitivity olPrivate
+End Sub
+Sub Sensitivity_Confidential()
+    ' v6.1 : cycle neant -> CONFIDENTIEL -> PRIVE -> PERSONNEL -> neant -> ...
+    modMailConfidentiality.ToggleSensitivityCycle
+End Sub
+ 
+

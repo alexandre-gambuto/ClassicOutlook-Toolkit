@@ -1,0 +1,2380 @@
+Option Explicit
+
+'==============================================================================
+' modQuickMove
+'==============================================================================
+' Purpose (EN): fast filing of mails into the folder trees of ALL mailboxes
+'   in the profile, and quick navigation to a folder. Built for 1000+ folders
+'   organized by
+'   project code (DOSS + 4 digits), contract (202X_XXXXX) and client/partner
+'   name. A prefill is extracted from the selected mail (subject, attachment
+'   names, then body); a unique match files directly, otherwise a search loop
+'   opens. The folder index is cached to disk and rebound at startup.
+'
+' Role
+'   Classement rapide des mails dans la hierarchie de dossiers de TOUTES les
+'   boites du profil (v11 ; avant : BAL par defaut seule), et navigation
+'   rapide vers un dossier (T("Aller au dossier", "Go to folder")). Pense pour ~1000+ dossiers metiers
+'   organises par DOSS (4 chiffres), contrat (202X_XXXXX) et nom de dossier
+'   client/partenaire.
+'
+' v11.2 (2026-08-28) : CREATION DE DOSSIER A LA VOLEE (recherche sans
+'   resultat). La boite "Aucun dossier" de QuickMoveSearch passe de
+'   modUi.Ask a modMsgBoxCustom.Confirm3, 3 boutons renommes :
+'   [Creer le dossier] [Re-scanner] [Annuler]. Annuler (ou Echap)
+'   revient a la SAISIE ; quitter = laisser la saisie suivante vide
+'   (sortie standard du module) - l'ancien "Reessayer sans re-scanner"
+'   est couvert par ce retour. CreateFolderInteractive (Public, aussi
+'   appelee par ThisOutlookSession, commande "+" du classement des
+'   envoyes) :
+'     1) code DV (4 chiffres) ou contrat (20XX_XXXXX), type DEDUIT du
+'        format (contrat teste AVANT DV : un contrat contient 4
+'        chiffres), pre-rempli avec la recherche en echec ;
+'     2) nom puis partenaire, OPTIONNELS, pre-remplis depuis Suivi de
+'        temps.xlsm si le code y figure deja
+'        (modProjectTag.LookupProjectByCode : cache en memoire, zero
+'        acces Excel pour le pre-remplissage) ;
+'     3) nom final "CODE - Nom - Partenaire" (segments vides omis,
+'        caracteres interdits nettoyes), creation sous le parent
+'        config.ini NewFolderParentProject / NewFolderParentContract
+'        (chemin relatif a la Boite de reception de la boite par
+'        defaut, resolue par GetDefaultFolder, jamais par son nom
+'        localise ; NewFolderCreateMissingParents=1 = creer la chaine
+'        manquante) ;
+'     4) entree ajoutee a l'index en memoire + cache disque reecrit
+'        (pas de re-scan complet), deplacement du mail par l'appelant
+'        (toasts et historique existants conserves) ;
+'     5) ligne ajoutee a Suivi de temps.xlsm si le code n'y est pas
+'        (modProjectTag.EnsureTimeTrackingEntry). Echec Excel NON
+'        bloquant : dossier cree et mail classe quand meme, MsgBox
+'        d'avertissement.
+'   NOUVELLES DEPENDANCES : modMsgBoxCustom, modProjectTag.
+'
+' v11.1 (2026-08-22) : revue UX pop-ups. Toutes les boites du module
+'   passent par modUi : les 5 InputBox (GoToFolder, QuickMoveSearch et
+'   leurs listes de resultats) via modUi.AskText, qui remonte Outlook au
+'   premier plan avant d'afficher - InputBox n'accepte aucun drapeau de
+'   premier plan, c'est structurel. Les 4 MsgBox de decision (proposition
+'   de re-scan, choix d'un numero detecte dans le corps) via modUi.Ask,
+'   qui ajoute vbMsgBoxSetForeground + vbSystemModal.
+'   POURQUOI ICI AUSSI, alors que ces commandes partent d'un clic ruban :
+'   ExtractPrefill est appelee depuis mSentItems_ItemAdd (via le prompt
+'   differe de ThisOutlookSession), donc en contexte evenementiel ou le
+'   premier plan n'est pas acquis. Traiter la moitie des boites aurait
+'   laisse le meme symptome sur l'autre moitie.
+'   Aucun changement de logique de classement, d'index ou de recherche.
+'   Dependance ajoutee : modUi.
+'
+' v11.0 (2026-08-21) : MULTIBOITE. L'index couvre desormais TOUTES les
+'   boites du profil (dossiers publics exclus ; exclusions supplementaires
+'   possibles via config.ini QuickMoveExcludeStores=nom1|nom2). Chaque
+'   entree porte le nom de sa boite (FolderInfo.StoreName) ; les chemins
+'   affiches des boites secondaires sont prefixes "[Boite] ". Recherche
+'   (FindMatches/FindMatchesLeaf) inchangee : elle porte sur le chemin sans
+'   prefixe. Cache et recents passent au format 2 (en-tete #QM2, lignes
+'   boite<TAB>chemin) ; un cache ancien format est lu comme "boite par
+'   defaut" (migration transparente, reecrit en #QM2 a la sauvegarde
+'   suivante). "Elements supprimes" exclus PAR boite. GoTo peut naviguer
+'   vers n'importe quelle boite ; QuickMove peut classer vers une autre
+'   boite (Move inter-boites = copie+suppression cote Exchange, 1-2 s).
+'   NOUVELLE DEPENDANCE : modStoreContext (nom de la boite par defaut).
+'
+' v10.4 (2026-08-17) : GoToFolder MEMORISE aussi ce qui est tape ou colle
+'   dans sa propre barre (mLastKeyword). Avant, seule la recherche manuelle
+'   de QuickMove alimentait la valeur par defaut : un code colle dans GoTo
+'   n'etait pas re-propose au GoTo suivant. MOD_VERSION / ModVersion.
+'
+' v10.3 (2026-07-16) : suffixe * dans QuickMoveSearch = deplacer PUIS ouvrir
+'   le dossier cible (ex : "2*" sur un numero de la liste, ou "2485*" en
+'   texte si match unique). * est un caractere interdit dans les noms de
+'   dossiers Outlook : aucune collision possible avec une recherche.
+'   Intention collante jusqu'au deplacement (un * tape lors d'un affinage
+'   reste valable pour le move final). NB Exchange Online : Move asynchrone,
+'   le mail peut mettre 1-2 s a apparaitre dans le dossier ouvert.
+'
+' v10.2 (2026-07-16) : GoToFolder pre-rempli avec le dernier mot-cle TAPE
+'   dans QuickMove (mLastKeyword, session courante). L'InputBox natif
+'   pre-selectionne le texte par defaut : une frappe le remplace d'un coup,
+'   Entree relance la recherche telle quelle.
+'
+' v10.1 (2026-07-07) : CollectBodyCandidates - collecte SILENCIEUSE des
+'   candidats du CORPS (memes 3 passes, meme nettoyage URLs/chemins et
+'   meme deduplication que l'etape 2 d'ExtractPrefill, mais ZERO fenetre),
+'   avec un contexte de 40 caracteres par candidat. Consommee par la
+'   fenetre unique de classement des envoyes (ThisOutlookSession v10.8),
+'   qui remplace la cascade de MsgBox par candidat d'ExtractPrefill.
+'
+'------------------------------------------------------------------------------
+' Points d'entree (Public Sub)
+'   QuickMove           Point d'entree unique (v7, ex-QuickMoveAuto fusionnee).
+'                       Extrait un prefill du mail selectionne (DOSS / 4 chiffres
+'                       / contrat dans sujet puis corps). Si le prefill matche
+'                       1 seul dossier -> deplacement direct sans fenetre.
+'                       Sinon (0 ou >1) -> ouvre la boucle de recherche, avec
+'                       en-tete "aucun dossier trouve" si 0 match sur prefill.
+'   GoToFolder         Navigation : InputBox -> bascule l'explorateur sur
+'                       le dossier choisi. Aucun mail n'est deplace.
+'   GoToMailFolder   Ouvre le dossier parent du mail selectionne (utile
+'                       depuis la vue de recherche Outlook).
+'   CreateFolderInteractive  (v11.2) Cree un dossier metier a la volee
+'                       (code + nom + partenaire), l'indexe et garantit
+'                       la ligne correspondante dans Suivi de temps.xlsm.
+'   QuickMoveReload     Re-scan complet MAPI + reecriture du cache.
+'   BackgroundReindex   Idem, sans MsgBox (appel depuis ThisOutlookSession
+'                       au demarrage si besoin).
+'
+'------------------------------------------------------------------------------
+' Fonctionnement interne
+'   Indexation        EnumerateFolders parcourt recursivement chaque boite
+'                     du profil (v11). Chaque dossier est stocke avec son
+'                     nom de boite et son chemin
+'                     "Inbox > Reseau > SNA_Bloc-notes 3 > COPIL" et l'objet
+'                     MAPI associe.
+'   Cache             QuickMoveCache.txt (chemins texte) dans modConfig.
+'                     AppDataOutlookPath(). Valide 24h. Au demarrage,
+'                     SmartLoad lit le cache puis ResolveFromCache rebinde
+'                     les objets MAPI. Si <80% resolus -> rescan complet.
+'   Recents           QuickMoveRecents.txt : top 5 des dossiers cibles
+'                     recents, ordre MRU. Affiche en tete quand on lance
+'                     QuickMove sans prefill.
+'   Prefill           ExtractPrefill cherche dans le sujet puis le corps :
+'                       1) DOSS + 4 chiffres
+'                       2) 4 chiffres isoles hors annees 2023-2032
+'                       3) Contrat 202X_XXXXX
+'                     Pour chaque candidat du corps, MsgBox avec contexte
+'                     (oui/non/annuler).
+'   Recherche         FindMatchesLeaf compare la chaine saisie au DERNIER
+'                     SEGMENT du chemin (apres le dernier " > "). Cherche
+'                     "6666" ne remonte PAS "6666 > A", "6666 > B"... car
+'                     pour atteindre ces sous-dossiers on aurait cherche
+'                     "A" ou "B". Plafond 200 resultats. FindMatches (match
+'                     sur tout le chemin) est conservee pour usage externe
+'                     eventuel mais plus appelee en interne.
+'   Deplacement       DoMoveToFolder iter en marche arriere sur la selection
+'                     (parce que Item.Move modifie la collection), agrege
+'                     succes/erreurs, trace la progression dans le log, et
+'                     enregistre le dossier dans Recents.
+'
+'------------------------------------------------------------------------------
+' Contraintes / pieges
+'   - Late binding partout (CreateObject), pas de reference COM.
+'   - Pas de UserForm (DSI) : InputBox/MsgBox uniquement.
+'   - Le separateur " > " (espace-superieur-espace) est en dur : ne JAMAIS
+'     l'utiliser dans un nom de dossier Outlook reel sous peine de casser
+'     ResolveFromCache et FindMatchesLeaf.
+'   - Le cache QuickMoveCache.txt peut diverger si on cree/supprime des
+'     dossiers entre deux sessions : QuickMove propose un re-scan auto
+'     quand FindMatches renvoie 0 resultat.
+'   - mFolders est public uniquement parce que ResolveFromCache et
+'     l'enumeration recursive y ecrivent ; ne pas le manipuler ailleurs.
+'
+'------------------------------------------------------------------------------
+' Historique des versions -> CHANGELOG.
+'==============================================================================
+
+Private Type FolderInfo
+    FolderPath As String      ' chemin SANS le nom de boite ("Inbox > X > Y")
+    StoreName As String       ' v11 : DisplayName de la boite
+    FolderObject As Object
+    EntryID As String         ' pack v3 (B1) : rebinding O(1) par GetFolderFromID
+    StoreID As String         ' pack v3 (B1)
+    PathLower As String       ' pack v3 : LCase(FolderPath), precalcule (FindMatches)
+    LeafLower As String       ' pack v3 : dernier segment en minuscules (FindMatchesLeaf)
+End Type
+
+Public mFolders() As FolderInfo
+Public mFolderCount As Long
+Public mLoaded As Boolean
+
+' v11 : EntryID des dossiers "Elements supprimes" de CHAQUE boite indexee
+' (Dictionary EntryID -> True) : exclus de l'index (eux et leur sous-arbre).
+' Resolus par GetDefaultFolder(olFolderDeletedItems) par boite -> robustes
+' aux noms localises.
+Private mExcludedEIDs As Object
+
+' v11 : nom de la boite par defaut (cache), pour l'affichage (les chemins de
+' la boite par defaut ne sont PAS prefixes).
+Private mDefaultStoreName As String
+Public mRecentFolders(1 To 5) As Long
+Public mRecentCount As Long
+
+Private Const MOD_NAME As String = "QuickMove"
+Private Const MOD_VERSION As String = "v11.2 - 2026-08-28"
+
+Private Const CACHE_FILE = "QuickMoveCache.txt"
+Private Const RECENT_FILE = "QuickMoveRecents.txt"
+
+' v3 : taille max du corps de mail scanne dans ExtractPrefill (en caracteres).
+' Au-dela, on tronque. Les codes DOSS/contrats/opportunites sont quasi toujours
+' dans les premiers ecrans du mail ; lire 300 Ko pour rien plombe la perf.
+Private Const BODY_MAX_SCAN As Long = 8000
+
+' v3 : regex VBScript.RegExp instancies a la demande (cache module).
+' Evite un CreateObject par appel d'ExtractPrefill (plusieurs fois par mail
+' entrant sur la boite des Envoyes).
+Private mRegex As Object
+Private mRegexDigits As Object
+
+' Pack v3 : entrees "ajoutees a chaud" (creation de dossier) sans EntryID
+' connu -> SetEntryFields les renseigne a partir de l'objet.
+
+' v10.2 : dernier mot-cle TAPE a la main dans QuickMove (recherche manuelle,
+' pas le prefill extrait du mail) ou, depuis v10.4, dans GoToFolder (tape ou
+' colle). Reutilise comme valeur par defaut de l'InputBox de GoToFolder.
+' Portee session : remis a zero au redemarrage d'Outlook ou apres un Reinit
+' VBE (sans consequence : prefill vide).
+Private mLastKeyword As String
+
+'=============================================================================
+' Version reellement chargee (lue par modMaintenance.MaintModuleVersions).
+'=============================================================================
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+'=============================================================================
+' HELPERS CHEMIN (v3 : centralise via modConfig)
+'=============================================================================
+Private Function CachePath() As String
+    CachePath = modConfig.AppDataOutlookPath() & "\" & CACHE_FILE
+End Function
+
+Private Function RecentPath() As String
+    RecentPath = modConfig.AppDataOutlookPath() & "\" & RECENT_FILE
+End Function
+
+'=============================================================================
+' Accesseurs regex (lazy init)
+'=============================================================================
+Private Function Regex() As Object
+    If mRegex Is Nothing Then
+        Set mRegex = CreateObject("VBScript.RegExp")
+        mRegex.IgnoreCase = True
+    End If
+    Set Regex = mRegex
+End Function
+
+Private Function RegexDigits() As Object
+    If mRegexDigits Is Nothing Then
+        Set mRegexDigits = CreateObject("VBScript.RegExp")
+        mRegexDigits.Pattern = modConfig.DigitsPattern()
+    End If
+    Set RegexDigits = mRegexDigits
+End Function
+
+' v13 : concatene les noms des pieces jointes (separes par un espace) pour les
+' scanner avec les memes regex que le sujet/corps. Filtre les images de
+' signature inline (png/jpg/jpeg/gif/bmp < 50 Ko) qui ne portent jamais de
+' code DOSS/contrat et pollueraient la detection. Acces .FileName / .Size gardes
+' par On Error Resume Next : certaines PJ embarquees (OLE, messages imbriques)
+' levent a la lecture de ces proprietes.
+Private Function ScanAttachmentNames(mailItem As Object) As String
+    Dim atts As Object
+    Dim att As Object
+    Dim i As Long
+    Dim fn As String
+    Dim ext As String
+    Dim sz As Long
+    Dim out As String
+    Dim dotPos As Long
+
+    On Error Resume Next
+    Set atts = mailItem.Attachments
+    On Error GoTo 0
+    If atts Is Nothing Then Exit Function
+
+    Dim n As Long
+    On Error Resume Next
+    n = atts.count
+    On Error GoTo 0
+    If n = 0 Then Exit Function
+
+    For i = 1 To n
+        fn = ""
+        sz = 0
+        On Error Resume Next
+        Set att = atts.Item(i)
+        fn = att.FileName
+        sz = att.Size
+        On Error GoTo 0
+
+        If Len(fn) > 0 Then
+            ' Extension en minuscules.
+            ext = ""
+            dotPos = InStrRev(fn, ".")
+            If dotPos > 0 Then ext = LCase$(Mid$(fn, dotPos + 1))
+
+            ' Skip images de signature inline (petites). On garde les images
+            ' plus lourdes (scan/photo de doc) qui peuvent porter un code.
+            If (ext = "png" Or ext = "jpg" Or ext = "jpeg" Or ext = "gif" _
+                Or ext = "bmp") And sz > 0 And sz < 51200 Then
+                ' ignore
+            Else
+                out = out & fn & " "
+            End If
+        End If
+    Next i
+
+    ScanAttachmentNames = out
+End Function
+
+' Ne conserve que les chiffres ASCII 0-9 d'une chaine. Evite l'erreur 13 sur
+' CLng quand digitMatches renvoie une valeur contenant des caracteres larges,
+' espaces insecables ou chiffres Unicode (frequent dans les corps HTML / PJ).
+Private Function OnlyDigits(ByVal s As String) As String
+    Dim i As Long, ch As String, out As String
+    For i = 1 To Len(s)
+        ch = Mid$(s, i, 1)
+        If ch >= "0" And ch <= "9" Then out = out & ch
+    Next i
+    OnlyDigits = out
+End Function
+
+' ============================================================================
+' POINT D'ENTREE UNIQUE (v7 : ex-QuickMove + QuickMoveAuto fusionnees)
+'   - Extrait le prefill (DOSS/contrat) du mail selectionne.
+'   - prefill matche EXACTEMENT 1 dossier -> deplacement direct, sans fenetre.
+'   - prefill vide, ou matche 0 / >1 dossier -> boucle de recherche
+'     (QuickMoveSearch), qui affiche l'en-tete "aucun dossier trouve" si le
+'     prefill non vide n'a rien matche.
+' ============================================================================
+Public Sub QuickMove()
+    Dim prefill As String
+    Dim matchIndexes() As Long
+    Dim matchCount As Long
+    If Not CheckSelection() Then Exit Sub
+    If Not mLoaded Then SmartLoad
+    prefill = ExtractPrefill(GetFirstTargetItem())
+    If Len(prefill) = 0 Then
+        QuickMoveSearch ""
+        Exit Sub
+    End If
+    matchCount = FindMatchesLeaf(prefill, matchIndexes)
+    If matchCount = 1 Then
+        DoMoveToFolder matchIndexes(1)
+        Exit Sub
+    End If
+    ' 0 ou >1 match : on entre dans la recherche en gardant le prefill, ce qui
+    ' permet a QuickMoveSearch d'afficher l'en-tete "aucun dossier trouve" et
+    ' la liste des recents au lieu d'un MsgBox bloquant.
+    QuickMoveSearch prefill
+End Sub
+
+' ============================================================================
+' GOTO DOSSIER - Naviguer rapidement vers un dossier
+' v4 : utilise FindMatchesLeaf => match sur le dernier segment du chemin
+'      uniquement. Chercher "6666" ne remonte pas "6666 > A", "6666 > B"...
+' ============================================================================
+Public Sub GoToFolder()
+    If Not mLoaded Then SmartLoad
+
+    ' --- Contexte recherche : si le message selectionne ne reside PAS dans le
+    '     dossier affiche par l'explorateur (resultat de recherche), GoTo
+    '     n'ouvre pas la barre de saisie : il bascule directement sur le
+    '     dossier reel du message (comportement GoToMailFolder). ---
+    If IsSearchContext() Then
+        GoToMailFolder
+        Exit Sub
+    End If
+
+    ' Pack v3 (C13) : boucle de selection partagee (PickFolder). Pre-remplie
+    ' avec le dernier mot-cle tape (v10.2/v10.4), qui est re-memorise par
+    ' PickFolder a chaque saisie.
+    Dim idx As Long
+    idx = PickFolder("GoTo - " & mFolderCount & T(" dossiers indexes", " indexed folders"), _
+                     T("GoTo - Naviguer vers un dossier", "GoTo - Navigate to a folder"), _
+                     mLastKeyword, True)
+    If idx > 0 Then NavigateToFolder idx
+End Sub
+
+
+' Navigue vers le dossier d'index donne, avec auto-reparation du cache :
+' si le dossier atteint ne correspond pas au dernier segment du chemin attendu
+' (cas typique : une macro a deplace le dossier depuis le chargement du cache,
+' le FolderObject pointe alors un dossier obsolete ou son ancien parent), on
+' recharge le cache UNE fois et on reessaie. Invisible si tout est coherent.
+Private Sub NavigateToFolder(ByVal idx As Long)
+    On Error GoTo Fail
+    Dim expectedPath As String, expectedStore As String
+    expectedPath = mFolders(idx).FolderPath
+    expectedStore = mFolders(idx).StoreName
+
+    If NavigateAndVerify(mFolders(idx).FolderObject, expectedPath) Then
+        modDebugLog.DInfo MOD_NAME, "GoTo -> " & expectedPath
+        Exit Sub
+    End If
+
+    ' Incoherence : cache probablement obsolete (dossier deplace). Rechargement
+    ' puis nouvelle tentative en re-cherchant le chemin attendu dans le cache.
+    modDebugLog.DInfo MOD_NAME, "GoTo : cible incoherente, rechargement cache (" & expectedPath & ")"
+    LoadAllFolders
+
+    Dim j As Long
+    For j = 1 To mFolderCount
+        If mFolders(j).FolderPath = expectedPath And _
+           StrComp(mFolders(j).StoreName, expectedStore, vbTextCompare) = 0 Then
+            If NavigateAndVerify(mFolders(j).FolderObject, expectedPath) Then
+                modDebugLog.DInfo MOD_NAME, "GoTo -> " & expectedPath & " (apres rechargement)"
+                Exit Sub
+            End If
+            Exit For
+        End If
+    Next j
+
+    ' Toujours pas : le dossier a sans doute ete renomme/deplace/supprime.
+    MsgBox T("Le dossier vise semble avoir ete deplace ou renomme depuis le", "The target folder seems to have been moved or renamed since the") & vbCrLf & _
+           T("dernier chargement. Le cache a ete recharge ; relance la recherche.", "last load. The cache was reloaded; run the search again."), _
+           vbExclamation, T("Aller au dossier", "Go to folder")
+    Exit Sub
+Fail:
+    modDebugLog.DError MOD_NAME, "NavigateToFolder " & Err.Number & " - " & Err.Description
+End Sub
+
+
+' Pose le dossier comme dossier courant et verifie que le .Name du dossier
+' reellement atteint correspond au dernier segment de expectedPath.
+' Renvoie False si l'objet est Nothing, si la navigation echoue, ou si le
+' dossier atteint ne correspond pas (cache obsolete).
+Private Function NavigateAndVerify(ByVal target As Object, ByVal expectedPath As String) As Boolean
+    On Error GoTo Fail
+    If target Is Nothing Then Exit Function
+
+    Set Application.ActiveExplorer.CurrentFolder = target
+
+    ' Dernier segment attendu (apres le dernier " > ").
+    Dim lastSeg As String, p As Long, q As Long
+    p = 1
+    Do
+        q = InStr(p, expectedPath, " > ")
+        If q = 0 Then Exit Do
+        p = q + 3
+    Loop
+    lastSeg = Mid$(expectedPath, p)
+
+    ' Comparaison avec le dossier reellement courant apres navigation.
+    Dim reached As String
+    reached = Application.ActiveExplorer.CurrentFolder.Name
+    NavigateAndVerify = (StrComp(reached, lastSeg, vbTextCompare) = 0)
+    Exit Function
+Fail:
+    NavigateAndVerify = False
+End Function
+
+' ============================================================================
+' RECHARGEMENT MANUEL + MAJ CACHE
+' ============================================================================
+Public Sub QuickMoveReload()
+    Dim sCachePath As String
+    LoadAllFolders
+    sCachePath = CachePath()
+    SaveToCache sCachePath
+    ' v10 - FIX : remapper les recents sur les NOUVEAUX indices. Sans cela,
+    ' mRecentFolders gardait les indices d'AVANT le re-scan (chaque dossier
+    ' cree/supprime decale tous les suivants) : l'affichage ET
+    ' DoMoveToFolder pointaient sur le dossier occupant desormais la
+    ' position -> deplacement possible vers le MAUVAIS dossier.
+    LoadRecents
+    MsgBox mFolderCount & T(" dossiers reindexes et cache mis a jour.", " folders reindexed and cache updated."), _
+           vbInformation, "QuickMove"
+End Sub
+
+' ============================================================================
+' CHARGEMENT INTELLIGENT
+' ============================================================================
+Public Sub SmartLoad()
+    Dim sCachePath As String
+    Dim cacheOK As Boolean
+    sCachePath = CachePath()
+    cacheOK = False
+    If Dir(sCachePath) <> "" Then
+        If (Now - FileDateTime(sCachePath)) < 1 Then
+            cacheOK = True
+        End If
+    End If
+    If cacheOK Then
+        LoadFromCache sCachePath
+        If mFolderCount > 0 Then
+            ResolveFromCache
+            If mLoaded Then
+                LoadRecents
+                Exit Sub
+            End If
+        End If
+    End If
+    LoadAllFolders
+    SaveToCache sCachePath
+    LoadRecents
+End Sub
+
+' ============================================================================
+' INDEXATION EN ARRIERE-PLAN
+' ============================================================================
+Public Sub BackgroundReindex()
+    Dim sCachePath As String
+    sCachePath = CachePath()
+    LoadAllFolders
+    SaveToCache sCachePath
+    LoadRecents   ' v10 - FIX : remapper les recents (cf. QuickMoveReload)
+    modDebugLog.DInfo MOD_NAME, "Reindexation arriere-plan terminee : " & mFolderCount & " dossiers."
+End Sub
+
+' ============================================================================
+' CHARGEMENT MAPI - v11 : TOUTES LES BOITES DU PROFIL
+' Dossiers publics exclus (ExchangeStoreType=2, garde). Exclusions
+' supplementaires par nom via config.ini : QuickMoveExcludeStores=nom1|nom2.
+' ============================================================================
+Public Sub LoadAllFolders()
+    Dim ns As Object
+    Dim rootFolder As Object
+    Dim st As Object
+
+    mFolderCount = 0
+    ReDim mFolders(1 To 2000)
+    Set mExcludedEIDs = CreateObject("Scripting.Dictionary")
+    mExcludedEIDs.CompareMode = 0   ' BinaryCompare (EntryID exact)
+
+    Set ns = Application.GetNamespace("MAPI")
+    mDefaultStoreName = ""
+    On Error Resume Next
+    mDefaultStoreName = modStoreContext.DefaultStore().DisplayName
+    On Error GoTo 0
+
+    ' Exclusions par nom (config, insensible a la casse).
+    Dim exclus As String
+    exclus = "|" & LCase$(Trim$(modConfig.Cfg("QuickMoveExcludeStores", ""))) & "|"
+
+    Dim nbStores As Long
+    For Each st In ns.Stores
+        Dim stType As Long, stName As String
+        stType = -1
+        stName = ""
+        On Error Resume Next
+        stName = st.DisplayName
+        stType = st.ExchangeStoreType
+        On Error GoTo 0
+
+        If stType = 2 Then GoTo NextStore                       ' dossiers publics
+        If InStr(exclus, "|" & LCase$(stName) & "|") > 0 Then GoTo NextStore
+
+        ' "Elements supprimes" de CETTE boite : exclu (nom localise couvert).
+        Dim delEID As String
+        delEID = ""
+        On Error Resume Next
+        delEID = st.GetDefaultFolder(olFolderDeletedItems).EntryID
+        On Error GoTo 0
+        If Len(delEID) > 0 Then
+            If Not mExcludedEIDs.Exists(delEID) Then mExcludedEIDs.Add delEID, True
+        End If
+
+        Set rootFolder = Nothing
+        On Error Resume Next
+        Set rootFolder = st.GetRootFolder
+        On Error GoTo 0
+        If Not rootFolder Is Nothing Then
+            EnumerateFolders rootFolder, "", stName
+            nbStores = nbStores + 1
+        End If
+NextStore:
+    Next st
+
+    mLoaded = True
+    modDebugLog.DInfo MOD_NAME, mFolderCount & " dossiers indexes (" & nbStores & " boite(s))."
+End Sub
+
+' ============================================================================
+' SAUVEGARDE CACHE DOSSIERS
+' ============================================================================
+Public Sub SaveToCache(sCachePath As String)
+    Dim f As Long
+    Dim i As Long
+    On Error GoTo ErrSave
+    f = FreeFile
+    Open sCachePath For Output As #f
+    ' Pack v3 (B1) : format #QM3 = boite<TAB>chemin<TAB>EntryID<TAB>StoreID.
+    ' Le rebinding au demarrage se fait par GetFolderFromID (1 appel COM par
+    ' dossier) au lieu d'une descente nominale niveau par niveau.
+    Print #f, "#QM3"
+    For i = 1 To mFolderCount
+        Print #f, mFolders(i).StoreName & vbTab & mFolders(i).FolderPath & vbTab & _
+                  mFolders(i).EntryID & vbTab & mFolders(i).StoreID
+    Next i
+    Close #f
+    modDebugLog.DInfo MOD_NAME, "Cache sauvegarde (#QM3) : " & mFolderCount & " dossiers."
+    Exit Sub
+ErrSave:
+    On Error Resume Next
+    Close #f
+    modDebugLog.DError MOD_NAME, "Erreur sauvegarde cache : " & Err.Description
+End Sub
+
+' ============================================================================
+' LECTURE CACHE DOSSIERS
+' ============================================================================
+Public Sub LoadFromCache(sCachePath As String)
+    Dim f As Long
+    Dim lineTxt As String
+    On Error GoTo ErrLoad
+    mFolderCount = 0
+    ReDim mFolders(1 To 2000)
+    ' Formats acceptes : #QM3 (boite TAB chemin TAB EntryID TAB StoreID, pack
+    ' v3), #QM2 (boite TAB chemin, v11) et l'ancien format (chemins nus =
+    ' boite par defaut). Migration transparente : reecrit en #QM3 a la
+    ' prochaine sauvegarde.
+    Dim fmt As Long, firstLine As Boolean
+    Dim parts() As String
+    fmt = 1
+    firstLine = True
+    f = FreeFile
+    Open sCachePath For Input As #f
+    Do While Not EOF(f)
+        Line Input #f, lineTxt
+        If firstLine Then
+            firstLine = False
+            If Trim(lineTxt) = "#QM3" Then
+                fmt = 3
+                GoTo NextLine
+            ElseIf Trim(lineTxt) = "#QM2" Then
+                fmt = 2
+                GoTo NextLine
+            End If
+        End If
+        If Len(Trim(lineTxt)) > 0 Then
+            mFolderCount = mFolderCount + 1
+            If mFolderCount > UBound(mFolders) Then
+                ReDim Preserve mFolders(1 To mFolderCount + 500)
+            End If
+            mFolders(mFolderCount).EntryID = ""
+            mFolders(mFolderCount).StoreID = ""
+            If fmt >= 2 Then
+                parts = Split(lineTxt, vbTab)
+                If UBound(parts) >= 1 Then
+                    mFolders(mFolderCount).StoreName = parts(0)
+                    mFolders(mFolderCount).FolderPath = parts(1)
+                    If UBound(parts) >= 3 Then
+                        mFolders(mFolderCount).EntryID = parts(2)
+                        mFolders(mFolderCount).StoreID = parts(3)
+                    End If
+                Else
+                    mFolders(mFolderCount).StoreName = ""
+                    mFolders(mFolderCount).FolderPath = lineTxt
+                End If
+            Else
+                mFolders(mFolderCount).StoreName = ""
+                mFolders(mFolderCount).FolderPath = lineTxt
+            End If
+            SetDerivedFields mFolderCount
+        End If
+NextLine:
+    Loop
+    Close #f
+    modDebugLog.DInfo MOD_NAME, "Cache lu (format " & fmt & ") : " & mFolderCount & " chemins."
+    Exit Sub
+ErrLoad:
+    On Error Resume Next
+    Close #f
+    mFolderCount = 0
+    modDebugLog.DError MOD_NAME, "Erreur lecture cache : " & Err.Description
+End Sub
+
+' ============================================================================
+' RESOLUTION DES OBJETS DOSSIER DEPUIS LE CACHE
+' ============================================================================
+Public Sub ResolveFromCache()
+    Dim ns As Object
+    Dim i As Long
+    Dim parts() As String
+    Dim folder As Object
+    Dim rootFolder As Object
+    Dim k As Long
+    Dim resolvedCount As Long, byIdCount As Long, healedCount As Long
+
+    Set ns = Application.GetNamespace("MAPI")
+
+    mDefaultStoreName = ""
+    On Error Resume Next
+    mDefaultStoreName = modStoreContext.DefaultStore().DisplayName
+    On Error GoTo 0
+
+    ' v11 : dictionnaire nom de boite -> racine (une resolution par boite).
+    Dim roots As Object
+    Set roots = CreateObject("Scripting.Dictionary")
+    roots.CompareMode = 1   ' TextCompare (noms de boites)
+    Dim st As Object
+    On Error Resume Next
+    For Each st In ns.Stores
+        If Not roots.Exists(st.DisplayName) Then roots.Add st.DisplayName, st.GetRootFolder
+    Next st
+    On Error GoTo 0
+
+    resolvedCount = 0
+    For i = 1 To mFolderCount
+        ' Entree ancien format (StoreName vide) -> boite par defaut.
+        If Len(mFolders(i).StoreName) = 0 Then mFolders(i).StoreName = mDefaultStoreName
+
+        Set folder = Nothing
+
+        ' --- Pack v3 (B1) : rebinding direct par EntryID + StoreID (1 appel).
+        ' Un dossier RENOMME ou DEPLACE garde son EntryID : on rafraichit le
+        ' chemin depuis l'objet vivant (auto-reparation du cache).
+        If Len(mFolders(i).EntryID) > 0 Then
+            On Error Resume Next
+            If Len(mFolders(i).StoreID) > 0 Then
+                Set folder = ns.GetFolderFromID(mFolders(i).EntryID, mFolders(i).StoreID)
+            Else
+                Set folder = ns.GetFolderFromID(mFolders(i).EntryID)
+            End If
+            If Err.Number <> 0 Then Set folder = Nothing
+            On Error GoTo 0
+            If Not folder Is Nothing Then
+                Dim livePath As String
+                livePath = PathFromFolderObject(folder)
+                If Len(livePath) > 0 Then
+                    If StrComp(livePath, mFolders(i).FolderPath, vbBinaryCompare) <> 0 Then
+                        mFolders(i).FolderPath = livePath
+                        SetDerivedFields i
+                        healedCount = healedCount + 1
+                    End If
+                End If
+                byIdCount = byIdCount + 1
+            End If
+        End If
+
+        ' --- Repli : descente nominale segment par segment (ChildByName).
+        If folder Is Nothing Then
+            parts = Split(mFolders(i).FolderPath, " > ")
+            Set rootFolder = Nothing
+            If roots.Exists(mFolders(i).StoreName) Then Set rootFolder = roots(mFolders(i).StoreName)
+            If Not rootFolder Is Nothing Then
+                Set folder = ChildByName(rootFolder, parts(0))
+                If Not folder Is Nothing Then
+                    For k = 1 To UBound(parts)
+                        Set folder = ChildByName(folder, parts(k))
+                        If folder Is Nothing Then Exit For
+                    Next k
+                End If
+            End If
+            If Not folder Is Nothing Then SetEntryFields i, folder
+        End If
+
+        If Not folder Is Nothing Then
+            Set mFolders(i).FolderObject = folder
+            resolvedCount = resolvedCount + 1
+        End If
+    Next i
+    modDebugLog.DInfo MOD_NAME, resolvedCount & "/" & mFolderCount & " resolus (" & _
+        byIdCount & " par EntryID, " & healedCount & " chemin(s) repare(s))."
+    If resolvedCount < mFolderCount * 0.8 Then
+        modDebugLog.DInfo MOD_NAME, "Cache obsolete, rechargement MAPI..."
+        mLoaded = False
+    Else
+        mLoaded = True
+        ' Chemins repares ou EntryID completes : on persiste sans re-scan.
+        If healedCount > 0 Then SaveToCache CachePath()
+    End If
+End Sub
+
+' Chemin d'index ("A > B > C", sans le nom de boite) d'un objet dossier,
+' derive de Folder.FolderPath ("\\Boite\A\B\C"). "" si illisible.
+Private Function PathFromFolderObject(ByVal fld As Object) As String
+    On Error Resume Next
+    PathFromFolderObject = ""
+    Dim fp As String
+    fp = CStr(fld.FolderPath)
+    If Len(fp) = 0 Then Exit Function
+    If Left$(fp, 2) = "\\" Then fp = Mid$(fp, 3)
+    Dim segs() As String, sPath As String, k As Long
+    segs = Split(fp, "\")
+    If UBound(segs) < 1 Then Exit Function
+    For k = 1 To UBound(segs)
+        If Len(sPath) > 0 Then sPath = sPath & " > "
+        sPath = sPath & segs(k)
+    Next k
+    PathFromFolderObject = sPath
+End Function
+
+' Sous-dossier d'un dossier par NOM exact, en parcourant .Folders un a un.
+' Remplace l'acces indexe .Folders(nom) qui peut echouer (ou pire, ne pas
+' lever d'erreur exploitable) sur des noms contenant des caracteres speciaux
+' comme "/". Renvoie Nothing si non trouve.
+Private Function ChildByName(ByVal parent As Object, ByVal folderName As String) As Object
+    On Error Resume Next
+    Dim f As Object
+    For Each f In parent.Folders
+        If StrComp(f.name, folderName, vbTextCompare) = 0 Then
+            Set ChildByName = f
+            Exit Function
+        End If
+    Next f
+End Function
+
+' ============================================================================
+' PACK v3 : champs derives d'une entree d'index (minuscules pour la recherche,
+' EntryID/StoreID pour le rebinding). Appele par EnumerateFolders,
+' LoadFromCache, ResolveFromCache et AddFolderToIndex.
+' ============================================================================
+Private Sub SetDerivedFields(ByVal idx As Long)
+    Dim p As String, q As Long, lastSep As Long
+    p = mFolders(idx).FolderPath
+    mFolders(idx).PathLower = LCase$(p)
+    lastSep = 0
+    q = InStr(1, p, " > ")
+    Do While q > 0
+        lastSep = q
+        q = InStr(q + 3, p, " > ")
+    Loop
+    If lastSep = 0 Then
+        mFolders(idx).LeafLower = mFolders(idx).PathLower
+    Else
+        mFolders(idx).LeafLower = LCase$(Mid$(p, lastSep + 3))
+    End If
+End Sub
+
+Private Sub SetEntryFields(ByVal idx As Long, ByVal fld As Object)
+    On Error Resume Next
+    mFolders(idx).EntryID = ""
+    mFolders(idx).StoreID = ""
+    If fld Is Nothing Then Exit Sub
+    mFolders(idx).EntryID = CStr(fld.EntryID)
+    mFolders(idx).StoreID = CStr(fld.StoreID)
+End Sub
+
+' ============================================================================
+' PARCOURS RECURSIF
+' ============================================================================
+Public Sub EnumerateFolders(parentFolder As Object, parentPath As String, _
+                            ByVal storeName As String)
+    Dim folder As Object
+    Dim currentPath As String
+    Dim i As Long
+    On Error Resume Next
+    ' Pack v3 (B7) : la collection Folders est evaluee UNE fois par niveau
+    ' (avant : .Folders.count + .Folders.Item(i) recreaient la collection COM
+    ' a chaque iteration, sur 1000+ dossiers).
+    Dim subs As Object, nbSubs As Long
+    Set subs = parentFolder.Folders
+    nbSubs = 0
+    nbSubs = subs.count
+    For i = 1 To nbSubs
+        ' v10 : sous On Error Resume Next, un Set qui echoue CONSERVE
+        ' l'objet precedent (dossier duplique dans l'index) -> repartir
+        ' de Nothing a chaque iteration.
+        Set folder = Nothing
+        Set folder = subs.Item(i)
+        If Not folder Is Nothing Then
+            ' v11 : exclure les "Elements supprimes" de toutes les boites
+            ' (et tout leur sous-arbre).
+            If Not mExcludedEIDs Is Nothing Then
+                If mExcludedEIDs.Exists(folder.EntryID) Then GoTo NextFolder
+            End If
+            If parentPath = "" Then
+                currentPath = folder.name
+            Else
+                currentPath = parentPath & " > " & folder.name
+            End If
+            mFolderCount = mFolderCount + 1
+            If mFolderCount > UBound(mFolders) Then
+                ReDim Preserve mFolders(1 To mFolderCount + 500)
+            End If
+            mFolders(mFolderCount).FolderPath = currentPath
+            mFolders(mFolderCount).StoreName = storeName
+            Set mFolders(mFolderCount).FolderObject = folder
+            SetEntryFields mFolderCount, folder
+            SetDerivedFields mFolderCount
+            Dim kids As Object, nbKids As Long
+            Set kids = folder.Folders
+            nbKids = 0
+            nbKids = kids.count
+            If nbKids > 0 Then
+                EnumerateFolders folder, currentPath, storeName
+            End If
+        End If
+NextFolder:
+    Next i
+    On Error GoTo 0
+End Sub
+
+
+' ============================================================================
+' AFFICHAGE (v11) : chemin prefixe "[Boite] " pour les boites secondaires.
+' Les chemins de la boite par defaut restent nus (lisibilite, continuite).
+' ============================================================================
+Public Function DisplayPath(ByVal idx As Long) As String
+    On Error Resume Next
+    DisplayPath = mFolders(idx).FolderPath
+    If Len(mFolders(idx).StoreName) = 0 Then Exit Function
+    If StrComp(mFolders(idx).StoreName, mDefaultStoreName, vbTextCompare) = 0 Then Exit Function
+    DisplayPath = "[" & mFolders(idx).StoreName & "] " & mFolders(idx).FolderPath
+End Function
+
+' ============================================================================
+' HISTORIQUE DES DOSSIERS RECENTS
+' ============================================================================
+Public Sub AddToRecent(folderIndex As Long)
+    Dim i As Long
+    Dim j As Long
+    
+    ' Verifier si deja present
+    For i = 1 To mRecentCount
+        If mRecentFolders(i) = folderIndex Then
+            ' Remonter en premiere position
+            For j = i To 2 Step -1
+                mRecentFolders(j) = mRecentFolders(j - 1)
+            Next j
+            mRecentFolders(1) = folderIndex
+            SaveRecents
+            Exit Sub
+        End If
+    Next i
+    
+    ' Decaler et ajouter
+    If mRecentCount < 5 Then mRecentCount = mRecentCount + 1
+    For i = mRecentCount To 2 Step -1
+        mRecentFolders(i) = mRecentFolders(i - 1)
+    Next i
+    mRecentFolders(1) = folderIndex
+    SaveRecents
+End Sub
+
+Public Sub SaveRecents()
+    Dim sRecentPath As String
+    Dim f As Long
+    Dim i As Long
+    sRecentPath = RecentPath()
+    On Error GoTo ErrSaveR
+    f = FreeFile
+    Open sRecentPath For Output As #f
+    Print #f, "#QM2"   ' v11 : lignes boite<TAB>chemin
+    For i = 1 To mRecentCount
+        If mRecentFolders(i) > 0 And mRecentFolders(i) <= mFolderCount Then
+            Print #f, mFolders(mRecentFolders(i)).StoreName & vbTab & _
+                      mFolders(mRecentFolders(i)).FolderPath
+        End If
+    Next i
+    Close #f
+    Exit Sub
+ErrSaveR:
+    On Error Resume Next
+    Close #f
+End Sub
+
+Public Sub LoadRecents()
+    Dim sRecentPath As String
+    Dim f As Long
+    Dim lineTxt As String
+    Dim i As Long
+    
+    sRecentPath = RecentPath()
+    mRecentCount = 0
+    
+    If Dir(sRecentPath) = "" Then Exit Sub
+    
+    On Error GoTo ErrLoadR
+    
+    ' v3 : dict cle -> index pour eviter la recherche lineaire O(n) par
+    ' recent. v11 : cle = boite & "|" & chemin (chemins identiques possibles
+    ' d'une boite a l'autre, ex "Inbox > X" des deux cotes).
+    Dim idx As Object
+    Set idx = CreateObject("Scripting.Dictionary")
+    idx.CompareMode = 0  ' BinaryCompare (case-sensitive, fidele a l'ancien comportement)
+    For i = 1 To mFolderCount
+        Dim ky As String
+        ky = mFolders(i).StoreName & "|" & mFolders(i).FolderPath
+        If Not idx.Exists(ky) Then
+            idx.Add ky, i
+        End If
+    Next i
+
+    Dim isV2 As Boolean, firstLine As Boolean, tabPos As Long, lu As String
+    firstLine = True
+    f = FreeFile
+    Open sRecentPath For Input As #f
+    Do While Not EOF(f) And mRecentCount < 5
+        Line Input #f, lineTxt
+        If firstLine Then
+            firstLine = False
+            If Trim(lineTxt) = "#QM2" Then
+                isV2 = True
+                GoTo NextRec
+            End If
+        End If
+        If Len(Trim(lineTxt)) > 0 Then
+            If isV2 Then
+                tabPos = InStr(lineTxt, vbTab)
+                If tabPos > 0 Then
+                    lu = Left$(lineTxt, tabPos - 1) & "|" & Mid$(lineTxt, tabPos + 1)
+                Else
+                    lu = mDefaultStoreName & "|" & lineTxt
+                End If
+            Else
+                ' Ancien format : chemin nu = boite par defaut.
+                lu = mDefaultStoreName & "|" & lineTxt
+            End If
+            If idx.Exists(lu) Then
+                mRecentCount = mRecentCount + 1
+                mRecentFolders(mRecentCount) = idx(lu)
+            End If
+        End If
+NextRec:
+    Loop
+    Close #f
+    modDebugLog.DInfo MOD_NAME, mRecentCount & " dossiers recents charges."
+    Exit Sub
+ErrLoadR:
+    On Error Resume Next
+    Close #f
+    mRecentCount = 0
+End Sub
+
+' ============================================================================
+' PACK v3 (C4) : SCANNER UNIQUE DE CODES
+' Les 3 passes (prefixe projet + N chiffres / N chiffres isoles hors annees /
+' contrat 20YY_NNNNN) etaient recopiees 7 fois entre ExtractPrefill,
+' ExtractPrefillSilent et CollectBodyCandidates. Un seul moteur :
+'   FirstCode(text)          -> 1er code par ordre de priorite (sujet, PJ)
+'   ScanCodes(text, ...)     -> tous les candidats dedoublonnes + positions,
+'                               dans l'ordre des passes (corps, interactif)
+'   PrioritizedCodes(text)   -> candidats de la passe la plus prioritaire
+'                               non vide (corps, silencieux : 1 seul = OK)
+'   CleanBodyText(body)      -> troncature + retrait URLs / chemins fichiers
+' ============================================================================
+Private Function CleanBodyText(ByVal body As String) As String
+    Dim rx As Object
+    If Len(body) > BODY_MAX_SCAN Then body = Left(body, BODY_MAX_SCAN)
+    Set rx = Regex()
+    rx.Global = True
+    rx.Pattern = "https?://[^\s<>""')]*"
+    body = rx.Replace(body, " ")
+    rx.Pattern = "[A-Za-z]:\\[^\s<>""]*"
+    body = rx.Replace(body, " ")
+    CleanBodyText = body
+End Function
+
+' Ajoute un candidat (dedoublonne) aux tableaux 1-based de l'appelant.
+Private Sub PushCandidate(ByVal candidate As String, ByVal pos As Long, _
+                          ByVal seen As Object, ByRef codes() As String, _
+                          ByRef positions() As Long, ByRef n As Long)
+    If Len(candidate) = 0 Then Exit Sub
+    If seen.Exists(candidate) Then Exit Sub
+    seen.Add candidate, 1
+    n = n + 1
+    If n > UBound(codes) Then
+        ReDim Preserve codes(1 To n + 50)
+        ReDim Preserve positions(1 To n + 50)
+    End If
+    codes(n) = candidate
+    positions(n) = pos
+End Sub
+
+' Passe 1 : prefixe projet + N chiffres (groupe capturant = numero).
+Private Sub ScanPassProject(ByVal txt As String, ByVal seen As Object, _
+                            ByRef codes() As String, ByRef positions() As Long, ByRef n As Long)
+    Dim rx As Object, matches As Object, m As Long
+    Set rx = Regex()
+    rx.Global = True
+    rx.Pattern = modConfig.ProjectCodePattern()
+    Set matches = rx.Execute(txt)
+    For m = 0 To matches.count - 1
+        If matches(m).SubMatches.count > 0 Then
+            PushCandidate CStr(matches(m).SubMatches(0)), matches(m).FirstIndex + 1, seen, codes, positions, n
+        End If
+    Next m
+End Sub
+
+' Passe 2 : N chiffres isoles, hors plage d'annees exclue.
+Private Sub ScanPassDigits(ByVal txt As String, ByVal seen As Object, _
+                           ByRef codes() As String, ByRef positions() As Long, ByRef n As Long)
+    Dim rx As Object, rxd As Object, matches As Object, digitMatches As Object
+    Dim m As Long, candidate As String, candidateNum As Long
+    Set rx = Regex()
+    Set rxd = RegexDigits()
+    rx.Global = True
+    rx.Pattern = modConfig.FourDigitPattern()
+    Set matches = rx.Execute(txt)
+    For m = 0 To matches.count - 1
+        Set digitMatches = rxd.Execute(matches(m).Value)
+        If digitMatches.count > 0 Then
+            candidate = OnlyDigits(digitMatches(0).Value)
+            If Len(candidate) > 0 Then
+                candidateNum = CLng(candidate)
+                If candidateNum < modConfig.YearExclusionMin() Or candidateNum > modConfig.YearExclusionMax() Then
+                    PushCandidate candidate, matches(m).FirstIndex + 1, seen, codes, positions, n
+                End If
+            End If
+        End If
+    Next m
+End Sub
+
+' Passe 3 : contrats 20YY_NNNNN.
+Private Sub ScanPassContract(ByVal txt As String, ByVal seen As Object, _
+                             ByRef codes() As String, ByRef positions() As Long, ByRef n As Long)
+    Dim rx As Object, matches As Object, m As Long
+    Set rx = Regex()
+    rx.Global = True
+    rx.Pattern = modConfig.ContractPattern()
+    Set matches = rx.Execute(txt)
+    For m = 0 To matches.count - 1
+        PushCandidate CStr(matches(m).Value), matches(m).FirstIndex + 1, seen, codes, positions, n
+    Next m
+End Sub
+
+' Tous les candidats, dans l'ordre des passes, dedoublonnes (positions 1-based).
+Private Function ScanCodes(ByVal txt As String, ByRef codes() As String, _
+                           ByRef positions() As Long) As Long
+    Dim n As Long
+    Dim seen As Object
+    Set seen = CreateObject("Scripting.Dictionary")
+    ReDim codes(1 To 50)
+    ReDim positions(1 To 50)
+    n = 0
+    If Len(txt) = 0 Then
+        ScanCodes = 0
+        Exit Function
+    End If
+    ScanPassProject txt, seen, codes, positions, n
+    ScanPassDigits txt, seen, codes, positions, n
+    ScanPassContract txt, seen, codes, positions, n
+    ScanCodes = n
+End Function
+
+' Candidats de la passe la plus prioritaire NON VIDE (contrat strict du
+' classement silencieux : on ne descend a la passe suivante que si la
+' precedente n'a rien donne).
+Private Function PrioritizedCodes(ByVal txt As String, ByRef codes() As String) As Long
+    Dim n As Long, positions() As Long
+    Dim seen As Object
+    Set seen = CreateObject("Scripting.Dictionary")
+    ReDim codes(1 To 50)
+    ReDim positions(1 To 50)
+    n = 0
+    If Len(txt) = 0 Then
+        PrioritizedCodes = 0
+        Exit Function
+    End If
+    ScanPassProject txt, seen, codes, positions, n
+    If n = 0 Then ScanPassDigits txt, seen, codes, positions, n
+    If n = 0 Then ScanPassContract txt, seen, codes, positions, n
+    PrioritizedCodes = n
+End Function
+
+' Premier code par ordre de priorite (sujet et noms de PJ : le premier
+' match fiable l'emporte, sans dialogue).
+Private Function FirstCode(ByVal txt As String) As String
+    Dim codes() As String, n As Long
+    FirstCode = ""
+    If Len(txt) = 0 Then Exit Function
+    n = PrioritizedCodes(txt, codes)
+    If n > 0 Then FirstCode = codes(1)
+End Function
+
+' ============================================================================
+' EXTRACTION DEPUIS LE SUJET ET LE CORPS
+' v3 :
+'   - Utilise les regex cached (Regex / RegexDigits) au lieu de recreer un
+'     VBScript.RegExp a chaque appel (gain sensible sur chaque mail entrant
+'     dans les Envoyes).
+'   - Limite la lecture du corps a BODY_MAX_SCAN caracteres. Les codes
+'     DOSS/contrats sont quasi toujours dans les premiers ecrans ; lire 300 Ko
+'     de body de newsletter pour rien plombe la perf.
+'   - Deduplication des candidats via Dictionary (O(n) au lieu de O(n^2)
+'     pour la verif d'existence).
+' ============================================================================
+Public Function ExtractPrefill(mailItem As Object) As String
+    Dim subject As String
+    Dim body As String
+    Dim userAnswer As VbMsgBoxResult
+
+    ExtractPrefill = ""
+    On Error Resume Next
+    subject = mailItem.subject
+    body = mailItem.body
+    On Error GoTo 0
+
+    ' Garde anti-pattern-vide : si la config n'a pas pu se charger, les patterns
+    ' sont "" et une regex vide matche partout (SubMatches.count=0) -> aucune
+    ' detection silencieuse. On refuse de scanner avec un pattern vide.
+    If Len(modConfig.ProjectCodePattern()) = 0 Then
+        modDebugLog.DError MOD_NAME, "ExtractPrefill : ProjectCodePattern vide (config non chargee)."
+        Exit Function
+    End If
+
+    ' ETAPE 1 : sujet (premier code fiable l'emporte)
+    ExtractPrefill = FirstCode(subject)
+    If Len(ExtractPrefill) > 0 Then Exit Function
+
+    ' ETAPE 1bis : noms de PJ (v13), memes regles que le sujet
+    ExtractPrefill = FirstCode(ScanAttachmentNames(mailItem))
+    If Len(ExtractPrefill) > 0 Then Exit Function
+
+    ' ETAPE 2 : corps, chaque candidat propose avec son contexte
+    If Len(body) = 0 Then Exit Function
+    Dim cleanBody As String
+    cleanBody = CleanBodyText(body)
+
+    Dim candidates() As String, candPositions() As Long, candCount As Long
+    candCount = ScanCodes(cleanBody, candidates, candPositions)
+
+    Dim c As Long
+    Dim context As String
+    For c = 1 To candCount
+        context = ExtractContext(cleanBody, candPositions(c), 80)
+
+        userAnswer = modUi.Ask(T("Numero detecte dans le corps du message :", "Number detected in the message body:") & vbCrLf & vbCrLf & _
+               "   -->  " & candidates(c) & "  <--" & vbCrLf & vbCrLf & _
+               T("Contexte :", "Context:") & vbCrLf & _
+               "..." & context & "..." & vbCrLf & vbCrLf & _
+               T("Utiliser ce numero ?", "Use this number?") & vbCrLf & vbCrLf & _
+               T("Oui = Utiliser", "Yes = Use") & vbCrLf & _
+               T("Non = Voir le suivant (", "No = See next (") & (candCount - c) & T(" restant(s))", " remaining)") & vbCrLf & _
+               T("Annuler = Saisir manuellement", "Cancel = Enter manually"), _
+               "QuickMove - " & c & "/" & candCount, vbYesNoCancel + vbQuestion)
+
+        If userAnswer = vbYes Then
+            ExtractPrefill = candidates(c)
+            Exit Function
+        ElseIf userAnswer = vbCancel Then
+            ExtractPrefill = ""
+            Exit Function
+        End If
+    Next c
+
+    ExtractPrefill = ""
+End Function
+
+' ============================================================================
+' EXTRACTION SILENCIEUSE (v5)
+' Variante d'ExtractPrefill qui ne pose JAMAIS de MsgBox. A utiliser
+' depuis les handlers d'evenement (mSentItems_ItemAdd...) ou afficher
+' une MsgBox bloquerait le thread UI Outlook.
+'
+' Logique :
+'   - Sujet : priorite 1a/1b/1c comme ExtractPrefill (deja silencieuses).
+'     Renvoie le premier match trouve.
+'   - Corps : on scanne avec les memes regex, mais sans MsgBox de
+'     confirmation. Pour ne pas faire d'erreur coupable, on n'utilise
+'     un candidat du corps QUE s'il y en a EXACTEMENT UN. Si plusieurs
+'     candidats sont trouves dans le corps, on renvoie "" et c'est au
+'     code appelant de proposer un prompt en differe (FIFO + OnTime).
+'     Ce contrat protege contre le faux positif : mieux vaut un mail non
+'     auto-classe qu'un mail mal range silencieusement.
+'
+' Appele par : ThisOutlookSession.mSentItems_ItemAdd
+' ============================================================================
+Public Function ExtractPrefillSilent(mailItem As Object) As String
+    Dim subject As String
+    Dim body As String
+
+    ExtractPrefillSilent = ""
+
+    On Error Resume Next
+    subject = mailItem.subject
+    body = mailItem.body
+    On Error GoTo 0
+
+    ' Garde anti-pattern-vide (cf. ExtractPrefill).
+    If Len(modConfig.ProjectCodePattern()) = 0 Then
+        modDebugLog.DError MOD_NAME, "ExtractPrefillSilent : ProjectCodePattern vide (config non chargee)."
+        Exit Function
+    End If
+
+    ' ETAPE 1 : sujet (premier match l'emporte)
+    ExtractPrefillSilent = FirstCode(subject)
+    If Len(ExtractPrefillSilent) > 0 Then Exit Function
+
+    ' ETAPE 1bis : noms de PJ (v13), traites comme le sujet
+    ExtractPrefillSilent = FirstCode(ScanAttachmentNames(mailItem))
+    If Len(ExtractPrefillSilent) > 0 Then Exit Function
+
+    ' ETAPE 2 : corps, UNIQUEMENT si la passe la plus prioritaire donne
+    ' EXACTEMENT un candidat (mieux vaut un mail non auto-classe qu'un mail
+    ' mal range en silence).
+    If Len(body) = 0 Then Exit Function
+    Dim codes() As String, n As Long
+    n = PrioritizedCodes(CleanBodyText(body), codes)
+    If n = 1 Then ExtractPrefillSilent = codes(1)
+End Function
+
+' ============================================================================
+' CollectBodyCandidates (v10.1) - candidats du CORPS, collecte SILENCIEUSE.
+' Meme balayage que l'etape 2 d'ExtractPrefill (3 passes : DOSS + 4 chiffres,
+' 4 chiffres hors annees, contrats), meme nettoyage (URLs, chemins) et meme
+' deduplication - mais AUCUNE fenetre. Remplit codes() et contexts()
+' (1-based ; contexte = 40 caracteres autour du match) et renvoie le nombre
+' de candidats (0 si corps vide, pattern non charge ou aucun match).
+' Appelee par ThisOutlookSession.PromptForSentItem (v10.8) pour afficher UNE
+' liste numerotee dans sa fenetre unique.
+' ============================================================================
+Public Function CollectBodyCandidates(mailItem As Object, _
+                                      ByRef codes() As String, _
+                                      ByRef contexts() As String) As Long
+    Dim body As String
+    Dim cleanBody As String
+
+    CollectBodyCandidates = 0
+
+    On Error Resume Next
+    body = mailItem.body
+    On Error GoTo 0
+    If Len(body) = 0 Then Exit Function
+
+    ' Garde anti-pattern-vide (cf. ExtractPrefill).
+    If Len(modConfig.ProjectCodePattern()) = 0 Then
+        modDebugLog.DError MOD_NAME, "CollectBodyCandidates : ProjectCodePattern vide (config non chargee)."
+        Exit Function
+    End If
+
+    cleanBody = CleanBodyText(body)
+
+    Dim cands() As String, candPositions() As Long, candCount As Long
+    candCount = ScanCodes(cleanBody, cands, candPositions)
+    If candCount = 0 Then Exit Function
+
+    ReDim codes(1 To candCount)
+    ReDim contexts(1 To candCount)
+    Dim c As Long
+    For c = 1 To candCount
+        codes(c) = cands(c)
+        contexts(c) = ExtractContext(cleanBody, candPositions(c), 40)
+    Next c
+
+    CollectBodyCandidates = candCount
+    modDebugLog.DTrace MOD_NAME, "CollectBodyCandidates : " & candCount & " candidat(s)"
+End Function
+
+Private Function ExtractContext(body As String, pos As Long, radius As Long) As String
+    Dim startPos As Long
+    Dim endPos As Long
+    Dim snippet As String
+    
+    startPos = pos - radius
+    If startPos < 1 Then startPos = 1
+    endPos = pos + radius
+    If endPos > Len(body) Then endPos = Len(body)
+    
+    snippet = Mid(body, startPos, endPos - startPos + 1)
+    snippet = Replace(snippet, vbCrLf, " ")
+    snippet = Replace(snippet, vbCr, " ")
+    snippet = Replace(snippet, vbLf, " ")
+    Do While InStr(snippet, "  ") > 0
+        snippet = Replace(snippet, "  ", " ")
+    Loop
+    ExtractContext = Trim(snippet)
+End Function
+
+
+' ============================================================================
+' CONTEXTE : items cibles selon Inspector (mail plein ecran) ou Explorer
+' v6  : prise en compte d'un mail ouvert en plein ecran (Inspector).
+' v6.1: FIX "rien ne se passe" en vue liste quand un Inspector traine en
+'       arriere-plan. On ne se base plus sur la simple EXISTENCE d'un
+'       Inspector (qui donnait priorite absolue au mail fantome ouvert puis
+'       ferme) mais sur la fenetre REELLEMENT au premier plan via
+'       Application.ActiveWindow. Si la fenetre active est un Explorer => on
+'       lit sa Selection ; si c'est un Inspector => on lit son CurrentItem.
+' ============================================================================
+Public Function GetTargetItems() As Object
+    Dim col As Object
+    Dim activeWin As Object
+    Dim curItem As Object
+    Dim sel As Object
+    Dim i As Long
+    Dim winClass As Long
+
+    Set col = CreateObject("Scripting.Dictionary")  ' utilise comme liste ordonnee
+
+    ' Fenetre reellement au premier plan (Explorer=34 ou Inspector=35).
+    On Error Resume Next
+    Set activeWin = Application.ActiveWindow
+    On Error GoTo 0
+
+    winClass = 0
+    If Not activeWin Is Nothing Then
+        On Error Resume Next
+        winClass = activeWin.Class
+        On Error GoTo 0
+    End If
+
+    ' --- Cas Inspector au premier plan (mail ouvert en plein ecran) ---
+    If winClass = 35 Then   ' olInspector
+        On Error Resume Next
+        Set curItem = activeWin.CurrentItem
+        On Error GoTo 0
+        If Not curItem Is Nothing Then
+            If IsMailLike(curItem) Then col.Add col.count, curItem
+        End If
+        Set GetTargetItems = col
+        Exit Function
+    End If
+
+    ' --- Cas Explorer au premier plan (vue liste) ---
+    ' Couvre aussi winClass=34 et le fallback si ActiveWindow indisponible.
+    Dim expl As Object
+    On Error Resume Next
+    If winClass = 34 Then
+        Set expl = activeWin                 ' la fenetre active EST l'explorer
+    Else
+        Set expl = Application.ActiveExplorer ' fallback
+    End If
+    On Error GoTo 0
+
+    If expl Is Nothing Then
+        Set GetTargetItems = col
+        Exit Function
+    End If
+
+    On Error Resume Next
+    Set sel = expl.Selection
+    On Error GoTo 0
+    If sel Is Nothing Then
+        Set GetTargetItems = col
+        Exit Function
+    End If
+    For i = 1 To sel.count
+        col.Add col.count, sel.Item(i)
+    Next i
+    Set GetTargetItems = col
+End Function
+
+' Vrai si l'item ressemble a un mail classable (MailItem, Report, Meeting...).
+Private Function IsMailLike(ByVal itm As Object) As Boolean
+    Dim cls As Long
+    IsMailLike = False
+    On Error Resume Next
+    cls = itm.Class
+    On Error GoTo 0
+    ' 43 = olMail, 46 = olReport, 53 = olMeetingRequest, 54..57 variantes reunion,
+    ' 75 = olSharingItem. On accepte large : tout ce qui a un .Move est deplacable.
+    Select Case cls
+        Case 43, 46, 53, 54, 55, 56, 57, 75
+            IsMailLike = True
+        Case Else
+            ' Fallback : si l'objet expose .Move on tente quand meme.
+            Dim hasMove As Boolean
+            hasMove = False
+            On Error Resume Next
+            hasMove = Not IsNull(itm.EntryID)
+            On Error GoTo 0
+            IsMailLike = hasMove
+    End Select
+End Function
+
+' Premier item cible, ou Nothing.
+Public Function GetFirstTargetItem() As Object
+    Dim col As Object
+    Set col = GetTargetItems()
+    If col.count > 0 Then
+        Set GetFirstTargetItem = col.Items()(0)
+    Else
+        Set GetFirstTargetItem = Nothing
+    End If
+End Function
+
+' ============================================================================
+' VERIFICATION SELECTION
+' v6 : prend en compte l'Inspector (mail plein ecran) via GetTargetItems.
+' ============================================================================
+Public Function CheckSelection() As Boolean
+    CheckSelection = False
+    Dim col As Object
+    Set col = GetTargetItems()
+    If col Is Nothing Then
+        MsgBox T("Aucune fenetre Outlook active.", "No active Outlook window."), vbExclamation, "QuickMove"
+        Exit Function
+    End If
+    If col.count = 0 Then
+        MsgBox T("Selectionnez au moins un message (ou ouvrez un mail).", "Select at least one message (or open a mail)."), _
+               vbExclamation, "QuickMove"
+        Exit Function
+    End If
+    CheckSelection = True
+End Function
+
+' ============================================================================
+' PACK v3 : accesseurs d'index pour les consommateurs externes
+' (ThisOutlookSession, modFolderMerge). mFolders reste Public pour la
+' compatibilite, mais la voie recommandee est ces fonctions.
+' ============================================================================
+Public Function IndexFolderObject(ByVal idx As Long) As Object
+    On Error Resume Next
+    Set IndexFolderObject = Nothing
+    If idx < 1 Or idx > mFolderCount Then Exit Function
+    Set IndexFolderObject = mFolders(idx).FolderObject
+End Function
+
+Public Function IndexFolderPath(ByVal idx As Long) As String
+    On Error Resume Next
+    IndexFolderPath = ""
+    If idx < 1 Or idx > mFolderCount Then Exit Function
+    IndexFolderPath = mFolders(idx).FolderPath
+End Function
+
+Public Function IndexCount() As Long
+    IndexCount = mFolderCount
+End Function
+
+Public Function IsIndexLoaded() As Boolean
+    IsIndexLoaded = mLoaded
+End Function
+
+' ============================================================================
+' PACK v3 (C13) : PickFolder - boucle de selection d'un dossier de l'index,
+' partagee par GoToFolder et modFolderMerge (qui portaient chacun la meme
+' boucle "saisie -> liste numerotee -> numero ou affinage").
+'   headerText : lignes affichees en tete de chaque tour (deja localisees)
+'   titleText  : titre des fenetres
+'   prefill    : texte propose au premier tour
+'   allowRescan: "!" / "rescan" relance l'indexation sans quitter
+' Renvoie l'index mFolders choisi, ou 0 si abandon (vide / Annuler).
+' Memorise le dernier terme tape dans mLastKeyword (pre-remplissage GoTo).
+' ============================================================================
+Public Function PickFolder(ByVal headerText As String, ByVal titleText As String, _
+                           ByVal prefill As String, _
+                           Optional ByVal allowRescan As Boolean = True) As Long
+    PickFolder = 0
+    If Not mLoaded Then SmartLoad
+
+    Dim searchText As String, choice As String, prompt As String, resultList As String
+    Dim matchIndexes() As Long, matchCount As Long, i As Long, choiceNum As Long
+    searchText = prefill
+
+    Do
+        If Len(Trim(searchText)) = 0 Then
+            prompt = headerText & vbCrLf & vbCrLf & _
+                     T("Tapez le nom, code ", "Type a name, ") & modConfig.ProjectPrefixUC() & _
+                     T(" ou contrat", " code or contract")
+            If allowRescan Then prompt = prompt & T(" (! = re-scanner)", " (! = re-scan)")
+            prompt = prompt & " :"
+            searchText = modUi.AskText(prompt, titleText, "")
+            If Len(Trim(searchText)) = 0 Then Exit Function
+        End If
+
+        If allowRescan Then
+            If Trim(searchText) = "!" Or LCase(Trim(searchText)) = "rescan" Then
+                RescanInline
+                searchText = ""
+                GoTo NextTurn
+            End If
+        End If
+
+        mLastKeyword = Trim$(searchText)
+        matchCount = FindMatchesLeaf(searchText, matchIndexes)
+
+        If matchCount = 0 Then
+            If allowRescan Then
+                If modUi.Ask(T("Aucun dossier pour ""","No folder for """) & searchText & """." & vbCrLf & vbCrLf & _
+                             T("Rescanner les dossiers (l'index est peut-etre obsolete) ?", _
+                               "Rescan folders (the index may be stale)?"), _
+                             titleText, vbYesNo + vbQuestion) = vbYes Then
+                    RescanInline
+                    GoTo NextTurn   ' meme terme, reessai
+                End If
+            Else
+                modUi.Inform T("Aucun dossier pour ""","No folder for """) & searchText & """.", titleText, vbExclamation
+            End If
+            searchText = ""
+        ElseIf matchCount = 1 Then
+            PickFolder = matchIndexes(1)
+            Exit Function
+        Else
+            resultList = ""
+            For i = 1 To MinVal(matchCount, 20)
+                resultList = resultList & "[" & i & "] " & DisplayPath(matchIndexes(i)) & vbCrLf
+            Next i
+            prompt = matchCount & T(" dossier(s) pour ""","  folder(s) for """) & searchText & """ :" & vbCrLf & vbCrLf & resultList
+            If matchCount > 20 Then
+                prompt = prompt & T("... et ", "... and ") & (matchCount - 20) & T(" autres (affinez)", " more (refine)") & vbCrLf
+            End If
+            prompt = prompt & vbCrLf & T("NUMERO pour choisir, ou TEXTE pour affiner :", "NUMBER to choose, or TEXT to refine:")
+            choice = modUi.AskText(prompt, titleText & " - " & matchCount & T(" resultats", " results"), "")
+            If Len(Trim(choice)) = 0 Then Exit Function
+            If IsNumeric(Trim(choice)) Then
+                choiceNum = CLng(Trim(choice))
+                If choiceNum >= 1 And choiceNum <= MinVal(matchCount, 20) Then
+                    PickFolder = matchIndexes(choiceNum)
+                    Exit Function
+                End If
+                modUi.Inform T("Numero invalide (1-", "Invalid number (1-") & MinVal(matchCount, 20) & ").", titleText, vbExclamation
+                searchText = ""
+            Else
+                searchText = choice
+            End If
+        End If
+NextTurn:
+    Loop
+End Function
+
+' ============================================================================
+' RECHERCHE COMPLETE (sur tout le chemin) - utilisee par QuickMove/QuickMoveAuto
+' ============================================================================
+Public Function FindMatches(searchText As String, ByRef matchIndexes() As Long) As Long
+    Dim i As Long
+    Dim matchCount As Long
+    Dim searchLower As String
+    matchCount = 0
+    If mFolderCount < 1 Then
+        FindMatches = 0
+        Exit Function
+    End If
+    ReDim matchIndexes(1 To mFolderCount)
+    searchLower = LCase(Trim(searchText))
+    ' Pack v3 : PathLower precalcule a l'indexation (plus de LCase par dossier
+    ' a chaque recherche).
+    For i = 1 To mFolderCount
+        If InStr(1, mFolders(i).PathLower, searchLower, vbBinaryCompare) > 0 Then
+            matchCount = matchCount + 1
+            matchIndexes(matchCount) = i
+            If matchCount >= 200 Then Exit For
+        End If
+    Next i
+    FindMatches = matchCount
+End Function
+
+' ============================================================================
+' RECHERCHE SUR LE DERNIER SEGMENT UNIQUEMENT - utilisee par GoToFolder
+' v4 : "6666" matche "xxx > 6666" mais pas "6666 > A" ni "6666 > B".
+'      La recherche porte sur la partie apres le dernier " > " du chemin.
+'      Si le chemin ne contient pas " > ", le segment est le chemin entier
+'      (dossier racine).
+' ============================================================================
+Public Function FindMatchesLeaf(searchText As String, ByRef matchIndexes() As Long) As Long
+    Dim i As Long
+    Dim matchCount As Long
+    Dim searchLower As String
+    matchCount = 0
+    If mFolderCount < 1 Then
+        FindMatchesLeaf = 0
+        Exit Function
+    End If
+    ReDim matchIndexes(1 To mFolderCount)
+    searchLower = LCase(Trim(searchText))
+    ' Pack v3 : LeafLower precalcule a l'indexation (avant : extraction du
+    ' dernier segment + LCase sur chaque dossier a chaque frappe).
+    For i = 1 To mFolderCount
+        If InStr(1, mFolders(i).LeafLower, searchLower, vbBinaryCompare) > 0 Then
+            matchCount = matchCount + 1
+            matchIndexes(matchCount) = i
+            If matchCount >= 200 Then Exit For
+        End If
+    Next i
+    FindMatchesLeaf = matchCount
+End Function
+
+' ============================================================================
+' BOUCLE DE RECHERCHE MANUELLE AVEC RECENTS
+' ============================================================================
+Public Sub QuickMoveSearch(prefill As String)
+    Dim searchText As String
+    Dim prompt As String
+    Dim resultList As String
+    Dim matchIndexes() As Long
+    Dim matchCount As Long
+    Dim i As Long
+    Dim choice As String
+    Dim choiceNum As Long
+    Dim mailCount As Long
+    Dim choicePrompt As String
+    Dim userAnswer As VbMsgBoxResult
+    Dim header As String
+    Dim hasPrefill As Boolean
+    Dim wantGo As Boolean   ' v10.3 : suffixe * = ouvrir le dossier apres move
+    Dim newIdx As Long      ' v11.2 : index du dossier cree a la volee
+
+    mailCount = GetTargetItems().count
+    searchText = prefill
+
+    ' v7 : si on arrive ici avec un prefill non vide, c'est que QuickMove n'a
+    ' PAS trouve 1 dossier unique pour le DOSS/contrat extrait. On memorise ce
+    ' fait pour afficher un en-tete explicite dans l'InputBox de recherche
+    ' (recents + saisie libre) au lieu d'un MsgBox bloquant "Aucun dossier".
+    hasPrefill = (Len(Trim(prefill)) > 0)
+    If hasPrefill Then
+        ' On verifie quand meme : un prefill non vide PEUT matcher >1 dossier
+        ' (cas matchCount>1 transmis par QuickMove). Dans ce cas on n'affiche
+        ' pas "aucun dossier trouve" mais directement la liste des resultats.
+        matchCount = FindMatchesLeaf(searchText, matchIndexes)
+        If matchCount > 1 Then GoTo ShowResults
+        ' matchCount = 0 ici (le cas =1 a deja ete traite par DoMoveToFolder
+        ' dans QuickMove). On bascule sur la saisie en gardant l'en-tete.
+        searchText = ""
+    End If
+
+    Do
+        ' En-tete commun : signale, le cas echeant, que le DOSS/contrat extrait
+        ' n'a donne aucun dossier. Consomme apres le premier affichage.
+        header = "QuickMove - " & mFolderCount & T(" dossiers indexes", " indexed folders") & vbCrLf
+        header = header & mailCount & T(" message(s) selectionne(s)", " message(s) selected") & vbCrLf
+        If hasPrefill Then
+            header = header & T("!! Aucun dossier trouve pour """, "!! No folder found for """) & prefill & """" & vbCrLf
+        End If
+        header = header & vbCrLf
+
+        ' Si pas de texte courant et qu'on a des recents, les proposer.
+        If Len(Trim(searchText)) = 0 And mRecentCount > 0 Then
+            Dim recentPrompt As String
+            recentPrompt = header & T("Dossiers recents :", "Recent folders:") & vbCrLf
+            For i = 1 To mRecentCount
+                If mRecentFolders(i) > 0 And mRecentFolders(i) <= mFolderCount Then
+                    recentPrompt = recentPrompt & "[" & i & "] " & DisplayPath(mRecentFolders(i)) & vbCrLf
+                End If
+            Next i
+            recentPrompt = recentPrompt & vbCrLf
+            recentPrompt = recentPrompt & T("NUMERO pour deplacer (+* = puis ouvrir), TEXTE pour chercher, ! pour re-scanner :", "NUMBER to move (+* = then open), TEXT to search, ! to re-scan:")
+
+            choice = modUi.AskText(recentPrompt, T("QuickMove - Recents", "QuickMove - Recent"), "")
+            If StripGoStar(choice) Then wantGo = True   ' v10.3
+            hasPrefill = False   ' en-tete consomme
+
+            If Len(Trim(choice)) = 0 Then Exit Sub
+
+            ' v7 : commande de re-scan inline.
+            If Trim(choice) = "!" Or LCase(Trim(choice)) = "rescan" Then
+                RescanInline
+                searchText = ""
+                GoTo ContinueLoop
+            End If
+
+            If IsNumeric(Trim(choice)) Then
+                choiceNum = CLng(Trim(choice))
+                If choiceNum >= 1 And choiceNum <= mRecentCount Then
+                    MoveThenGo mRecentFolders(choiceNum), wantGo
+                    Exit Sub
+                End If
+            End If
+            searchText = choice
+        End If
+
+        If Len(Trim(searchText)) = 0 Then
+            prompt = header & T("Tapez le nom (ou partie) du dossier cible", "Type the target folder name (or part)") & vbCrLf
+            prompt = prompt & T("(ou ! pour re-scanner les dossiers) :", "(or ! to re-scan folders):")
+
+            searchText = modUi.AskText(prompt, T("QuickMove - Recherche", "QuickMove - Search"), searchText)
+            If StripGoStar(searchText) Then wantGo = True   ' v10.3
+            hasPrefill = False   ' en-tete consomme
+
+            If Len(Trim(searchText)) = 0 Then Exit Sub
+
+            If Trim(searchText) = "!" Or LCase(Trim(searchText)) = "rescan" Then
+                RescanInline
+                searchText = ""
+                GoTo ContinueLoop
+            End If
+        End If
+
+        ' v10.2 : memoriser le mot-cle tape (pre-remplissage de GoToFolder).
+        mLastKeyword = Trim$(searchText)
+
+        matchCount = FindMatchesLeaf(searchText, matchIndexes)
+
+        If matchCount = 0 Then
+            ' v11.2 : 3 issues, boutons renommes via modMsgBoxCustom.Confirm3
+            ' (hook WH_CBT deja valide sous EDR). [Creer le dossier] quand on
+            ' SAIT que le dossier n'existe pas ; [Re-scanner] quand l'index
+            ' est peut-etre obsolete ; [Annuler] (et Echap) = RETOUR A LA
+            ' SAISIE. Quitter = laisser la saisie suivante vide (sortie
+            ' standard du module) : l'ancien "Reessayer sans re-scanner" est
+            ' couvert par ce retour.
+            userAnswer = modMsgBoxCustom.Confirm3( _
+                   T("Aucun dossier pour """, "No folder for """) & searchText & """." & vbCrLf & vbCrLf & _
+                   T("Le dossier n'existe peut-etre pas encore (Cr~eer)," & vbCrLf & _
+                     "ou l'index est peut-etre obsolete (Re-scanner).", _
+                     "The folder may not exist yet (Create)," & vbCrLf & _
+                     "or the index may be stale (Re-scan)."), _
+                   "QuickMove", _
+                   T("Cr~eer le dossier", "Create folder"), _
+                   T("Re-scanner", "Re-scan"), _
+                   T("Annuler", "Cancel"), vbExclamation)
+            If userAnswer = vbYes Then
+                If CreateFolderInteractive(searchText, newIdx) Then
+                    MoveThenGo newIdx, wantGo
+                    Exit Sub
+                End If
+                ' Creation annulee ou en echec : retour a la saisie.
+            ElseIf userAnswer = vbNo Then
+                RescanInline
+                matchCount = FindMatchesLeaf(searchText, matchIndexes)
+                If matchCount = 0 Then
+                    MsgBox T("Toujours aucun dossier pour """, "Still no folder for """) & searchText & T(""" apres re-scan.", """ after re-scan."), _
+                           vbExclamation, "QuickMove"
+                ElseIf matchCount = 1 Then
+                    MoveThenGo matchIndexes(1), wantGo
+                    Exit Sub
+                End If
+                If matchCount > 1 Then GoTo ShowResults
+            End If
+            searchText = ""
+
+        ElseIf matchCount = 1 Then
+            MoveThenGo matchIndexes(1), wantGo
+            Exit Sub
+
+        Else
+ShowResults:
+            resultList = ""
+            For i = 1 To MinVal(matchCount, 20)
+                resultList = resultList & "[" & i & "] " & DisplayPath(matchIndexes(i)) & vbCrLf
+            Next i
+
+            choicePrompt = matchCount & T(" dossier(s) pour """, " folder(s) for """) & searchText & T(""" :", """:") & vbCrLf & vbCrLf
+            choicePrompt = choicePrompt & resultList
+            If matchCount > 20 Then
+                choicePrompt = choicePrompt & T("... et ", "... and ") & (matchCount - 20) & T(" autres (affinez)", " more (refine)") & vbCrLf
+            End If
+            choicePrompt = choicePrompt & vbCrLf
+            choicePrompt = choicePrompt & T("NUMERO pour deplacer (+* = puis ouvrir), TEXTE pour affiner, ! pour re-scanner :", "NUMBER to move (+* = then open), TEXT to refine, ! to re-scan:")
+
+            choice = modUi.AskText(choicePrompt, "QuickMove - " & matchCount & T(" resultats", " results"), "")
+            If StripGoStar(choice) Then wantGo = True   ' v10.3
+
+            If Len(Trim(choice)) = 0 Then Exit Sub
+
+            If Trim(choice) = "!" Or LCase(Trim(choice)) = "rescan" Then
+                RescanInline
+                searchText = ""
+                GoTo ContinueLoop
+            End If
+
+            If IsNumeric(Trim(choice)) Then
+                choiceNum = CLng(Trim(choice))
+                If choiceNum >= 1 And choiceNum <= MinVal(matchCount, 20) Then
+                    MoveThenGo matchIndexes(choiceNum), wantGo
+                    Exit Sub
+                Else
+                    MsgBox T("Numero invalide (1-", "Invalid number (1-") & MinVal(matchCount, 20) & ").", _
+                           vbExclamation, "QuickMove"
+                End If
+            Else
+                searchText = choice
+            End If
+        End If
+ContinueLoop:
+    Loop
+End Sub
+
+' ============================================================================
+' RE-SCAN INLINE (v7)
+' Relance un scan MAPI complet + reecriture du cache, sans MsgBox, sans
+' fermer la boucle de recherche. Utilise par la commande "!" / "rescan"
+' depuis QuickMoveSearch et par la branche "Oui" du MsgBox aucun-dossier.
+' ============================================================================
+Private Sub RescanInline()
+    Dim sCachePath As String
+    LoadAllFolders
+    sCachePath = CachePath()
+    SaveToCache sCachePath
+    LoadRecents   ' v10 - FIX : remapper les recents (cf. QuickMoveReload)
+    ' v10 (fix B5 residuel) : Explorer.StatusBar n'existe pas dans le
+    ' modele objet Outlook (l'appel etait un no-op silencieux sous OERN)
+    ' -> trace via modCommon.SetStatus (log DEBUG), cf. modCommon v1.1.
+    modCommon.SetStatus MOD_NAME, "QuickMove : " & mFolderCount & " dossiers reindexes."
+End Sub
+
+' ============================================================================
+' v10.3 - SUFFIXE * : deplacer PUIS ouvrir le dossier
+' StripGoStar : si la saisie se termine par *, le retire (ByRef) et renvoie
+'   True. * seul devient chaine vide (traitee comme annulation en amont).
+' MoveThenGo : DoMoveToFolder puis, si demande, NavigateToFolder sur le meme
+'   index. Move Exchange Online asynchrone : le mail peut apparaitre avec
+'   1-2 s de retard dans le dossier ouvert (cosmetique).
+' ============================================================================
+Private Function StripGoStar(ByRef userText As String) As Boolean
+    Dim tmp As String
+    tmp = Trim(userText)
+    If Len(tmp) > 0 Then
+        If Right(tmp, 1) = "*" Then
+            userText = Trim(Left(tmp, Len(tmp) - 1))
+            StripGoStar = True
+        End If
+    End If
+End Function
+
+Private Sub MoveThenGo(ByVal folderIndex As Long, ByVal alsoGo As Boolean)
+    DoMoveToFolder folderIndex
+    If alsoGo Then NavigateToFolder folderIndex
+End Sub
+
+' ============================================================================
+' DEPLACEMENT AVEC HISTORIQUE
+' ============================================================================
+Public Sub DoMoveToFolder(folderIndex As Long)
+    Dim targetFolder As Object
+    Dim col As Object
+    Dim mailCount As Long
+    Dim Item As Object
+    Dim movedCount As Long
+    Dim errCount As Long
+    Dim i As Long
+    Dim msg As String
+    Dim fromInspector As Boolean
+    Dim activeWin As Object
+    Dim winClass As Long
+
+    Set targetFolder = mFolders(folderIndex).FolderObject
+    If targetFolder Is Nothing Then
+        MsgBox T("Dossier introuvable.", "Folder not found."), vbCritical, "QuickMove"
+        Exit Sub
+    End If
+
+    ' v6.1 : on capture la fenetre au premier plan AVANT GetTargetItems pour
+    ' savoir si l'on classe depuis un mail plein ecran (Inspector=35).
+    On Error Resume Next
+    Set activeWin = Application.ActiveWindow
+    On Error GoTo 0
+    winClass = 0
+    If Not activeWin Is Nothing Then
+        On Error Resume Next
+        winClass = activeWin.Class
+        On Error GoTo 0
+    End If
+    fromInspector = (winClass = 35)
+
+    ' items issus de l'Inspector (mail plein ecran) ou de l'Explorer.
+    Set col = GetTargetItems()
+    mailCount = col.count
+    If mailCount = 0 Then
+        MsgBox T("Aucun message a deplacer.", "No message to move."), vbExclamation, "QuickMove"
+        Exit Sub
+    End If
+
+    movedCount = 0
+    errCount = 0
+    ' Iteration en marche arriere (Move modifie les collections Explorer).
+    For i = mailCount - 1 To 0 Step -1
+        Set Item = col.Items()(i)
+        On Error Resume Next
+        Item.Move targetFolder
+        If Err.Number = 0 Then
+            movedCount = movedCount + 1
+        Else
+            errCount = errCount + 1
+            Err.Clear
+        End If
+        On Error GoTo 0
+    Next i
+
+    If movedCount = 1 Then
+        msg = "1 msg -> " & DisplayPath(folderIndex)
+    Else
+        msg = movedCount & " msg -> " & DisplayPath(folderIndex)
+    End If
+    ' v10 (fix B5 residuel) : Explorer.StatusBar n'existe pas dans le
+    ' modele objet Outlook (no-op silencieux) -> le DInfo ci-dessous et le
+    ' toast plus bas assurent le retour utilisateur.
+    modDebugLog.DInfo MOD_NAME, msg
+
+    ' Notification toast non bloquante (mshta externe, auto-fermee).
+    If movedCount > 0 Then
+        Dim toastFolderName As String
+        On Error Resume Next
+        If Not mFolders(folderIndex).FolderObject Is Nothing Then
+            toastFolderName = mFolders(folderIndex).FolderObject.Name
+        End If
+        On Error GoTo 0
+        If Len(toastFolderName) = 0 Then
+            ' Fallback : dernier segment du FolderPath ("... > Dossier").
+            Dim segParts() As String
+            segParts = Split(mFolders(folderIndex).FolderPath, " > ")
+            toastFolderName = segParts(UBound(segParts))
+        End If
+        modNotify.NotifyFiled toastFolderName
+    End If
+
+    ' Enregistrer dans l'historique
+    AddToRecent folderIndex
+
+    If errCount > 0 Then
+        MsgBox movedCount & T(" deplace(s), ", " moved, ") & errCount & T(" erreur(s).", " error(s).") & vbCrLf & _
+               "-> " & DisplayPath(folderIndex), _
+               vbExclamation, "QuickMove"
+    End If
+
+    ' v6.1 : si on classait depuis un mail plein ecran et que tout est parti,
+    ' fermer la fenetre (l'item n'est plus dans son dossier d'origine).
+    If fromInspector And movedCount > 0 And errCount = 0 Then
+        On Error Resume Next
+        activeWin.Close 1   ' olDiscard : pas de prompt de sauvegarde
+        On Error GoTo 0
+    End If
+End Sub
+
+' ============================================================================
+' OUVRIR LE DOSSIER DU MAIL SELECTIONNE
+' Utile depuis la vue de recherche : un clic et on va au dossier du mail
+' ============================================================================
+Public Sub GoToMailFolder()
+    If Application.ActiveExplorer Is Nothing Then
+        MsgBox T("Aucune fenetre Outlook active.", "No active Outlook window."), vbExclamation, T("Aller au dossier", "Go to folder")
+        Exit Sub
+    End If
+    
+    If Application.ActiveExplorer.Selection.count = 0 Then
+        MsgBox T("Selectionnez un message.", "Select a message."), vbExclamation, T("Aller au dossier", "Go to folder")
+        Exit Sub
+    End If
+    
+    ' Recuperer le mail selectionne et son dossier parent
+    Dim selectedItem As Object
+    Dim parentFolder As Object
+    
+    On Error Resume Next
+    Set selectedItem = Application.ActiveExplorer.Selection.Item(1)
+    Set parentFolder = selectedItem.parent
+    On Error GoTo 0
+    
+    If parentFolder Is Nothing Then
+        MsgBox T("Impossible de trouver le dossier parent.", "Cannot find the parent folder."), vbExclamation, T("Aller au dossier", "Go to folder")
+        Exit Sub
+    End If
+    
+    ' Basculer l'affichage sur ce dossier
+    Set Application.ActiveExplorer.CurrentFolder = parentFolder
+    
+    modDebugLog.DInfo MOD_NAME, "GoTo -> " & parentFolder.FolderPath
+End Sub
+
+' ============================================================================
+' CONTEXTE RECHERCHE
+' True si le message selectionne reside dans un dossier different de celui
+' actuellement affiche par l'explorateur (cas d'un resultat de recherche).
+' Comparaison par EntryID des dossiers (fiable, independant du nom).
+' Tolerant aux erreurs : renvoie False si quoi que ce soit echoue, pour ne
+' jamais bloquer le comportement normal a cause de cette detection.
+' ============================================================================
+Private Function IsSearchContext() As Boolean
+    On Error GoTo Fail
+    IsSearchContext = False
+
+    If Application.ActiveExplorer Is Nothing Then Exit Function
+    If Application.ActiveExplorer.Selection.count = 0 Then Exit Function
+
+    Dim itm As Object
+    On Error Resume Next
+    Set itm = Application.ActiveExplorer.Selection.Item(1)
+    On Error GoTo Fail
+    If itm Is Nothing Then Exit Function
+
+    Dim parentFolder As Object
+    On Error Resume Next
+    Set parentFolder = itm.parent
+    On Error GoTo Fail
+    If parentFolder Is Nothing Then Exit Function
+
+    Dim curFolder As Object
+    On Error Resume Next
+    Set curFolder = Application.ActiveExplorer.CurrentFolder
+    On Error GoTo Fail
+    If curFolder Is Nothing Then Exit Function
+
+    Dim idParent As String, idCur As String
+    On Error Resume Next
+    idParent = parentFolder.EntryID
+    idCur = curFolder.EntryID
+    On Error GoTo Fail
+    If Len(idParent) = 0 Or Len(idCur) = 0 Then Exit Function
+
+    IsSearchContext = (StrComp(idParent, idCur, vbBinaryCompare) <> 0)
+    Exit Function
+Fail:
+    IsSearchContext = False
+End Function
+
+Public Function MinVal(a As Long, b As Long) As Long
+    If a < b Then MinVal = a Else MinVal = b
+End Function
+
+' ============================================================================
+' v11.2 - CREATION DE DOSSIER A LA VOLEE
+'
+' CreateFolderInteractive : cree un dossier Outlook metier quand une
+' recherche n'a rien donne, puis synchronise le referentiel Excel.
+'   - Appelee par QuickMoveSearch (bouton [Creer le dossier]) et par
+'     ThisOutlookSession.PromptForSentItem (commande "+").
+'   - initialText : texte de la recherche en echec (pre-remplit le code).
+'   - newIndex (ByRef) : index mFolders du dossier cree (ou retrouve) ;
+'     l'appelant effectue lui-meme le deplacement (MoveThenGo / Item.Move),
+'     ce qui conserve les toasts et l'historique existants.
+'   - Renvoie False si l'utilisateur annule ou si la creation echoue.
+' ============================================================================
+Public Function CreateFolderInteractive(ByVal initialText As String, _
+                                        ByRef newIndex As Long) As Boolean
+    CreateFolderInteractive = False
+    newIndex = 0
+    On Error GoTo Fail
+
+    If Not mLoaded Then SmartLoad
+
+    ' --- 1/3 : code DV ou contrat (boucle jusqu'a un format valide) ---
+    Dim code As String, isContract As Boolean
+    code = Trim$(initialText)
+    Do While Not ClassifyCode(code, isContract)
+        code = Trim$(modUi.AskText( _
+            T("Cr~eer un dossier - 1/3" & vbCrLf & vbCrLf & _
+              "Num~ero de ", "Create folder - 1/3" & vbCrLf & vbCrLf & _
+              "Enter a ") & modConfig.ProjectPrefixUC() & _
+            T(" (4 chiffres) ou de contrat (20XX_XXXXX) :", _
+              " code (4 digits) or a contract (20XX_XXXXX):"), _
+            T("Cr~eer un dossier", "Create a folder"), code))
+        If Len(code) = 0 Then Exit Function   ' vide ou Annuler
+    Loop
+
+    ' --- 2/3 et 3/3 : nom puis partenaire, pre-remplis depuis Suivi de
+    '     temps.xlsm si le code y figure (cache en memoire, zero Excel). ---
+    Dim defName As String, defPartner As String
+    On Error Resume Next
+    modProjectTag.LookupProjectByCode code, isContract, defName, defPartner
+    On Error GoTo Fail
+
+    Dim projName As String, partner As String
+    projName = Trim$(modUi.AskText( _
+        T("Cr~eer un dossier - 2/3" & vbCrLf & vbCrLf & _
+          "Nom du dossier / projet (optionnel, vide = ignorer) :", _
+          "Create folder - 2/3" & vbCrLf & vbCrLf & _
+          "Folder / project name (optional, empty = skip):"), _
+        T("Cr~eer un dossier", "Create a folder"), defName))
+
+    partner = Trim$(modUi.AskText( _
+        T("Cr~eer un dossier - 3/3" & vbCrLf & vbCrLf & _
+          "Partenaire (optionnel, vide = ignorer) :", _
+          "Create folder - 3/3" & vbCrLf & vbCrLf & _
+          "Partner (optional, empty = skip):"), _
+        T("Cr~eer un dossier", "Create a folder"), defPartner))
+
+    ' --- Nom final : CODE - Nom - Partenaire (" - " en dur, vides omis) ---
+    Dim folderName As String
+    folderName = code
+    If Len(projName) > 0 Then folderName = folderName & " - " & projName
+    If Len(partner) > 0 Then folderName = folderName & " - " & partner
+    folderName = SanitizeFolderName(folderName)
+    If Len(folderName) = 0 Then Exit Function
+
+    ' --- Parent (config) sous la Boite de reception de la boite par defaut ---
+    Dim parentFolder As Object
+    Set parentFolder = ResolveNewFolderParent(isContract)
+    If parentFolder Is Nothing Then Exit Function   ' deja signale
+
+    ' --- Creation (ou reutilisation si le dossier existe deja cote MAPI :
+    '     index obsolete, dossier cree sur un autre poste, etc.) ---
+    Dim newFolder As Object
+    Set newFolder = ChildByName(parentFolder, folderName)
+    If newFolder Is Nothing Then
+        On Error Resume Next
+        Err.Clear
+        Set newFolder = parentFolder.Folders.Add(folderName)
+        If Err.Number <> 0 Or newFolder Is Nothing Then
+            modDebugLog.DError MOD_NAME, "Folders.Add '" & folderName & _
+                "' err " & Err.Number & " - " & Err.Description
+            On Error GoTo Fail
+            modUi.Fail T("Cr~eation du dossier refus~ee par Outlook :", _
+                         "Outlook refused to create the folder:") & vbCrLf & _
+                       folderName, T("Cr~eer un dossier", "Create a folder"), vbCritical
+            Exit Function
+        End If
+        On Error GoTo Fail
+        modDebugLog.DInfo MOD_NAME, "Dossier cree : " & folderName
+    Else
+        modDebugLog.DInfo MOD_NAME, "Dossier deja existant, reutilise : " & folderName
+    End If
+
+    ' --- Ajout a l'index en memoire + cache disque (pas de re-scan) ---
+    newIndex = AddFolderToIndex(newFolder)
+    If newIndex = 0 Then
+        ' Index KO : repli sur un re-scan complet, puis re-recherche.
+        RescanInline
+        Dim mi() As Long
+        If FindMatchesLeaf(folderName, mi) >= 1 Then newIndex = mi(1)
+    End If
+    If newIndex = 0 Then Exit Function
+
+    ' --- Referentiel Excel (NON bloquant en cas d'echec) ---
+    Dim dvCode As String, contractCode As String, res As Long
+    If isContract Then contractCode = code Else dvCode = code
+    res = -1
+    On Error Resume Next
+    res = modProjectTag.EnsureTimeTrackingEntry(dvCode, contractCode, projName, partner)
+    On Error GoTo Fail
+    Select Case res
+        Case 1
+            modDebugLog.DInfo MOD_NAME, "Suivi de temps : ligne ajoutee (" & code & ")"
+        Case 0
+            modDebugLog.DInfo MOD_NAME, "Suivi de temps : code deja present (" & code & ")"
+        Case Else
+            modUi.Fail T("Dossier Outlook cr~e~e, mais ligne NON ajout~ee au " & _
+                         "suivi de temps (fichier verrouill~e ou introuvable ?).", _
+                         "Outlook folder created, but the row was NOT added to " & _
+                         "the time-tracking workbook (file locked or missing?).") & _
+                       vbCrLf & T("A ajouter a la main : ", "Add it manually: ") & code, _
+                       T("Cr~eer un dossier", "Create a folder")
+    End Select
+
+    CreateFolderInteractive = True
+    Exit Function
+Fail:
+    modDebugLog.DError MOD_NAME, "CreateFolderInteractive err " & Err.Number & _
+        " - " & Err.Description
+End Function
+
+' ----------------------------------------------------------------------------
+' ClassifyCode : classe un texte en code contrat (True / isContract=True),
+' code DV (True / isContract=False) ou ni l'un ni l'autre (False). Le
+' contrat est teste AVANT le DV : "2026_00277" contient "2026", soit 4
+' chiffres valides pour le motif DV. Motifs config : ContractPattern /
+' DigitsPattern (modConfig), ancres ^$ ajoutees ici (le code doit etre
+' la TOTALITE de la saisie).
+' ----------------------------------------------------------------------------
+Private Function ClassifyCode(ByVal txt As String, ByRef isContract As Boolean) As Boolean
+    ClassifyCode = False
+    isContract = False
+    If Len(txt) = 0 Then Exit Function
+    On Error GoTo Fail
+    Dim re As Object
+    Set re = CreateObject("VBScript.RegExp")
+    re.IgnoreCase = True
+    re.Global = False
+    re.Pattern = "^(?:" & modConfig.ContractPattern() & ")$"
+    If re.Test(txt) Then
+        isContract = True
+        ClassifyCode = True
+        Exit Function
+    End If
+    re.Pattern = "^(?:" & modConfig.DigitsPattern() & ")$"
+    If re.Test(txt) Then ClassifyCode = True
+    Exit Function
+Fail:
+    modDebugLog.DError MOD_NAME, "ClassifyCode err " & Err.Number & " - " & Err.Description
+End Function
+
+' ----------------------------------------------------------------------------
+' SanitizeFolderName : nettoie un nom de dossier Outlook. Caracteres
+' interdits ou a risque remplaces par "-", la sequence " > " neutralisee
+' (separateur de l'index, cf. en-tete "Contraintes / pieges"), espaces et
+' tirets superflus reduits, bornes nettoyees.
+' ----------------------------------------------------------------------------
+Private Function SanitizeFolderName(ByVal s As String) As String
+    Dim bad As Variant, i As Long
+    s = Replace(s, " > ", " - ")
+    bad = Array("\", "/", ":", "*", "?", """", "<", ">", "|", vbCr, vbLf, vbTab)
+    For i = LBound(bad) To UBound(bad)
+        s = Replace(s, CStr(bad(i)), "-")
+    Next i
+    Do While InStr(s, "  ") > 0
+        s = Replace(s, "  ", " ")
+    Loop
+    Do While InStr(s, "- -") > 0
+        s = Replace(s, "- -", "-")
+    Loop
+    s = Trim$(s)
+    Do While Len(s) > 0
+        If Right$(s, 1) = "-" Or Right$(s, 1) = "." Then
+            s = Trim$(Left$(s, Len(s) - 1))
+        Else
+            Exit Do
+        End If
+    Loop
+    SanitizeFolderName = s
+End Function
+
+' ----------------------------------------------------------------------------
+' ResolveNewFolderParent : resout (ou cree, si NewFolderCreateMissingParents
+' =1) le dossier parent configure, RELATIF a la Boite de reception de la
+' boite PAR DEFAUT, resolue par GetDefaultFolder(olFolderInbox) - jamais
+' par son nom, localise. Renvoie Nothing apres avoir signale l'erreur.
+' ----------------------------------------------------------------------------
+Private Function ResolveNewFolderParent(ByVal isContract As Boolean) As Object
+    Set ResolveNewFolderParent = Nothing
+    On Error GoTo Fail
+
+    Dim keyName As String, relPath As String
+    If isContract Then
+        keyName = "NewFolderParentContract"
+    Else
+        keyName = "NewFolderParentProject"
+    End If
+    relPath = Trim$(modConfig.Cfg(keyName, ""))
+    If Len(relPath) = 0 Then
+        modUi.Fail T("Cl~e config.ini absente ou vide : ", _
+                     "Missing or empty config.ini key: ") & keyName, _
+                   T("Cr~eer un dossier", "Create a folder")
+        Exit Function
+    End If
+
+    Dim cur As Object
+    Set cur = Application.Session.GetDefaultFolder(6)   ' olFolderInbox
+    If cur Is Nothing Then Exit Function
+
+    Dim createMissing As Boolean
+    createMissing = (Trim$(modConfig.Cfg("NewFolderCreateMissingParents", "0")) = "1")
+
+    Dim parts() As String, k As Long, child As Object
+    parts = Split(relPath, " > ")
+    For k = LBound(parts) To UBound(parts)
+        If Len(Trim$(parts(k))) > 0 Then
+            Set child = ChildByName(cur, Trim$(parts(k)))
+            If child Is Nothing And createMissing Then
+                On Error Resume Next
+                Set child = cur.Folders.Add(Trim$(parts(k)))
+                On Error GoTo Fail
+            End If
+            If child Is Nothing Then
+                modUi.Fail T("Dossier parent introuvable sous la Bo~ite de r~eception : ", _
+                             "Parent folder not found under the Inbox: ") & relPath & vbCrLf & _
+                           T("(cl~e ", "(key ") & keyName & _
+                           " ; NewFolderCreateMissingParents=0)", _
+                           T("Cr~eer un dossier", "Create a folder")
+                Exit Function
+            End If
+            Set cur = child
+        End If
+    Next k
+    Set ResolveNewFolderParent = cur
+    Exit Function
+Fail:
+    modDebugLog.DError MOD_NAME, "ResolveNewFolderParent err " & Err.Number & _
+        " - " & Err.Description
+End Function
+
+' ----------------------------------------------------------------------------
+' AddFolderToIndex : ajoute un dossier fraichement cree a l'index en memoire
+' et reecrit le cache disque. Chemin derive de Folder.FolderPath
+' ("\\Boite\Inbox\DV\Nom" -> segments " > " sans le nom de boite, meme
+' convention qu'EnumerateFolders ; le 1er segment EST le nom de la boite,
+' repris tel quel comme StoreName). Renvoie l'index mFolders (0 si echec).
+' ----------------------------------------------------------------------------
+Private Function AddFolderToIndex(ByVal newFolder As Object) As Long
+    AddFolderToIndex = 0
+    On Error GoTo Fail
+
+    Dim fp As String
+    fp = CStr(newFolder.FolderPath)
+    If Left$(fp, 2) = "\\" Then fp = Mid$(fp, 3)
+    Dim segs() As String, sPath As String, k As Long
+    segs = Split(fp, "\")
+    If UBound(segs) < 1 Then Exit Function   ' au moins boite + 1 dossier
+    For k = 1 To UBound(segs)                ' segs(0) = nom de la boite
+        If Len(sPath) > 0 Then sPath = sPath & " > "
+        sPath = sPath & segs(k)
+    Next k
+
+    ' Tableau eventuellement non initialise ou plein.
+    Dim ub As Long
+    ub = 0
+    On Error Resume Next
+    ub = UBound(mFolders)
+    On Error GoTo Fail
+    If ub = 0 Then
+        ReDim mFolders(1 To 100)
+    ElseIf mFolderCount + 1 > ub Then
+        ReDim Preserve mFolders(1 To mFolderCount + 100)
+    End If
+
+    mFolderCount = mFolderCount + 1
+    mFolders(mFolderCount).FolderPath = sPath
+    mFolders(mFolderCount).StoreName = segs(0)
+    Set mFolders(mFolderCount).FolderObject = newFolder
+    SetEntryFields mFolderCount, newFolder
+    SetDerivedFields mFolderCount
+    SaveToCache CachePath()
+    modDebugLog.DInfo MOD_NAME, "Index +1 : [" & segs(0) & "] " & sPath
+    AddFolderToIndex = mFolderCount
+    Exit Function
+Fail:
+    modDebugLog.DError MOD_NAME, "AddFolderToIndex err " & Err.Number & _
+        " - " & Err.Description
+End Function

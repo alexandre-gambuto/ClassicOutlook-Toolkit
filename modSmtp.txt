@@ -1,0 +1,372 @@
+Option Explicit
+
+'=============================================================================
+' modSmtp  (v1.0 - 2026-09-02)  [PACK v3 - C2 / B8]
+' Purpose (EN): single place for SMTP address resolution (current user,
+'   recipients, organizer, sender), domain extraction and the internal /
+'   external verdict, with a session cache. Replaces the 2-3 private copies
+'   that lived in modMeetingColor, modReplySuspicion, modMeetingToAppointment,
+'   modAppointmentPrivacy, modReplyGreeting and modMailResponseTracker.
+'
+' Resolution SMTP centralisee, AVEC CACHE DE SESSION :
+'   - MySmtp() / MyName()        : identite du compte courant (calculee 1 fois)
+'   - RecipientSmtp(rcp)         : SMTP d'un Recipient (cache par rcp.Address)
+'   - AddressEntrySmtp(ae)       : SMTP d'une AddressEntry
+'   - OrganizerSmtp(appt)        : SMTP de l'organisateur d'un RDV
+'   - SenderSmtp(mail)           : SMTP de l'expediteur d'un mail
+'   - ExtractDomain(smtp)        : partie apres @ (minuscules)
+'   - IsInternalDomain(domain)   : domaine interne (config InternalDomains),
+'                                  egalite OU sous-domaine (".domaine")
+'   - IsInternalSmtp(smtp)       : raccourci ExtractDomain + IsInternalDomain
+'   - IsMe(smtp)                 : adresse = compte courant
+'   - ClearCache                 : vide le cache (modDevTools.Reinit / tests)
+'
+' POURQUOI UN CACHE : sur un meme evenement calendrier, modMeetingColor,
+' modMeetingToAppointment et modAppointmentPrivacy resolvaient chacun les
+' participants via GetExchangeUser (aller-retour Exchange par participant),
+' et GetMySmtp etait recalcule a chaque appel. Une adresse Exchange (DN "EX")
+' ne change pas de SMTP au cours d'une session : on la memorise.
+'
+' CHAINE DE RESOLUTION D'UN RECIPIENT (union des chaines historiques, de la
+' moins couteuse a la plus couteuse) :
+'   1. rcp.Address contient "@"                 -> SMTP natif
+'   2. AddressEntry.PropertyAccessor PR_SMTP     (0x39FE001E)
+'   3. AddressEntry type Exchange -> GetExchangeUser / GetExchangeDistributionList
+'   4. AddressEntry contact Outlook -> GetContact.Email1Address
+'   5. Recipient.PropertyAccessor PR_SMTP puis PR_EMAIL_ADDRESS (0x3003001E)
+' Tout est sous garde d'erreur : une etape qui leve passe a la suivante.
+'
+' Convention : les adresses renvoyees sont TRIMMEES, casse d'origine ; les
+' comparaisons se font en vbTextCompare cote appelant (ou via IsMe).
+' DEPENDANCES : modConfig (InternalDomains), modDebugLog.
+'=============================================================================
+
+Private Const MOD_NAME As String = "Smtp"
+Private Const MOD_VERSION As String = "v1.0 - 2026-09-02"
+
+Private Const PR_SMTP_ADDRESS As String = "http://schemas.microsoft.com/mapi/proptag/0x39FE001E"
+Private Const PR_EMAIL_ADDRESS As String = "http://schemas.microsoft.com/mapi/proptag/0x3003001E"
+Private Const PR_SENDER_SMTP As String = "http://schemas.microsoft.com/mapi/proptag/0x5D01001F"
+Private Const PR_SENT_REPR_SMTP As String = "http://schemas.microsoft.com/mapi/proptag/0x5D02001F"
+Private Const PR_SENT_REPR_EMAIL As String = "http://schemas.microsoft.com/mapi/proptag/0x0065001F"
+
+' AddressEntryUserType (valeurs en dur : late binding tolere partout)
+Private Const AE_EXCHANGE_USER As Long = 0
+Private Const AE_EXCHANGE_DL As Long = 1
+Private Const AE_OUTLOOK_CONTACT As Long = 10
+Private Const AE_EXCHANGE_REMOTE As Long = 5
+
+' Plafond du cache (entrees) : au-dela, on repart de zero.
+Private Const CACHE_MAX As Long = 3000
+
+Private mMySmtp As String
+Private mMyName As String
+Private mCache As Object          ' Scripting.Dictionary : cle -> SMTP
+
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+'=============================================================================
+' Cache
+'=============================================================================
+Private Sub EnsureCache()
+    If mCache Is Nothing Then
+        Set mCache = CreateObject("Scripting.Dictionary")
+        mCache.CompareMode = 1   ' TextCompare
+    ElseIf mCache.Count > CACHE_MAX Then
+        mCache.RemoveAll
+    End If
+End Sub
+
+Public Sub ClearCache()
+    On Error Resume Next
+    Set mCache = Nothing
+    mMySmtp = ""
+    mMyName = ""
+    modDebugLog.DDebug MOD_NAME, "Cache SMTP vide"
+End Sub
+
+Private Function CacheGet(ByVal key As String, ByRef found As Boolean) As String
+    found = False
+    On Error Resume Next
+    EnsureCache
+    If Len(key) = 0 Then Exit Function
+    If mCache.Exists(key) Then
+        CacheGet = CStr(mCache(key))
+        found = True
+    End If
+End Function
+
+Private Sub CachePut(ByVal key As String, ByVal smtp As String)
+    On Error Resume Next
+    EnsureCache
+    If Len(key) = 0 Then Exit Sub
+    mCache(key) = smtp
+End Sub
+
+'=============================================================================
+' Identite du compte courant (calculee une fois par session)
+'=============================================================================
+Public Function MySmtp() As String
+    On Error Resume Next
+    If Len(mMySmtp) > 0 Then
+        MySmtp = mMySmtp
+        Exit Function
+    End If
+    Dim s As String
+    Dim ae As Object
+    Set ae = Application.Session.CurrentUser.AddressEntry
+    If Not ae Is Nothing Then s = AddressEntrySmtp(ae)
+    If InStr(s, "@") = 0 Then s = CStr(Application.Session.CurrentUser.Address)
+    If InStr(s, "@") = 0 Then s = ""
+    mMySmtp = Trim$(s)
+    MySmtp = mMySmtp
+End Function
+
+Public Function MyName() As String
+    On Error Resume Next
+    If Len(mMyName) = 0 Then mMyName = Trim$(CStr(Application.Session.CurrentUser.Name))
+    MyName = mMyName
+End Function
+
+' True si smtp est l'adresse du compte courant (comparaison insensible a la casse).
+Public Function IsMe(ByVal smtp As String) As Boolean
+    Dim mine As String
+    mine = MySmtp()
+    If Len(mine) = 0 Or Len(smtp) = 0 Then Exit Function
+    IsMe = (StrComp(Trim$(smtp), mine, vbTextCompare) = 0)
+End Function
+
+'=============================================================================
+' AddressEntry -> SMTP (sans cache : l'appelant cache par sa propre cle)
+'=============================================================================
+Public Function AddressEntrySmtp(ByVal ae As Object) As String
+    AddressEntrySmtp = ""
+    On Error Resume Next
+    If ae Is Nothing Then Exit Function
+
+    Dim s As String
+    s = ""
+    s = CStr(ae.PropertyAccessor.GetProperty(PR_SMTP_ADDRESS))
+    If InStr(s, "@") > 0 Then
+        AddressEntrySmtp = Trim$(s)
+        Exit Function
+    End If
+
+    Dim typ As Long
+    typ = -1
+    typ = ae.AddressEntryUserType
+    s = ""
+    Select Case typ
+        Case AE_EXCHANGE_USER, AE_EXCHANGE_REMOTE
+            s = CStr(ae.GetExchangeUser().PrimarySmtpAddress)
+        Case AE_EXCHANGE_DL
+            s = CStr(ae.GetExchangeDistributionList().PrimarySmtpAddress)
+        Case AE_OUTLOOK_CONTACT
+            s = CStr(ae.GetContact().Email1Address)
+    End Select
+    If InStr(s, "@") > 0 Then
+        AddressEntrySmtp = Trim$(s)
+        Exit Function
+    End If
+
+    s = ""
+    s = CStr(ae.Address)
+    If InStr(s, "@") > 0 Then AddressEntrySmtp = Trim$(s)
+End Function
+
+'=============================================================================
+' Recipient -> SMTP (cache par rcp.Address : un DN Exchange ne change pas)
+'=============================================================================
+Public Function RecipientSmtp(ByVal rcp As Object) As String
+    RecipientSmtp = ""
+    On Error Resume Next
+    If rcp Is Nothing Then Exit Function
+
+    Dim addr As String
+    addr = ""
+    addr = CStr(rcp.Address)
+    If InStr(addr, "@") > 0 Then
+        RecipientSmtp = Trim$(addr)
+        Exit Function
+    End If
+
+    Dim found As Boolean, cached As String
+    cached = CacheGet(addr, found)
+    If found Then
+        RecipientSmtp = cached
+        Exit Function
+    End If
+
+    Dim s As String
+    Dim ae As Object
+    Set ae = rcp.AddressEntry
+    If ae Is Nothing Then
+        rcp.Resolve
+        Set ae = rcp.AddressEntry
+    End If
+    If Not ae Is Nothing Then s = AddressEntrySmtp(ae)
+
+    If InStr(s, "@") = 0 Then
+        s = ""
+        s = CStr(rcp.PropertyAccessor.GetProperty(PR_SMTP_ADDRESS))
+    End If
+    If InStr(s, "@") = 0 Then
+        s = ""
+        s = CStr(rcp.PropertyAccessor.GetProperty(PR_EMAIL_ADDRESS))
+    End If
+    If InStr(s, "@") = 0 Then s = ""
+
+    s = Trim$(s)
+    If Len(s) > 0 Then CachePut addr, s
+    RecipientSmtp = s
+End Function
+
+'=============================================================================
+' Organisateur d'un RDV -> SMTP. Chaine (moins couteuse d'abord) :
+'   1. PR_SENT_REPRESENTING_SMTP_ADDRESS sur l'item
+'   2. appt.GetOrganizer() -> RecipientSmtp
+'   3. PR_SENT_REPRESENTING_EMAIL_ADDRESS (si "@")
+'   4. CreateRecipient(appt.Organizer).Resolve -> RecipientSmtp
+'   5. Recipient du RDV portant le meme nom d'affichage que l'organisateur
+' Cache par EntryID (un item existant ne change pas d'organisateur).
+'=============================================================================
+Public Function OrganizerSmtp(ByVal appt As Object) As String
+    OrganizerSmtp = ""
+    On Error Resume Next
+    If appt Is Nothing Then Exit Function
+
+    Dim eid As String
+    eid = ""
+    eid = CStr(appt.EntryID)
+    Dim found As Boolean, cached As String
+    If Len(eid) > 0 Then
+        cached = CacheGet("ORG|" & eid, found)
+        If found Then
+            OrganizerSmtp = cached
+            Exit Function
+        End If
+    End If
+
+    Dim s As String
+    s = ""
+    s = CStr(appt.PropertyAccessor.GetProperty(PR_SENT_REPR_SMTP))
+    If InStr(s, "@") = 0 Then
+        s = ""
+        Dim rcp As Object
+        Set rcp = appt.GetOrganizer()
+        If Not rcp Is Nothing Then s = RecipientSmtp(rcp)
+    End If
+    If InStr(s, "@") = 0 Then
+        s = ""
+        s = CStr(appt.PropertyAccessor.GetProperty(PR_SENT_REPR_EMAIL))
+        If InStr(s, "@") = 0 Then s = ""
+    End If
+
+    Dim orgName As String
+    orgName = ""
+    orgName = Trim$(CStr(appt.Organizer))
+
+    If InStr(s, "@") = 0 And Len(orgName) > 0 Then
+        s = ""
+        Dim r2 As Object
+        Set r2 = Application.Session.CreateRecipient(orgName)
+        If Not r2 Is Nothing Then
+            r2.Resolve
+            If r2.Resolved Then s = RecipientSmtp(r2)
+        End If
+    End If
+
+    If InStr(s, "@") = 0 And Len(orgName) > 0 Then
+        s = ""
+        Dim r As Object
+        For Each r In appt.Recipients
+            If StrComp(CStr(r.Name), orgName, vbTextCompare) = 0 Then
+                s = RecipientSmtp(r)
+                If InStr(s, "@") > 0 Then Exit For
+            End If
+        Next r
+    End If
+
+    If InStr(s, "@") = 0 Then s = ""
+    s = Trim$(s)
+    If Len(eid) > 0 And Len(s) > 0 Then CachePut "ORG|" & eid, s
+    OrganizerSmtp = s
+End Function
+
+'=============================================================================
+' Expediteur d'un mail -> SMTP : PR_SENDER_SMTP_ADDRESS, puis
+' SenderEmailAddress si deja SMTP, puis Sender (AddressEntry) -> Exchange.
+'=============================================================================
+Public Function SenderSmtp(ByVal mail As Object) As String
+    SenderSmtp = ""
+    On Error Resume Next
+    If mail Is Nothing Then Exit Function
+
+    Dim s As String
+    s = ""
+    s = CStr(mail.PropertyAccessor.GetProperty(PR_SENDER_SMTP))
+    If InStr(s, "@") = 0 Then
+        s = ""
+        s = CStr(mail.SenderEmailAddress)
+        If InStr(s, "@") = 0 Then
+            s = ""
+            Dim ae As Object
+            Set ae = mail.Sender
+            If Not ae Is Nothing Then s = AddressEntrySmtp(ae)
+        End If
+    End If
+    If InStr(s, "@") = 0 Then s = ""
+    SenderSmtp = Trim$(s)
+End Function
+
+'=============================================================================
+' Domaines
+'=============================================================================
+Public Function ExtractDomain(ByVal smtp As String) As String
+    ExtractDomain = ""
+    Dim p As Long
+    p = InStr(smtp, "@")
+    If p > 0 And p < Len(smtp) Then ExtractDomain = LCase$(Trim$(Mid$(smtp, p + 1)))
+End Function
+
+' Domaine interne : egalite avec un domaine configure OU sous-domaine
+' (".domaine"). Ni "contient" (sous-chaine trop large), ni egalite stricte
+' seule (un sous-domaine interne serait juge externe).
+Public Function IsInternalDomain(ByVal domain As String) As Boolean
+    IsInternalDomain = False
+    Dim d As String
+    d = LCase$(Trim$(domain))
+    If Len(d) = 0 Then Exit Function
+    Dim domains() As String, i As Long, ref As String
+    domains = Split(modConfig.InternalDomains(), "|")
+    For i = LBound(domains) To UBound(domains)
+        ref = LCase$(Trim$(domains(i)))
+        If Len(ref) > 0 Then
+            If d = ref Then
+                IsInternalDomain = True
+                Exit Function
+            ElseIf Len(d) > Len(ref) + 1 Then
+                If Right$(d, Len(ref) + 1) = "." & ref Then
+                    IsInternalDomain = True
+                    Exit Function
+                End If
+            End If
+        End If
+    Next i
+End Function
+
+Public Function IsInternalSmtp(ByVal smtp As String) As Boolean
+    IsInternalSmtp = IsInternalDomain(ExtractDomain(smtp))
+End Function
+
+'=============================================================================
+' Diagnostic (fenetre Execution) : identite + taille du cache.
+'=============================================================================
+Public Sub SmtpDiag()
+    On Error Resume Next
+    EnsureCache
+    modDebugLog.DInfo MOD_NAME, "MySmtp=" & MySmtp() & " MyName=" & MyName() & _
+        " cache=" & mCache.Count & " entree(s)"
+End Sub

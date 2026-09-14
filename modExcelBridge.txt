@@ -1,0 +1,325 @@
+Option Explicit
+
+'=============================================================================
+' modExcelBridge  (v1.0 - 2026-09-02)  [PACK v3 - C1]
+' Purpose (EN): shared Excel COM lifecycle for every module that reads or
+'   writes a workbook from Outlook: get-or-create an Excel instance (ghost
+'   detection, adoption of an invisible automation leftover), open a workbook
+'   hidden with retry/backoff, read a block in ONE COM call, compute the last
+'   data row, and close/quit safely (never persisting a hidden window).
+'
+' Cycle de vie Excel PARTAGE. Les regles reunies ici etaient reimplementees
+' (a des niveaux de maturite differents) dans modProjectTag,
+' modMailResponseTracker, modMailCampaign et modBackupAuto :
+'   - GetObject prefere l'instance existante ; elle peut etre un FANTOME
+'     (EXCEL.EXE residuel, proxy COM mort : erreur 462 a la 1re ecriture) ->
+'     validation par modCommon.ExcelAlive (aller-retour complet).
+'   - une instance INVISIBLE n'est jamais celle de l'utilisateur : c'est un
+'     reste d'automation -> adoptee (createdByUs=True), quittee a la fin si
+'     elle n'heberge plus aucun classeur.
+'   - Excel "busy" (cellule en edition, dialogue modal) refuse les appels
+'     COM (RPC_E_CALL_REJECTED / RETRYLATER) -> retry/backoff progressif.
+'   - Workbooks : iteration PAR INDEX (For Each sur une collection COM busy
+'     peut lever en plein parcours).
+'   - ouverture FURTIVE : ScreenUpdating coupe, fenetre du classeur masquee.
+'   - Excel PERSISTE la visibilite de la fenetre DANS le fichier : un Save
+'     fenetre masquee rend le classeur invisible aux ouvertures suivantes
+'     (Excel "vide") -> SaveWorkbookVisible re-affiche AVANT d'enregistrer.
+'
+' API :
+'   GetExcelApp(createdByUs)                      -> Excel.Application ou Nothing
+'   OpenWorkbook(path, readOnly, xlApp, wb, wasOpen, createdByUs) -> Boolean
+'   CloseWorkbook(xlApp, wb, wasOpen, createdByUs, saveChanges)
+'   SaveWorkbookVisible(xlApp, wb)
+'   ReadBlock(ws, r1, c1, r2, c2)                 -> Variant 2D (toujours)
+'   DataLastRow(ws, firstCol, lastCol)            -> Long (max des End(xlUp))
+'   IsRetryableCOMError(errNum), PauseMs(ms)
+'
+' NON COUVERT (volontairement) : la gestion d'imbrication du tracker
+' (mWbDepth, HandOverWorkbook) reste dans modMailResponseTracker, dont le
+' cycle de vie v5.9 a ete durci en production ; il n'utilise ici que
+' modCommon.ExcelAlive (copie privee supprimee).
+' DEPENDANCES : modCommon (ExcelAlive), modDebugLog.
+'=============================================================================
+
+Private Const MOD_NAME As String = "ExcelBridge"
+Private Const MOD_VERSION As String = "v1.0 - 2026-09-02"
+
+Private Const COM_MAX_RETRIES As Long = 5
+Private Const COM_BACKOFF_MS As Long = 200    ' delai de base, croissant
+
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+'=============================================================================
+' Vrai si l'erreur VBA correspond a un refus temporaire d'appel COM Excel.
+' NB : la facon dont VBA expose 0x80010001 n'est pas garantie (peut arriver
+' en -2147418111, enveloppe en 1004, ou DISP_E_EXCEPTION) : on liste les
+' codes connus, et les appelants retentent sur TOUTE erreur pour les appels
+' ou Excel existe forcement (Count / Open).
+'=============================================================================
+Public Function IsRetryableCOMError(ByVal errNum As Long) As Boolean
+    Select Case errNum
+        Case -2147418111, -2147417846, -2147417851, 1004
+            IsRetryableCOMError = True
+        Case Else
+            IsRetryableCOMError = False
+    End Select
+End Function
+
+' Pause active courte (ms) sans dependance API : laisse Excel finir son
+' operation en cours avant de reessayer.
+Public Sub PauseMs(ByVal ms As Long)
+    Dim t0 As Double
+    t0 = Timer
+    Do While (Timer - t0) * 1000 < ms
+        DoEvents
+        If Timer < t0 Then Exit Do   ' passage de minuit
+    Loop
+End Sub
+
+'=============================================================================
+' GetExcelApp : instance Excel existante (validee) ou nouvelle (invisible).
+' createdByUs : True si l'instance est a nous (creee, ou invisible adoptee)
+' -> l'appelant la quitte via CloseWorkbook quand plus aucun classeur.
+'=============================================================================
+Public Function GetExcelApp(ByRef createdByUs As Boolean) As Object
+    Set GetExcelApp = Nothing
+    createdByUs = False
+
+    Dim xl As Object
+    Dim tentative As Long, e As Long
+    For tentative = 1 To COM_MAX_RETRIES
+        Err.Clear
+        On Error Resume Next
+        Set xl = GetObject(, "Excel.Application")
+        e = Err.Number
+        On Error GoTo 0
+        If e = 0 Then Exit For
+        If Not IsRetryableCOMError(e) Then Exit For   ' Excel pas lance -> creer
+        modDebugLog.DDebug MOD_NAME, "GetObject Excel busy (err " & e & "), retry " & tentative
+        PauseMs COM_BACKOFF_MS * tentative
+    Next tentative
+
+    If Not xl Is Nothing Then
+        If Not modCommon.ExcelAlive(xl) Then
+            modDebugLog.DInfo MOD_NAME, "Instance Excel fantome ignoree (GetObject)"
+            Set xl = Nothing
+        End If
+    End If
+
+    If xl Is Nothing Then
+        On Error Resume Next
+        Set xl = CreateObject("Excel.Application")
+        On Error GoTo 0
+        If xl Is Nothing Then
+            modDebugLog.DError MOD_NAME, "Impossible d'obtenir une instance Excel"
+            Exit Function
+        End If
+        On Error Resume Next
+        xl.Visible = False
+        On Error GoTo 0
+        createdByUs = True
+    Else
+        ' Une instance INVISIBLE n'est jamais celle de l'utilisateur.
+        Dim appVisible As Boolean
+        appVisible = True
+        On Error Resume Next
+        appVisible = CBool(xl.Visible)
+        On Error GoTo 0
+        createdByUs = Not appVisible
+        If createdByUs Then modDebugLog.DInfo MOD_NAME, "Instance Excel invisible existante adoptee"
+    End If
+
+    Set GetExcelApp = xl
+End Function
+
+'=============================================================================
+' OpenWorkbook : retrouve le classeur s'il est deja ouvert (wasOpen=True),
+' sinon l'ouvre en mode furtif (lecture seule si demande).
+' Renvoie False si le fichier n'existe pas ou si Excel/l'ouverture echoue.
+'=============================================================================
+Public Function OpenWorkbook(ByVal path As String, ByVal readOnlyMode As Boolean, _
+                             ByRef xlApp As Object, ByRef wb As Object, _
+                             ByRef wasOpen As Boolean, ByRef createdByUs As Boolean) As Boolean
+    OpenWorkbook = False
+    wasOpen = False
+    Set wb = Nothing
+
+    If Dir(path) = "" Then
+        modDebugLog.DError MOD_NAME, "Classeur introuvable : " & path
+        Exit Function
+    End If
+
+    If xlApp Is Nothing Then Set xlApp = GetExcelApp(createdByUs)
+    If xlApp Is Nothing Then Exit Function
+
+    ' --- Deja ouvert ? Iteration PAR INDEX + retry sur le comptage ---
+    Dim nbWb As Long, tentative As Long, e As Long
+    nbWb = -1
+    For tentative = 1 To COM_MAX_RETRIES
+        Err.Clear
+        On Error Resume Next
+        nbWb = xlApp.Workbooks.Count
+        e = Err.Number
+        On Error GoTo 0
+        If e = 0 Then Exit For
+        modDebugLog.DDebug MOD_NAME, "Workbooks.Count err " & e & ", retry " & tentative
+        PauseMs COM_BACKOFF_MS * tentative
+    Next tentative
+
+    Dim lowPath As String
+    lowPath = LCase$(path)
+    If nbWb > 0 Then
+        Dim idx As Long, wbN As Object, fullN As String
+        For idx = 1 To nbWb
+            Set wbN = Nothing
+            fullN = ""
+            On Error Resume Next
+            Set wbN = xlApp.Workbooks.Item(idx)
+            If Not wbN Is Nothing Then fullN = wbN.FullName
+            On Error GoTo 0
+            If Len(fullN) > 0 Then
+                If LCase$(fullN) = lowPath Then
+                    Set wb = wbN
+                    wasOpen = True
+                    Exit For
+                End If
+            End If
+        Next idx
+    End If
+
+    ' --- Ouverture furtive avec retry/backoff ---
+    If Not wasOpen Then
+        On Error Resume Next
+        xlApp.ScreenUpdating = False
+        On Error GoTo 0
+        For tentative = 1 To COM_MAX_RETRIES
+            Err.Clear
+            On Error Resume Next
+            If readOnlyMode Then
+                Set wb = xlApp.Workbooks.Open(path, UpdateLinks:=0, ReadOnly:=True)
+            Else
+                Set wb = xlApp.Workbooks.Open(path, UpdateLinks:=0)
+            End If
+            e = Err.Number
+            On Error GoTo 0
+            If e = 0 And Not wb Is Nothing Then Exit For
+            modDebugLog.DDebug MOD_NAME, "Workbooks.Open err " & e & ", retry " & tentative
+            PauseMs COM_BACKOFF_MS * tentative
+        Next tentative
+        On Error Resume Next
+        If Not wb Is Nothing Then wb.Windows(1).Visible = False
+        xlApp.ScreenUpdating = True
+        On Error GoTo 0
+    End If
+
+    If wb Is Nothing Then
+        modDebugLog.DError MOD_NAME, "Echec ouverture " & path & " apres " & COM_MAX_RETRIES & " tentatives"
+        Exit Function
+    End If
+    OpenWorkbook = True
+End Function
+
+'=============================================================================
+' SaveWorkbookVisible : re-affiche la fenetre AVANT d'enregistrer (Excel
+' persiste la visibilite dans le fichier), ScreenUpdating coupe pour eviter
+' le flash, puis re-masque si elle etait masquee.
+'=============================================================================
+Public Sub SaveWorkbookVisible(ByVal xlApp As Object, ByVal wb As Object)
+    On Error Resume Next
+    If wb Is Nothing Then Exit Sub
+    Dim wasHidden As Boolean
+    wasHidden = False
+    wasHidden = Not CBool(wb.Windows(1).Visible)
+    If wasHidden Then
+        xlApp.ScreenUpdating = False
+        wb.Windows(1).Visible = True
+    End If
+    Err.Clear
+    wb.Save
+    If Err.Number <> 0 Then
+        modDebugLog.DError MOD_NAME, "Save err " & Err.Number & " - " & Err.Description
+        Err.Clear
+    End If
+    If wasHidden Then
+        wb.Windows(1).Visible = False
+        xlApp.ScreenUpdating = True
+    End If
+End Sub
+
+'=============================================================================
+' CloseWorkbook : enregistre si demande (fenetre re-affichee), referme le
+' classeur si c'est nous qui l'avons ouvert, quitte Excel si l'instance est
+' a nous et n'heberge plus rien. Jamais d'erreur vers l'appelant.
+'=============================================================================
+Public Sub CloseWorkbook(ByRef xlApp As Object, ByRef wb As Object, _
+                         ByVal wasOpen As Boolean, ByVal createdByUs As Boolean, _
+                         ByVal saveChanges As Boolean)
+    On Error Resume Next
+    If Not wb Is Nothing Then
+        If saveChanges Then
+            If wasOpen Then
+                ' Classeur de l'utilisateur : on enregistre sans le refermer.
+                SaveWorkbookVisible xlApp, wb
+            Else
+                xlApp.ScreenUpdating = False
+                wb.Windows(1).Visible = True
+                wb.Close SaveChanges:=True
+                xlApp.ScreenUpdating = True
+            End If
+        ElseIf Not wasOpen Then
+            wb.Close SaveChanges:=False
+        End If
+    End If
+    Set wb = Nothing
+
+    If createdByUs And Not xlApp Is Nothing Then
+        Dim n As Long
+        n = 0
+        n = xlApp.Workbooks.Count
+        If n = 0 Then
+            xlApp.DisplayAlerts = True
+            xlApp.Quit
+            Set xlApp = Nothing
+        End If
+    End If
+End Sub
+
+'=============================================================================
+' ReadBlock : lecture d'une plage en UN aller-retour COM. Renvoie toujours
+' un tableau 2D (1..n, 1..m), meme pour une cellule unique.
+'=============================================================================
+Public Function ReadBlock(ByVal ws As Object, ByVal r1 As Long, ByVal c1 As Long, _
+                          ByVal r2 As Long, ByVal c2 As Long) As Variant
+    Dim data As Variant
+    If r2 < r1 Or c2 < c1 Then
+        Dim empty2(1 To 1, 1 To 1) As Variant
+        ReadBlock = empty2
+        Exit Function
+    End If
+    data = ws.Range(ws.Cells(r1, c1), ws.Cells(r2, c2)).Value
+    If Not IsArray(data) Then
+        Dim one(1 To 1, 1 To 1) As Variant
+        one(1, 1) = data
+        data = one
+    End If
+    ReadBlock = data
+End Function
+
+'=============================================================================
+' DataLastRow : derniere ligne de DONNEES = max des End(xlUp) sur les
+' colonnes firstCol..lastCol. Renvoie 1 pour une feuille sans donnees.
+'=============================================================================
+Public Function DataLastRow(ByVal ws As Object, ByVal firstCol As Long, ByVal lastCol As Long) As Long
+    Dim c As Long, lr As Long, best As Long
+    best = 1
+    On Error Resume Next
+    For c = firstCol To lastCol
+        lr = 0
+        lr = ws.Cells(ws.Rows.Count, c).End(-4162).Row   ' -4162 = xlUp
+        If lr > best Then best = lr
+    Next c
+    DataLastRow = best
+End Function

@@ -1,0 +1,165 @@
+Option Explicit
+
+'=============================================================================
+' modStoreContext  (v1.1 - 2026-08-22)
+'
+' Contexte multiboite partage. Determine la boite (Outlook.Store) visee par
+' une commande a partir du dossier actuellement selectionne dans Outlook, et
+' fournit les acces derives : compte d'envoi (SendUsingAccount) et dossiers
+' systeme DE CETTE BOITE (Brouillons, Reception...).
+'
+' CONVENTION TOOLKIT : la boite cible d'une commande est DEDUITE du dossier
+' courant (meme logique que les modules contacts), jamais demandee. La
+' deduction etant silencieuse, les modules consommateurs affichent la boite
+' retenue dans leurs recapitulatifs/confirmations.
+'
+' POINTS D'ENTREE :
+'   DefaultStore()       : Store de la boite par defaut du profil.
+'   CurrentStore()       : Store du dossier selectionne (repli : defaut).
+'   IsDefaultStore(st)   : True si st est la boite par defaut.
+'   AccountForStore(st)  : Outlook.Account dont la boite de LIVRAISON est st
+'                          (pour SendUsingAccount), ou Nothing si la boite
+'                          n'a pas de compte propre (boite partagee ouverte
+'                          sous un autre compte, archive...).
+'   SysFolder(st, tp)    : dossier systeme tp (16=Brouillons, 6=Reception...)
+'                          de st, ou Nothing (tolerant : une archive sans
+'                          Brouillons ne leve pas d'erreur).
+'   StoreContextDiag()   : diagnostic (boites du profil, compte associe a
+'                          chacune, cible courante). A lancer sur le poste
+'                          AVANT d'utiliser les fonctions multiboite d'un
+'                          module consommateur (probe before build).
+'
+' CONSOMMATEURS : modMailCampaign v11 (premier). Les autres modules
+' mono-boite (QuickMove, Snooze, ReplyInPlace...) migreront un a un.
+'
+' PIEGES COUVERTS :
+'   - ActiveExplorer peut etre Nothing (fenetre Inspector seule) -> repli.
+'   - Account.DeliveryStore peut lever une erreur selon le type de compte
+'     -> tolere, compte ignore.
+'   - GetDefaultFolder sur un Store sans le dossier demande leve une erreur
+'     -> Nothing renvoye, l'appelant decide du repli.
+'
+' v1.1 (2026-08-22) : revue traduction. StoreContextDiag etait le seul point
+'   visible du module et il etait INTEGRALEMENT en francais, hors T() :
+'   libelles du rapport, mentions [defaut] / (sans compte propre) /
+'   (compte : ...) et titre de fenetre en dur. Language=EN ne le traduisait
+'   pas d'une ligne. Tout passe par T().
+'   Le diagnostic passe par modUi.Inform (garantie de premier plan) : il est
+'   souvent lance depuis la fenetre Execution du VBE, contexte ou une MsgBox
+'   native peut s'ouvrir derriere l'editeur.
+'   Ligne de titre normalisee et MOD_VERSION passe au format projet
+'   "vN.N - YYYY-MM-DD" (il portait "1.0", non conforme au gabarit lu par
+'   modMaintenance).
+'   Les noms de boites et de comptes restent HORS de T() : ce sont des
+'   donnees, et T() applique A() a ses branches (un nom contenant "~e" ou
+'   "~a" serait altere).
+'
+' DEPENDANCES : modConfig (T), modDebugLog, modUi.
+'=============================================================================
+
+Private Const MOD_NAME As String = "StoreCtx"
+Private Const MOD_VERSION As String = "v1.1 - 2026-08-22"
+
+Private Const OL_FOLDER_INBOX As Long = 6
+
+
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+
+' Store de la boite par defaut du profil. Repli : 1er store du profil.
+Public Function DefaultStore() As Object
+    On Error Resume Next
+    Set DefaultStore = Application.Session.GetDefaultFolder(OL_FOLDER_INBOX).Store
+    If DefaultStore Is Nothing Then Set DefaultStore = Application.Session.Stores.Item(1)
+End Function
+
+
+' Store du dossier actuellement selectionne dans l'explorateur Outlook.
+' Repli sur la boite par defaut si pas d'explorateur (Inspector seul) ou
+' si le dossier courant n'expose pas de Store.
+Public Function CurrentStore() As Object
+    On Error Resume Next
+    Dim xpl As Object
+    Set xpl = Application.ActiveExplorer
+    If Not xpl Is Nothing Then
+        If Not xpl.CurrentFolder Is Nothing Then
+            Set CurrentStore = xpl.CurrentFolder.Store
+        End If
+    End If
+    If CurrentStore Is Nothing Then
+        Set CurrentStore = DefaultStore()
+        modDebugLog.DDebug MOD_NAME, "CurrentStore : repli boite par defaut"
+    End If
+End Function
+
+
+Public Function IsDefaultStore(ByVal st As Object) As Boolean
+    On Error Resume Next
+    If st Is Nothing Then Exit Function
+    Dim stDef As Object
+    Set stDef = DefaultStore()
+    If stDef Is Nothing Then Exit Function
+    IsDefaultStore = (st.StoreID = stDef.StoreID)
+End Function
+
+
+' Compte du profil dont la boite de LIVRAISON est st (comparaison par
+' StoreID). Nothing si aucun : boite partagee montee sous un autre compte,
+' archive, dossiers publics. Dans ce cas l'envoi "depuis" cette boite passe
+' par SentOnBehalfOfName (droits Exchange requis), pas par SendUsingAccount.
+Public Function AccountForStore(ByVal st As Object) As Object
+    On Error Resume Next
+    If st Is Nothing Then Exit Function
+    Dim acc As Object, dlv As Object
+    For Each acc In Application.Session.Accounts
+        Set dlv = Nothing
+        Set dlv = acc.DeliveryStore
+        If Not dlv Is Nothing Then
+            If dlv.StoreID = st.StoreID Then
+                Set AccountForStore = acc
+                Exit Function
+            End If
+        End If
+    Next acc
+End Function
+
+
+' Dossier systeme folderType de la boite st, ou Nothing (jamais d'erreur).
+Public Function SysFolder(ByVal st As Object, ByVal folderType As Long) As Object
+    On Error Resume Next
+    If st Is Nothing Then Exit Function
+    Set SysFolder = st.GetDefaultFolder(folderType)
+End Function
+
+
+' Diagnostic terrain : liste les boites du profil, le compte d'envoi associe
+' a chacune (ou son absence) et la boite deduite du dossier courant.
+' v1.1 : integralement localise. Les DONNEES (DisplayName des boites et des
+' comptes) restent hors T().
+Public Sub StoreContextDiag()
+    On Error Resume Next
+    Dim rpt As String, st As Object, acc As Object
+
+    rpt = T("Bo~ites du profil :", "Profile mailboxes:") & vbCrLf
+    For Each st In Application.Session.Stores
+        Set acc = AccountForStore(st)
+        rpt = rpt & " - " & st.DisplayName
+        If IsDefaultStore(st) Then rpt = rpt & "  " & T("[d~efaut]", "[default]")
+        If acc Is Nothing Then
+            rpt = rpt & "  " & T("(sans compte propre)", "(no dedicated account)")
+        Else
+            rpt = rpt & "  " & T("(compte : ", "(account: ") & acc.DisplayName & ")"
+        End If
+        rpt = rpt & vbCrLf
+    Next st
+
+    Dim cur As Object
+    Set cur = CurrentStore()
+    rpt = rpt & vbCrLf & T("Cible (dossier courant) : ", "Target (current folder): ") & _
+          cur.DisplayName
+
+    modDebugLog.DInfo MOD_NAME, "Diag : cible = " & cur.DisplayName
+    modUi.Inform rpt, T("Bo~ites du profil - diagnostic", "Profile mailboxes - diagnostics")
+End Sub

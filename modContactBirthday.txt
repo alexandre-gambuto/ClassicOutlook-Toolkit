@@ -1,0 +1,1552 @@
+Option Explicit
+
+'=============================================================================
+' modContactBirthday v1.9  (2026-08-19)
+' Purpose (EN): create and maintain ONE yearly all-day birthday event per
+'   contact (Birthday field) in a calendar of your choice, scanning ALL
+'   contact folders of a chosen store (sub-folders included, Exchange system
+'   folders excluded). Idempotent (stable per-contact key), dry-run first,
+'   orphan purge with typed confirmation. No UserForm.
+'
+' Genere et maintient, dans le calendrier de son choix (existant ou cree a
+' la volee), un evenement annuel "journee entiere" par contact possedant une
+' date d'anniversaire. Parcourt TOUS les dossiers de contacts du compte
+' selectionne.
+'
+' POURQUOI CE MODULE (mode B) : le calendrier d'anniversaire natif
+' d'Outlook.com reste vide pour des contacts IMPORTES (CSV / vCard) et
+' n'offre aucun controle. Ici tout est pilote : calendrier cible, sujet
+' "Prenom NOM - Anniversaire - 7 juin 1991" (format configurable), rappel
+' J-1 a l'heure choisie, categorie coloree, statut Libre (aucune
+' indisponibilite affichee), evenements prives optionnels.
+'
+' IDEMPOTENCE : chaque evenement porte une UserProperty "BirthdayKey" = cle
+' stable derivee du NOM du contact (jamais de l'EntryID, qui mute au moindre
+' deplacement de fiche - cf. modQuickMove). Un second passage MET A JOUR au
+' lieu de dupliquer ; un changement de date supprime et recree la serie ; un
+' contact disparu laisse un evenement orphelin, liste dans le rapport et
+' purgeable apres confirmation TAPEE.
+'
+' MILLESIME 1604 : convention Microsoft "annee de naissance inconnue" (tout
+' millesime < 1800 est traite ainsi). La serie demarre alors l'annee
+' courante - ou la derniere annee bissextile pour un 29 fevrier - au lieu
+' de generer 400 ans d'occurrences ; le sujet omet l'annee.
+'
+' 29 FEVRIER : comportement natif d'Outlook conserve (occurrence le 28/02
+' les annees non bissextiles), aucun decalage impose.
+'
+' TROIS TYPES D'EVENEMENTS (v1.3), tous annuels, journee entiere, meme
+' calendrier / rappel / categorie, cles distinctes donc jamais confondus :
+'   B|nom  Anniversaire            champ Birthday
+'   M|nom  Anniversaire de mariage champ Anniversary  (AnniversaryEnabled,
+'          AnniversaryFolders, AnniversaryLabel ; le champ Outlook est
+'          libelle "Anniversaire de mariage/fete" en francais, on ne s'en
+'          sert QUE pour le mariage, la fete du prenom a sa propre
+'          UserProperty NameDay)
+'   N|nom  Fete du prenom          UserProperty NameDay ("MM-JJ")
+'
+' ANNEE INCONNUE : millesime <= UnknownBirthYearMax (1800 par defaut) ou
+' egal a UnknownBirthYear. L'annee est alors omise du sujet et la serie
+' demarre l'annee courante. Le millesime STOCKE reste au choix
+' (UnknownBirthYear, 1604 par defaut - convention Microsoft/Apple).
+'
+' FETES (v1.1) : pour les fiches des dossiers dont le nom repond a
+' NameDayFolders (*Amis*|*Famille* par defaut), un second evenement annuel
+' "Prenom NOM - Fete - 22 avril" est genere a partir de la UserProperty
+' NameDay ("MM-JJ") posee par modContactNormalize (v1.1+). Cle "N|nom"
+' distincte de la cle "B|nom" des anniversaires ; memes rappel / categorie /
+' calendrier ; sans NameDay la fiche n'a simplement pas d'evenement Fete.
+' Desactiver NameDayEnabled : les evenements Fete existants ressortent en
+' orphelins, purgeables.
+'
+' EVENEMENTS CALENDRIER DU TOOLKIT SUSPENDUS pendant l'ecriture
+' (ThisOutlookSession.SuspendCalendarEvents) : sinon chaque creation
+' reveillerait modMeetingColor / modAntiOverlap (+15 min !) / modProjectTag
+' (demande de tag). Restauration garantie, y compris en erreur.
+'
+' RAPPORT : <Bureau>\Macro VBA\Outlook\ContactBirthday-AAAAMMJJ-HHMMSS.txt
+' (UTF-8), ouverture proposee dans Notepad en fin de passe.
+'
+' RAPPELS (v1.4) : reglables PAR TYPE - BirthdayReminderDaysBefore pour les
+' anniversaires, NameDayReminderDaysBefore et AnniversaryReminderDaysBefore
+' pour les fetes et les mariages (valeur -1 = aucun rappel ; absentes du
+' config.ini = meme reglage que les anniversaires). Utile : fetes +
+' anniversaires + mariages font vite une alerte tous les deux jours.
+' ContactBirthdayReminders bascule ensuite tous les rappels du calendrier
+' (ou d'un seul type) sans regenerer les evenements.
+'
+' MISE EN PLACE DE LA VUE CALENDRIER (v1.5) - ContactBirthdaySetupView :
+'   1. bascule le volet sur le module Calendrier (OBLIGATOIRE : la doc
+'      Microsoft precise que IsSelected ne peut PAS etre mis a True si le
+'      module Calendrier n'est pas le module courant - le v1.4 echouait
+'      donc silencieusement) ;
+'   2. deplace le calendrier des anniversaires dans le groupe "Mes
+'      calendriers" (GetDefaultNavigationGroup olMyFoldersGroup) : il
+'      cessera de reapparaitre dans la rubrique des calendriers partages ;
+'   3. le coche et le passe en SUPERPOSITION (IsSideBySide = False) ;
+'   4. decoche tous les autres calendriers, sauf ceux listes dans
+'      BirthdayCalendarKeepPaths (chemins) et / ou
+'      BirthdayCalendarKeepDefaultOf (comptes dont le calendrier PAR DEFAUT
+'      reste coche - designation par ROLE, insensible au nom du dossier :
+'      Exchange re-localise "Calendar" en "Calendrier" tout seul quand la
+'      langue de la boite change) ;
+'   5. force la vue Calendrier / Semaine (olCalendarViewWeek : samedi et
+'      dimanche inclus, contrairement a la semaine de travail).
+' A appeler au PREMIER passage dans le calendrier de la session. Dans ce
+' projet : depuis ThisOutlookSession.SetupBirthdayViewDeferred (modDefer,
+' cle "BirthdayView"), en passant la fenetre calendrier en parametre
+' (l'architecture a deux fenetres a role rend ActiveExplorer ambigu).
+' v1.9 : l'appel est DIFFERE et VERIFIE. Appelee en synchrone juste apres
+' Explorers.Add/Display, la fenetre n'etait pas encore construite : le coche
+' partait sur le volet de l'autre fenetre (flash visible cote courrier),
+' puis la fenetre calendrier finissait son rendu et rechargeait ses
+' calendriers coches depuis l'etat persistant -> reglage ecrase. Desormais :
+' apres application on RELIT IsSelected du calendrier cible ; la garde
+' mViewDone n'est posee que si c'est verifie (ou si rien a faire). Sinon
+' l'appelant peut relancer (ContactBirthdayViewPending), au plus
+' VIEW_MAX_ATTEMPTS fois. ContactBirthdayResetViewFlag pour re-tester.
+'
+' SUBS PUBLIQUES (epinglables au QAT) :
+'   ContactBirthdaySync         compte -> calendrier cible -> Simulation /
+'                               Appliquer -> rapport (+ purge orphelins)
+'   ContactBirthdayReminders    active / desactive les rappels du calendrier
+'   ContactBirthdaySetupView    met en place la vue calendrier (1 fois par
+'                               session, sur FolderSwitch)
+'
+' Dependances : modConfig (Cfg/CfgL/CfgB, T, A, LangIsEN, MacroVBADir),
+'   modDebugLog, modMsgBoxCustom.Confirm3, ThisOutlookSession
+'   (SuspendCalendarEvents).
+'
+' Cles config.ini (section CONTACTS - ANNIVERSAIRES) : BirthdayCalendarName,
+'   BirthdayLabel, BirthdaySubjectFormat, BirthdayReminderDaysBefore,
+'   BirthdayReminderHour, BirthdayCategory, BirthdayCategoryColor,
+'   BirthdayBodyDetails, BirthdayPrivate, NameDayEnabled, NameDayFolders,
+'   NameDayLabel, AnniversaryEnabled, AnniversaryFolders, AnniversaryLabel,
+'   UnknownBirthYear, UnknownBirthYearMax, NameDayReminderDaysBefore,
+'   AnniversaryReminderDaysBefore, BirthdayCalendarPath,
+'   BirthdayCalendarAutoShow, BirthdayCalendarOverlay,
+'   BirthdayCalendarUncheckOthers, BirthdayCalendarKeepPaths,
+'   BirthdayCalendarKeepDefaultOf,
+'   BirthdayCalendarWeekView, ContactSkipFolders (partagee).
+'
+' UserProperties (fonctionnelles, jamais traduites) : BirthdayKey (sur les
+' evenements), NameDay (sur les fiches, posee par modContactNormalize).
+'
+' A LANCER APRES modContactNormalize (le sujet reprend Prenom / NOM tels
+' qu'ils sont dans la fiche).
+'=============================================================================
+
+Private Const MOD_NAME As String = "ContBday"
+Private Const MOD_VERSION As String = "v1.9 - 2026-08-19"
+
+' UserProperty posee sur chaque evenement genere (fonctionnelle, hors T()).
+Private Const UP_KEY As String = "BirthdayKey"
+' UserProperty "MM-JJ" posee sur les fiches par modContactNormalize.
+Private Const UP_NAMEDAY As String = "NameDay"
+' Outlook renvoie 01/01/4501 pour un champ Anniversaire vide.
+Private Const NO_BIRTHDAY_YEAR As Long = 4500
+' Millesime en deca duquel l'annee est reputee inconnue (1604 Microsoft,
+' 1601 / 1900 vus sur d'autres imports).
+Private Const UNKNOWN_YEAR_BELOW As Long = 1800
+' PR_ATTR_HIDDEN (dossiers systeme Exchange) et PR_CONTAINER_CLASS.
+Private Const PROPTAG_HIDDEN As String = "http://schemas.microsoft.com/mapi/proptag/0x10F4000B"
+Private Const PROPTAG_CONTAINER_CLASS As String = "http://schemas.microsoft.com/mapi/proptag/0x3613001F"
+' Classe de conteneur du calendrier d'anniversaire NATIF d'Outlook.com
+' (genere cote serveur, ne pas y ecrire).
+Private Const NATIVE_BIRTHDAY_CLASS As String = "ipf.appointment.birthday"
+' Dossiers de contacts systeme (motifs Like, insensibles a la casse).
+Private Const DEFAULT_SKIP As String = "{*|Recipient Cache|*sugg*|GAL Contacts|Organizational Contacts|Companies|PeopleCentricConversation Buddies|*Lync*|*Skype*|ExternalContacts"
+
+Private Declare PtrSafe Sub Sleep Lib "kernel32" (ByVal dwMilliseconds As Long)
+
+' --- Reglages (charges par LoadSettings en tete de passe) ---
+Private mCalName As String
+Private mLabel As String
+Private mSubjectFmt As String
+Private mRemindDays As Long
+Private mRemindHour As Long
+Private mCategory As String
+Private mCategoryColor As Long
+Private mBodyDetails As Boolean
+Private mPrivate As Boolean
+Private mSkipFolders As String
+Private mNameDayOn As Boolean
+Private mNameDayFolders As String
+Private mNameDayLabel As String
+Private mAnnivOn As Boolean
+Private mAnnivFolders As String
+Private mAnnivLabel As String
+Private mUnknownYear As Long
+Private mUnknownMax As Long
+Private mRemindDaysND As Long
+Private mRemindDaysAN As Long
+Private mCalPath As String
+Private mViewDone As Boolean      ' garde : une mise en place VERIFIEE par session
+Private mViewAttempts As Long     ' v1.9 : tentatives de mise en place (echecs compris)
+Private Const VIEW_MAX_ATTEMPTS As Long = 4
+
+' --- Rapport (buffer texte, ecrit en UTF-8 a la fin) ---
+Private mReport As String
+Private mReportPath As String
+
+' --- Compteurs de la passe courante ---
+Private mScanned As Long
+Private mWithBday As Long
+Private mCreated As Long
+Private mUpdated As Long
+Private mSame As Long
+Private mSkipped As Long
+Private mCollisions As Long
+Private mErrors As Long
+Private mOrphans As Long
+Private mFolders As Long
+Private mNoKeyEvents As Long
+Private mWithNameDay As Long
+Private mWithAnniv As Long
+
+'=============================================================================
+' ModVersion - version REELLEMENT chargee dans le VBE.
+'=============================================================================
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+'=============================================================================
+' ContactBirthdaySync  (epinglable au QAT)
+' 1) compte, 2) calendrier cible (existant ou nouveau), 3) Simulation /
+' Appliquer, 4) parcours de tous les dossiers de contacts, 5) orphelins,
+' 6) rapport.
+'=============================================================================
+Public Sub ContactBirthdaySync()
+    Dim suspendedHere As Boolean
+    Dim errNo As Long, errDesc As String
+    On Error GoTo ErrH
+    LoadSettings
+    ResetCounters
+
+    Dim st As Outlook.Store
+    Set st = PickStore()
+    If st Is Nothing Then Exit Sub
+
+    Dim calFolder As Outlook.MAPIFolder
+    Set calFolder = PickCalendar(st)
+    If calFolder Is Nothing Then Exit Sub
+
+    Dim choice As VbMsgBoxResult
+    choice = modMsgBoxCustom.Confirm3( _
+        T("Compte : ", "Account: ") & st.DisplayName & vbCrLf & _
+        T("Calendrier cible : ", "Target calendar: ") & ShortPath(calFolder, st) & vbCrLf & vbCrLf & _
+        T("Simulation : rien n'est ~ecrit, le rapport liste ce qui SERAIT fait." & vbCrLf & _
+          "Appliquer : cr~ee / met ~a jour les ~ev~enements (annuels, journ~ee enti~fre)." & vbCrLf & _
+          "(Boutons natifs : Oui = Simulation, Non = Appliquer.)", _
+          "Dry run: nothing is written, the report lists what WOULD be done." & vbCrLf & _
+          "Apply: creates / updates the events (yearly, all-day)." & vbCrLf & _
+          "(Native buttons: Yes = Dry run, No = Apply.)"), _
+        UiTitle(), T("&Simulation", "&Dry run"), T("&Appliquer", "&Apply"), T("A&nnuler", "&Cancel"))
+    If choice = vbCancel Then Exit Sub
+    Dim dryRun As Boolean
+    dryRun = (choice = vbYes)
+
+    modDebugLog.DInfo MOD_NAME, "Sync start store=" & st.DisplayName & _
+        " cal=" & calFolder.FolderPath & " dryRun=" & dryRun
+
+    ReportLine "modContactBirthday " & MOD_VERSION & " - " & Format$(Now, "yyyy-mm-dd hh:nn:ss")
+    ReportLine IIf(dryRun, "MODE : SIMULATION (aucune modification)", "MODE : APPLIQUE")
+    ReportLine "Compte : " & st.DisplayName
+    ReportLine "Calendrier : " & calFolder.FolderPath
+    ReportLine "Sujet : " & mSubjectFmt & " | rappels A/M/F : " & ReminderText(mRemindDays) & _
+               " / " & ReminderText(mRemindDaysAN) & " / " & ReminderText(mRemindDaysND) & _
+               " | categorie : " & mCategory & IIf(mPrivate, " | prive", "")
+    ReportLine "Fetes : " & IIf(mNameDayOn, "actives, dossiers " & mNameDayFolders, "desactivees") & _
+               " | Mariages : " & IIf(mAnnivOn, "actifs, dossiers " & mAnnivFolders, "desactives") & _
+               " | annee inconnue <= " & mUnknownMax & " ou = " & mUnknownYear
+    ReportLine String$(78, "-")
+
+    ' Index des evenements deja generes (cle -> master de serie)
+    Dim existing As Object
+    Set existing = IndexExisting(calFolder)
+    ReportLine "Evenements deja poses par ce module (cle " & UP_KEY & ") : " & existing.Count
+    ReportLine "Autres evenements dans ce calendrier (sans cle, non touches) : " & mNoKeyEvents
+    ReportLine String$(78, "-")
+
+    If Not dryRun Then EnsureCategory st
+
+    ' Suspension des handlers calendrier du toolkit (restauree en sortie)
+    On Error Resume Next
+    If Not dryRun Then
+        If Not ThisOutlookSession.SuspendCalendarEvents Then
+            ThisOutlookSession.SuspendCalendarEvents = True
+            suspendedHere = True
+        End If
+    End If
+    On Error GoTo ErrH
+
+    Dim seen As Object
+    Set seen = CreateObject("Scripting.Dictionary")
+    ProcessFolderTree st.GetRootFolder, calFolder, existing, seen, dryRun
+
+    ' Orphelins : evenements a cle dont plus aucun contact ne repond
+    HandleOrphans existing, dryRun
+
+    If suspendedHere Then ThisOutlookSession.SuspendCalendarEvents = False
+    suspendedHere = False
+
+    WriteReport
+    modDebugLog.DInfo MOD_NAME, "Sync end scanned=" & mScanned & " bday=" & mWithBday & _
+        " created=" & mCreated & " updated=" & mUpdated & " same=" & mSame & _
+        " skipped=" & mSkipped & " collisions=" & mCollisions & " orphans=" & mOrphans & _
+        " errors=" & mErrors & " dryRun=" & dryRun
+    ShowSummary dryRun
+    Exit Sub
+
+ErrH:
+    errNo = Err.Number
+    errDesc = Err.Description
+    On Error Resume Next
+    modDebugLog.DError MOD_NAME, "ContactBirthdaySync err " & errNo & " - " & errDesc
+    If suspendedHere Then ThisOutlookSession.SuspendCalendarEvents = False
+    ReportLine "!! ERREUR " & errNo & " - " & errDesc
+    WriteReport
+    MsgBox T("Erreur : ", "Error: ") & errNo & " - " & errDesc & vbCrLf & _
+           T("Rapport : ", "Report: ") & mReportPath, vbExclamation, UiTitle()
+End Sub
+
+'=============================================================================
+' ContactBirthdayReminders  (epinglable au QAT)
+' Active ou desactive les rappels des evenements poses par ce module dans un
+' calendrier, sans les regenerer. Portee : tous, ou un seul type.
+'=============================================================================
+Public Sub ContactBirthdayReminders()
+    Dim errNo As Long, errDesc As String
+    On Error GoTo ErrH
+    LoadSettings
+
+    Dim st As Outlook.Store
+    Set st = PickStore()
+    If st Is Nothing Then Exit Sub
+    Dim calFolder As Outlook.MAPIFolder
+    Set calFolder = PickCalendar(st)
+    If calFolder Is Nothing Then Exit Sub
+
+    Dim scopeAns As String
+    scopeAns = UCase$(Trim$(InputBox( _
+        T("Quels ~ev~enements ?", "Which events?") & vbCrLf & vbCrLf & _
+        T( _
+          "A = anniversaires    M = mariages    F = f" & ChrW$(234) & "tes    T = tous", _
+          "Which events?" & vbCrLf & vbCrLf & _
+          "A = birthdays    M = anniversaries    F = name days    T = all"), UiTitle(), "T")))
+    If Len(scopeAns) = 0 Then Exit Sub
+    If InStr("AMFT", Left$(scopeAns, 1)) = 0 Then
+        MsgBox T("Choix invalide.", "Invalid choice."), vbExclamation, UiTitle()
+        Exit Sub
+    End If
+    scopeAns = Left$(scopeAns, 1)
+
+    Dim onOff As VbMsgBoxResult
+    onOff = modMsgBoxCustom.Confirm3( _
+        T("Rappels des ~ev~enements s~electionn~es dans ", "Reminders of the selected events in ") & _
+        calFolder.Name & " :", UiTitle(), T("&Activer", "Turn &on"), T("&D~esactiver", "Turn o&ff"), _
+        T("A&nnuler", "&Cancel"))
+    If onOff = vbCancel Then Exit Sub
+    Dim wantOn As Boolean
+    wantOn = (onOff = vbYes)
+
+    Dim itm As Object, up As Outlook.UserProperty, keyStr As String
+    Dim touched As Long, seenN As Long, remMin As Long
+    On Error Resume Next
+    For Each itm In calFolder.Items
+        If TypeName(itm) = "AppointmentItem" Then
+            Set up = Nothing
+            Set up = itm.UserProperties.Find(UP_KEY)
+            If Not up Is Nothing Then
+                keyStr = CStr(up.Value)
+                If scopeAns = "T" Or Left$(keyStr, 1) = scopeAns Or _
+                   (scopeAns = "A" And Left$(keyStr, 1) = "B") Then
+                    seenN = seenN + 1
+                    remMin = ReminderMinutes(keyStr)
+                    If wantOn And remMin < 0 Then remMin = 1440 - mRemindHour * 60
+                    If itm.ReminderSet <> wantOn Or (wantOn And itm.ReminderMinutesBeforeStart <> remMin) Then
+                        itm.ReminderSet = wantOn
+                        If wantOn Then itm.ReminderMinutesBeforeStart = remMin
+                        If SafeSave(itm) Then touched = touched + 1
+                    End If
+                End If
+            End If
+        End If
+    Next itm
+    On Error GoTo ErrH
+
+    modDebugLog.DInfo MOD_NAME, "Reminders scope=" & scopeAns & " on=" & wantOn & _
+        " seen=" & seenN & " changed=" & touched
+    MsgBox T("~Ev~enements concern~es : ", "Events in scope: ") & seenN & vbCrLf & _
+           T("Rappels modifi~es : ", "Reminders changed: ") & touched & vbCrLf & _
+           T("~Etat : ", "State: ") & IIf(wantOn, T("activ~es", "on"), T("d~esactiv~es", "off")), _
+           vbInformation, UiTitle()
+    Exit Sub
+ErrH:
+    errNo = Err.Number
+    errDesc = Err.Description
+    modDebugLog.DError MOD_NAME, "ContactBirthdayReminders err " & errNo & " - " & errDesc
+    MsgBox T("Erreur : ", "Error: ") & errNo & " - " & errDesc, vbExclamation, UiTitle()
+End Sub
+
+'=============================================================================
+' ContactBirthdaySetupView
+' Met en place la vue calendrier : calendrier des anniversaires dans "Mes
+' calendriers", coche, en superposition, les autres decoches, vue Semaine.
+' Silencieuse (aucune boite, aucune erreur visible), une seule fois par
+' session. A appeler au premier passage dans le calendrier (FolderSwitch).
+'=============================================================================
+Public Sub ContactBirthdaySetupView(Optional ByVal targetExp As Outlook.Explorer = Nothing)
+    On Error Resume Next
+    If mViewDone Then Exit Sub
+    mViewAttempts = mViewAttempts + 1
+    If mViewAttempts > VIEW_MAX_ATTEMPTS Then
+        modDebugLog.DInfo MOD_NAME, "Vue calendrier : abandon apres " & VIEW_MAX_ATTEMPTS & " tentatives"
+        mViewDone = True
+        Exit Sub
+    End If
+    modConfig.EnsureLoaded
+    If Not modConfig.CfgB("BirthdayCalendarAutoShow", False) Then
+        ' Pack v3 (A8) : trace explicite - c'etait la cause du "bug" de vue
+        ' non appliquee (cle a 0 dans config.ini, pas un defaut du code).
+        modDebugLog.DInfo MOD_NAME, "Vue calendrier : BirthdayCalendarAutoShow=0, mise en place ignoree (passer la cle a 1)"
+        mViewDone = True
+        Exit Sub
+    End If
+    Dim wantPath As String
+    wantPath = Trim$(modConfig.Cfg("BirthdayCalendarPath", ""))
+    If Len(wantPath) = 0 Then
+        mViewDone = True
+        Exit Sub
+    End If
+    Dim overlay As Boolean, uncheck As Boolean, weekView As Boolean, keepPaths As String
+    overlay = modConfig.CfgB("BirthdayCalendarOverlay", True)
+    uncheck = modConfig.CfgB("BirthdayCalendarUncheckOthers", True)
+    weekView = modConfig.CfgB("BirthdayCalendarWeekView", True)
+    keepPaths = "|" & LCase$(modConfig.Cfg("BirthdayCalendarKeepPaths", "")) & "|"
+    ' Designation par ROLE : chemins des calendriers PAR DEFAUT des comptes
+    ' listes, resolus a l'execution (insensible au nom / a la langue).
+    keepPaths = keepPaths & DefaultCalendarPaths(modConfig.Cfg("BirthdayCalendarKeepDefaultOf", ""))
+
+    Dim exp As Outlook.Explorer
+    Set exp = targetExp
+    If exp Is Nothing Then Set exp = Application.ActiveExplorer
+    If exp Is Nothing Then Exit Sub
+    Dim pane As Outlook.NavigationPane
+    Set pane = exp.NavigationPane
+    If pane Is Nothing Then Exit Sub
+    Dim calMod As Outlook.CalendarModule
+    Set calMod = pane.Modules.GetNavigationModule(olModuleCalendar)
+    If calMod Is Nothing Then
+        modDebugLog.DDebug MOD_NAME, "Module Calendrier indisponible"
+        Err.Clear
+        Exit Sub
+    End If
+    ' IsSelected n'est modifiable QUE si le module Calendrier est courant.
+    Set pane.CurrentModule = calMod
+    If Err.Number <> 0 Then
+        modDebugLog.DDebug MOD_NAME, "CurrentModule err " & Err.Number
+        Err.Clear
+        Exit Sub
+    End If
+
+    ' 1) le calendrier cible doit vivre dans "Mes calendriers"
+    Dim target As Outlook.NavigationFolder
+    Set target = FindNavFolder(calMod, wantPath)
+    Dim myGroup As Outlook.NavigationGroup
+    Set myGroup = calMod.NavigationGroups.GetDefaultNavigationGroup(olMyFoldersGroup)
+    If target Is Nothing And Not myGroup Is Nothing Then
+        Dim fld As Outlook.MAPIFolder
+        Set fld = FolderFromPath(wantPath)
+        If Not fld Is Nothing Then
+            Err.Clear
+            Set target = myGroup.NavigationFolders.Add(fld)
+            If Err.Number = 0 Then
+                modDebugLog.DInfo MOD_NAME, "Calendrier ajoute a Mes calendriers : " & wantPath
+            Else
+                modDebugLog.DError MOD_NAME, "Ajout au groupe err " & Err.Number
+                Err.Clear
+            End If
+        End If
+    End If
+    If target Is Nothing Then
+        modDebugLog.DInfo MOD_NAME, "Calendrier introuvable dans le volet : " & wantPath
+        mViewDone = True
+        Exit Sub
+    End If
+
+    ' 2) cocher + superposer, decocher les autres (sauf exceptions)
+    Dim grp As Outlook.NavigationGroup, nf As Outlook.NavigationFolder, pth As String
+    For Each grp In calMod.NavigationGroups
+        For Each nf In grp.NavigationFolders
+            pth = ""
+            pth = nf.Folder.FolderPath
+            If StrComp(pth, wantPath, vbTextCompare) = 0 Then
+                If Not nf.IsSelected Then nf.IsSelected = True
+                If overlay Then nf.IsSideBySide = False
+            ElseIf uncheck Then
+                If InStr(keepPaths, "|" & LCase$(pth) & "|") = 0 Then
+                    If nf.IsSelected Then nf.IsSelected = False
+                End If
+            End If
+            Err.Clear
+        Next nf
+    Next grp
+
+    ' 3) vue Calendrier / Semaine (samedi et dimanche visibles)
+    If weekView Then ApplyWeekView exp
+
+    ' 4) VERIFICATION (v1.9) : on relit l'etat reel du volet. Si la fenetre
+    '    n'etait pas encore construite, Outlook recharge ses calendriers
+    '    coches apres nous et le coche est perdu : on NE pose PAS la garde,
+    '    l'appelant relancera.
+    Dim applied As Boolean
+    applied = False
+    Err.Clear
+    Set target = FindNavFolder(calMod, wantPath)
+    If Not target Is Nothing Then applied = target.IsSelected
+    If Err.Number <> 0 Then applied = False: Err.Clear
+
+    If applied Then
+        mViewDone = True
+        modDebugLog.DInfo MOD_NAME, "Vue calendrier mise en place (overlay=" & overlay & _
+            " uncheck=" & uncheck & " week=" & weekView & ", tentative " & mViewAttempts & ")"
+    Else
+        modDebugLog.DInfo MOD_NAME, "Vue calendrier : coche non confirme (tentative " & _
+            mViewAttempts & "/" & VIEW_MAX_ATTEMPTS & ")"
+    End If
+    Err.Clear
+End Sub
+
+' True tant que la mise en place n'est pas verifiee (et pas abandonnee) :
+' l'appelant peut re-armer un appel differe. Lu par ThisOutlookSession.
+Public Function ContactBirthdayViewPending() As Boolean
+    ContactBirthdayViewPending = Not mViewDone
+End Function
+
+' Reinitialise la garde (test manuel depuis la fenetre Execution du VBE).
+Public Sub ContactBirthdayResetViewFlag()
+    mViewDone = False
+    mViewAttempts = 0
+End Sub
+
+' "compte1|compte2" -> "chemin1|chemin2|" en minuscules, borne des deux
+' cotes, pret a etre concatene a keepPaths. Un compte introuvable est logue
+' et ignore. Correspondance sur le nom d'affichage OU l'adresse du store.
+Private Function DefaultCalendarPaths(ByVal accounts As String) As String
+    On Error Resume Next
+    If Len(Trim$(accounts)) = 0 Then Exit Function
+    Dim wanted() As String, idx As Long, st As Outlook.Store, nm As String
+    Dim res As String, hit As Boolean, pth As String
+    wanted = Split(accounts, "|")
+    For idx = LBound(wanted) To UBound(wanted)
+        nm = LCase$(Trim$(wanted(idx)))
+        If Len(nm) > 0 Then
+            hit = False
+            For Each st In Application.Session.Stores
+                If LCase$(st.DisplayName) = nm Then
+                    pth = ""
+                    pth = st.GetDefaultFolder(olFolderCalendar).FolderPath
+                    If Err.Number = 0 And Len(pth) > 0 Then
+                        res = res & LCase$(pth) & "|"
+                        hit = True
+                        modDebugLog.DDebug MOD_NAME, "Calendrier par defaut conserve : " & pth
+                    End If
+                    Err.Clear
+                    Exit For
+                End If
+            Next st
+            If Not hit Then modDebugLog.DInfo MOD_NAME, "Compte introuvable (KeepDefaultOf) : " & nm
+        End If
+    Next idx
+    DefaultCalendarPaths = res
+    Err.Clear
+End Function
+
+Private Function FindNavFolder(ByVal calMod As Outlook.CalendarModule, _
+                               ByVal wantPath As String) As Outlook.NavigationFolder
+    On Error Resume Next
+    Dim grp As Outlook.NavigationGroup, nf As Outlook.NavigationFolder
+    For Each grp In calMod.NavigationGroups
+        For Each nf In grp.NavigationFolders
+            If StrComp(nf.Folder.FolderPath, wantPath, vbTextCompare) = 0 Then
+                Set FindNavFolder = nf
+                Exit Function
+            End If
+        Next nf
+    Next grp
+    Err.Clear
+End Function
+
+' "\\compte\Calendrier\Anniversaires" -> MAPIFolder.
+Private Function FolderFromPath(ByVal fullPath As String) As Outlook.MAPIFolder
+    On Error Resume Next
+    Dim ns As Outlook.NameSpace, st As Outlook.Store, idx As Long
+    Set ns = Application.Session
+    For idx = 1 To ns.Stores.Count
+        Set st = ns.Stores(idx)
+        Set FolderFromPath = WalkForPath(st.GetRootFolder, fullPath)
+        If Not FolderFromPath Is Nothing Then Exit Function
+    Next idx
+    Err.Clear
+End Function
+
+Private Function WalkForPath(ByVal fld As Outlook.MAPIFolder, ByVal fullPath As String) As Outlook.MAPIFolder
+    On Error Resume Next
+    If StrComp(fld.FolderPath, fullPath, vbTextCompare) = 0 Then
+        Set WalkForPath = fld
+        Exit Function
+    End If
+    Dim child As Outlook.MAPIFolder
+    For Each child In fld.Folders
+        Set WalkForPath = WalkForPath(child, fullPath)
+        If Not WalkForPath Is Nothing Then Exit Function
+    Next child
+    Err.Clear
+End Function
+
+' Vue Calendrier en mode Semaine (pas Semaine de travail, pas Liste).
+Private Sub ApplyWeekView(ByVal exp As Outlook.Explorer)
+    On Error Resume Next
+    Dim vw As Object
+    Set vw = exp.CurrentView
+    If vw Is Nothing Then Exit Sub
+    If vw.ViewType <> olCalendarView Then
+        ' vue Liste active : basculer sur la premiere vue de type Calendrier
+        Dim v As Object
+        For Each v In exp.CurrentFolder.Views
+            If v.ViewType = olCalendarView Then
+                v.Apply
+                Set vw = exp.CurrentView
+                Exit For
+            End If
+        Next v
+    End If
+    If vw Is Nothing Then Exit Sub
+    If vw.ViewType = olCalendarView Then
+        If vw.CalendarViewMode <> olCalendarViewWeek Then
+            vw.CalendarViewMode = olCalendarViewWeek
+            vw.Save
+        End If
+    End If
+    Err.Clear
+End Sub
+
+'=============================================================================
+' Reglages
+'=============================================================================
+Private Sub LoadSettings()
+    modConfig.EnsureLoaded
+    mCalName = Trim$(modConfig.Cfg("BirthdayCalendarName", ""))
+    If Len(mCalName) = 0 Then mCalName = T("Anniversaires contacts", "Contact birthdays")
+    mLabel = Trim$(modConfig.Cfg("BirthdayLabel", ""))
+    If Len(mLabel) = 0 Then mLabel = T("Anniversaire", "Birthday")
+    mSubjectFmt = modConfig.Cfg("BirthdaySubjectFormat", "{name} - {label} - {date}")
+    mRemindDays = modConfig.CfgL("BirthdayReminderDaysBefore", 1)
+    mRemindHour = modConfig.CfgL("BirthdayReminderHour", 9)
+    If mRemindHour < 0 Then mRemindHour = 0
+    If mRemindHour > 23 Then mRemindHour = 23
+    mCategory = Trim$(modConfig.Cfg("BirthdayCategory", ""))
+    mCategoryColor = modConfig.CfgL("BirthdayCategoryColor", 3)
+    mBodyDetails = modConfig.CfgB("BirthdayBodyDetails", True)
+    mPrivate = modConfig.CfgB("BirthdayPrivate", False)
+    mSkipFolders = modConfig.Cfg("ContactSkipFolders", DEFAULT_SKIP)
+    mNameDayOn = modConfig.CfgB("NameDayEnabled", True)
+    mNameDayFolders = modConfig.Cfg("NameDayFolders", "*Amis*|*Famille*")
+    mNameDayLabel = Trim$(modConfig.Cfg("NameDayLabel", ""))
+    If Len(mNameDayLabel) = 0 Then mNameDayLabel = T("F" & ChrW$(234) & "te", "Name day")
+    mAnnivOn = modConfig.CfgB("AnniversaryEnabled", True)
+    mAnnivFolders = modConfig.Cfg("AnniversaryFolders", "*")
+    mAnnivLabel = Trim$(modConfig.Cfg("AnniversaryLabel", ""))
+    If Len(mAnnivLabel) = 0 Then mAnnivLabel = T("Anniversaire de mariage", "Wedding anniversary")
+    mUnknownYear = modConfig.CfgL("UnknownBirthYear", 1604)
+    mUnknownMax = modConfig.CfgL("UnknownBirthYearMax", UNKNOWN_YEAR_BELOW)
+    mRemindDaysND = modConfig.CfgL("NameDayReminderDaysBefore", mRemindDays)
+    mRemindDaysAN = modConfig.CfgL("AnniversaryReminderDaysBefore", mRemindDays)
+    mCalPath = Trim$(modConfig.Cfg("BirthdayCalendarPath", ""))
+End Sub
+
+' Annee de naissance non renseignee (sentinelle ou millesime aberrant).
+Private Function YearUnknown(ByVal yr As Long) As Boolean
+    YearUnknown = (yr <= mUnknownMax) Or (yr = mUnknownYear)
+End Function
+
+Private Sub ResetCounters()
+    mReport = ""
+    mReportPath = ""
+    mScanned = 0: mWithBday = 0: mCreated = 0: mUpdated = 0: mSame = 0
+    mSkipped = 0: mCollisions = 0: mErrors = 0: mOrphans = 0: mFolders = 0
+    mNoKeyEvents = 0: mWithNameDay = 0: mWithAnniv = 0
+End Sub
+
+Private Function UiTitle() As String
+    UiTitle = T("Anniversaires des contacts", "Contact birthdays")
+End Function
+
+'=============================================================================
+' Choix du compte (store). Defaut = store du dossier courant de l'explorateur.
+'=============================================================================
+Private Function PickStore() As Outlook.Store
+    On Error GoTo ErrH
+    Dim ns As Outlook.NameSpace
+    Set ns = Application.Session
+    Dim cur As Outlook.Store
+    On Error Resume Next
+    Set cur = Application.ActiveExplorer.CurrentFolder.Store
+    On Error GoTo ErrH
+
+    Dim listTxt As String, idx As Long, defIdx As Long
+    For idx = 1 To ns.Stores.Count
+        listTxt = listTxt & idx & " - " & ns.Stores(idx).DisplayName & vbCrLf
+        If Not cur Is Nothing Then
+            If ns.Stores(idx).StoreID = cur.StoreID Then defIdx = idx
+        End If
+    Next idx
+    If defIdx = 0 Then defIdx = 1
+
+    Dim ans As String
+    ans = Trim$(InputBox(T("Compte dont les contacts sont ~a parcourir (num~ero) :", _
+                           "Account whose contacts will be scanned (number):") & _
+                         vbCrLf & vbCrLf & listTxt, UiTitle(), CStr(defIdx)))
+    If Len(ans) = 0 Then Exit Function
+    If Not IsNumeric(ans) Then GoTo BadChoice
+    Dim num As Long
+    num = CLng(ans)
+    If num < 1 Or num > ns.Stores.Count Then GoTo BadChoice
+    Set PickStore = ns.Stores(num)
+    Exit Function
+BadChoice:
+    MsgBox T("Choix invalide.", "Invalid choice."), vbExclamation, UiTitle()
+    Exit Function
+ErrH:
+    modDebugLog.DError MOD_NAME, "PickStore err " & Err.Number & " - " & Err.Description
+End Function
+
+'=============================================================================
+' Choix du calendrier cible : liste des calendriers du store (0 = nouveau).
+' Defaut = celui dont le nom = BirthdayCalendarName s'il existe.
+' Refuse le calendrier d'anniversaire NATIF d'Outlook.com (serveur).
+'=============================================================================
+Private Function PickCalendar(ByVal st As Outlook.Store) As Outlook.MAPIFolder
+    On Error GoTo ErrH
+    Dim cals As Collection
+    Set cals = New Collection
+    CollectCalendars st.GetRootFolder, cals
+
+    Dim listTxt As String, idx As Long, defIdx As Long
+    listTxt = "0 - " & T("NOUVEAU calendrier (le nom est demand~e ensuite)", _
+                        "NEW calendar (name asked next)") & vbCrLf
+    For idx = 1 To cals.Count
+        listTxt = listTxt & idx & " - " & ShortPath(cals(idx), st)
+        If IsNativeBirthdayCalendar(cals(idx)) Then
+            listTxt = listTxt & "  " & T("(natif Outlook.com, refus~e)", "(native Outlook.com, refused)")
+        End If
+        listTxt = listTxt & vbCrLf
+        If defIdx = 0 Then
+            If StrComp(cals(idx).Name, mCalName, vbTextCompare) = 0 Then defIdx = idx
+        End If
+    Next idx
+
+    Dim ans As String
+    ans = Trim$(InputBox(T("Calendrier cible (num~ero) :", "Target calendar (number):") & _
+                         vbCrLf & vbCrLf & listTxt, UiTitle(), CStr(defIdx)))
+    If Len(ans) = 0 Then Exit Function
+    If Not IsNumeric(ans) Then GoTo BadChoice
+    Dim num As Long
+    num = CLng(ans)
+    If num < 0 Or num > cals.Count Then GoTo BadChoice
+
+    If num > 0 Then
+        If IsNativeBirthdayCalendar(cals(num)) Then GoTo NativeRefused
+        Set PickCalendar = cals(num)
+        Exit Function
+    End If
+
+    ' Nouveau calendrier
+    Dim newName As String
+    newName = Trim$(InputBox(T("Nom du nouveau calendrier :", "Name of the new calendar:"), _
+                             UiTitle(), mCalName))
+    If Len(newName) = 0 Then Exit Function
+    For idx = 1 To cals.Count
+        If StrComp(cals(idx).Name, newName, vbTextCompare) = 0 Then
+            If IsNativeBirthdayCalendar(cals(idx)) Then GoTo NativeRefused
+            MsgBox T("Ce calendrier existe d~ej~a : il sera r~eutilis~e.", _
+                     "This calendar already exists: it will be reused."), vbInformation, UiTitle()
+            Set PickCalendar = cals(idx)
+            Exit Function
+        End If
+    Next idx
+    Dim parentCal As Outlook.MAPIFolder
+    Set parentCal = st.GetDefaultFolder(olFolderCalendar)
+    Set PickCalendar = parentCal.Folders.Add(newName, olFolderCalendar)
+    modDebugLog.DInfo MOD_NAME, "Calendrier cree : " & newName
+    Exit Function
+
+NativeRefused:
+    MsgBox T("Ce calendrier est le calendrier d'anniversaire NATIF d'Outlook.com, g~en~er~e par le serveur : " & _
+             "on ne peut pas y ~ecrire. Choisis ou cr~ee un autre calendrier.", _
+             "This is the NATIVE Outlook.com birthday calendar, generated server-side: " & _
+             "it cannot be written to. Pick or create another calendar."), vbExclamation, UiTitle()
+    Exit Function
+BadChoice:
+    MsgBox T("Choix invalide.", "Invalid choice."), vbExclamation, UiTitle()
+    Exit Function
+ErrH:
+    modDebugLog.DError MOD_NAME, "PickCalendar err " & Err.Number & " - " & Err.Description
+    MsgBox T("Impossible de s~electionner ou de cr~eer le calendrier : ", _
+             "Cannot select or create the calendar: ") & Err.Description, vbExclamation, UiTitle()
+End Function
+
+Private Sub CollectCalendars(ByVal fld As Outlook.MAPIFolder, ByVal cals As Collection)
+    On Error Resume Next
+    Dim isCal As Boolean
+    isCal = (fld.DefaultItemType = olAppointmentItem)
+    If Err.Number <> 0 Then isCal = False: Err.Clear
+    If isCal Then
+        If Not IsHiddenFolder(fld) And Not IsInDeletedItems(fld) Then cals.Add fld
+    End If
+    Dim child As Outlook.MAPIFolder
+    For Each child In fld.Folders
+        CollectCalendars child, cals
+    Next child
+End Sub
+
+Private Function IsNativeBirthdayCalendar(ByVal fld As Outlook.MAPIFolder) As Boolean
+    On Error Resume Next
+    Dim cls As String
+    cls = LCase$(CStr(fld.PropertyAccessor.GetProperty(PROPTAG_CONTAINER_CLASS)))
+    If Err.Number <> 0 Then Err.Clear: Exit Function
+    IsNativeBirthdayCalendar = (cls = NATIVE_BIRTHDAY_CLASS)
+End Function
+
+Private Function IsHiddenFolder(ByVal fld As Outlook.MAPIFolder) As Boolean
+    ' Pack v3 (C3) : delegation modContactCommon (helper partage).
+    IsHiddenFolder = modContactCommon.IsHiddenFolder(fld)
+End Function
+
+Private Function ShortPath(ByVal fld As Outlook.MAPIFolder, ByVal st As Outlook.Store) As String
+    On Error Resume Next
+    ShortPath = Replace(fld.FolderPath, "\\" & st.DisplayName & "\", "")
+    If Len(ShortPath) = 0 Then ShortPath = fld.Name
+End Function
+
+'=============================================================================
+' Categorie : creee dans la liste maitre du store si absente (couleur config).
+'=============================================================================
+Private Sub EnsureCategory(ByVal st As Outlook.Store)
+    On Error Resume Next
+    If Len(mCategory) = 0 Then Exit Sub
+    Dim cats As Outlook.Categories
+    Set cats = st.Categories
+    If cats Is Nothing Then Set cats = Application.Session.Categories
+    If cats Is Nothing Then Exit Sub
+    Dim cat As Outlook.Category
+    Set cat = cats.Item(mCategory)
+    If cat Is Nothing Then
+        Err.Clear
+        cats.Add mCategory, mCategoryColor
+        If Err.Number = 0 Then
+            modDebugLog.DInfo MOD_NAME, "Categorie creee : " & mCategory
+        Else
+            modDebugLog.DDebug MOD_NAME, "Categorie non creee (" & Err.Number & ") : " & mCategory
+        End If
+    End If
+    Err.Clear
+End Sub
+
+'=============================================================================
+' Index des evenements deja generes : cle -> master de serie.
+' Un doublon de cle (deux masters, meme cle) est range sous "cle|dupN" :
+' il ressortira comme orphelin, donc purgeable.
+'=============================================================================
+Private Function IndexExisting(ByVal calFolder As Outlook.MAPIFolder) As Object
+    Dim dict As Object
+    Set dict = CreateObject("Scripting.Dictionary")
+    On Error Resume Next
+    Dim itm As Object, up As Outlook.UserProperty, keyStr As String, dupN As Long
+    For Each itm In calFolder.Items
+        If TypeName(itm) = "AppointmentItem" Then
+            Set up = Nothing
+            Set up = itm.UserProperties.Find(UP_KEY)
+            If up Is Nothing Then
+                mNoKeyEvents = mNoKeyEvents + 1
+            Else
+                keyStr = CStr(up.Value)
+                If Len(keyStr) > 0 Then
+                    If dict.Exists(keyStr) Then
+                        dupN = dupN + 1
+                        dict.Add keyStr & "|dup" & dupN, itm
+                    Else
+                        dict.Add keyStr, itm
+                    End If
+                End If
+            End If
+        End If
+    Next itm
+    Err.Clear
+    Set IndexExisting = dict
+End Function
+
+'=============================================================================
+' Parcours recursif des dossiers du store : chaque dossier de type Contact
+' (non systeme, non cache) est traite.
+'=============================================================================
+Private Sub ProcessFolderTree(ByVal fld As Outlook.MAPIFolder, ByVal calFolder As Outlook.MAPIFolder, _
+                              ByVal existing As Object, ByVal seen As Object, ByVal dryRun As Boolean)
+    On Error Resume Next
+    Dim isContacts As Boolean
+    isContacts = (fld.DefaultItemType = olContactItem)
+    If Err.Number <> 0 Then isContacts = False: Err.Clear
+    If isContacts Then
+        If IsSkippedFolder(fld) Then
+            modDebugLog.DDebug MOD_NAME, "Dossier ignore : " & fld.FolderPath
+        Else
+            ProcessContacts fld, calFolder, existing, seen, dryRun
+        End If
+    End If
+    Dim child As Outlook.MAPIFolder
+    For Each child In fld.Folders
+        ProcessFolderTree child, calFolder, existing, seen, dryRun
+    Next child
+End Sub
+
+Private Function IsSkippedFolder(ByVal fld As Outlook.MAPIFolder) As Boolean
+    ' Pack v3 (C3) : delegation modContactCommon (helper partage).
+    IsSkippedFolder = modContactCommon.IsSkippedFolder(fld, mSkipFolders)
+End Function
+
+' Dossier situe sous les Elements supprimes de son compte (corbeille) ?
+Private Function IsInDeletedItems(ByVal fld As Outlook.MAPIFolder) As Boolean
+    ' Pack v3 (C3) : delegation modContactCommon (helper partage).
+    IsInDeletedItems = modContactCommon.IsInDeletedItems(fld)
+End Function
+
+
+Private Sub ProcessContacts(ByVal fld As Outlook.MAPIFolder, ByVal calFolder As Outlook.MAPIFolder, _
+                            ByVal existing As Object, ByVal seen As Object, ByVal dryRun As Boolean)
+    On Error GoTo ErrH
+    mFolders = mFolders + 1
+    Dim before As Long, beforeB As Long
+    before = mScanned
+    beforeB = mWithBday
+    Dim feteHere As Boolean, annivHere As Boolean
+    feteHere = mNameDayOn And FolderMatches(fld.Name, mNameDayFolders)
+    annivHere = mAnnivOn And FolderMatches(fld.Name, mAnnivFolders)
+    ReportLine "=== Dossier " & fld.FolderPath & " (anniversaires" & _
+               IIf(annivHere, " + mariages", "") & IIf(feteHere, " + fetes", "") & ") ==="
+    Dim itm As Object, cnt As Long
+    For Each itm In fld.Items
+        cnt = cnt + 1
+        If TypeName(itm) = "ContactItem" Then
+            ProcessOne itm, fld, calFolder, existing, seen, dryRun, feteHere, annivHere
+        End If
+        If (cnt Mod 25) = 0 Then DoEvents
+    Next itm
+    ReportLine "    -> " & (mScanned - before) & " contacts, " & (mWithBday - beforeB) & " avec anniversaire"
+    Exit Sub
+ErrH:
+    mErrors = mErrors + 1
+    modDebugLog.DError MOD_NAME, "ProcessContacts " & fld.FolderPath & " err " & Err.Number & " - " & Err.Description
+    ReportLine "!! Dossier " & fld.FolderPath & " : erreur " & Err.Number & " - " & Err.Description
+End Sub
+
+'=============================================================================
+' Traitement d'une fiche : anniversaire (cle B|nom) et, si le dossier y est
+' eligible, fete du prenom (cle N|nom, UserProperty NameDay). Chaque
+' evenement : creation / mise a jour / recreation (date changee) / inchange.
+'=============================================================================
+Private Sub ProcessOne(ByVal ct As Outlook.ContactItem, ByVal fld As Outlook.MAPIFolder, _
+                       ByVal calFolder As Outlook.MAPIFolder, ByVal existing As Object, _
+                       ByVal seen As Object, ByVal dryRun As Boolean, ByVal feteHere As Boolean, _
+                       ByVal annivHere As Boolean)
+    Dim errNo As Long, errDesc As String
+    On Error GoTo ErrH
+    mScanned = mScanned + 1
+
+    Dim bd As Date, hasBd As Boolean
+    bd = ct.Birthday
+    hasBd = HasBirthday(bd)
+
+    Dim ndDay As Long, ndMon As Long, hasNd As Boolean
+    If feteHere Then hasNd = ReadNameDay(ct, ndDay, ndMon)
+
+    Dim wd As Date, hasWd As Boolean
+    If annivHere Then
+        wd = ct.Anniversary
+        hasWd = HasBirthday(wd)
+    End If
+
+    If Not hasBd And Not hasNd And Not hasWd Then Exit Sub
+
+    Dim nm As String
+    nm = ContactDisplayName(ct)
+    If Len(nm) = 0 Then
+        mSkipped = mSkipped + 1
+        ReportLine "[IGNORE ] fiche sans nom - " & fld.FolderPath
+        Exit Sub
+    End If
+
+    If hasBd Then
+        mWithBday = mWithBday + 1
+        Dim startYear As Long, birthYear As Long
+        YearsFor bd, birthYear, startYear
+        SyncEvent "B|" & NormKey(nm), nm, mLabel, Day(bd), Month(bd), birthYear, startYear, _
+                  ct, fld, calFolder, existing, seen, dryRun
+    End If
+
+    If hasWd Then
+        mWithAnniv = mWithAnniv + 1
+        Dim wYear As Long, wStart As Long
+        YearsFor wd, wYear, wStart
+        SyncEvent "M|" & NormKey(nm), nm, mAnnivLabel, Day(wd), Month(wd), wYear, wStart, _
+                  ct, fld, calFolder, existing, seen, dryRun
+    End If
+
+    If hasNd Then
+        mWithNameDay = mWithNameDay + 1
+        SyncEvent "N|" & NormKey(nm), nm, mNameDayLabel, ndDay, ndMon, 0, Year(Date), _
+                  ct, fld, calFolder, existing, seen, dryRun
+    End If
+    Exit Sub
+
+ErrH:
+    errNo = Err.Number
+    errDesc = Err.Description
+    mErrors = mErrors + 1
+    modDebugLog.DError MOD_NAME, "ProcessOne err " & errNo & " - " & errDesc
+    ReportLine "[ERREUR ] " & errNo & " - " & errDesc & " (" & fld.FolderPath & ")"
+End Sub
+
+' Annee affichee (0 = inconnue) et annee de depart de la serie.
+Private Sub YearsFor(ByVal d As Date, ByRef shownYear As Long, ByRef startYear As Long)
+    If YearUnknown(Year(d)) Then
+        shownYear = 0
+        startYear = Year(Date)
+        If Month(d) = 2 And Day(d) = 29 Then startYear = LastLeapYear(startYear)
+    Else
+        shownYear = Year(d)
+        startYear = shownYear
+    End If
+End Sub
+
+' UserProperty NameDay "MM-JJ" -> jour / mois. False si absente ou invalide.
+Private Function ReadNameDay(ByVal ct As Outlook.ContactItem, ByRef dayN As Long, ByRef monN As Long) As Boolean
+    On Error Resume Next
+    Dim up As Outlook.UserProperty, v As String
+    Set up = ct.UserProperties.Find(UP_NAMEDAY)
+    If up Is Nothing Then Exit Function
+    v = Trim$(CStr(up.Value))
+    If Not v Like "##-##" Then Exit Function
+    monN = CLng(Left$(v, 2))
+    dayN = CLng(Right$(v, 2))
+    If monN < 1 Or monN > 12 Or dayN < 1 Or dayN > 31 Then Exit Function
+    ReadNameDay = (Err.Number = 0)
+    Err.Clear
+End Function
+
+' Nom de dossier vs motifs Like (separes par |, insensibles a la casse).
+Private Function FolderMatches(ByVal folderName As String, ByVal patterns As String) As Boolean
+    Dim pats() As String, idx As Long, nm As String
+    nm = LCase$(folderName)
+    pats = Split(patterns, "|")
+    For idx = LBound(pats) To UBound(pats)
+        If Len(Trim$(pats(idx))) > 0 Then
+            If nm Like LCase$(Trim$(pats(idx))) Then
+                FolderMatches = True
+                Exit Function
+            End If
+        End If
+    Next idx
+End Function
+
+' Un evenement annuel (anniversaire ou fete) : creation / mise a jour /
+' recreation si la date a change / inchange. Anti-doublon par cle.
+Private Sub SyncEvent(ByVal keyStr As String, ByVal nm As String, ByVal lbl As String, _
+                      ByVal dayN As Long, ByVal monN As Long, ByVal birthYear As Long, ByVal startYear As Long, _
+                      ByVal ct As Outlook.ContactItem, ByVal fld As Outlook.MAPIFolder, _
+                      ByVal calFolder As Outlook.MAPIFolder, ByVal existing As Object, _
+                      ByVal seen As Object, ByVal dryRun As Boolean)
+    Dim errNo As Long, errDesc As String
+    On Error GoTo ErrH
+    Dim kind As String
+    Select Case Left$(keyStr, 2)                     ' marqueur de type au rapport
+        Case "N|": kind = "F"                        ' fete du prenom
+        Case "M|": kind = "M"                        ' mariage
+        Case Else: kind = "A"                        ' anniversaire
+    End Select
+
+    If seen.Exists(keyStr) Then
+        mCollisions = mCollisions + 1
+        ReportLine "[COLLIS ] " & kind & " " & nm & " : meme cle que " & seen.Item(keyStr) & " - fiche ignoree (homonyme ou doublon)"
+        Exit Sub
+    End If
+    seen.Add keyStr, nm & " @ " & fld.Name
+
+    Dim subj As String, body As String, remMin As Long
+    subj = BuildSubject(nm, lbl, dayN, monN, birthYear)
+    remMin = ReminderMinutes(keyStr)
+    If mBodyDetails Then body = BuildBody(ct, fld, keyStr)
+
+    Dim tag As String
+    tag = kind & " " & nm & " | " & DateLabel(dayN, monN, birthYear)
+
+    Dim appt As Outlook.AppointmentItem
+    Dim curDay As Long, curMon As Long, curStartYear As Long
+    Dim res As Long
+
+    If existing.Exists(keyStr) Then
+        Set appt = existing.Item(keyStr)
+        existing.Remove keyStr
+        ReadPattern appt, curDay, curMon, curStartYear
+        If curDay <> dayN Or curMon <> monN Or curStartYear <> startYear Then
+            If dryRun Then
+                mUpdated = mUpdated + 1
+                ReportLine "[RECREE ] " & tag & " (serie actuelle : " & Format$(curDay, "00") & "/" & _
+                           Format$(curMon, "00") & "/" & curStartYear & ")"
+            Else
+                appt.Delete
+                If CreateEvent(calFolder, keyStr, subj, body, dayN, monN, startYear, remMin) Then
+                    mUpdated = mUpdated + 1
+                    ReportLine "[RECREE ] " & tag
+                Else
+                    mErrors = mErrors + 1
+                    ReportLine "[ERREUR ] " & tag & " (recreation)"
+                End If
+            End If
+        Else
+            res = UpdateEvent(appt, subj, body, remMin, dryRun)
+            If res > 0 Then
+                mUpdated = mUpdated + 1
+                ReportLine "[MAJ    ] " & tag & " (" & res & " champ(s))"
+            ElseIf res = 0 Then
+                mSame = mSame + 1
+                ReportLine "[OK     ] " & tag
+            Else
+                mErrors = mErrors + 1
+                ReportLine "[ERREUR ] " & tag & " (mise a jour)"
+            End If
+        End If
+    Else
+        If dryRun Then
+            mCreated = mCreated + 1
+            ReportLine "[CREE   ] " & tag & " -> " & subj
+        ElseIf CreateEvent(calFolder, keyStr, subj, body, dayN, monN, startYear, remMin) Then
+            mCreated = mCreated + 1
+            ReportLine "[CREE   ] " & tag & " -> " & subj
+        Else
+            mErrors = mErrors + 1
+            ReportLine "[ERREUR ] " & tag & " (creation)"
+        End If
+    End If
+    Exit Sub
+ErrH:
+    errNo = Err.Number
+    errDesc = Err.Description
+    mErrors = mErrors + 1
+    modDebugLog.DError MOD_NAME, "SyncEvent err " & errNo & " - " & errDesc & " (" & keyStr & ")"
+    ReportLine "[ERREUR ] " & keyStr & " : " & errNo & " - " & errDesc
+End Sub
+
+'=============================================================================
+' Creation d'une serie annuelle "journee entiere".
+'=============================================================================
+Private Function CreateEvent(ByVal calFolder As Outlook.MAPIFolder, ByVal keyStr As String, _
+                             ByVal subj As String, ByVal body As String, _
+                             ByVal dayN As Long, ByVal monN As Long, ByVal startYear As Long, _
+                             ByVal remMin As Long) As Boolean
+    Dim errNo As Long, errDesc As String
+    On Error GoTo ErrH
+    Dim appt As Outlook.AppointmentItem
+    Set appt = calFolder.Items.Add(olAppointmentItem)
+    Dim firstDay As Date
+    firstDay = DateSerial(startYear, monN, dayN)
+    appt.Subject = subj
+    appt.Start = firstDay
+    appt.End = firstDay + 1
+    appt.AllDayEvent = True
+    If Len(body) > 0 Then appt.Body = body
+    appt.BusyStatus = olFree
+    If remMin >= 0 Then
+        appt.ReminderSet = True
+        appt.ReminderMinutesBeforeStart = remMin
+    Else
+        appt.ReminderSet = False
+    End If
+    If Len(mCategory) > 0 Then appt.Categories = mCategory
+    If mPrivate Then appt.Sensitivity = olPrivate
+
+    Dim pat As Outlook.RecurrencePattern
+    Set pat = appt.GetRecurrencePattern
+    pat.RecurrenceType = olRecursYearly
+    pat.PatternStartDate = firstDay
+    pat.DayOfMonth = dayN
+    pat.MonthOfYear = monN
+    pat.NoEndDate = True
+
+    Dim up As Outlook.UserProperty
+    Set up = appt.UserProperties.Add(UP_KEY, olText, False)
+    up.Value = keyStr
+
+    CreateEvent = SafeSave(appt)
+    Exit Function
+ErrH:
+    errNo = Err.Number
+    errDesc = Err.Description
+    modDebugLog.DError MOD_NAME, "CreateEvent err " & errNo & " - " & errDesc & " (" & subj & ")"
+    CreateEvent = False
+End Function
+
+'=============================================================================
+' Mise a jour en place (date inchangee). Renvoie le nombre de champs
+' differents (0 = rien a faire), -1 en erreur. En simulation : compte
+' seulement, n'ecrit rien.
+'=============================================================================
+Private Function UpdateEvent(ByVal appt As Outlook.AppointmentItem, ByVal subj As String, _
+                             ByVal body As String, ByVal remMin As Long, ByVal dryRun As Boolean) As Long
+    Dim errNo As Long, errDesc As String
+    On Error GoTo ErrH
+    Dim diffs As Long
+    Dim wantReminder As Boolean
+    wantReminder = (remMin >= 0)
+
+    Dim dSubj As Boolean, dBody As Boolean, dRem As Boolean, dCat As Boolean
+    Dim dPriv As Boolean, dBusy As Boolean
+
+    dSubj = (StrComp(appt.Subject, subj, vbBinaryCompare) <> 0)
+    If mBodyDetails Then dBody = (StrComp(FlatText(appt.Body), FlatText(body), vbBinaryCompare) <> 0)
+    dRem = (appt.ReminderSet <> wantReminder)
+    If Not dRem And wantReminder Then dRem = (appt.ReminderMinutesBeforeStart <> remMin)
+    If Len(mCategory) > 0 Then
+        dCat = Not HasCategory(appt.Categories, mCategory)
+    Else
+        dCat = (Len(Trim$(appt.Categories)) > 0)      ' config videe -> on retire
+    End If
+    If mPrivate Then dPriv = (appt.Sensitivity <> olPrivate)
+    dBusy = (appt.BusyStatus <> olFree)
+
+    diffs = -CLng(dSubj) - CLng(dBody) - CLng(dRem) - CLng(dCat) - CLng(dPriv) - CLng(dBusy)
+    UpdateEvent = diffs
+    If diffs = 0 Or dryRun Then Exit Function
+
+    If dSubj Then appt.Subject = subj
+    If dBody Then appt.Body = body
+    If dRem Then
+        appt.ReminderSet = wantReminder
+        If wantReminder Then appt.ReminderMinutesBeforeStart = remMin
+    End If
+    If dCat Then
+        If Len(mCategory) = 0 Then
+            appt.Categories = ""
+        ElseIf Len(Trim$(appt.Categories)) = 0 Then
+            appt.Categories = mCategory
+        Else
+            appt.Categories = appt.Categories & "; " & mCategory
+        End If
+    End If
+    If dPriv Then appt.Sensitivity = olPrivate
+    If dBusy Then appt.BusyStatus = olFree
+    If Not SafeSave(appt) Then UpdateEvent = -1
+    Exit Function
+ErrH:
+    errNo = Err.Number
+    errDesc = Err.Description
+    modDebugLog.DError MOD_NAME, "UpdateEvent err " & errNo & " - " & errDesc & " (" & subj & ")"
+    UpdateEvent = -1
+End Function
+
+Private Sub ReadPattern(ByVal appt As Outlook.AppointmentItem, ByRef dayN As Long, _
+                        ByRef monN As Long, ByRef startYear As Long)
+    On Error Resume Next
+    dayN = 0: monN = 0: startYear = 0
+    If Not appt.IsRecurring Then Exit Sub
+    Dim pat As Outlook.RecurrencePattern
+    Set pat = appt.GetRecurrencePattern
+    dayN = pat.DayOfMonth
+    monN = pat.MonthOfYear
+    startYear = Year(pat.PatternStartDate)
+    If Err.Number <> 0 Then
+        dayN = 0: monN = 0: startYear = 0
+        Err.Clear
+    End If
+End Sub
+
+'=============================================================================
+' Orphelins : evenements a cle restes dans l'index (aucun contact ne repond
+' plus). Listes dans le rapport ; en mode Appliquer, suppression proposee
+' avec confirmation TAPEE.
+'=============================================================================
+Private Sub HandleOrphans(ByVal existing As Object, ByVal dryRun As Boolean)
+    On Error Resume Next
+    mOrphans = existing.Count
+    If mOrphans = 0 Then Exit Sub
+    ReportLine String$(78, "-")
+    ReportLine "ORPHELINS (evenement a cle sans contact correspondant) : " & mOrphans
+    Dim k As Variant, appt As Outlook.AppointmentItem
+    For Each k In existing.Keys
+        Set appt = existing.Item(k)
+        ReportLine "[ORPHEL ] " & SafeSubj(appt) & "   {" & CStr(k) & "}"
+    Next k
+    If dryRun Then Exit Sub
+
+    Dim answer As VbMsgBoxResult
+    answer = MsgBox(mOrphans & T(" ~ev~enement(s) g~en~er~e(s) par ce module ne correspondent plus ~a aucun contact " & _
+                    "(fiche supprim~ee, renomm~ee, ou anniversaire retir~e)." & vbCrLf & vbCrLf & _
+                    "Les supprimer du calendrier ? (liste dans le rapport)", _
+                    " event(s) generated by this module no longer match any contact " & _
+                    "(deleted / renamed card, or birthday removed)." & vbCrLf & vbCrLf & _
+                    "Delete them from the calendar? (listed in the report)"), _
+                    vbYesNo + vbQuestion + vbDefaultButton2, UiTitle())
+    If answer <> vbYes Then
+        ReportLine "Orphelins conserves (choix utilisateur)."
+        Exit Sub
+    End If
+    Dim word As String
+    word = UCase$(T("SUPPRIMER", "DELETE"))
+    Dim typed As String
+    typed = InputBox(T("Pour confirmer la suppression, tapez ", "To confirm deletion, type ") & word & " :", UiTitle())
+    If UCase$(Trim$(typed)) <> word Then
+        ReportLine "Suppression des orphelins annulee (confirmation non saisie)."
+        Exit Sub
+    End If
+    Dim delN As Long
+    For Each k In existing.Keys
+        Set appt = existing.Item(k)
+        Err.Clear
+        appt.Delete
+        If Err.Number = 0 Then
+            delN = delN + 1
+        Else
+            modDebugLog.DError MOD_NAME, "Orphelin non supprime : " & CStr(k) & " err " & Err.Number
+            Err.Clear
+        End If
+    Next k
+    ReportLine "Orphelins supprimes : " & delN & " / " & mOrphans
+    modDebugLog.DInfo MOD_NAME, "Orphelins supprimes : " & delN & " / " & mOrphans
+End Sub
+
+'=============================================================================
+' Helpers metier
+'=============================================================================
+Private Function HasBirthday(ByVal bd As Date) As Boolean
+    HasBirthday = False
+    If bd <= DateSerial(1600, 1, 1) Then Exit Function
+    If Year(bd) >= NO_BIRTHDAY_YEAR Then Exit Function
+    HasBirthday = True
+End Function
+
+' "Prenom NOM" tel qu'en fiche ; replis FullName / FileAs / Societe.
+Private Function ContactDisplayName(ByVal ct As Outlook.ContactItem) As String
+    On Error Resume Next
+    Dim fn As String, ln As String, res As String
+    fn = Trim$(ct.FirstName)
+    ln = Trim$(ct.LastName)
+    If Len(fn) > 0 And Len(ln) > 0 Then
+        res = fn & " " & ln
+    Else
+        res = Trim$(ct.FullName)
+        If Len(res) = 0 Then res = Trim$(ct.FileAs)
+        If Len(res) = 0 Then res = Trim$(ct.CompanyName)
+    End If
+    ContactDisplayName = CollapseSpaces(res)
+End Function
+
+Private Function BuildSubject(ByVal nm As String, ByVal lbl As String, ByVal dayN As Long, _
+                              ByVal monN As Long, ByVal birthYear As Long) As String
+    Dim res As String
+    res = mSubjectFmt
+    res = Replace(res, "{name}", nm)
+    res = Replace(res, "{label}", lbl)
+    res = Replace(res, "{date}", DateLabel(dayN, monN, birthYear))
+    BuildSubject = res
+End Function
+
+Private Function DateLabel(ByVal dayN As Long, ByVal monN As Long, ByVal birthYear As Long) As String
+    Dim dayTxt As String
+    If modConfig.LangIsEN() Then
+        dayTxt = CStr(dayN)
+    ElseIf dayN = 1 Then
+        dayTxt = "1er"
+    Else
+        dayTxt = CStr(dayN)
+    End If
+    DateLabel = dayTxt & " " & MonthLabel(monN) & IIf(birthYear > 0, " " & birthYear, "")
+End Function
+
+Private Function MonthLabel(ByVal monN As Long) As String
+    Select Case monN
+        Case 1: MonthLabel = T("janvier", "January")
+        Case 2: MonthLabel = T("f~evrier", "February")
+        Case 3: MonthLabel = T("mars", "March")
+        Case 4: MonthLabel = T("avril", "April")
+        Case 5: MonthLabel = T("mai", "May")
+        Case 6: MonthLabel = T("juin", "June")
+        Case 7: MonthLabel = T("juillet", "July")
+        Case 8: MonthLabel = T("ao" & ChrW$(251) & "t", "August")
+        Case 9: MonthLabel = T("septembre", "September")
+        Case 10: MonthLabel = T("octobre", "October")
+        Case 11: MonthLabel = T("novembre", "November")
+        Case 12: MonthLabel = T("d~ecembre", "December")
+        Case Else: MonthLabel = "?"
+    End Select
+End Function
+
+' Rappel en minutes avant le debut (minuit du jour J). J-1 a 9h = 900.
+' -1 = pas de rappel (BirthdayReminderDaysBefore negatif).
+' Rappel en minutes pour un type ("B|", "M|", "N|"). -1 = aucun rappel.
+Private Function ReminderMinutes(ByVal keyStr As String) As Long
+    Dim days As Long
+    Select Case Left$(keyStr, 2)
+        Case "N|": days = mRemindDaysND
+        Case "M|": days = mRemindDaysAN
+        Case Else: days = mRemindDays
+    End Select
+    If days < 0 Then
+        ReminderMinutes = -1
+        Exit Function
+    End If
+    Dim mins As Long
+    mins = days * 1440 - mRemindHour * 60
+    If mins < 0 Then mins = 0
+    ReminderMinutes = mins
+End Function
+
+Private Function ReminderText(ByVal days As Long) As String
+    If days < 0 Then
+        ReminderText = "aucun"
+    Else
+        ReminderText = "J-" & days & " " & Format$(mRemindHour, "00") & "h00"
+    End If
+End Function
+
+Private Function BuildBody(ByVal ct As Outlook.ContactItem, ByVal fld As Outlook.MAPIFolder, _
+                           ByVal keyStr As String) As String
+    On Error Resume Next
+    Dim res As String, v As String
+    res = ContactDisplayName(ct) & vbCrLf
+    v = Trim$(ct.CompanyName)
+    If Len(v) > 0 Then res = res & v & vbCrLf
+    v = Trim$(ct.MobileTelephoneNumber)
+    If Len(v) > 0 Then res = res & T("Mobile : ", "Mobile: ") & v & vbCrLf
+    v = Trim$(ct.Email1Address)
+    If Len(v) > 0 And InStr(v, "@") > 0 Then res = res & v & vbCrLf
+    res = res & vbCrLf & T("Fiche : ", "Card: ") & fld.FolderPath & vbCrLf
+    res = res & "modContactBirthday " & keyStr
+    BuildBody = res
+End Function
+
+' Cle stable : nom sans accents, majuscules, alphanumerique, espaces simples.
+Private Function NormKey(ByVal s As String) As String
+    ' Pack v3 (C3) : delegation modContactCommon (helper partage).
+    NormKey = modContactCommon.NormKey(s)
+End Function
+
+Private Function StripAccents(ByVal s As String) As String
+    ' Pack v3 (C3) : delegation modContactCommon (helper partage).
+    StripAccents = modContactCommon.StripAccents(s)
+End Function
+
+Private Function CollapseSpaces(ByVal s As String) As String
+    ' Pack v3 (C3) : delegation modContactCommon (helper partage).
+    CollapseSpaces = modContactCommon.CollapseSpaces(s)
+End Function
+
+Private Function FlatText(ByVal s As String) As String
+    ' Pack v3 (C3) : delegation modContactCommon (helper partage).
+    FlatText = modContactCommon.FlatText(s)
+End Function
+
+Private Function HasCategory(ByVal cats As String, ByVal wanted As String) As Boolean
+    Dim parts() As String, idx As Long
+    If Len(Trim$(cats)) = 0 Then Exit Function
+    parts = Split(cats, ";")
+    For idx = LBound(parts) To UBound(parts)
+        If StrComp(Trim$(parts(idx)), wanted, vbTextCompare) = 0 Then
+            HasCategory = True
+            Exit Function
+        End If
+    Next idx
+End Function
+
+Private Function IsLeap(ByVal yr As Long) As Boolean
+    IsLeap = ((yr Mod 4 = 0) And (yr Mod 100 <> 0)) Or (yr Mod 400 = 0)
+End Function
+
+Private Function LastLeapYear(ByVal yr As Long) As Long
+    Do While Not IsLeap(yr)
+        yr = yr - 1
+    Loop
+    LastLeapYear = yr
+End Function
+
+Private Function SafeSubj(ByVal itm As Object) As String
+    On Error Resume Next
+    SafeSubj = itm.Subject
+End Function
+
+' Save avec 3 essais (Exchange Online : erreurs transitoires).
+Private Function SafeSave(ByVal itm As Object) As Boolean
+    Dim tries As Long
+    On Error Resume Next
+    For tries = 1 To 3
+        Err.Clear
+        itm.Save
+        If Err.Number = 0 Then
+            SafeSave = True
+            Exit Function
+        End If
+        modDebugLog.DDebug MOD_NAME, "Save essai " & tries & " err " & Err.Number & " - " & Err.Description
+        Sleep 300 * tries
+    Next tries
+    SafeSave = False
+End Function
+
+'=============================================================================
+' Rapport
+'=============================================================================
+Private Sub ReportLine(ByVal s As String)
+    mReport = mReport & s & vbCrLf
+End Sub
+
+Private Sub WriteReport()
+    On Error Resume Next
+    Dim dirPath As String
+    dirPath = modConfig.MacroVBADir()
+    If Dir(dirPath, vbDirectory) = "" Then MkDir dirPath
+    mReportPath = dirPath & "\ContactBirthday-" & Format$(Now, "yyyymmdd-hhnnss") & ".txt"
+    Dim stm As Object
+    Set stm = CreateObject("ADODB.Stream")
+    stm.Type = 2
+    stm.Charset = "utf-8"
+    stm.Open
+    stm.WriteText mReport
+    stm.SaveToFile mReportPath, 2
+    stm.Close
+    If Err.Number <> 0 Then
+        modDebugLog.DError MOD_NAME, "WriteReport err " & Err.Number & " - " & Err.Description
+        Err.Clear
+    End If
+End Sub
+
+Private Sub ShowSummary(ByVal dryRun As Boolean)
+    Dim msg As String
+    msg = IIf(dryRun, T("SIMULATION - rien n'a ~et~e ~ecrit.", "DRY RUN - nothing was written."), _
+                      T("Termin~e.", "Done.")) & vbCrLf & vbCrLf & _
+          T("Dossiers de contacts : ", "Contact folders: ") & mFolders & vbCrLf & _
+          T("Contacts parcourus : ", "Contacts scanned: ") & mScanned & vbCrLf & _
+          T("Avec anniversaire : ", "With a birthday: ") & mWithBday & "   " & _
+          T("avec f" & ChrW$(234) & "te : ", "with a name day: ") & mWithNameDay & "   " & _
+          T("avec mariage : ", "with an anniversary: ") & mWithAnniv & vbCrLf & vbCrLf & _
+          T("Cr~e~es : ", "Created: ") & mCreated & "   " & _
+          T("Mis ~a jour : ", "Updated: ") & mUpdated & "   " & _
+          T("Inchang~es : ", "Unchanged: ") & mSame & vbCrLf & _
+          T("Ignor~es (sans nom) : ", "Skipped (no name): ") & mSkipped & "   " & _
+          T("Collisions de cl~e : ", "Key collisions: ") & mCollisions & vbCrLf & _
+          T("Orphelins : ", "Orphans: ") & mOrphans & "   " & _
+          T("Erreurs : ", "Errors: ") & mErrors & vbCrLf & vbCrLf & _
+          T("Rapport : ", "Report: ") & mReportPath & vbCrLf & vbCrLf & _
+          T("Ouvrir le rapport ?", "Open the report?")
+    If MsgBox(msg, vbYesNo + vbInformation, UiTitle()) = vbYes Then
+        If Dir(mReportPath) <> "" Then Shell "notepad.exe """ & mReportPath & """", vbNormalFocus
+    End If
+End Sub

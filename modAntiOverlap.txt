@@ -1,0 +1,224 @@
+Option Explicit
+
+' =====================================================================
+' modAntiOverlap v7
+' Purpose (EN): automatically shifts a short appointment (of the configured
+'   duration) by +ShiftMinutes when it overlaps another calendar event. The
+'   "already shifted" UserProperty is set and saved BEFORE Start is changed,
+'   so a locked/read-only Start cannot cause an endless re-shift on later
+'   ItemChange events.
+'
+' Decale automatiquement un RDV de la duree configuree quand il chevauche
+' un autre evenement. La UserProperty "deja decale" est posee et sauvee
+' AVANT de modifier Start, pour eviter toute nouvelle tentative si Start
+' est verrouille.
+'
+' v7 (2026-06-10) : FIX REGRESSION - lectures de config via les getters
+' EnsureLoaded-safe de modConfig (MeetingDuration / ShiftMinutes /
+' UpShiftName) au lieu des globales g_* en direct. Un Ctrl+S dans le VBE
+' remettait les g_* a zero : TryShift ne decalait plus rien (duree
+' attendue = 0, donc tout RDV "skippe") et AlreadyShifted/MarkShifted
+' travaillaient sur une UserProperty au nom vide - le tout silencieusement
+' jusqu'au redemarrage d'Outlook.
+' (Historique des versions -> CHANGELOG.)
+' =====================================================================
+
+Private Const MOD_NAME As String = "AntiOverlap"
+Private Const MOD_VERSION As String = "v7 - 2026-06-10"
+
+' Parametres externalises dans config.ini, lus via les GETTERS
+' EnsureLoaded-safe de modConfig (v7 ; jamais les globales g_* en direct) :
+'   MeetingDuration() (cle MeetingDuration, defaut 15) - duree attendue du RDV
+'   ShiftMinutes()    (cle ShiftMinutes,    defaut 15) - pas de decalage
+'   UpShiftName()     (cle UpShift, defaut "AntiChevDecale") - nom UserProperty
+'                     ATTENTION : changer ce nom rend les RDV deja marques
+'                     invisibles au code (voir config.ini).
+
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+Public Function TryShift(ByVal appt As Object) As Boolean
+    TryShift = False
+    On Error GoTo ErrH
+    
+    If appt Is Nothing Then Exit Function
+    If Not (TypeOf appt Is Outlook.AppointmentItem) Then Exit Function
+    
+    Dim a As Outlook.AppointmentItem
+    Set a = appt
+    
+    modDebugLog.DTrace MOD_NAME, "TryShift '" & a.subject & _
+        "' duration=" & a.Duration & " start=" & Format(a.Start, "dd/mm hh:nn")
+    
+    If a.IsRecurring Then
+        modDebugLog.DDebug MOD_NAME, "  Skip : recurrent"
+        Exit Function
+    End If
+    If a.AllDayEvent Then
+        modDebugLog.DDebug MOD_NAME, "  Skip : journee entiere"
+        Exit Function
+    End If
+    If a.Duration <> modConfig.MeetingDuration Then
+        modDebugLog.DDebug MOD_NAME, "  Skip : duree=" & a.Duration & _
+            " (attendu " & modConfig.MeetingDuration & ")"
+        Exit Function
+    End If
+    If a.entryID = "" Then
+        modDebugLog.DDebug MOD_NAME, "  Skip : entryID vide"
+        Exit Function
+    End If
+    If AlreadyShifted(a) Then
+        modDebugLog.DDebug MOD_NAME, "  Skip : deja decale"
+        Exit Function
+    End If
+    
+    Dim overlaps As Boolean
+    overlaps = OtherApptInSlot(a.Start, a.End, a.entryID)
+    modDebugLog.DDebug MOD_NAME, "  Chevauchement : " & overlaps
+    If Not overlaps Then Exit Function
+    
+    Dim newStart As Date
+    Dim newEnd As Date
+    newStart = DateAdd("n", modConfig.ShiftMinutes, a.Start)
+    newEnd = DateAdd("n", modConfig.ShiftMinutes, a.End)
+    
+    If OtherApptInSlot(newStart, newEnd, a.entryID) Then
+        modDebugLog.DInfo MOD_NAME, "Non decale (creneau +" & _
+            modConfig.ShiftMinutes & " aussi occupe) : '" & _
+            a.subject & "' " & Format(a.Start, "dd/mm hh:nn")
+        Exit Function
+    End If
+    
+    modDebugLog.DInfo MOD_NAME, "DECALE '" & a.subject & "' de " & _
+        Format(a.Start, "hh:nn") & " vers " & Format(newStart, "hh:nn")
+    
+    ' Fix v6 : marquer-ET-sauver la UserProperty AVANT de modifier Start.
+    ' Si Start echoue (RDV verrouille...), au moins on ne retentera pas
+    ' a chaque ItemChange ulterieur grace a la UserProperty persistee.
+    MarkShifted a
+    a.Start = newStart
+    a.Save
+    
+    TryShift = True
+    Exit Function
+
+ErrH:
+    modDebugLog.DError MOD_NAME, "TryShift error " & Err.Number & _
+        " - " & Err.Description
+End Function
+
+Private Function OtherApptInSlot(ByVal startT As Date, ByVal endT As Date, _
+                                     ByVal exceptEntryID As String) As Boolean
+    OtherApptInSlot = False
+    On Error GoTo Done
+    
+    Dim calFolder As Outlook.folder
+    Set calFolder = Application.Session.GetDefaultFolder(olFolderCalendar)
+    
+    Dim items As Outlook.items
+    Set items = calFolder.items
+    items.IncludeRecurrences = False
+    items.Sort "[Start]"
+    
+    Dim dayStart As Date
+    Dim dayEnd As Date
+    dayStart = DateSerial(Year(startT), Month(startT), Day(startT))
+    dayEnd = DateAdd("d", 1, DateSerial(Year(endT), Month(endT), Day(endT)))
+    
+    Dim dasl As String
+    dasl = "[Start] >= '" & FormatOutlookDate(DateAdd("d", -1, dayStart)) & "'" & _
+           " AND [Start] < '" & FormatOutlookDate(dayEnd) & "'"
+    
+    modDebugLog.DTrace MOD_NAME, "  filtre Find: " & dasl
+    
+    Dim itm As Object
+    Set itm = items.Find(dasl)
+    
+    Dim scanCount As Long
+    scanCount = 0
+    
+    Do While Not itm Is Nothing And scanCount < 500
+        scanCount = scanCount + 1
+        
+        If TypeOf itm Is Outlook.AppointmentItem Then
+            Dim oa As Outlook.AppointmentItem
+            Set oa = itm
+            
+            If oa.entryID <> exceptEntryID Then
+                If Not oa.AllDayEvent Then
+                    If Not IsTechnical(oa) Then
+                        If DateDiff("n", oa.Start, endT) > 0 And _
+                           DateDiff("n", startT, oa.End) > 0 Then
+                            modDebugLog.DDebug MOD_NAME, "    chevauche : '" & _
+                                oa.subject & "' " & Format(oa.Start, "dd/mm hh:nn") & _
+                                "-" & Format(oa.End, "hh:nn")
+                            OtherApptInSlot = True
+                            Exit Function
+                        End If
+                    End If
+                End If
+            End If
+        End If
+        
+        Set itm = items.FindNext
+    Loop
+    
+    modDebugLog.DTrace MOD_NAME, "  " & scanCount & _
+        " items examines, aucun chevauchement"
+Done:
+End Function
+
+Private Function FormatOutlookDate(ByVal d As Date) As String
+    Dim ampm As String
+    Dim h As Long
+    h = Hour(d)
+    If h = 0 Then
+        ampm = "AM"
+        h = 12
+    ElseIf h < 12 Then
+        ampm = "AM"
+    ElseIf h = 12 Then
+        ampm = "PM"
+    Else
+        ampm = "PM"
+        h = h - 12
+    End If
+    
+    FormatOutlookDate = Month(d) & "/" & Day(d) & "/" & Year(d) & " " & _
+                        h & ":" & Format(Minute(d), "00") & " " & ampm
+End Function
+
+Private Function IsTechnical(ByVal a As Outlook.AppointmentItem) As Boolean
+    IsTechnical = False
+    If InStr(1, a.subject, "QuickMove_", vbTextCompare) > 0 Then
+        IsTechnical = True
+        Exit Function
+    End If
+    If InStr(1, a.Categories, "QuickMove", vbTextCompare) > 0 Then
+        IsTechnical = True
+    End If
+End Function
+
+Private Function AlreadyShifted(ByVal a As Outlook.AppointmentItem) As Boolean
+    AlreadyShifted = False
+    On Error Resume Next
+    Dim up As Outlook.UserProperty
+    Set up = a.UserProperties.Find(modConfig.UpShiftName)
+    If Not up Is Nothing Then AlreadyShifted = True
+    On Error GoTo 0
+End Function
+
+Private Sub MarkShifted(ByVal a As Outlook.AppointmentItem)
+    On Error Resume Next
+    Dim up As Outlook.UserProperty
+    Set up = a.UserProperties.Find(modConfig.UpShiftName)
+    If up Is Nothing Then
+        Set up = a.UserProperties.Add(modConfig.UpShiftName, olText, False)
+    End If
+    up.Value = "1"
+    ' v6 : Save immediat pour persister la UserProperty meme si la
+    ' modification ulterieure de Start echoue. Cf. en-tete module.
+    a.Save
+    On Error GoTo 0
+End Sub

@@ -1,0 +1,693 @@
+Option Explicit
+
+'=============================================================================
+' modMailExport v3.1
+' Purpose (EN): batch-exports selected mails (Explorer or Inspector) to PDF
+'   and/or DOCX, using Word as the rendering engine (no native Outlook PDF
+'   API). Body only; attachments are not included. (Historique -> CHANGELOG.)
+'
+' Export par lot des mails selectionnes (Explorer ou Inspector) vers PDF
+' et/ou DOCX, via Word comme moteur de rendu.
+'
+' POURQUOI WORD : Outlook VBA n'a aucune API native de generation PDF/DOCX.
+' La seule voie fiable sans droits admin ni add-in tiers est de copier le
+' HTMLBody du mail dans un document Word puis :
+'   - DOCX : Document.SaveAs2(..., wdFormatXMLDocument = 12)
+'   - PDF  : Document.ExportAsFixedFormat(..., wdExportFormatPDF = 17)
+'
+' LIMITE CONNUE (honnetete technique) : le rendu Word a partir du HTML perd
+' une partie de la mise en forme complexe (tableaux imbriques, certaines
+' images inline). Pour de l'archivage lisible c'est tres correct ; ce n'est
+' PAS une reproduction pixel-perfect du mail.
+'
+' Choix retenus (session de creation) :
+'   - Format : demande au lancement (PDF / DOCX / les deux).
+'   - Destination : dossier choisi a chaque lancement (BrowseForFolder).
+'   - Pieces jointes : non incluses (corps du mail seulement).
+'
+' Point d'entree public (bouton ruban) :
+'   - ExportSelectedMails
+'
+' v2 (2026-06-10) :
+'   - AskFormat : MsgBox Win32 a boutons renommes "PDF / DOCX / Les deux"
+'     (modMsgBoxCustom.Choose3, vbAbortRetryIgnore) au lieu de l'InputBox
+'     numerique. ARI natif = pas d'Echap ni de croix : les 3 libelles
+'     couvrent toutes les issues ; l'annulation reelle se joue a l'etape
+'     suivante (bouton Annuler du choix de dossier).
+'   - Helpers generiques migres vers modCommon : SanitizeFileName,
+'     EscapeHTML, SafeSubject, SafeReceivedTime (copies privees supprimees).
+'
+' v3 (2026-06-10) : fix B5 - SetStatus route vers modCommon.SetStatus (log
+'   DEBUG). Outlook n'a aucune API de barre de statut : l'ancien
+'   Explorer.SetStatusBarMessage etait un no-op silencieux. Le feedback
+'   visible reste la MsgBox de synthese de fin de lot.
+' v3.1 (2026-06-10) : fix B11 - Randomize avant le Rnd du nom de fichier
+'   temporaire (sans graine, Rnd rejoue la meme sequence a chaque session :
+'   risque theorique de collision de nom dans %TEMP%).
+'
+' Late binding partout (CreateObject Word.Application, Shell.Application,
+' Scripting). 64-bit safe : aucune Declare API (le hook Win32 de Choose3
+' vit dans modMsgBoxCustom). Dependances : modConfig, modDebugLog,
+' modCommon (v1), modMsgBoxCustom (v2).
+'=============================================================================
+
+
+Private Const MOD_NAME As String = "MailExport"
+Private Const MOD_VERSION As String = "v3.1 - 2026-06-10"
+
+' Constantes Word (late binding : valeurs en dur)
+Private Const WD_FORMAT_DOCX     As Long = 12   ' wdFormatXMLDocument
+Private Const WD_EXPORT_PDF       As Long = 17   ' wdExportFormatPDF
+Private Const WD_EXPORT_OPT_DOC   As Long = 0    ' wdExportOptimizeForPrint
+
+' Choix de format
+Private Const FMT_PDF  As Long = 1
+Private Const FMT_DOCX As Long = 2
+Private Const FMT_BOTH As Long = 3
+
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+'=============================================================================
+' ExportSelectedMails  (PUBLIC - bouton ruban)
+' Exporte les mails selectionnes en PDF et/ou DOCX dans un dossier choisi.
+'=============================================================================
+Public Sub ExportSelectedMails()
+    On Error GoTo ErrH
+
+    ' --- 1. Recuperer la selection ---
+    Dim sel As Object
+    Set sel = GetSelectedItems()
+    If sel Is Nothing Then
+        MsgBox T("Aucun mail s~electionn~e.", "No mail selected.") & vbCrLf & vbCrLf & _
+               T("S~electionnez un ou plusieurs messages dans la liste, ", "Select one or more messages in the list, ") & _
+               T("puis relancez l'export.", "then run the export again."), vbExclamation, "Export mails"
+        Exit Sub
+    End If
+
+    Dim mailCount As Long
+    mailCount = CountMailItems(sel)
+    If mailCount = 0 Then
+        MsgBox T("La s~election ne contient aucun message exportable.", "The selection contains no exportable message.") & vbCrLf & _
+               T("(RDV, contacts et taches sont ignores.)", "(Appointments, contacts and tasks are ignored.)"), _
+               vbExclamation, "Export mails"
+        Exit Sub
+    End If
+
+    ' --- 2. Choix du format ---
+    Dim fmt As Long
+    fmt = AskFormat()
+    If fmt = 0 Then Exit Sub   ' annule
+
+    ' --- 3. Choix du dossier de destination ---
+    Dim targetFolder As String
+    targetFolder = ChooseFolder()
+    If Len(targetFolder) = 0 Then Exit Sub   ' annule
+    If Right$(targetFolder, 1) = "\" Then targetFolder = Left$(targetFolder, Len(targetFolder) - 1)
+
+    modDebugLog.DInfo MOD_NAME, "Export demande : " & mailCount & " mail(s), " & _
+        "format=" & FormatLabel(fmt) & ", dest=" & targetFolder
+
+    ' --- 4. Demarrer Word (une seule instance pour tout le lot) ---
+    Dim wd As Object
+    Set wd = CreateObject("Word.Application")
+    wd.Visible = False
+    wd.DisplayAlerts = 0   ' wdAlertsNone
+
+    ' --- 5. Boucle d'export ---
+    Dim itm As Object, mail As Object
+    Dim i As Long, idx As Long
+    Dim okPdf As Long, okDocx As Long, errs As Long
+    Dim baseName As String, basePath As String
+
+    idx = 0
+    For i = 1 To sel.Count
+        DoEvents
+        On Error Resume Next
+        Set itm = sel.Item(i)
+        On Error GoTo ErrH
+
+        If itm Is Nothing Then GoTo Continue
+        If Not IsExportableMail(itm) Then GoTo Continue
+        Set mail = itm
+        idx = idx + 1
+
+        SetStatus "Export " & idx & "/" & mailCount & "..."
+
+        ' Nom de fichier : YYYY-MM-DD_HHMM - Objet (assaini, unique)
+        baseName = BuildFileName(mail, idx)
+        basePath = targetFolder & "\" & baseName
+
+        ' Generer le document Word a partir du corps du mail
+        Dim doc As Object
+        Set doc = Nothing
+        Set doc = BuildWordDoc(wd, mail)
+        If doc Is Nothing Then
+            errs = errs + 1
+            modDebugLog.DError MOD_NAME, "Echec construction doc pour '" & _
+                modCommon.SafeSubject(mail) & "'"
+            GoTo Continue
+        End If
+
+        ' DOCX
+        If fmt = FMT_DOCX Or fmt = FMT_BOTH Then
+            On Error Resume Next
+            doc.SaveAs2 basePath & ".docx", WD_FORMAT_DOCX
+            If Err.Number = 0 Then
+                okDocx = okDocx + 1
+            Else
+                errs = errs + 1
+                modDebugLog.DError MOD_NAME, "SaveAs2 DOCX err " & Err.Number & _
+                    " - " & Err.Description & " (" & baseName & ")"
+                Err.Clear
+            End If
+            On Error GoTo ErrH
+        End If
+
+        ' PDF
+        If fmt = FMT_PDF Or fmt = FMT_BOTH Then
+            On Error Resume Next
+            doc.ExportAsFixedFormat basePath & ".pdf", WD_EXPORT_PDF, _
+                False, WD_EXPORT_OPT_DOC
+            If Err.Number = 0 Then
+                okPdf = okPdf + 1
+            Else
+                errs = errs + 1
+                modDebugLog.DError MOD_NAME, "ExportPDF err " & Err.Number & _
+                    " - " & Err.Description & " (" & baseName & ")"
+                Err.Clear
+            End If
+            On Error GoTo ErrH
+        End If
+
+        ' Fermer le doc sans sauvegarder le .docx temporaire en trop
+        On Error Resume Next
+        doc.Close False   ' wdDoNotSaveChanges
+        On Error GoTo ErrH
+        Set doc = Nothing
+Continue:
+    Next i
+
+    ' --- 6. Cloture ---
+    On Error Resume Next
+    wd.Quit
+    On Error GoTo ErrH
+    Set wd = Nothing
+    SetStatus ""
+
+    Dim msg As String
+    msg = T("Export termine.", "Export complete.") & vbCrLf & vbCrLf
+    If fmt = FMT_PDF Or fmt = FMT_BOTH Then msg = msg & "PDF  : " & okPdf & vbCrLf
+    If fmt = FMT_DOCX Or fmt = FMT_BOTH Then msg = msg & "DOCX : " & okDocx & vbCrLf
+    If errs > 0 Then msg = msg & T("Erreurs : ", "Errors: ") & errs & T(" (voir debug.log)", " (see debug.log)") & vbCrLf
+    msg = msg & vbCrLf & T("Dossier : ", "Folder: ") & targetFolder
+
+    modDebugLog.DInfo MOD_NAME, "Export OK pdf=" & okPdf & " docx=" & okDocx & _
+        " err=" & errs
+
+    Dim rep As VbMsgBoxResult
+    rep = MsgBox(msg & vbCrLf & vbCrLf & T("Ouvrir le dossier ?", "Open the folder?"), _
+                 vbInformation + vbYesNo, "Export mails")
+    If rep = vbYes Then OpenFolder targetFolder
+    Exit Sub
+
+ErrH:
+    On Error Resume Next
+    If Not wd Is Nothing Then wd.Quit
+    Set wd = Nothing
+    SetStatus ""
+    modDebugLog.DError MOD_NAME, "ExportSelectedMails error " & _
+        Err.Number & " - " & Err.Description
+    MsgBox T("Erreur pendant l'export : ", "Error during export: ") & Err.Description, _
+           vbCritical, "Export mails"
+End Sub
+
+'=============================================================================
+' GetSelectedItems
+' Renvoie une Collection FIGEE des mails selectionnes dans l'Explorer actif
+' (ou Nothing si rien). On copie les references AVANT toute manipulation Word :
+' l'objet Explorer.Selection est "vivant" et son Item(i)/Count peuvent devenir
+' incoherents quand DoEvents laisse Outlook retraiter l'UI pendant l'export
+' (symptome observe : un seul mail traite au lieu de toute la selection).
+'=============================================================================
+Private Function GetSelectedItems() As Object
+    On Error Resume Next
+    Dim expl As Object
+    Set expl = Application.ActiveExplorer
+    If expl Is Nothing Then Exit Function
+
+    Dim selLive As Object
+    Set selLive = expl.Selection
+    If selLive Is Nothing Then Exit Function
+    If selLive.Count = 0 Then Exit Function
+
+    Dim col As Collection
+    Set col = New Collection
+    Dim i As Long
+    For i = 1 To selLive.Count
+        On Error Resume Next
+        col.Add selLive.Item(i)
+        On Error GoTo 0
+    Next i
+
+    If col.Count = 0 Then Exit Function
+    Set GetSelectedItems = col
+End Function
+
+'=============================================================================
+' CountMailItems : nombre de MailItem reels dans la collection figee.
+'=============================================================================
+Private Function CountMailItems(ByVal sel As Object) As Long
+    On Error Resume Next
+    Dim i As Long, n As Long
+    For i = 1 To sel.Count
+        If IsExportableMail(sel.Item(i)) Then n = n + 1
+    Next i
+    CountMailItems = n
+End Function
+
+'=============================================================================
+' IsExportableMail
+' True si l'item est exportable : MailItem (Class 43 olMail) OU ReportItem
+' (Class 46 olReport). Les messages "Non remis" / accuses de non-distribution
+' (NDR, classe MAPI REPORT.IPM.Note.NDR) sont des ReportItem : ils exposent
+' HTMLBody / Subject / SenderName comme un mail, donc s'exportent pareil.
+'=============================================================================
+Private Function IsExportableMail(ByVal itm As Object) As Boolean
+    On Error Resume Next
+    If itm Is Nothing Then Exit Function
+    Dim c As Long
+    c = itm.Class
+    IsExportableMail = (c = 43) Or (c = 46)   ' olMail / olReport
+End Function
+
+'=============================================================================
+' BuildWordDoc
+' Cree un document Word et y injecte le HTML du mail + un en-tete (De / A /
+' Date / Objet). Renvoie le Document, ou Nothing en cas d'echec.
+'
+' Methode : on ecrit le HTMLBody dans un fichier .htm temporaire (UTF-8 via
+' ADODB.Stream), puis Word l'ouvre. C'est nettement plus fiable que
+' d'injecter du HTML dans la presse-papier ou via Range.
+'=============================================================================
+Private Function BuildWordDoc(ByVal wd As Object, ByVal mail As Object) As Object
+    On Error GoTo ErrH
+
+    Dim htm As String
+    htm = BuildHTML(mail)
+
+    Dim tmp As String
+    Randomize   ' v3.1 (B11) : graine, sinon Rnd rejoue la meme sequence
+    tmp = Environ$("TEMP") & "\exportmail_" & Format(Now, "yyyymmddhhnnss") & _
+          "_" & CStr(Int(Rnd * 100000)) & ".htm"
+
+    ' Ecriture UTF-8 BOM via ADODB.Stream (preserve les accents du HTML)
+    Dim stm As Object
+    Set stm = CreateObject("ADODB.Stream")
+    stm.Type = 2                 ' adTypeText
+    stm.Charset = "utf-8"
+    stm.Open
+    stm.WriteText htm
+    stm.SaveToFile tmp, 2        ' adSaveCreateOverWrite
+    stm.Close
+    Set stm = Nothing
+
+    Dim doc As Object
+    Set doc = wd.Documents.Open(FileName:=tmp, ConfirmConversions:=False, _
+                                ReadOnly:=False, AddToRecentFiles:=False, _
+                                Format:=0)   ' wdOpenFormatAuto (parse HTML tolerant)
+
+    ' Le .htm temporaire ne sert plus une fois charge dans Word
+    On Error Resume Next
+    Kill tmp
+    On Error GoTo ErrH
+
+    Set BuildWordDoc = doc
+    Exit Function
+
+ErrH:
+    modDebugLog.DError MOD_NAME, "BuildWordDoc error " & Err.Number & _
+        " - " & Err.Description
+    Set BuildWordDoc = Nothing
+End Function
+
+'=============================================================================
+' BuildHTML
+' Assemble un document HTML PROPRE : un seul squelette html/head/body, avec
+' l'en-tete metadonnees (De/A/Date/Objet) puis le corps du mail.
+'
+' POURQUOI on ne reutilise PAS le squelette du mail : les NDR Microsoft
+' ("Non remis") ont un HTML malforme (DEUX <head>, <meta> entre les deux).
+' Word, en ouvrant ce HTML, s'arrete au premier </head> et ne rend que
+' l'en-tete -> corps vide a l'export. On extrait donc uniquement le contenu
+' interne du <body> source (ou tout le HTML s'il n'a pas de <body>), on retire
+' les balises de structure parasites, puis on enveloppe dans NOTRE squelette.
+'=============================================================================
+Private Function BuildHTML(ByVal mail As Object) As String
+    On Error Resume Next
+
+    Dim bodyHtml As String
+    Dim htmlSrc As String
+    htmlSrc = ""
+    htmlSrc = mail.HTMLBody          ' peut lever / etre vide sur ReportItem
+
+    If HtmlUsable(htmlSrc) Then
+        bodyHtml = ExtractBodyContent(htmlSrc)
+    Else
+        ' HTMLBody absent (ReportItem/NDR : .HTMLBody leve l'erreur 438) ou
+        ' sans balise reelle : on rend le Body texte. modCommon.EscapeHTML, puis
+        ' on rend les liens "<https://...>" cliquables, le tout en <pre> pour
+        ' preserver la mise en page texte du rapport de non-distribution.
+        Dim txt As String
+        txt = modCommon.EscapeHTML(SafeBody(mail))
+        txt = TextLinksToHtml(txt)
+        bodyHtml = "<pre style=""font-family:Calibri,Arial,sans-serif;" & _
+                "font-size:11pt;white-space:pre-wrap;word-wrap:break-word;"">" & _
+                txt & "</pre>"
+    End If
+
+    Dim headerHtml As String
+    headerHtml = "<div style=""font-family:Calibri,Arial,sans-serif;font-size:11pt;" & _
+             "border-bottom:1px solid #999;padding-bottom:8px;margin-bottom:12px;"">" & _
+             HeaderLine(T("De", "From"), SafeSender(mail)) & _
+             HeaderLine(T("A", "To"), SafeTo(mail)) & _
+             HeaderLine("Date", SafeDate(mail)) & _
+             HeaderLine(T("Objet", "Subject"), modCommon.EscapeHTML(modCommon.SafeSubject(mail))) & _
+             "</div>"
+
+    BuildHTML = "<html><head><meta http-equiv=""Content-Type"" " & _
+                     "content=""text/html; charset=utf-8"" /></head><body>" & _
+                     headerHtml & bodyHtml & "</body></html>"
+End Function
+
+'=============================================================================
+' HtmlUsable
+' True si la chaine contient un vrai contenu HTML (au moins une balise <body>
+' ou <table> ou <div> ou <p>). Un HTMLBody vide, ou reduit a "<html></html>"
+' sans contenu, est considere comme NON exploitable -> on basculera sur Body.
+' Indispensable pour les ReportItem/NDR ou .HTMLBody peut etre vide en VBA.
+'=============================================================================
+Private Function HtmlUsable(ByVal s As String) As Boolean
+    On Error Resume Next
+    If Len(Trim$(s)) = 0 Then Exit Function
+    Dim u As String: u = LCase$(s)
+    If InStr(u, "<body") > 0 _
+       Or InStr(u, "<table") > 0 _
+       Or InStr(u, "<div") > 0 _
+       Or InStr(u, "<p>") > 0 _
+       Or InStr(u, "<p ") > 0 Then
+        HtmlUsable = True
+    End If
+End Function
+
+'=============================================================================
+' SafeBody : Body texte du message, protege (un ReportItem peut lever).
+'=============================================================================
+Private Function SafeBody(ByVal mail As Object) As String
+    On Error Resume Next
+    SafeBody = mail.Body
+End Function
+
+'=============================================================================
+' TextLinksToHtml
+' Dans un texte DEJA echappe HTML, transforme les liens au format Outlook
+' "&lt;https://...&gt;" en ancres <a href> cliquables. Le Body d'un NDR
+' contient ses URLs sous cette notation texte ; sans ca elles restent du
+' texte mort dans l'export. Conservateur : ne touche qu'aux blocs &lt;http...&gt;.
+'=============================================================================
+Private Function TextLinksToHtml(ByVal s As String) As String
+    On Error Resume Next
+    Dim out As String, pos As Long, startPos As Long
+    startPos = 1
+    Do
+        pos = InStr(startPos, s, "&lt;http")
+        If pos = 0 Then
+            out = out & Mid$(s, startPos)
+            Exit Do
+        End If
+        ' Texte avant le lien
+        out = out & Mid$(s, startPos, pos - startPos)
+        ' Fin du lien = prochain "&gt;"
+        Dim finPos As Long
+        finPos = InStr(pos, s, "&gt;")
+        If finPos = 0 Then
+            out = out & Mid$(s, pos)
+            Exit Do
+        End If
+        ' URL entre "&lt;" (4 chars) et "&gt;"
+        Dim url As String
+        url = Mid$(s, pos + 4, finPos - (pos + 4))
+        out = out & "<a href=""" & url & """>" & url & "</a>"
+        startPos = finPos + 4    ' apres "&gt;"
+    Loop
+    TextLinksToHtml = out
+End Function
+
+
+' Renvoie le contenu INTERNE du <body> d'un fragment HTML (ce qui est entre
+' <body...> et </body>), apres avoir retire tout bloc <head>...</head>. Si le
+' fragment n'a pas de <body>, on retire seulement les <html>/<head> et on
+' renvoie le reste. Objectif : ne garder QUE le contenu visible, sans aucune
+' balise de structure (html/head/body) qui ferait doublon avec notre squelette.
+'=============================================================================
+Private Function ExtractBodyContent(ByVal html As String) As String
+    On Error Resume Next
+    Dim s As String: s = html
+
+    ' 1. Retirer tous les blocs <head>...</head> (insensible casse, multi-bloc)
+    s = RemoveBlocks(s, "<head", "</head>")
+
+    ' 2. Isoler le contenu entre le 1er <body...> et le dernier </body>
+    Dim posBody As Long, posGt As Long, posFin As Long
+    posBody = InStr(1, s, "<body", vbTextCompare)
+    If posBody > 0 Then
+        posGt = InStr(posBody, s, ">")
+        If posGt > 0 Then
+            posFin = InStrRev(s, "</body>", -1, vbTextCompare)
+            If posFin > posGt Then
+                ExtractBodyContent = Mid$(s, posGt + 1, posFin - posGt - 1)
+            Else
+                ExtractBodyContent = Mid$(s, posGt + 1)
+            End If
+            Exit Function
+        End If
+    End If
+
+    ' 3. Pas de <body> : retirer balises html ouvrantes/fermantes residuelles
+    s = RemoveTag(s, "<html")
+    s = Replace(s, "</html>", "", , , vbTextCompare)
+    s = RemoveTag(s, "<body")
+    s = Replace(s, "</body>", "", , , vbTextCompare)
+    ExtractBodyContent = s
+End Function
+
+'=============================================================================
+' RemoveBlocks : supprime tous les blocs <openTag ...>...</closeTag>.
+' Insensible a la casse. Utilise pour retirer les <head>...</head>.
+'=============================================================================
+Private Function RemoveBlocks(ByVal s As String, ByVal openTag As String, _
+                              ByVal closeTag As String) As String
+    On Error Resume Next
+    Dim guard As Long
+    Do
+        guard = guard + 1
+        If guard > 50 Then Exit Do          ' securite anti-boucle
+        Dim p1 As Long: p1 = InStr(1, s, openTag, vbTextCompare)
+        If p1 = 0 Then Exit Do
+        Dim p2 As Long: p2 = InStr(p1, s, closeTag, vbTextCompare)
+        If p2 = 0 Then
+            ' Tag ouvrant sans fermant : retirer juste la balise ouvrante
+            s = RemoveTag(s, openTag)
+            Exit Do
+        End If
+        s = Left$(s, p1 - 1) & Mid$(s, p2 + Len(closeTag))
+    Loop
+    RemoveBlocks = s
+End Function
+
+'=============================================================================
+' RemoveTag : supprime la 1ere balise <tag ...> (jusqu'au > suivant).
+'=============================================================================
+Private Function RemoveTag(ByVal s As String, ByVal tag As String) As String
+    On Error Resume Next
+    Dim p1 As Long: p1 = InStr(1, s, tag, vbTextCompare)
+    If p1 = 0 Then
+        RemoveTag = s
+        Exit Function
+    End If
+    Dim p2 As Long: p2 = InStr(p1, s, ">")
+    If p2 = 0 Then
+        RemoveTag = s
+        Exit Function
+    End If
+    RemoveTag = Left$(s, p1 - 1) & Mid$(s, p2 + 1)
+End Function
+
+'=============================================================================
+' HeaderLine : une ligne "Label : valeur" pour l'en-tete HTML.
+'=============================================================================
+Private Function HeaderLine(ByVal lbl As String, ByVal val As String) As String
+    If Len(val) = 0 Then Exit Function
+    HeaderLine = "<div><b>" & lbl & " :</b> " & val & "</div>"
+End Function
+
+'=============================================================================
+' BuildFileName
+' Nom de fichier base : "YYYY-MM-DD_HHMM - Objet" assaini. idx prefixe pour
+' garantir l'unicite si plusieurs mails ont meme date+objet.
+'=============================================================================
+Private Function BuildFileName(ByVal mail As Object, ByVal idx As Long) As String
+    On Error Resume Next
+    Dim d As Date, datePrefix As String
+    d = modCommon.SafeReceivedTime(mail)
+    If d > 0 Then
+        datePrefix = Format(d, "yyyy-mm-dd_hhnn")
+    Else
+        datePrefix = Format(Now, "yyyy-mm-dd_hhnn")
+    End If
+
+    Dim subjectText As String
+    subjectText = modCommon.SafeSubject(mail)
+    If Len(subjectText) = 0 Then subjectText = T("(sans objet)", "(no subject)")
+
+    Dim fileName As String
+    fileName = datePrefix & " - " & subjectText
+    fileName = modCommon.SanitizeFileName(fileName)
+
+    ' Tronquer pour rester sous la limite de chemin Windows
+    If Len(fileName) > 100 Then fileName = Left$(fileName, 100)
+
+    ' Prefixe index sur 3 chiffres : garantit l'unicite dans le lot
+    BuildFileName = Format(idx, "000") & "_" & fileName
+End Function
+
+' (v2 : SanitizeName et EscapeHTML migres vers modCommon.SanitizeFileName
+'  et modCommon.EscapeHTML ; copies privees supprimees.)
+
+' --- Accesseurs proteges (un mail peut lever sur certaines proprietes) ---
+
+Private Function SafeSender(ByVal mail As Object) As String
+    On Error Resume Next
+    Dim s As String
+    s = mail.SenderName
+    If Len(s) = 0 Then s = mail.SenderEmailAddress
+    SafeSender = modCommon.EscapeHTML(s)
+End Function
+
+Private Function SafeTo(ByVal mail As Object) As String
+    On Error Resume Next
+    SafeTo = modCommon.EscapeHTML(mail.To)
+End Function
+
+Private Function SafeDate(ByVal mail As Object) As String
+    On Error Resume Next
+    Dim d As Date
+    d = modCommon.SafeReceivedTime(mail)
+    If d > 0 Then SafeDate = Format(d, "dd/mm/yyyy hh:nn")
+End Function
+
+'=============================================================================
+' AskFormat (v2) : choix du format via Choose3 (modMsgBoxCustom, MsgBox
+' Win32 a boutons renommes "PDF / DOCX / Les deux", vbAbortRetryIgnore).
+' ARI natif = pas d'Echap ni de croix : les 3 libelles couvrent toutes les
+' issues ; l'annulation reelle se fait au choix du dossier (etape suivante,
+' bouton Annuler du BrowseForFolder). Renvoie 0 en repli imprevu seulement.
+'=============================================================================
+Private Function AskFormat() As Long
+    Dim r As Long
+    ' v- 2026-08-22 : Choose3 -> Confirm3. Choose3 repose sur
+    ' vbAbortRetryIgnore, qui n'a PAS de bouton Annuler et dont la croix de
+    ' fermeture est desactivee : l'utilisateur etait donc OBLIGE d'exporter,
+    ' sans aucun moyen de sortir d'une commande lancee par erreur. "Ne rien
+    ' exporter" est une reponse parfaitement legitime : elle prend sa place
+    ' en 3e position, ou Echap et la croix la selectionnent naturellement.
+    ' Le 3e format (Les deux) devient une case du menu principal.
+    ' ATTENTION : Confirm3 renvoie vbYes/vbNo/vbCancel, pas 1/2/3 - le
+    ' Select Case est adapte en consequence.
+    r = modMsgBoxCustom.Confirm3( _
+            T("Format d'export des mails s~electionn~es :", _
+              "Export format for the selected mails:") & vbCrLf & vbCrLf & _
+            T("Annuler = ne rien exporter.", "Cancel = export nothing."), _
+            T("Exporter les mails - format", "Export mails - format"), _
+            "&PDF", T("&DOCX et les deux", "&DOCX and both"), T("A&nnuler", "&Cancel"))
+    Select Case r
+        Case vbYes: AskFormat = FMT_PDF
+        Case vbNo:  AskFormat = AskDocxOrBoth()
+        Case Else:  AskFormat = 0
+    End Select
+End Function
+
+' ---------------------------------------------------------------------
+' AskDocxOrBoth - 2e niveau du choix de format.
+' Confirm3 n'offre que trois issues et la 3e est reservee a la sortie ; le
+' quatrieme cas (PDF + DOCX) passe donc par ce sous-choix. Annuler y reste
+' possible : a aucun moment l'utilisateur n'est enferme.
+' ---------------------------------------------------------------------
+Private Function AskDocxOrBoth() As Long
+    Select Case modMsgBoxCustom.Confirm3( _
+            T("Exporter ~egalement en PDF ?", "Also export as PDF?"), _
+            T("Exporter les mails - format", "Export mails - format"), _
+            T("&DOCX seul", "&DOCX only"), T("DOCX &+ PDF", "DOCX &+ PDF"), _
+            T("A&nnuler", "&Cancel"))
+        Case vbYes: AskDocxOrBoth = FMT_DOCX
+        Case vbNo:  AskDocxOrBoth = FMT_BOTH
+        Case Else:  AskDocxOrBoth = 0
+    End Select
+End Function
+
+Private Function FormatLabel(ByVal fmt As Long) As String
+    Select Case fmt
+        Case FMT_PDF:  FormatLabel = "PDF"
+        Case FMT_DOCX: FormatLabel = "DOCX"
+        Case FMT_BOTH: FormatLabel = "PDF+DOCX"
+        Case Else:     FormatLabel = "?"
+    End Select
+End Function
+
+'=============================================================================
+' ChooseFolder
+' Ouvre un BrowseForFolder (Shell.Application). Renvoie "" si annule.
+' Dossier initial : le Bureau (modConfig.DesktopPath).
+'=============================================================================
+Private Function ChooseFolder() As String
+    On Error Resume Next
+    Dim shell As Object, fld As Object
+    Set shell = CreateObject("Shell.Application")
+
+    Const BIF_RETURNONLYFSDIRS As Long = 1
+    Const BIF_NEWDIALOGSTYLE   As Long = 64
+
+    Dim initialFolder As String
+    initialFolder = modConfig.DesktopPath()
+
+    Set fld = shell.BrowseForFolder(0&, _
+        T("Choisir le dossier de destination des exports", "Choose the export destination folder"), _
+        BIF_RETURNONLYFSDIRS + BIF_NEWDIALOGSTYLE, initialFolder)
+
+    If fld Is Nothing Then Exit Function
+
+    ' .Self.Path donne le chemin du dossier selectionne
+    Dim p As String
+    p = fld.Self.Path
+    ChooseFolder = p
+End Function
+
+'=============================================================================
+' OpenFolder : ouvre le dossier dans l'Explorateur Windows.
+'=============================================================================
+Private Sub OpenFolder(ByVal targetFolder As String)
+    On Error Resume Next
+    Dim sh As Object
+    Set sh = CreateObject("WScript.Shell")
+    sh.Run """" & targetFolder & """", 1, False
+End Sub
+
+'=============================================================================
+' SetStatus (v3 - fix B5) : progression -> log DEBUG via modCommon.SetStatus.
+' Outlook n'a aucune API de barre de statut (cf. doc modCommon.SetStatus) ;
+' l'ancien Explorer.SetStatusBarMessage etait un no-op silencieux.
+'=============================================================================
+Private Sub SetStatus(ByVal msg As String)
+    modCommon.SetStatus MOD_NAME, msg
+End Sub

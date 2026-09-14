@@ -1,0 +1,483 @@
+; ============================================================
+; config.ini.example - modele de configuration (ClassicOutlook-Toolkit)
+;
+; COPIER ce fichier en  config.ini  dans :
+;   <Bureau>\Macro VBA\Outlook\config.ini
+; puis adapter les valeurs. Le fichier config.ini lui-meme N'EST PAS
+; versionne (voir .gitignore) : il peut contenir des donnees propres a
+; votre environnement (domaines, adresses) et la cle API.
+;
+; Format : cle=valeur (une par ligne).
+;   ; ou #  en debut de ligne = commentaire (ignore)
+;   [Section]               = ignore (parse a plat, cles globales)
+;   espaces autour de = supprimes
+;   terminateurs CRLF / CR / LF tous acceptes
+;
+; Toute cle absente retombe sur un defaut neutre code dans
+; modConfig.LoadConfig. Le fichier entier est OPTIONNEL.
+;
+; Apres edition : ruban Maintenance > Configuration > Recharger
+; (relit le fichier ET re-applique les variables globales).
+; ============================================================
+
+; ------------------------------------------------------------
+; LANGUE DE L'INTERFACE
+;   Language : FR (defaut) ou EN. Impacte toutes les fenetres et messages
+;   (MsgBox / InputBox / barre de statut). Repli FR si une traduction EN
+;   manque -> le projet reste pleinement fonctionnel quel que soit l'etat
+;   de la traduction.
+; ------------------------------------------------------------
+Language=FR
+
+; ------------------------------------------------------------
+; SALUTATION AUTO DES REPONSES (modReplyGreeting)
+;   GreetingEnabled : 1 (defaut) = insere "Bonjour Prenom," en tete des
+;     reponses quand le champ A ne contient qu'une seule personne.
+;     0 = desactive. Le prenom est extrait de l'adresse SMTP
+;     (prenom.nom@domaine) ; transferts et reponses a plusieurs exclus.
+;   GreetingWord : mot de salutation. Vide = suit la langue de
+;     l'interface (Bonjour si FR, Hello si EN). Si un mail du meme fil
+;     a deja ete envoye le meme jour avec ce mot, seul le prenom est
+;     insere.
+; ------------------------------------------------------------
+GreetingEnabled=1
+GreetingWord=
+
+; ------------------------------------------------------------
+; CHEMINS (laisser vide = calcul auto depuis le Bureau, qui suit
+; la redirection OneDrive). Ne renseigner que pour forcer un
+; emplacement non standard (chemin absolu complet).
+; ------------------------------------------------------------
+VBADir=
+TimeTrackingPath=
+MailTrackingPath=
+
+; ------------------------------------------------------------
+; REFERENTIELS EXCEL (noms de fichiers et feuilles)
+;   SuiviTemps : referentiel projets/dossiers + heures par mois
+;   SuiviMails : tracker des reponses attendues
+; ------------------------------------------------------------
+TimeTrackingFilename=Suivi de temps.xlsm
+TimeTrackingSheet=Temps par mois
+MailTrackingFilename=Suivi des mails.xlsx
+MailTrackingSheet=Suivi
+
+; ------------------------------------------------------------
+; ARCHIVAGE AUTOMATIQUE (modFolderScan)
+; AutoArchiveFolders : sous-dossiers de la Boite de reception dont les
+;   sous-dossiers inactifs sont deplaces vers un dossier d'archives, separes
+;   par | (pipe). Vide = archivage automatique desactive.
+;   Chaque dossier doit contenir un sous-dossier nomme comme ArchiveSubfolderName.
+; AutoArchiveMonths : un sous-dossier dont le dernier mail est plus ancien
+;   que ce nombre de mois est archive (et remonte s'il redevient actif).
+; ArchiveSubfolderName : nom du sous-dossier d'archives.
+; Exemple : AutoArchiveFolders=Projets|Partenaires
+; ------------------------------------------------------------
+AutoArchiveFolders=
+AutoArchiveMonths=1
+ArchiveSubfolderName=_Archives
+
+; ------------------------------------------------------------
+; COLORATION DES REUNIONS (modMeetingColor)
+; Domaines internes : separes par | (pipe). Un participant dont
+; l'adresse appartient a l'un de ces domaines est "interne".
+; Renseignez ici le(s) domaine(s) de votre organisation.
+; ------------------------------------------------------------
+InternalDomains=domaine1.fr|domaine2.fr
+ExternalMeetingCategory=Reunion externe
+InternalMeetingCategory=Reunion interne
+
+; Optional: map ONE contract code to a dedicated Outlook category.
+; Leave SpecialContractCode empty to disable this mapping (default).
+SpecialContractCode=
+SpecialContractCategory=
+
+; ------------------------------------------------------------
+; DUREES ET DECALAGES (minutes)
+;   DefaultAppointmentDuration  : duree posee sur un nouveau RDV/reunion
+;   MeetingDuration    : duree consideree par l'anti-chevauchement
+;   ShiftMinutes : pas de decalage applique en cas de collision
+; ------------------------------------------------------------
+DefaultAppointmentDuration=15
+MeetingDuration=15
+ShiftMinutes=15
+
+; ------------------------------------------------------------
+; SUIVI DES MAILS / SUSPICION DE REPONSE
+;   ReplyDelayDays : delai avant rappel d'un mail sans reponse
+;   SuspicionThreshold    : score a partir duquel on propose le suivi
+;   KeywordsCap   : plafond de points apportes par les mots-cles
+; ------------------------------------------------------------
+ReplyDelayDays=7
+SuspicionThreshold=3
+KeywordsCap=3
+
+; ------------------------------------------------------------
+; TAG PROJET (modProjectTag)
+;   TagPageSize : nb max de projets affiches dans le selecteur
+; ------------------------------------------------------------
+TagPageSize=12
+
+; ------------------------------------------------------------
+; !!! USERPROPERTIES - LIRE AVANT DE MODIFIER !!!
+;
+; UpTag / UpShift sont les noms internes des proprietes posees par le
+; code sur les RDV (tag projet et marqueur anti-chevauchement).
+;
+; SI VOUS CHANGEZ CES VALEURS sur un environnement DEJA UTILISE, tous les
+; RDV deja marques avec l'ancien nom deviennent invisibles au code (il
+; cherchera le nouveau nom). Consequence : re-tag de RDV deja tagges,
+; anti-chevauchement qui re-decale. Un module de migration (modMigrateTags)
+; permet de renommer proprement les marqueurs existants.
+; Sur un environnement neuf : laisser tel quel.
+; ------------------------------------------------------------
+UpTag=ProjectTag
+UpShift=AntiChevDecale
+
+; ------------------------------------------------------------
+; BACKUP
+;   BackupRetentionMonths : nb de dossiers de backup mensuel conserves
+; ------------------------------------------------------------
+BackupRetentionMonths=12
+
+; ------------------------------------------------------------
+; CAMPAGNE MAIL (envoi cadence - modMailCampaign)
+;   CampaignStepSec       : delai REEL entre 2 envois (secondes).
+;                          ATTENTION : Outlook est fige pendant l'envoi.
+;   CampaignBatchSize : nb d'envois avant une pause longue
+;   CampaignPauseSec     : pause longue tous les TaillePaquet (secondes)
+;   CampaignCap      : plafond DUR d'envois par lancement (securite)
+; ------------------------------------------------------------
+CampaignStepSec=20
+CampaignBatchSize=50
+CampaignPauseSec=180
+CampaignCap=200
+
+; ------------------------------------------------------------
+; SIGNATURE (delimiteur - modSendToLLM, modMailCampaign)
+; Permet de tronquer le corps d'un mail AVANT la signature.
+;   SignatureBookmark      : nom du signet HTML qui marque le debut de la
+;                            signature. Outlook natif insere "_MailAutoSig".
+;                            Un outil de signature tiers peut utiliser un
+;                            autre signet : indiquez-le ici.
+;   SignatureTextMarker : repli en texte brut (sous-chaine marquant le
+;                            debut de la signature) si le signet est absent.
+;                            Ex. votre nom complet. Vide par defaut.
+; ------------------------------------------------------------
+SignatureBookmark=_MailAutoSig
+SignatureTextMarker=
+
+; ------------------------------------------------------------
+; BANNIERE CONFIDENTIALITE (couleurs HTML #RRGGBB - modMailConfidentiality)
+;   Perso = bleu, Prive = bronze, Conf = rouge/orange (exemple)
+; ------------------------------------------------------------
+ConfidTextColorPersonal=#1F4E79
+ConfidBandColorPersonal=#2E75B6
+ConfidTextColorPrivate=#9C6500
+ConfidBandColorPrivate=#BF8F00
+ConfidTextColorConf=#C00000
+ConfidBandColorConf=#C65911
+ConfidTextColorUrgent=#B00020
+ConfidBandColorUrgent=#D13438
+
+; ------------------------------------------------------------
+; NOTIFICATION TOAST (modNotify)
+; Petite fenetre non bloquante (mshta.exe) apres un classement de mail.
+;   ToastEnabled        : 1 = actives, 0 = aucun toast
+;   ToastKeptInSent : 1 = toast aussi quand le mail N'EST PAS deplace
+;   ToastDurationMs      : duree d'affichage (millisecondes)
+;   ToastColorFiled : bordure gauche, classement reussi
+;   ToastColorKept : bordure gauche, reste dans les envoyes
+;   ToastColorText : couleur du texte
+; (Couleurs ci-dessous = exemple ; mettez vos couleurs si souhaite.)
+; ------------------------------------------------------------
+ToastEnabled=1
+ToastKeptInSent=0
+ToastDurationMs=3000
+ToastColorFiled=#2E7D32
+ToastColorKept=#1565C0
+ToastColorText=#1565C0
+
+; ------------------------------------------------------------
+; ONENOTE (noms exacts des blocs-notes a traiter - modOneNote)
+; ------------------------------------------------------------
+OneNoteNotebook1=Bloc-notes 1
+OneNoteNotebook2=Bloc-notes 2
+OneNoteNotebook3=Bloc-notes 3
+
+; ------------------------------------------------------------
+; LOGGING (modDebugLog)
+;   DefaultLogLevel : niveau applique au demarrage
+;     0 = OFF (erreurs seules)   1 = INFO (defaut)
+;     2 = DEBUG (decisions)      3 = TRACE (verbeux)
+; ------------------------------------------------------------
+DefaultLogLevel=1
+
+; ------------------------------------------------------------
+; API ANTHROPIC (modSendToLLM / ContactExtractor / OneNote)
+; NE JAMAIS COMMITER config.ini AVEC UNE CLE REELLE.
+; Laisser vide si non utilise.
+; ------------------------------------------------------------
+AnthropicApiKey=
+
+; ------------------------------------------------------------
+; CODES METIER - briques de construction
+;
+; Decrivez vos codes avec des elements simples ; le code assemble les
+; motifs de detection automatiquement (pas besoin de connaitre les regex).
+; Ces briques pilotent la DETECTION (classement + scanners de tag), la
+; VALIDATION des tags ET la CONSTRUCTION des tags poses sur les RDV.
+;
+;   Code dossier     : ProjectPrefix + ProjectCodeLength chiffres
+;     ex. "DOSS" + 4 -> detecte DOSS1234 (et 1234 isole en repli)
+;   Code contrat     : ContractYearPrefix + 1 chiffre + sep + N chiffres
+;     ex. "202" + "_" + 5 -> detecte 2024_00123 (decennie 2020-2029 ;
+;     pour 2030+, passer ContractYearPrefix a "203")
+;   Opportunite      : 20XX + type + numero (types separes par |)
+;     ex. "OP" + 4 -> 2025_OP_0001 (plusieurs types via | : "OP|XX")
+;   Code transversal : CrossPrefix + CrossCodeLength chiffres
+;     ex. "TR" + 1 -> TR1, TR0
+;   YearExclusionMin/Max : pour le "4 chiffres isole", ignore les nombres
+;     dans [min,max] (evite de confondre une annee avec un code dossier)
+; ------------------------------------------------------------
+ProjectPrefix=DOSS
+ProjectCodeLength=4
+ContractYearPrefix=202
+ContractNumberLength=5
+OpportunityTypes=OP
+OpportunityNumberLength=4
+CrossPrefix=TR
+CrossCodeLength=1
+YearExclusionMin=2023
+YearExclusionMax=2032
+
+; ------------------------------------------------------------
+; ANALYSE STATISTIQUE - boites mail (outil Excel modEmailAnalytics)
+; Pre-remplit le formulaire de configuration de l'outil Excel d'analyse
+; (projet VBA distinct, lecteur config.ini autonome - implemente en V23.5).
+; Une ligne par boite, indexee StatMailbox1, StatMailbox2, ...
+;   format : StatMailboxN = fragment_nom ; mot-cle ; #RRGGBB [; email]
+;     fragment_nom : sous-chaine du NOM de la boite tel qu'affiche dans
+;                    Outlook (adresse, domaine ou libelle) - premier match
+;     mot-cle      : terme marquant un envoi interne / vous
+;     #RRGGBB      : couleur exacte attribuee dans les graphiques
+;     email        : OPTIONNEL - adresse de l'utilisateur pour cette boite
+;                    (pre-remplit email + domaine ; sinon extraction auto)
+;   StatMailboxDefault : couleur de repli des boites NON listees, prise en
+;     compte seulement si au moins une ligne StatMailboxN est definie
+;     (sinon l'outil garde sa rotation de couleurs automatique).
+; ------------------------------------------------------------
+;StatMailbox1=domaine1.fr ; moncompte ; #2E7D32 ; prenom.nom@domaine1.fr
+;StatMailbox2=domaine2.fr ; moncompte ; #1565C0
+;StatMailboxDefault=#888888
+
+; ------------------------------------------------------------
+; RECHERCHE (modSearch) - noms des vues Outlook utilisees (v3)
+; Les noms de vues sont propres au profil Outlook (langue d'affichage,
+; renommages). Defauts du code : Compacter / Apercu (c-cedille, pose par
+; le code via Chr(231) - ne pas taper d'accent ici si le fichier risque
+; un transcodage). Decommenter et adapter si besoin (ex. client EN :
+; Compact / Preview).
+; ------------------------------------------------------------
+;ViewCompact=Compacter
+;ViewPreview=Apercu
+
+; ------------------------------------------------------------
+; REUNIONS TEAMS (modMeetingToAppointment)
+; Retrait automatique des blocs "Reunion Microsoft Teams" cites depuis le
+; fil, a l'ouverture d'une reunion en composition : sans ce nettoyage, le
+; complement Teams refuse d'injecter un nouveau lien.
+; 1 = actif (valeur par defaut si la cle est absente), 0 = desactive.
+; ------------------------------------------------------------
+TeamsPreCleanEnabled=1
+
+; ------------------------------------------------------------
+; MAINTENANCE - liste des modules connus (filtre log + versions)
+; Noms courts = MOD_NAME de chaque module. Separateur : pipe |
+; Decommenter pour surcharger la liste par defaut du code.
+; ------------------------------------------------------------
+;KnownModules=Config|DebugLog|QuickMove|Snooze|Search|ProjectTag|MeetingColor|AntiOverlap|NewMeeting|ShiftAppt|FlashAppt|ReplyInPlace|PurgeCat|DevTools|FolderScan|BackupVBA|BackupAuto|Maint|OneNote|MailConfid|ApptPrivacy|MaxWindow|MailTracker|Analytics|ApptWatch|Campaign|Common|FolderMerge|MailExport|MigrateTags|MsgBoxC|Mtg2Appt|Notify|ReplySusp|SendLLM|ThisOutlook|AppEvents|Defer|ExplorerWatch|MarkRead|OneNoteProbe|ReplyGreeting
+
+; ------------------------------------------------------------
+; MAINTENANCE - versions des modules
+; OBSOLETE depuis modMaintenance v3 : les cles Version.* ne sont plus
+; lues. Une version declaree dans un fichier de configuration ne prouve
+; rien sur le code reellement charge dans le VBE. MaintModuleVersions
+; interroge desormais la constante MOD_VERSION portee par chaque module
+; (modXxx.ModVersion). Ces cles peuvent etre supprimees.
+; ------------------------------------------------------------
+
+; ============================================================
+; PACK v3 (2026-09-02) - NOUVELLES CLES
+; ============================================================
+
+; ------------------------------------------------------------
+; CATEGORIES OUTLOOK FONCTIONNELLES (avant : en dur dans 4 modules)
+;   PersonalCategory      : RDV personnels (exclus du tag, de la couleur,
+;                           passes en prive). PersonalCategoryAlt = variante
+;                           courte acceptee.
+;   InternalTaskCategory  : categorie posee sur les taches transversales
+;   CommercialCategory    : categorie posee sur les opportunites
+; ------------------------------------------------------------
+PersonalCategory=Personnel
+PersonalCategoryAlt=Perso
+InternalTaskCategory=Interne
+CommercialCategory=Commercial
+
+; ------------------------------------------------------------
+; LIBELLES ECRITS DANS LE REFERENTIEL (colonne Contrat, jamais vide)
+; ------------------------------------------------------------
+ContractLabelOpportunity=Opportunite CRM
+ContractLabelDefault=Operations commerciales et support
+
+; ------------------------------------------------------------
+; MOTS-CLES "ATTENTE DE REPONSE" (modReplySuspicion) - separes par |
+;   Vide = liste FR par defaut du code. Version EN ci-dessous en commentaire.
+; ------------------------------------------------------------
+SuspicionKeywords=merci de|pouvez-vous|pourriez-vous|pouvez vous|pourriez vous|avant le|d'ici|dans l'attente|retour|confirmer|confirmation|validation|valider|votre avis|vos disponibilites|me dire|repondre|reponse|feriez-vous|serait-il possible
+;SuspicionKeywords=please|could you|can you|would you|by |before |looking forward|feedback|confirm|confirmation|validate|your thoughts|your availability|let me know|reply|answer|is it possible
+
+; ------------------------------------------------------------
+; MIGRATION DES ANCIENS NOMS DE PROPRIETES (modMigrateTags)
+;   Format : Ancien>Nouveau;Ancien2>Nouveau2
+; ------------------------------------------------------------
+TagMigrationMap=TempoTag>ProjectTag;TempoDemande>ProjectAsk
+
+; ============================================================
+; CLES LUES PAR LE CODE MAIS ABSENTES DE CE MODELE JUSQU'AU PACK v3
+; (generees par validate.py --gen-config ; valeur = defaut du code ;
+;  les cles numerotees XxxN se declinent en 1, 2, 3...)
+; ============================================================
+
+; --- modAppointmentPrivacy ---
+;   PrivateOrganizers : Organisateurs (SMTP, separes par |) dont les RDV passent en prive
+PrivateOrganizers=
+;   PrivateStripCategories : auto = retirer les categories automatiques sur les RDV prives
+PrivateStripCategories=auto
+
+; --- modConfig ---
+InboxAlertDefaultColor=#1565C0
+InboxAlertDefaultSound=
+InboxAlertDurationMs=5000
+InboxAlertEnabled=0
+InboxAlertGroupMs=1500
+InboxAlertSkipIfForeground=0
+InboxAlertUnreadOnly=1
+ToastColorError=#C62828
+ToastColorInfo=#1565C0
+ToastColorSuccess=#2E7D32
+ToastColorWarn=#EF6C00
+
+; --- modContactBirthday ---
+AnniversaryEnabled=1
+AnniversaryFolders=*
+AnniversaryLabel=
+AnniversaryReminderDaysBefore=
+BirthdayBodyDetails=1
+;   BirthdayCalendarAutoShow : Vue Anniversaires appliquee au demarrage (1 = oui ; defaut du code 0, ce modele force 1)
+BirthdayCalendarAutoShow=1
+BirthdayCalendarKeepDefaultOf=
+BirthdayCalendarKeepPaths=
+BirthdayCalendarName=
+BirthdayCalendarOverlay=1
+;   BirthdayCalendarPath : Chemin Outlook du calendrier des anniversaires (\\Boite\Calendrier\Anniversaires)
+BirthdayCalendarPath=
+BirthdayCalendarUncheckOthers=1
+BirthdayCalendarWeekView=1
+BirthdayCategory=
+BirthdayCategoryColor=3
+BirthdayLabel=
+BirthdayPrivate=0
+BirthdayReminderDaysBefore=1
+BirthdayReminderHour=9
+BirthdaySubjectFormat={name} - {label} - {date}
+ContactSkipFolders=
+NameDayEnabled=1
+NameDayFolders=*Amis*|*Famille*
+NameDayLabel=
+NameDayReminderDaysBefore=
+UnknownBirthYear=1604
+UnknownBirthYearMax=
+
+; --- modContactExport ---
+ContactCsvSeparator=;
+ContactExportDir=
+ContactExportPhotos=1
+
+; --- modContactFromMail ---
+ContactFromMailCategory=
+ContactFromMailDefaultFolder=
+PhoneDefaultCountryCode=33
+
+; --- modContactImport ---
+ContactImportAllowMove=1
+ContactImportCreateFolders=1
+
+; --- modContactNormalize ---
+AddressCityUppercase=1
+AddressCountryUppercase=1
+AddressDefaultCountry=
+AddressLowercaseWords=
+AddressUppercaseWords=
+ClearCategoriesPrompt=1
+ContactFileAsFormat=LastFirst
+NameDayExtra=
+NameParticles=
+NormalizeAddresses=1
+NormalizeEmails=1
+NormalizeNameDay=1
+NormalizeNames=1
+NormalizePhones=1
+PhoneOutputSpaced=0
+
+; --- modContactRelation ---
+RelationScanExcludeDomains=
+RelationScanMonths=48
+RelationScanStores=
+RelationScanThresholdDays=180
+
+; --- modFolderRename ---
+FolderRenameRoot=DV
+
+; --- modHideBcc ---
+;   HideBccOnCompose : Masquer le champ Cci a l'ouverture d'un nouveau message (1/0)
+HideBccOnCompose=1
+
+; --- modInboxAlert ---
+InboxAlertColor=
+InboxAlertSound=
+InboxAlertSound1=
+InboxAlertStore=
+
+; --- modMailAnalytics__frmConfig_Code ---
+AddressMode=
+ColorIndex=
+ColorRGB=
+DateMin=
+DateMinEnabled=
+Domain=
+EmailUser=
+Keyword=
+
+; --- modMaintenance ---
+KnownModules=
+
+; --- modMeetingToAppointment ---
+;   PersonalSlotToast : Toast quand une reunion est reconvertie en creneau personnel (1/0)
+PersonalSlotToast=1
+
+; --- modQuickMove ---
+NewFolderCreateMissingParents=0
+;   QuickMoveExcludeStores : Boites exclues de l'index QuickMove (noms affiches, separes par |)
+QuickMoveExcludeStores=
+
+; --- modSearch ---
+ViewCompact=Compacter
+ViewPreview=Aper
+
+; --- modSendToLLM ---
+LLM_AutoEnter=1
+LLM_DelayChatGPTMs=
+LLM_DelayClaudeMs=
+LLM_DelayMistralMs=
+LLM_PromptPrefix=

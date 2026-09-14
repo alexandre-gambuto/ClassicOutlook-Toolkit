@@ -1,0 +1,101 @@
+Option Explicit
+
+'=============================================================================
+' clsInboxWatcher  (v1.0 - 2026-08-18)
+' Purpose (EN): watches the Inbox of ONE mailbox (store) via WithEvents on its
+'   Items collection and relays every ItemAdd to modInboxAlert. One instance per
+'   configured mailbox; lifetime managed by modInboxAlert (kept in a module-level
+'   collection, otherwise the VBA GC kills the instance and the WithEvents dies).
+'
+' Surveille la boite de reception d'UNE boite aux lettres (store) via
+' WithEvents sur sa collection Items, et relaie chaque ItemAdd a
+' modInboxAlert.OnInboxItemAdd. Une instance par boite configuree ; les
+' instances sont STOCKEES dans modInboxAlert (sinon le GC VBA detruit
+' l'objet et le WithEvents meurt aussitot).
+'
+' Aucune logique metier ici : le filtrage (mail / non lu / premier plan),
+' le regroupement des rafales, le toast et le son sont dans modInboxAlert.
+'=============================================================================
+
+Private Const MOD_NAME As String = "InboxWatch"
+Private Const MOD_VERSION As String = "v1.0 - 2026-08-18"
+
+Private WithEvents m_Items As Outlook.Items
+Private m_StoreName As String     ' nom affiche de la boite (pour le toast)
+Private m_CfgIndex As Long        ' index config InboxAlertStoreN (0 = defaut)
+Private m_FolderPath As String    ' pour les logs / diagnostics
+
+'-----------------------------------------------------------------------------
+' Init : lie le watcher a la boite de reception passee.
+'   inboxFolder : MAPIFolder (boite de reception d'un store)
+'   storeName   : nom affiche du store (repris tel quel dans le toast)
+'   cfgIndex    : index N des cles InboxAlertStoreN / ColorN / SoundN
+'                 (0 = boite par defaut, sans cle dediee)
+' Renvoie True si le binding est effectif.
+'-----------------------------------------------------------------------------
+'-----------------------------------------------------------------------------
+' ModVersion - version REELLEMENT chargee dans le VBE (lue par
+' modMaintenance). La constante MOD_VERSION existait sans son accesseur :
+' la version etait donc illisible de l'exterieur.
+'-----------------------------------------------------------------------------
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+Public Function Init(ByVal inboxFolder As Outlook.MAPIFolder, _
+                     ByVal storeName As String, ByVal cfgIndex As Long) As Boolean
+    On Error GoTo ErrH
+    Init = False
+    Set m_Items = Nothing
+    m_StoreName = storeName
+    m_CfgIndex = cfgIndex
+    m_FolderPath = inboxFolder.FolderPath
+
+    Set m_Items = inboxFolder.Items
+
+    ' "Reveil" du dossier : sur une boite partagee ou secondaire, la
+    ' collection Items n'emet parfois aucun ItemAdd tant qu'elle n'a pas
+    ' ete lue une premiere fois par le client. Une lecture de Count suffit.
+    Dim n As Long
+    n = m_Items.Count
+
+    modDebugLog.DInfo MOD_NAME, "Watcher arme sur '" & storeName & "' (" & _
+        m_FolderPath & ", " & n & " items)"
+    Init = True
+    Exit Function
+
+ErrH:
+    modDebugLog.DError MOD_NAME, "Init KO sur '" & storeName & "' : " & _
+        Err.Number & " - " & Err.Description
+    Set m_Items = Nothing
+    Init = False
+End Function
+
+'-----------------------------------------------------------------------------
+' IsBound : True si le WithEvents est encore vivant (health-check).
+'-----------------------------------------------------------------------------
+Public Property Get IsBound() As Boolean
+    IsBound = Not (m_Items Is Nothing)
+End Property
+
+Public Property Get StoreName() As String
+    StoreName = m_StoreName
+End Property
+
+Public Property Get CfgIndex() As Long
+    CfgIndex = m_CfgIndex
+End Property
+
+Public Property Get FolderPath() As String
+    FolderPath = m_FolderPath
+End Property
+
+'-----------------------------------------------------------------------------
+' ItemAdd : nouvel element dans la boite de reception surveillee.
+' Relais pur vers modInboxAlert ; tout est sous On Error Resume Next (un
+' handler d'evenement ne doit jamais faire remonter d'erreur).
+'-----------------------------------------------------------------------------
+Private Sub m_Items_ItemAdd(ByVal Item As Object)
+    On Error Resume Next
+    modInboxAlert.OnInboxItemAdd Item, m_StoreName, m_CfgIndex
+End Sub

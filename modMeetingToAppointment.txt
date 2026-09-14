@@ -1,0 +1,1387 @@
+Option Explicit
+
+'=============================================================================
+' modMeetingToAppointment  (v6.2 - 2026-09-01)
+' Purpose (EN): when a meeting with no third-party invitees is saved, Outlook
+'   may leave MeetingStatus = olMeeting (the inspector still shows the recipient
+'   field + Send button). DemoteIfEmptyMeeting forces olNonMeeting (a real
+'   appointment) and best-effort removes the Teams block from the body. Also
+'   provides manual diagnostics (DiagMeetingStatus, DiagWordBody, DumpAppointmentHTML).
+'
+' Probleme cible :
+'   Quand on cree une REUNION sans inviter de tiers et qu'on l'enregistre,
+'   Outlook propose de la convertir en RENDEZ-VOUS. Apres "Oui", le
+'   MeetingStatus reste a olMeeting (1) au lieu de olNonMeeting (0).
+'   Consequence : l'inspecteur continue d'afficher le champ destinataires
+'   + le bouton Envoyer, comme si c'etait encore une reunion.
+'
+' Ce module fournit :
+'   - DiagMeetingStatus : diagnostic manuel sur le RDV selectionne
+'     (MeetingStatus, Recipients.Count dont tiers hors moi, ResponseStatus,
+'     MessageClass).
+'   - DemoteIfEmptyMeeting : appele depuis CalendarItems_ItemAdd ET
+'     ItemChange. Si olMeeting et AUCUN destinataire tiers (le seul
+'     "participant" est l'organisateur = moi), force olNonMeeting.
+'     Cooldown EntryID+timestamp anti-boucle.
+'
+' v3 (2026-06-10) : suppression du code mort de l'ancienne approche texte
+'   (8 fonctions orphelines auto-referencees, ~125 lignes : IsUnderlineLine,
+'   LineStart, LineEnd, FindUnderlineBefore/After, LineAt, LastIndex,
+'   FindTextInWord). La voie vivante est l'approche par paragraphes Word
+'   (ParaIsUnderline) ; LocationIsTeams est conservee (appelee).
+' v3.1 (2026-06-28) : GARDE-FOU lien Teams. clsApptWatcher nettoyait le bloc
+'   Teams du corps a CHAQUE Save d'un inspecteur de RDV des que le corps
+'   contenait teams.microsoft.com - SANS verifier s'il s'agissait d'une vraie
+'   reunion a envoyer. Resultat : les invites externes recevaient une
+'   invitation SANS le lien de connexion. Nouvelle fonction publique
+'   IsRealThirdPartyMeeting (olMeeting + >= 1 invite tiers) servant de
+'   garde-fou au watcher : on ne touche jamais au corps d'une reunion
+'   destinee a des tiers.
+' v4 (2026-07-10) : PRE-NETTOYAGE A L'OUVERTURE des anciens blocs Teams
+'   cites dans le corps. Cible : "Repondre par une reunion" (Ctrl+Alt+R)
+'   sur un fil citant un ancien bloc Teams -> le complement Teams croit la
+'   reunion deja en ligne et n'injecte pas de nouveau lien (bug Outlook
+'   documente ; contournement valide = retirer l'ancien bloc du corps).
+'   OnNewInspector arme un differe +1s (modDefer, cle TeamsPreClean)
+'   UNIQUEMENT sur un item jamais enregistre (EntryID vide). A l'echeance,
+'   gardes stricts (olMeeting + >= 1 destinataire, Location non-Teams,
+'   lien teams present) puis retrait de TOUS les anciens blocs via
+'   RemoveOneTeamsBlock : bornes LOCALES par bloc + validation qu'un lien
+'   teams existe dans la fenetre du bloc avant toute suppression.
+'   (Le moteur historique bornait sur le DERNIER "surtax" du document :
+'   avec 2 blocs cites, il emportait tout le texte entre eux ; il est
+'   reste en service pour la voie Demote/manuel jusqu'en v6.2.)
+'   Cle config : TeamsPreCleanEnabled (defaut 1, lue via modConfig.CfgB,
+'   aucun getter dedie necessaire).
+' v5 (2026-07-10) : BORNAGE REECRIT + commande manuelle. Le bornage v4
+'   exigeait des separateurs en caracteres '_' et/ou la ligne "(Appel non
+'   surtaxe)" : un bloc Teams cite depuis un mail HTML utilise souvent des
+'   BORDURES de paragraphe (invisibles au niveau caractere) et les blocs
+'   recents n'ont plus la ligne surtaxe -> abstention systematique.
+'   Nouveau : ParaIsSeparator (underscores OU paragraphe vide a bordure
+'   basse) + marche en GRAPPE de marqueurs FR/EN depuis le titre
+'   (ParaIsBlockMarker ; un hyperlien teams.microsoft.com dans le
+'   paragraphe compte comme marqueur ; lignes vides neutres ; arret au
+'   premier separateur ou apres 3 paragraphes non-marqueurs). Logs DDebug
+'   a chaque garde de DelayedTeamsPreClean. NOUVELLE commande manuelle
+'   TeamsPreCleanNow (Alt+F8 / QAT) : meme moteur sur l'inspecteur actif,
+'   verdict MsgBox - teste le moteur sans dependre du differe.
+' v5.1 (2026-07-10) : fix compile - variable locale wEnd de
+'   RemoveOneTeamsBlock renommee winEnd ("wEnd" = mot-cle reserve VBA
+'   Wend, insensible a la casse -> Erreur de syntaxe sur le Dim).
+' v6 (2026-07-11) : TITRE ROBUSTE + vocabulaire Teams 2026 (diagnostic
+'   rdv_word.txt reel du 11/07). (a) L'en-tete cite "-----Rendez-vous
+'   d'origine-----" (De/Envoye/Ou : Reunion Microsoft Teams) precede le
+'   vrai titre dans le corps : il etait retenu comme titre, sa grappe
+'   echouait (Ordre du jour... = non-marqueurs) et RemoveOneTeamsBlock
+'   sortait SANS essayer le candidat suivant -> abstention systematique.
+'   Fix : un titre doit etre un paragraphe COURT (< PRECLEAN_TITLE_MAX
+'   caracteres) et une grappe vide passe au candidat suivant.
+'   (b) Marqueurs ajoutes pour le libelle 2026 : "ro de r"(eunion),
+'   "ro de conf"(erence), "Trouver un num", "Participer par t"(elephone),
+'   "All locations". (c) ParaIsEmptyish : l'image incorporee Chr(1) et
+'   les lignes reduites a "/" ou "|" sont neutres (elles cassaient la
+'   grappe au milieu du bloc).
+' v6.1 (2026-09-01) : premier toast (retrait du lien seulement) - jamais vu
+'   en pratique : le moteur historique exigeait l'URL teams dans le TEXTE
+'   visible ; les blocs 2026 la portent en hyperlien -> aucun nettoyage,
+'   aucun toast. Remplacee par v6.2.
+' v6.2 (2026-09-01) : CRENEAU PERSONNEL - toast, couleur, moteur unique.
+'   (a) TOAST a la conversion (NotifyPersonalSlot) : "Reunion convertie en
+'   creneau personnel" / "lien Teams retire" (succes) / "lien Teams a
+'   retirer" (attention, bloc encore dans le corps : ouvrir le RDV puis
+'   CleanTeamsSelection). 2e ligne = objet. Un seul toast par RDV (les deux
+'   voies - clsApptWatcher au Write, DemoteIfEmptyMeeting a l'ItemChange -
+'   touchent le meme RDV a quelques secondes d'ecart : anti-doublon sujet +
+'   debut, TOAST_DEDUP_SEC). Cle config PersonalSlotToast (defaut 1).
+'   (b) COULEUR : la categorie auto (reunion interne/externe) posee par
+'   modMeetingColor pendant que l'item etait encore olMeeting restait sur
+'   le creneau converti (le cooldown anti-reentrance d'ApplyCategory ecarte
+'   l'ItemChange suivant). DemoteIfEmptyMeeting appelle desormais
+'   modMeetingColor.ClearAutoCategory juste apres la conversion.
+'   (c) MOTEUR UNIQUE : le nettoyage au Write (clsApptWatcher), a la
+'   conversion (CleanTeamsBlock) et manuel (CleanTeamsSelection) passe par
+'   le moteur v6 (DocHasTeamsLink + CleanAllTeamsBlocks : lien en texte OU
+'   en hyperlien, bornes locales par bloc, vocabulaire 2026). Le moteur
+'   historique CleanBodyViaWordImpl (URL en texte visible obligatoire,
+'   borne sur "surtax") est supprime. BodyHasTeamsBlock (texte MAPI) sert
+'   au verdict du toast.
+' (Historique des versions -> CHANGELOG.)
+'
+' PRUDENCE : defensif. S'il reste un vrai invite, nbTiers >= 1 et on ne
+'   touche a rien.
+'
+' Late binding. Logs via modDebugLog.
+'=============================================================================
+
+Private Const MOD_NAME As String = "Mtg2Appt"
+Private Const MOD_VERSION As String = "v6.2 - 2026-09-01"
+
+' Constantes Outlook (valeurs en dur, late binding)
+Private Const OL_MEETING As Long = 1            ' olMeeting
+Private Const OL_NON_MEETING As Long = 0        ' olNonMeeting
+Private Const OL_APPOINTMENT_CLASS As Long = 26 ' olAppointment
+
+' Cooldown anti-boucle : apres notre Save, l'ItemChange re-arrive en
+' asynchrone. On ignore le meme EntryID pendant COOLDOWN_SEC secondes.
+Private Const COOLDOWN_SEC As Long = 5
+Private gLastEntryID As String
+Private gLastSaveAt As Date
+
+' Collection des watchers d'inspecteurs de reunion (un clsApptWatcher
+' par fenetre ouverte). Indispensable de les STOCKER, sinon le GC VBA detruit
+' l'instance et le WithEvents meurt aussitot. Cle = "watch_<seq>".
+Private gWatchers As Object        ' Scripting.Dictionary key -> clsApptWatcher
+Private gWatchSeq As Long
+
+' v4 : pre-nettoyage differe des anciens blocs Teams (inspecteurs de
+' reunion en composition, jamais enregistrees). Cle = "pc_<seq>".
+' Pack v3 (C12) : file des inspecteurs (pre-nettoyage Teams) dans
+' modInspectorQueue ; la relance +2s re-enregistre l'inspecteur sous une
+' nouvelle cle suffixee "_r" (via un tag distinct).
+Private Const PRECLEAN_WINDOW As Long = 25    ' paragraphes max d'un bloc Teams
+Private Const PRECLEAN_MAX_PASSES As Long = 8
+Private Const PRECLEAN_TITLE_MAX As Long = 60 ' long. max (car.) du paragraphe titre
+
+' v6.2 : toast "creneau personnel". Le nettoyage du corps (clsApptWatcher
+' au Write) et la conversion (DemoteIfEmptyMeeting a l'ItemChange) touchent
+' le meme RDV a quelques secondes d'ecart : un seul toast par RDV (cle
+' sujet + debut, fenetre TOAST_DEDUP_SEC). Le premier emis gagne.
+Private Const TOAST_DEDUP_SEC As Long = 20
+Private gToastKey As String
+Private gToastAt As Date
+Private gLastBodyCleaned As Boolean   ' pose par CleanTeamsBlock : bloc retire du corps
+
+'=============================================================================
+' ModVersion - version reellement chargee dans le VBE (modMaintenance).
+'=============================================================================
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+'=============================================================================
+' NotifyPersonalSlot (v6.2) : toast quand un RDV devient (ou est) un creneau
+' personnel. Appele par DemoteIfEmptyMeeting (conversion) et par
+' clsApptWatcher (bloc Teams retire au Write, fenetre ouverte).
+'   linkRemoved : le bloc Teams vient d'etre retire du corps (succes)
+'   linkRemains : un bloc Teams est ENCORE dans le corps (attention :
+'                 ouvrir le RDV puis CleanTeamsSelection)
+'   ni l'un ni l'autre : simple conversion (succes)
+' Un seul toast par RDV (anti-doublon sujet + debut, TOAST_DEDUP_SEC ; le
+' premier emis gagne). Passe par modUi.Toast (repli barre d'etat si les
+' toasts sont desactives). Cle config PersonalSlotToast=0 pour couper ce
+' toast seul. Ne remonte jamais d'erreur.
+'=============================================================================
+Public Sub NotifyPersonalSlot(ByVal appt As Object, ByVal linkRemoved As Boolean, _
+                              ByVal linkRemains As Boolean)
+    On Error Resume Next
+    If appt Is Nothing Then Exit Sub
+    If Not modConfig.CfgB("PersonalSlotToast", True) Then Exit Sub
+
+    Dim subj As String
+    subj = ""
+    subj = CStr(appt.subject)
+    Dim dedupKey As String
+    dedupKey = subj & "|" & CStr(appt.Start)
+
+    If Len(gToastKey) > 0 Then
+        If StrComp(dedupKey, gToastKey, vbBinaryCompare) = 0 Then
+            If DateDiff("s", gToastAt, Now) < TOAST_DEDUP_SEC Then
+                modDebugLog.DTrace MOD_NAME, "Toast creneau personnel deja emis pour ce RDV, skip"
+                Exit Sub
+            End If
+        End If
+    End If
+    gToastKey = dedupKey
+    gToastAt = Now
+
+    If Len(subj) = 0 Then subj = T("(sans objet)", "(no subject)")
+
+    Dim headline As String
+    Dim level As UiToastLevel
+    If linkRemoved Then
+        headline = T("Cr~eneau personnel : lien Teams retir~e", _
+                     "Personal slot: Teams link removed")
+        level = uiSuccess
+    ElseIf linkRemains Then
+        headline = T("Cr~eneau personnel : lien Teams ~a retirer", _
+                     "Personal slot: Teams link still to remove")
+        level = uiWarn
+    Else
+        headline = T("R~eunion convertie en cr~eneau personnel", _
+                     "Meeting converted to a personal slot")
+        level = uiSuccess
+    End If
+
+    modUi.Toast headline & vbLf & Left(subj, 60), level, True
+    modDebugLog.DInfo MOD_NAME, "Toast creneau personnel (retire=" & linkRemoved & _
+        " reste=" & linkRemains & ") sur '" & Left(subj, 40) & "'"
+End Sub
+
+'=============================================================================
+' OnNewInspector : appele par clsAppEvents sur chaque nouvel inspecteur.
+' Si c'est un AppointmentItem, on arme un clsApptWatcher qui nettoiera le
+' bloc Teams au Save (Write), fenetre ouverte (WordEditor disponible).
+'=============================================================================
+Public Sub OnNewInspector(ByVal Inspector As Object)
+    On Error Resume Next
+
+    If Inspector Is Nothing Then Exit Sub
+    Dim itm As Object
+    Set itm = Inspector.CurrentItem
+    If itm Is Nothing Then Exit Sub
+    If Not (TypeOf itm Is Outlook.AppointmentItem) Then Exit Sub
+
+    If gWatchers Is Nothing Then Set gWatchers = CreateObject("Scripting.Dictionary")
+
+    gWatchSeq = gWatchSeq + 1
+    Dim key As String
+    key = "watch_" & gWatchSeq
+
+    Dim w As clsApptWatcher
+    Set w = New clsApptWatcher
+    w.Init Inspector, key
+    gWatchers.Add key, w
+
+    modDebugLog.DTrace MOD_NAME, "Watcher cree (" & key & "), total " & gWatchers.count
+
+    ' -----------------------------------------------------------------
+    ' v4 : pre-nettoyage des ANCIENS blocs Teams cites dans le corps.
+    ' Arme UNIQUEMENT sur un item JAMAIS enregistre (EntryID vide) :
+    ' jamais sur une reunion recue ou existante. WordEditor pas pret a
+    ' l'instant du NewInspector -> differe +1s via modDefer (meme
+    ' raison que modNewMeetingDefault).
+    ' -----------------------------------------------------------------
+    If modConfig.CfgB("TeamsPreCleanEnabled", True) Then
+        Dim eidNew As String
+        eidNew = "x"
+        eidNew = itm.entryID
+        If Len(eidNew) = 0 Then
+            Dim pcKey As String
+            pcKey = modInspectorQueue.Register(Inspector, "pc", 1)
+            If Len(pcKey) > 0 Then
+                modDefer.Arm "TeamsPreClean", 1, pcKey
+                modDebugLog.DTrace MOD_NAME, "PreClean arme (" & pcKey & ")"
+            End If
+        End If
+    End If
+
+    On Error GoTo 0
+End Sub
+
+'=============================================================================
+' ReleaseWatcher : appele par clsApptWatcher quand son inspecteur se ferme.
+'=============================================================================
+Public Sub ReleaseWatcher(ByVal key As String)
+    On Error Resume Next
+    If gWatchers Is Nothing Then Exit Sub
+    If gWatchers.Exists(key) Then
+        gWatchers.Remove key
+        modDebugLog.DTrace MOD_NAME, "Watcher libere (" & key & "), reste " & gWatchers.count
+    End If
+    On Error GoTo 0
+End Sub
+
+'=============================================================================
+' v4 - PRE-NETTOYAGE A L'OUVERTURE (cible modDefer "TeamsPreClean").
+' Retire du corps d'une reunion EN COMPOSITION (jamais enregistree) les
+' anciens blocs "Reunion Microsoft Teams" cites depuis le fil de mail,
+' pour que le complement Teams accepte d'injecter un nouveau lien.
+' En cas de doute (bornes introuvables, WordEditor absent apres relance),
+' ON NE TOUCHE A RIEN : un bloc residuel vaut mieux qu'un fil ampute.
+'=============================================================================
+Public Sub DelayedTeamsPreClean(ByVal actionArg As String)
+    On Error Resume Next
+
+    Dim insp As Object
+    Set insp = modInspectorQueue.Take(actionArg)
+    If insp Is Nothing Then
+        modDebugLog.DDebug MOD_NAME, "PreClean : cle inconnue ou fenetre fermee (" & actionArg & ")"
+        Exit Sub
+    End If
+
+    Dim itm As Object
+    Set itm = Nothing
+    Set itm = insp.CurrentItem              ' fenetre deja fermee -> Nothing
+    If itm Is Nothing Then
+        modDebugLog.DDebug MOD_NAME, "PreClean : fenetre deja fermee"
+        Exit Sub
+    End If
+    If Not (TypeOf itm Is Outlook.AppointmentItem) Then Exit Sub
+
+    Dim appt As Outlook.AppointmentItem
+    Set appt = itm
+
+    ' Garde 1 : item JAMAIS enregistre uniquement. Un Save entre
+    ' l'armement et l'echeance = item reel -> abstention totale.
+    Dim eid As String
+    eid = "x"
+    eid = appt.entryID
+    If Len(eid) > 0 Then
+        modDebugLog.DDebug MOD_NAME, "PreClean : item deja enregistre, abstention"
+        Exit Sub
+    End If
+
+    ' Garde 2 : reunion en cours de composition avec au moins un
+    ' destinataire (cas "Repondre par une reunion"). RDV simple ou
+    ' reunion vierge : pas concernes.
+    Dim msVal As Long
+    msVal = -1
+    msVal = appt.MeetingStatus
+    If msVal <> OL_MEETING Then
+        modDebugLog.DDebug MOD_NAME, "PreClean : MeetingStatus=" & msVal & ", abstention"
+        Exit Sub
+    End If
+    If appt.recipients.count < 1 Then
+        modDebugLog.DDebug MOD_NAME, "PreClean : aucun destinataire, abstention"
+        Exit Sub
+    End If
+
+    ' Garde 3 : si le complement Teams a DEJA pose sa reunion en ligne,
+    ' ne toucher a rien (le bloc present est le NOUVEAU lien).
+    If LocationIsTeams(CStr(appt.Location)) Then
+        modDebugLog.DTrace MOD_NAME, "PreClean : Location deja Teams, abstention"
+        Exit Sub
+    End If
+
+    Dim doc As Object
+    Set doc = Nothing
+    Set doc = insp.WordEditor
+    If doc Is Nothing Then
+        ' WordEditor parfois pas encore pret a +1s : UNE relance a +2s.
+        If Left$(actionArg, 3) <> "pcr" Then
+            Dim retryKey As String
+            retryKey = modInspectorQueue.Register(insp, "pcr", 1)
+            If Len(retryKey) > 0 Then modDefer.Arm "TeamsPreClean", 2, retryKey
+            modDebugLog.DDebug MOD_NAME, "PreClean : WordEditor pas pret, relance +2s"
+        Else
+            modDebugLog.DDebug MOD_NAME, "PreClean : WordEditor indisponible, abandon"
+        End If
+        Exit Sub
+    End If
+
+    ' Garde 4 : un lien teams doit exister (texte OU hyperlien Word).
+    If Not DocHasTeamsLink(doc) Then
+        modDebugLog.DDebug MOD_NAME, "PreClean : aucun lien teams dans le corps"
+        Exit Sub
+    End If
+
+    Dim removed As Long
+    removed = CleanAllTeamsBlocks(doc)
+
+    If removed > 0 Then
+        modDebugLog.DInfo MOD_NAME, "PreClean : " & removed & _
+            " ancien(s) bloc(s) Teams retire(s) a l'ouverture sur '" & _
+            Left(CStr(appt.subject), 40) & "'"
+    Else
+        modDebugLog.DInfo MOD_NAME, "PreClean : lien teams present mais " & _
+            "aucun bloc borne (analyser via DiagWordBody)"
+    End If
+End Sub
+
+'=============================================================================
+' TeamsPreCleanNow (v5) - COMMANDE MANUELLE (Alt+F8 ou bouton QAT).
+' Applique le MEME moteur de nettoyage que le differe, sur l'inspecteur
+' ACTIF, avec verdict MsgBox. Sert a :
+'   - tester le moteur sans dependre du differe ni du niveau de log ;
+'   - rattraper a la main une fenetre ou le differe n'a pas agi.
+' Manuel = intentionnel : pas de garde EntryID/MeetingStatus (comme
+' CleanTeamsSelection). A ne lancer que sur une reunion en composition.
+'=============================================================================
+Public Sub TeamsPreCleanNow()
+    On Error GoTo ErrH
+
+    Dim insp As Outlook.Inspector
+    Set insp = Application.ActiveInspector
+    If insp Is Nothing Then
+        MsgBox T("Ouvrez d'abord la r~eunion ~a nettoyer (fen~xtre active).", _
+                 "First open the meeting to clean (active window)."), _
+               vbExclamation, T("Nettoyage pr~ealable Teams", "Teams pre-clean")
+        Exit Sub
+    End If
+    If Not (TypeOf insp.CurrentItem Is Outlook.AppointmentItem) Then
+        MsgBox T("La fen~xtre active n'est pas un rendez-vous / une r~eunion.", _
+                 "The active window is not an appointment / meeting."), _
+               vbExclamation, T("Nettoyage pr~ealable Teams", "Teams pre-clean")
+        Exit Sub
+    End If
+
+    Dim doc As Object
+    Set doc = insp.WordEditor
+    If doc Is Nothing Then
+        MsgBox T("Editeur de corps indisponible sur cette fen~xtre.", _
+                 "Body editor unavailable on this window."), _
+               vbExclamation, T("Nettoyage pr~ealable Teams", "Teams pre-clean")
+        Exit Sub
+    End If
+
+    If Not DocHasTeamsLink(doc) Then
+        MsgBox T("Aucun lien teams.microsoft.com dans le corps : rien ~a faire.", _
+                 "No teams.microsoft.com link in the body: nothing to do."), _
+               vbInformation, T("Nettoyage pr~ealable Teams", "Teams pre-clean")
+        Exit Sub
+    End If
+
+    Dim removed As Long
+    removed = CleanAllTeamsBlocks(doc)
+
+    modDebugLog.DInfo MOD_NAME, "TeamsPreCleanNow : " & removed & " bloc(s) retire(s)"
+
+    If removed > 0 Then
+        MsgBox removed & T(" bloc(s) Teams retir~e(s) du corps.", _
+                           " Teams block(s) removed from the body."), _
+               vbInformation, T("Nettoyage pr~ealable Teams", "Teams pre-clean")
+    Else
+        MsgBox T("Lien teams pr~esent mais aucun bloc born~e.", _
+                 "Teams link present but no block could be bounded.") & vbCrLf & _
+               T("Lancez DiagWordBody sur cette fen~xtre et envoyez rdv_word.txt.", _
+                 "Run DiagWordBody on this window and send rdv_word.txt."), _
+               vbExclamation, T("Nettoyage pr~ealable Teams", "Teams pre-clean")
+    End If
+    Exit Sub
+
+ErrH:
+    modDebugLog.DError MOD_NAME, "TeamsPreCleanNow err " & Err.Number & " - " & Err.Description
+    MsgBox T("Erreur : ", "Error: ") & Err.Number & " - " & Err.Description, _
+           vbExclamation, T("Nettoyage pr~ealable Teams", "Teams pre-clean")
+End Sub
+
+'=============================================================================
+' DocHasTeamsLink : le document Word contient-il un lien teams.microsoft.com
+' (dans le texte visible OU comme cible d'hyperlien) ?
+'=============================================================================
+Private Function DocHasTeamsLink(ByVal doc As Object) As Boolean
+    On Error Resume Next
+    DocHasTeamsLink = False
+    If InStr(1, doc.Content.text, "teams.microsoft.com", vbTextCompare) > 0 Then
+        DocHasTeamsLink = True
+        Exit Function
+    End If
+    Dim hl As Object
+    For Each hl In doc.Hyperlinks
+        If InStr(1, CStr(hl.Address), "teams.microsoft.com", vbTextCompare) > 0 Then
+            DocHasTeamsLink = True
+            Exit Function
+        End If
+    Next hl
+End Function
+
+'=============================================================================
+' CleanAllTeamsBlocks : retire TOUS les blocs Teams du document, un par
+' passe (les index de paragraphes bougent apres chaque suppression : on
+' rescanne depuis le debut). Renvoie le nombre de blocs retires.
+'=============================================================================
+Private Function CleanAllTeamsBlocks(ByVal doc As Object) As Long
+    On Error Resume Next
+    Dim nb As Long
+    Dim pass As Long
+    For pass = 1 To PRECLEAN_MAX_PASSES
+        If Not RemoveOneTeamsBlock(doc) Then Exit For
+        nb = nb + 1
+    Next pass
+    CleanAllTeamsBlocks = nb
+End Function
+
+'=============================================================================
+' RemoveOneTeamsBlock (v6) : trouve et supprime LE PREMIER bloc Teams du
+' document, avec des bornes LOCALES au bloc.
+'   - titre       : paragraphe COURT (< PRECLEAN_TITLE_MAX caracteres)
+'                   contenant "Microsoft Teams" DONT la fenetre
+'                   (PRECLEAN_WINDOW paragraphes) contient un lien teams
+'                   (texte ou hyperlien). Ecarte les en-tetes cites
+'                   ("Ou : Reunion Microsoft Teams" dans un pave
+'                   De/Envoye/A/Objet de plusieurs centaines de
+'                   caracteres) et la plupart des phrases du fil.
+'   - borne haute : separateur (ParaIsSeparator) 1 ou 2 paragraphes
+'                   au-dessus du titre, sinon le titre lui-meme. On
+'                   remonte a travers les lignes vides uniquement.
+'   - borne basse : MARCHE EN GRAPPE depuis le titre. Chaque paragraphe
+'                   marqueur (ParaIsBlockMarker) etend la borne ; les
+'                   lignes vides sont neutres ; un separateur ARRETE la
+'                   grappe (et devient la borne) ; 4 paragraphes
+'                   non-marqueurs consecutifs arretent la grappe sans
+'                   l'etendre.
+'   - v6 : un candidat dont la grappe reste vide n'arrete plus tout :
+'                   on passe au candidat SUIVANT (en v5, le premier faux
+'                   candidat - en-tete cite - bloquait le vrai bloc situe
+'                   plus bas -> abstention systematique).
+'=============================================================================
+Private Function RemoveOneTeamsBlock(ByVal doc As Object) As Boolean
+    RemoveOneTeamsBlock = False
+    On Error GoTo Done
+
+    Dim paras As Object
+    Set paras = doc.Paragraphs
+    Dim nP As Long
+    nP = paras.count
+    If nP = 0 Then Exit Function
+
+    Dim i As Long
+    For i = 1 To nP
+        Dim pTxt As String
+        pTxt = paras(i).Range.text
+        If InStr(1, pTxt, "Microsoft Teams", vbTextCompare) > 0 _
+           And Len(pTxt) < PRECLEAN_TITLE_MAX Then
+
+            Dim winEnd As Long
+            winEnd = i + PRECLEAN_WINDOW
+            If winEnd > nP Then winEnd = nP
+
+            If BlockWindowHasTeamsLink(doc, paras, i, winEnd) Then
+
+                ' Borne haute : separateur 1 ou 2 paragraphes au-dessus
+                ' (on ne traverse que des lignes vides).
+                Dim idxTop As Long
+                idxTop = i
+                Dim j As Long
+                For j = i - 1 To i - 2 Step -1
+                    If j < 1 Then Exit For
+                    If ParaIsSeparator(paras(j)) Then
+                        idxTop = j
+                        Exit For
+                    End If
+                    If Not ParaIsEmptyish(paras(j)) Then Exit For
+                Next j
+
+                ' Borne basse : grappe de marqueurs.
+                Dim idxBottom As Long
+                Dim gap As Long
+                idxBottom = i
+                gap = 0
+                For j = i + 1 To winEnd
+                    If ParaIsSeparator(paras(j)) Then
+                        idxBottom = j
+                        Exit For
+                    ElseIf ParaIsBlockMarker(paras(j)) Then
+                        idxBottom = j
+                        gap = 0
+                    ElseIf ParaIsEmptyish(paras(j)) Then
+                        ' ligne vide : neutre
+                    Else
+                        gap = gap + 1
+                        If gap > 3 Then Exit For
+                    End If
+                Next j
+
+                If idxBottom > i Then
+                    Dim startPos As Long, endPos As Long
+                    startPos = paras(idxTop).Range.Start
+                    endPos = paras(idxBottom).Range.End
+                    If endPos > startPos Then
+                        doc.Range(startPos, endPos).Delete
+                        RemoveOneTeamsBlock = True
+                        Exit Function
+                    End If
+                Else
+                    modDebugLog.DDebug MOD_NAME, _
+                        "RemoveOneTeamsBlock : grappe vide au para " & i & ", candidat suivant"
+                End If
+            End If
+        End If
+    Next i
+Done:
+End Function
+
+'=============================================================================
+' ParaIsSeparator (v5) : ligne de soulignement en caracteres '_' (moteur
+' historique) OU paragraphe VIDE portant une bordure basse (bloc Teams cite
+' depuis un mail HTML : les separateurs y sont des bordures de paragraphe,
+' invisibles au niveau caractere - cf. note DiagWordBody).
+' wdBorderBottom = -3 ; wdLineStyleNone = 0.
+'=============================================================================
+Private Function ParaIsSeparator(ByVal para As Object) As Boolean
+    On Error Resume Next
+    ParaIsSeparator = False
+    If ParaIsUnderline(para) Then
+        ParaIsSeparator = True
+        Exit Function
+    End If
+    If ParaIsEmptyish(para) Then
+        Dim ls As Long
+        ls = 0
+        ls = para.Borders(-3).LineStyle
+        If ls <> 0 Then ParaIsSeparator = True
+    End If
+End Function
+
+'=============================================================================
+' ParaIsEmptyish (v6) : paragraphe vide ou ne contenant que des espaces /
+' tabulations / marques de paragraphe / image incorporee Chr(1) / barres
+' "/" ou "|" isolees (blocs Teams 2026 : icone d'aide et separateurs de
+' liens ; ils cassaient la marche en grappe au milieu du bloc).
+'=============================================================================
+Private Function ParaIsEmptyish(ByVal para As Object) As Boolean
+    On Error Resume Next
+    ParaIsEmptyish = False
+    Dim pTxt As String
+    pTxt = para.Range.text
+    pTxt = Replace(pTxt, " ", "")
+    pTxt = Replace(pTxt, vbTab, "")
+    pTxt = Replace(pTxt, vbCr, "")
+    pTxt = Replace(pTxt, vbLf, "")
+    pTxt = Replace(pTxt, Chr(7), "")
+    pTxt = Replace(pTxt, Chr(11), "")
+    pTxt = Replace(pTxt, Chr(160), "")
+    pTxt = Replace(pTxt, Chr(1), "")
+    pTxt = Replace(pTxt, "/", "")
+    pTxt = Replace(pTxt, "|", "")
+    ParaIsEmptyish = (Len(pTxt) = 0)
+End Function
+
+'=============================================================================
+' ParaIsBlockMarker (v6) : le paragraphe appartient-il visiblement a un bloc
+' Teams ? Marqueurs FR/EN (sous-chaines ASCII, comparaison insensible a la
+' casse ; les mots accentues sont tronques AVANT l'accent : "ID de r" couvre
+' "ID de reunion"). Un hyperlien teams.microsoft.com dans le paragraphe
+' compte aussi comme marqueur (le lien "Cliquez ici..." n'expose pas l'URL
+' dans le texte). "Microsoft Teams" volontairement ABSENT de la liste : le
+' titre est traite a part, et une phrase du fil citant Teams ne doit pas
+' etendre la grappe.
+' v6 : libelle Teams 2026 ajoute ("Numero de reunion", "Numero de
+' conference telephonique", "Trouver un numero local", "Participer par
+' telephone", "France, All locations") via les sous-chaines ASCII-safe
+' "ro de r", "ro de conf", "Trouver un num", "Participer par t",
+' "All locations".
+'=============================================================================
+Private Function ParaIsBlockMarker(ByVal para As Object) As Boolean
+    On Error Resume Next
+    ParaIsBlockMarker = False
+
+    Dim pTxt As String
+    pTxt = para.Range.text
+
+    Dim marks As Variant
+    marks = Array("teams.microsoft.com", "surtax", _
+                  "ID de r", "ID de conf", "Code secret", "code confidentiel", _
+                  "Meeting ID", "Passcode", "Conference ID", _
+                  "Rejoindre la r", "Join the meeting", "Join on your", _
+                  "Cliquez ici pour participer", _
+                  "sur votre ordinateur", "on your computer", _
+                  "Options de r", "Meeting options", _
+                  "En savoir plus", "Learn More", "Besoin d'aide", _
+                  "Rechercher un num", "Trouver un num", "local number", _
+                  "Dial in", "composez le", "Appelez le", _
+                  "audio uniquement", "audio only", _
+                  "Pour les organisateurs", "For organizers", _
+                  "ro de r", "ro de conf", "Participer par t", "All locations")
+
+    Dim k As Long
+    For k = LBound(marks) To UBound(marks)
+        If InStr(1, pTxt, CStr(marks(k)), vbTextCompare) > 0 Then
+            ParaIsBlockMarker = True
+            Exit Function
+        End If
+    Next k
+
+    Dim hl As Object
+    For Each hl In para.Range.Hyperlinks
+        If InStr(1, CStr(hl.Address), "teams.microsoft.com", vbTextCompare) > 0 Then
+            ParaIsBlockMarker = True
+            Exit Function
+        End If
+    Next hl
+End Function
+
+'=============================================================================
+' BlockWindowHasTeamsLink : la plage [iStart..iEnd] (paragraphes) contient-
+' elle un lien teams.microsoft.com, en texte visible ou en cible d'hyperlien ?
+'=============================================================================
+Private Function BlockWindowHasTeamsLink(ByVal doc As Object, ByVal paras As Object, _
+                                         ByVal iStart As Long, ByVal iEnd As Long) As Boolean
+    On Error Resume Next
+    BlockWindowHasTeamsLink = False
+    Dim rng As Object
+    Set rng = doc.Range(paras(iStart).Range.Start, paras(iEnd).Range.End)
+    If rng Is Nothing Then Exit Function
+    If InStr(1, rng.text, "teams.microsoft.com", vbTextCompare) > 0 Then
+        BlockWindowHasTeamsLink = True
+        Exit Function
+    End If
+    Dim hl As Object
+    For Each hl In rng.Hyperlinks
+        If InStr(1, CStr(hl.Address), "teams.microsoft.com", vbTextCompare) > 0 Then
+            BlockWindowHasTeamsLink = True
+            Exit Function
+        End If
+    Next hl
+End Function
+
+'=============================================================================
+' CleanBodyViaWord (v6.2) : retire TOUS les blocs Teams du corps du RDV
+' affiche par l'inspecteur (WordEditor requis), avec le moteur v6
+' (DocHasTeamsLink + CleanAllTeamsBlocks : lien en texte visible OU en
+' hyperlien, bornes locales par bloc, vocabulaire 2026). Ne fait AUCUN
+' Save. Renvoie True si au moins un bloc a ete retire. Publique pour
+' clsApptWatcher (au Write) ; utilisee aussi par CleanTeamsBlock et
+' CleanTeamsSelection. N'echoue jamais vers l'appelant.
+'=============================================================================
+Public Function CleanBodyViaWord(ByVal insp As Object) As Boolean
+    CleanBodyViaWord = False
+    On Error Resume Next
+    If insp Is Nothing Then Exit Function
+
+    Dim doc As Object
+    Set doc = Nothing
+    Set doc = insp.WordEditor
+    If doc Is Nothing Then Exit Function
+
+    If Not DocHasTeamsLink(doc) Then Exit Function
+
+    Dim removed As Long
+    removed = CleanAllTeamsBlocks(doc)
+    If removed > 0 Then
+        CleanBodyViaWord = True
+        modDebugLog.DInfo MOD_NAME, "CleanBodyViaWord : " & removed & " bloc(s) Teams retire(s)"
+    Else
+        modDebugLog.DInfo MOD_NAME, "CleanBodyViaWord : lien teams present mais " & _
+            "aucun bloc borne (analyser via DiagWordBody)"
+    End If
+End Function
+
+'=============================================================================
+' DIAGNOSTIC MANUEL
+' Selectionner le RDV converti problematique, puis lancer cette macro.
+'=============================================================================
+Public Sub DiagMeetingStatus()
+    On Error GoTo ErrH
+
+    Dim a As Outlook.AppointmentItem
+    Set a = GetTargetAppointment()
+    If a Is Nothing Then
+        MsgBox T("S~electionnez (ou ouvrez) un rendez-vous d'abord.", "Select (or open) an appointment first."), _
+               vbExclamation, T("Diagnostic - statut de r~eunion", "Diagnostics - meeting status")
+        Exit Sub
+    End If
+
+    Dim ms As Long, rc As Long, rs As Long
+    Dim mc As String
+    ms = -999: rc = -999: rs = -999: mc = "?"
+    On Error Resume Next
+    ms = a.MeetingStatus
+    rc = a.recipients.count
+    rs = a.ResponseStatus
+    mc = a.MessageClass
+    On Error GoTo ErrH
+
+    Dim thirdPartyCount As Long
+    thirdPartyCount = CountThirdPartyRecipients(a)
+
+    Dim msTxt As String
+    Select Case ms
+        Case 0: msTxt = T("0 olNonMeeting (= vrai rendez-vous)", "0 olNonMeeting (= real appointment)")
+        Case 1: msTxt = T("1 olMeeting (= reunion : champ Envoye affiche)", "1 olMeeting (= meeting: Send field shown)")
+        Case 3: msTxt = "3 olMeetingReceived"
+        Case 5: msTxt = "5 olMeetingCanceled"
+        Case 7: msTxt = "7 olMeetingReceivedAndCanceled"
+        Case Else: msTxt = CStr(ms)
+    End Select
+
+    Dim msg As String
+    msg = "=== Diagnostic MeetingStatus ===" & vbCrLf & vbCrLf & _
+          T("Sujet           : ", "Subject         : ") & Left(CStr(a.subject), 60) & vbCrLf & _
+          "MeetingStatus   : " & msTxt & vbCrLf & _
+          "Recipients.Count: " & rc & T(" (dont ", " (of which ") & thirdPartyCount & T(" tiers hors moi)", " third-party, excluding me)") & vbCrLf & _
+          "ResponseStatus  : " & rs & vbCrLf & _
+          "MessageClass    : " & mc & vbCrLf & vbCrLf
+
+    If ms = OL_MEETING And thirdPartyCount = 0 Then
+        msg = msg & T("=> CAS CIBLE : reunion sans invite tiers restee en olMeeting.", "=> TARGET CASE: meeting with no third-party invitee left as olMeeting.") & vbCrLf & _
+                    T("   DemoteIfEmptyMeeting la convertira en rendez-vous.", "   DemoteIfEmptyMeeting will convert it to an appointment.")
+    ElseIf ms = OL_NON_MEETING Then
+        msg = msg & T("=> Deja un vrai rendez-vous (olNonMeeting). Rien a faire.", "=> Already a real appointment (olNonMeeting). Nothing to do.")
+    Else
+        msg = msg & T("=> Vraie reunion (", "=> Real meeting (") & thirdPartyCount & T(" invite(s) tiers). On ne touche pas.", " third-party invitee(s)). Leaving it alone.")
+    End If
+
+    modDebugLog.DInfo MOD_NAME, "DiagMeetingStatus ms=" & ms & " rc=" & rc & _
+        " tiers=" & thirdPartyCount & " rs=" & rs & " class=" & mc & _
+        " '" & Left(CStr(a.subject), 40) & "'"
+
+    MsgBox msg, vbInformation, T("Diagnostic - statut de r~eunion", "Diagnostics - meeting status")
+    Exit Sub
+
+ErrH:
+    modDebugLog.DError MOD_NAME, "DiagMeetingStatus err " & Err.Number & _
+        " - " & Err.Description
+    MsgBox T("Erreur : ", "Error: ") & Err.Number & " - " & Err.Description, vbExclamation, _
+           T("Diagnostic - statut de r~eunion", "Diagnostics - meeting status")
+End Sub
+
+'=============================================================================
+' FIX AUTO : appele depuis ThisOutlookSession.CalendarItems_ItemChange.
+' Si l'item est une reunion (olMeeting) SANS aucun destinataire, c'est une
+' reunion qu'on a videe et qu'Outlook n'a pas proprement reconvertie : on
+' force olNonMeeting (vraie conversion en rendez-vous).
+'=============================================================================
+Public Sub DemoteIfEmptyMeeting(ByVal appt As Object)
+    On Error GoTo ErrH
+
+    If appt Is Nothing Then Exit Sub
+    If Not (TypeOf appt Is Outlook.AppointmentItem) Then Exit Sub
+
+    Dim a As Outlook.AppointmentItem
+    Set a = appt
+
+    ' Cooldown anti-boucle (notre Save re-declenche un ItemChange asynchrone)
+    If Len(gLastEntryID) > 0 And Len(a.entryID) > 0 Then
+        If StrComp(gLastEntryID, a.entryID, vbBinaryCompare) = 0 Then
+            If DateDiff("s", gLastSaveAt, Now) < COOLDOWN_SEC Then
+                modDebugLog.DTrace MOD_NAME, "Skip : cooldown sur '" & a.subject & "'"
+                Exit Sub
+            End If
+        End If
+    End If
+
+    ' Conditions : reunion marquee olMeeting, dont AUCUN destinataire n'est
+    ' un tiers (le seul "participant" est l'organisateur = moi-meme).
+    ' NB : Outlook s'ajoute automatiquement comme Recipient sur une reunion,
+    ' donc une reunion "videe de ses invites" a Recipients.Count = 1 (moi),
+    ' PAS 0. On compte donc les destinataires AUTRES que moi.
+    Dim ms As Long
+    ms = -1
+    On Error Resume Next
+    ms = a.MeetingStatus
+    On Error GoTo ErrH
+
+    If ms <> OL_MEETING Then Exit Sub        ' pas une reunion -> rien
+
+    Dim othersCount As Long
+    othersCount = CountThirdPartyRecipients(a)
+
+    If othersCount > 0 Then
+        ' Il reste de vrais invites : c'est une vraie reunion, on ne touche pas.
+        modDebugLog.DTrace MOD_NAME, "Skip : " & othersCount & _
+            " invite(s) tiers sur '" & Left(CStr(a.subject), 40) & "'"
+        Exit Sub
+    End If
+
+    ' Reunion sans aucun invite tiers -> conversion en vrai rendez-vous.
+    ' PRIORITE ABSOLUE : la conversion ne doit JAMAIS dependre du nettoyage
+    ' Teams (qui est un bonus best-effort). On convertit + Save D'ABORD,
+    ' puis on tente le nettoyage dans un bloc isole qui ne peut pas faire
+    ' echouer la conversion.
+    a.MeetingStatus = OL_NON_MEETING
+    a.Save
+
+    ' Memoriser pour le cooldown (avant le nettoyage : si le nettoyage
+    ' relance un Save/ItemChange, le cooldown protege deja).
+    On Error Resume Next
+    gLastEntryID = a.entryID
+    gLastSaveAt = Now
+    On Error GoTo ErrH
+
+    modDebugLog.DInfo MOD_NAME, "Reunion sans invite convertie en rendez-vous : '" & _
+        Left(CStr(a.subject), 60) & "'"
+
+    ' v6.2 : COULEUR. La categorie auto (reunion interne/externe) a pu etre
+    ' posee par modMeetingColor quelques instants plus tot, l'item etant
+    ' encore olMeeting ; son cooldown anti-reentrance ecarte l'ItemChange
+    ' qui suit notre Save, la couleur resterait. Un creneau personnel n'a
+    ' aucun participant : on la retire ici, explicitement. Isole : un echec
+    ' ne touche pas la conversion.
+    On Error Resume Next
+    If modMeetingColor.ClearAutoCategory(a) Then gLastSaveAt = Now
+    On Error GoTo ErrH
+
+    ' v3.1 : nettoyage Teams ISOLE. Toute erreur ici est avalee et n'affecte
+    ' pas la conversion deja faite. On re-Save seulement si le nettoyage a
+    ' effectivement modifie quelque chose.
+    On Error Resume Next
+    Dim wasModified As Boolean
+    wasModified = CleanTeamsBlock(a)
+    If wasModified Then
+        a.Save
+        gLastSaveAt = Now    ' rafraichir le cooldown apres ce 2e Save
+    End If
+
+    ' v6.2 : TOAST a la conversion. Verdict Teams : bloc retire ici
+    ' (gLastBodyCleaned), sinon bloc encore present dans le corps
+    ' (BodyHasTeamsBlock, texte MAPI), sinon simple conversion. Si
+    ' clsApptWatcher a deja nettoye et toaste au Write, l'anti-doublon
+    ' de NotifyPersonalSlot absorbe cet appel.
+    NotifyPersonalSlot a, gLastBodyCleaned, (Not gLastBodyCleaned) And BodyHasTeamsBlock(a)
+    On Error GoTo 0
+    Exit Sub
+
+ErrH:
+    modDebugLog.DError MOD_NAME, "DemoteIfEmptyMeeting err " & Err.Number & _
+        " - " & Err.Description
+End Sub
+
+'=============================================================================
+' Compte les destinataires d'une reunion qui ne sont PAS l'organisateur
+' (= pas moi). Une reunion videe de ses invites contient quand meme
+' l'organisateur en Recipient ; on l'exclut pour decider de la conversion.
+'=============================================================================
+Private Function CountThirdPartyRecipients(ByVal a As Outlook.AppointmentItem) As Long
+    On Error Resume Next
+    CountThirdPartyRecipients = 0
+
+    Dim mySmtp As String, myName As String
+    mySmtp = LCase$(GetMySmtp())
+    myName = LCase$(GetMyName())
+
+    ' L'organisateur peut aussi etre identifie par Organizer (nom affiche).
+    Dim organizer As String
+    organizer = LCase$(CStr(a.Organizer))
+
+    Dim rcp As Outlook.Recipient
+    For Each rcp In a.recipients
+        Dim smtp As String, displayName As String
+        smtp = LCase$(ResolveSmtp(rcp))
+        displayName = LCase$(CStr(rcp.name))
+
+        Dim isMe As Boolean
+        isMe = False
+        If Len(mySmtp) > 0 And smtp = mySmtp Then isMe = True
+        If Not isMe And Len(myName) > 0 And displayName = myName Then isMe = True
+        If Not isMe And Len(organizer) > 0 And displayName = organizer Then isMe = True
+
+        If Not isMe Then
+            CountThirdPartyRecipients = CountThirdPartyRecipients + 1
+        End If
+    Next rcp
+    On Error GoTo 0
+End Function
+
+'=============================================================================
+' v3.1 - IsRealThirdPartyMeeting : True si l'item est une VRAIE reunion a
+' envoyer, c'est-a-dire olMeeting AVEC au moins un invite tiers (hors
+' organisateur). Sert de garde-fou : on ne nettoie JAMAIS le bloc Teams du
+' corps dans ce cas, sinon le lien de connexion disparait du message recu
+' par les invites. Publique pour que clsApptWatcher puisse l'interroger.
+'=============================================================================
+Public Function IsRealThirdPartyMeeting(ByVal appt As Object) As Boolean
+    IsRealThirdPartyMeeting = False
+    On Error Resume Next
+    If appt Is Nothing Then Exit Function
+    If Not (TypeOf appt Is Outlook.AppointmentItem) Then Exit Function
+    Dim a As Outlook.AppointmentItem
+    Set a = appt
+    If a.MeetingStatus <> OL_MEETING Then Exit Function
+    If CountThirdPartyRecipients(a) > 0 Then IsRealThirdPartyMeeting = True
+End Function
+
+'=============================================================================
+' Helpers d'identite (autonomes, late binding).
+'=============================================================================
+Private Function GetMySmtp() As String
+    ' Pack v3 (C2/B8) : cache de session modSmtp (avant : GetExchangeUser a chaque appel).
+    GetMySmtp = modSmtp.MySmtp()
+End Function
+
+Private Function GetMyName() As String
+    GetMyName = modSmtp.MyName()
+End Function
+
+Private Function ResolveSmtp(ByVal rcp As Outlook.Recipient) As String
+    ' Pack v3 (C2/B8) : resolution + cache par adresse (modSmtp).
+    ResolveSmtp = modSmtp.RecipientSmtp(rcp)
+End Function
+
+'=============================================================================
+' Recupere le RDV cible : inspecteur actif, sinon selection unique calendrier.
+'=============================================================================
+Private Function GetTargetAppointment() As Outlook.AppointmentItem
+    On Error Resume Next
+    Set GetTargetAppointment = Nothing
+
+    Dim insp As Outlook.Inspector
+    Set insp = Application.ActiveInspector
+    If Not insp Is Nothing Then
+        If Not insp.CurrentItem Is Nothing Then
+            If TypeOf insp.CurrentItem Is Outlook.AppointmentItem Then
+                Set GetTargetAppointment = insp.CurrentItem
+                Exit Function
+            End If
+        End If
+    End If
+
+    Dim expl As Outlook.Explorer
+    Set expl = Application.ActiveExplorer
+    If expl Is Nothing Then Exit Function
+    If expl.Selection Is Nothing Then Exit Function
+    If expl.Selection.count <> 1 Then Exit Function
+    If TypeOf expl.Selection.Item(1) Is Outlook.AppointmentItem Then
+        Set GetTargetAppointment = expl.Selection.Item(1)
+    End If
+End Function
+
+'=============================================================================
+' CleanTeamsBlock : retire le bloc "Reunion Microsoft Teams" du corps du
+' RDV (en preservant le reste du corps, ex. un fil de mail HTML en dessous)
+' + vide le champ Location s'il vaut la valeur Teams.
+'
+' STRATEGIE (option 1) :
+'   Le corps riche d'un AppointmentItem n'est editable proprement que via
+'   l'editeur Word (Inspector.WordEditor), qui n'existe QUE si une fenetre
+'   du RDV est ouverte. Donc :
+'     - Inspector ouvert dispo  -> nettoyage Word chirurgical (preserve la
+'       mise en forme et le contenu hors bloc Teams).
+'     - Pas d'inspecteur        -> on NE TOUCHE PAS au corps (on ne charcute
+'       pas le RTF a l'aveugle). On vide quand meme Location si Teams.
+'       Le bloc Teams pourra etre retire plus tard via CleanTeamsSelection
+'       (macro manuelle, RDV ouvert).
+'
+' Bornes du bloc : moteur v6 via CleanBodyViaWord (RemoveOneTeamsBlock :
+'   titre court "Microsoft Teams" avec lien dans sa fenetre, separateur
+'   au-dessus, grappe de marqueurs en dessous ; abstention si bornes
+'   introuvables).
+' RETOUR : True si la fonction a MODIFIE l'item (Location videe et/ou bloc
+' Teams retire), pour que l'appelant decide de re-Save. Ne fait AUCUN Save
+' elle-meme : c'est l'appelant qui sauve, une seule fois, apres.
+' Cette fonction n'echoue jamais vers l'exterieur (erreurs avalees) : le
+' nettoyage est un bonus best-effort qui ne doit pas casser la conversion.
+'=============================================================================
+Private Function CleanTeamsBlock(ByVal a As Outlook.AppointmentItem) As Boolean
+    CleanTeamsBlock = False
+    gLastBodyCleaned = False   ' v6.1
+    On Error GoTo ErrH
+
+    ' 1) Location : vider si c'est la valeur Teams generique.
+    Dim loc As String
+    loc = CStr(a.Location)
+    If LocationIsTeams(loc) Then
+        a.Location = ""
+        CleanTeamsBlock = True
+        modDebugLog.DInfo MOD_NAME, "Location Teams videe"
+    End If
+
+    ' 2) Corps : nettoyage via WordEditor SI un inspecteur est ouvert.
+    Dim insp As Outlook.Inspector
+    Set insp = FindAppointmentInspector(a)
+    If insp Is Nothing Then
+        modDebugLog.DInfo MOD_NAME, "Pas d'inspecteur ouvert : bloc Teams non nettoye " & _
+            "(corps preserve, rattrapage possible via CleanTeamsSelection)"
+        Exit Function
+    End If
+
+    Dim okWord As Boolean
+    okWord = CleanBodyViaWord(insp)
+    If okWord Then
+        CleanTeamsBlock = True
+        gLastBodyCleaned = True   ' v6.1
+        modDebugLog.DInfo MOD_NAME, "Bloc Teams retire via WordEditor"
+    Else
+        modDebugLog.DInfo MOD_NAME, "Bloc Teams non trouve / non retire (corps intact)"
+    End If
+    Exit Function
+
+ErrH:
+    ' Erreur avalee : on a peut-etre deja modifie Location (CleanTeamsBlock
+    ' reste a True dans ce cas), mais on ne propage rien.
+    modDebugLog.DError MOD_NAME, "CleanTeamsBlock err " & Err.Number & " - " & Err.Description
+End Function
+
+'=============================================================================
+' MACRO MANUELLE de rattrapage : nettoie le bloc Teams du RDV ouvert/selectionne.
+' A binder sur un bouton, ou lancer via Alt+F8. Utile pour les RDV deja
+' convertis avant ce code, ou quand l'auto n'a pas pu agir (pas d'inspecteur).
+' Necessite que le RDV soit OUVERT (WordEditor requis).
+'=============================================================================
+Public Sub CleanTeamsSelection()
+    On Error GoTo ErrH
+
+    Dim a As Outlook.AppointmentItem
+    Set a = GetTargetAppointment()
+    If a Is Nothing Then
+        MsgBox T("Ouvrez ou s~electionnez un rendez-vous d'abord.", "Open or select an appointment first."), vbExclamation, T("Nettoyage Teams", "Teams cleanup")
+        Exit Sub
+    End If
+
+    ' Location
+    If LocationIsTeams(CStr(a.Location)) Then a.Location = ""
+
+    Dim insp As Outlook.Inspector
+    Set insp = FindAppointmentInspector(a)
+    If insp Is Nothing Then
+        MsgBox T("Pour nettoyer le corps, ouvrez d'abord le rendez-vous dans sa fen~xtre", "To clean the body, first open the appointment in its window") & vbCrLf & _
+               T("(l'editeur de corps n'est disponible que sur un RDV ouvert).", "(the body editor is only available on an open appointment)."), _
+               vbExclamation, T("Nettoyage Teams", "Teams cleanup")
+        a.Save
+        Exit Sub
+    End If
+
+    If CleanBodyViaWord(insp) Then
+        a.Save
+        MsgBox T("Bloc Microsoft Teams retire.", "Microsoft Teams block removed."), vbInformation, T("Nettoyage Teams", "Teams cleanup")
+    Else
+        MsgBox T("Aucun bloc Teams d~etect~e dans ce rendez-vous.", "No Teams block detected in this appointment."), vbInformation, T("Nettoyage Teams", "Teams cleanup")
+    End If
+    Exit Sub
+
+ErrH:
+    modDebugLog.DError MOD_NAME, "CleanTeamsSelection err " & Err.Number & " - " & Err.Description
+    MsgBox T("Erreur : ", "Error: ") & Err.Number & " - " & Err.Description, vbExclamation, T("Nettoyage Teams", "Teams cleanup")
+End Sub
+
+'=============================================================================
+' BodyHasTeamsBlock (v6.2) : un bloc Teams est-il encore dans le corps (texte
+' MAPI .Body, lisible sans inspecteur) ? URL teams.microsoft.com, ou titre
+' "Microsoft Teams" accompagne d'un identifiant de reunion (FR/EN). Sert au
+' verdict du toast de conversion. Le corps n'est jamais logue.
+'=============================================================================
+Private Function BodyHasTeamsBlock(ByVal a As Outlook.AppointmentItem) As Boolean
+    On Error Resume Next
+    BodyHasTeamsBlock = False
+    Dim b As String
+    b = ""
+    b = a.body
+    If Len(b) = 0 Then Exit Function
+    If InStr(1, b, "teams.microsoft.com", vbTextCompare) > 0 Then
+        BodyHasTeamsBlock = True
+        Exit Function
+    End If
+    If InStr(1, b, "Microsoft Teams", vbTextCompare) = 0 Then Exit Function
+    If InStr(1, b, "ID de r", vbTextCompare) > 0 _
+       Or InStr(1, b, "ro de r", vbTextCompare) > 0 _
+       Or InStr(1, b, "Meeting ID", vbTextCompare) > 0 _
+       Or InStr(1, b, "Code secret", vbTextCompare) > 0 _
+       Or InStr(1, b, "Passcode", vbTextCompare) > 0 Then
+        BodyHasTeamsBlock = True
+    End If
+End Function
+
+' Vrai si un paragraphe Word est une ligne de soulignement (>= 20 '_',
+' hors espaces et marque de fin de paragraphe).
+Private Function ParaIsUnderline(ByVal para As Object) As Boolean
+    ParaIsUnderline = False
+    On Error Resume Next
+    Dim t As String
+    t = para.Range.text
+    ' retirer espaces, tabs, et marques de paragraphe (Chr 13/7/etc.)
+    t = Replace(t, " ", "")
+    t = Replace(t, vbTab, "")
+    t = Replace(t, vbCr, "")
+    t = Replace(t, vbLf, "")
+    t = Replace(t, Chr(7), "")
+    t = Replace(t, Chr(11), "")
+    If Len(t) < 20 Then Exit Function
+    Dim i As Long
+    For i = 1 To Len(t)
+        If Mid$(t, i, 1) <> "_" Then Exit Function
+    Next i
+    ParaIsUnderline = True
+End Function
+
+' True si le champ Location est une valeur Teams generique.
+Private Function LocationIsTeams(ByVal loc As String) As Boolean
+    LocationIsTeams = False
+    Dim l As String
+    l = LCase$(Trim$(loc))
+    If l = "" Then Exit Function
+    If InStr(l, "microsoft teams") > 0 Then LocationIsTeams = True
+    If InStr(l, "reunion microsoft teams") > 0 Then LocationIsTeams = True
+    If InStr(l, "teams meeting") > 0 Then LocationIsTeams = True
+    If InStr(l, "teams.microsoft.com") > 0 Then LocationIsTeams = True
+End Function
+
+' Trouve l'inspecteur ouvert affichant ce RDV (par EntryID), ou Nothing.
+Private Function FindAppointmentInspector(ByVal a As Outlook.AppointmentItem) As Outlook.Inspector
+    On Error Resume Next
+    Set FindAppointmentInspector = Nothing
+
+    Dim eidA As String
+    eidA = a.entryID   ' peut etre vide sur un item jamais sauve
+
+    Dim insp As Outlook.Inspector
+    For Each insp In Application.Inspectors
+        Dim itm As Object
+        Set itm = Nothing
+        Set itm = insp.CurrentItem
+        If Not itm Is Nothing Then
+            If TypeOf itm Is Outlook.AppointmentItem Then
+                ' Correspondance par EntryID si dispo, sinon par sujet + start
+                If Len(eidA) > 0 And Len(itm.entryID) > 0 Then
+                    If StrComp(itm.entryID, eidA, vbBinaryCompare) = 0 Then
+                        Set FindAppointmentInspector = insp
+                        Exit Function
+                    End If
+                Else
+                    If StrComp(CStr(itm.subject), CStr(a.subject), vbBinaryCompare) = 0 Then
+                        Set FindAppointmentInspector = insp
+                        Exit Function
+                    End If
+                End If
+            End If
+        End If
+    Next insp
+    On Error GoTo 0
+End Function
+
+'=============================================================================
+' DumpAppointmentHTML : ecrit le corps d'un RENDEZ-VOUS (RTFBody converti, ou Body
+' brut) dans un fichier texte, pour analyse manuelle de la structure du
+' bloc Teams avant d'ecrire un nettoyage chirurgical.
+'
+' A lancer sur le RDV/reunion selectionne ou ouvert. Ecrit deux fichiers
+' sur Bureau\Macro VBA\Outlook :
+'   - rdv_body.txt  : la propriete .Body (texte brut, lignes Teams visibles)
+'   - rdv_location.txt : le champ .Location
+' Les AppointmentItem n'exposent PAS de .HTMLBody (contrairement aux mails) ;
+' le HTML reel est dans RTFBody (binaire). Pour delimiter le bloc Teams, le
+' .Body texte suffit dans la majorite des cas (les separateurs ____ et les
+' lignes "Reunion Microsoft Teams" / "teams.microsoft.com" y figurent).
+'=============================================================================
+Public Sub DumpAppointmentHTML()
+    On Error GoTo ErrH
+
+    Dim a As Outlook.AppointmentItem
+    Set a = GetTargetAppointment()
+    If a Is Nothing Then
+        MsgBox T("S~electionnez ou ouvrez un rendez-vous d'abord.", "Select or open an appointment first."), _
+               vbExclamation, T("Dump RDV", "Dump appointment")
+        Exit Sub
+    End If
+
+    Dim folder As String
+    folder = modConfig.DesktopPath() & "\Macro VBA\Outlook"
+
+    Dim pBody As String, pLoc As String
+    pBody = folder & "\rdv_body.txt"
+    pLoc = folder & "\rdv_location.txt"
+
+    Dim f As Integer
+    f = FreeFile
+    Open pBody For Output As #f
+    Print #f, a.body
+    Close #f
+
+    f = FreeFile
+    Open pLoc For Output As #f
+    Print #f, "Location = " & a.Location
+    Print #f, "MeetingStatus = " & a.MeetingStatus
+    Close #f
+
+    modDebugLog.DInfo MOD_NAME, "DumpAppointmentHTML : body=" & Len(a.body) & _
+        " chars, location='" & a.Location & "'"
+
+    If MsgBox(T("Corps du RDV sauvegarde :", "Appointment body saved:") & vbCrLf & pBody & vbCrLf & vbCrLf & _
+              "Location : " & a.Location & vbCrLf & vbCrLf & _
+              T("Ouvrir rdv_body.txt maintenant ?", "Open rdv_body.txt now?"), _
+              vbYesNo + vbQuestion, T("Dump RDV OK", "Dump OK")) = vbYes Then
+        Shell "notepad.exe """ & pBody & """", vbNormalFocus
+    End If
+    Exit Sub
+
+ErrH:
+    modDebugLog.DError MOD_NAME, "DumpAppointmentHTML err " & Err.Number & " - " & Err.Description
+    MsgBox T("Erreur : ", "Error: ") & Err.Number & " - " & Err.Description, vbExclamation, T("Dump RDV", "Dump appointment")
+End Sub
+
+'=============================================================================
+' DiagWordBody : DIAGNOSTIC du corps tel que le voit WordEditor (et non le
+' .Body MAPI). C'est sur CE texte que CleanBodyViaWord travaille, donc
+' c'est lui qu'il faut analyser quand "Aucun bloc Teams detecte".
+'
+' Le RDV doit etre OUVERT (WordEditor requis). Ecrit dans
+' Bureau\Macro VBA\Outlook\rdv_word.txt :
+'   - le texte integral vu par Word (doc.Content.text)
+'   - puis, ligne par ligne, le numero, la longueur, et le CODE du 1er
+'     caractere non-espace (pour voir si les "lignes de separation" sont
+'     des underscores Chr(95), des tirets, ou des bordures de paragraphe
+'     invisibles au niveau caractere).
+'=============================================================================
+Public Sub DiagWordBody()
+    On Error GoTo ErrH
+
+    Dim a As Outlook.AppointmentItem
+    Set a = GetTargetAppointment()
+    If a Is Nothing Then
+        MsgBox T("Ouvrez ou s~electionnez un rendez-vous d'abord.", "Open or select an appointment first."), vbExclamation, T("Diag corps Word", "Diag Word body")
+        Exit Sub
+    End If
+
+    Dim insp As Outlook.Inspector
+    Set insp = FindAppointmentInspector(a)
+    If insp Is Nothing Then
+        MsgBox T("Ouvrez le rendez-vous dans sa fen~xtre (WordEditor requis).", "Open the appointment in its window (WordEditor required)."), _
+               vbExclamation, T("Diag corps Word", "Diag Word body")
+        Exit Sub
+    End If
+
+    Dim doc As Object
+    Set doc = insp.WordEditor
+    If doc Is Nothing Then
+        MsgBox T("WordEditor indisponible sur cet inspecteur.", "WordEditor unavailable on this inspector."), vbExclamation, T("Diag corps Word", "Diag Word body")
+        Exit Sub
+    End If
+
+    Dim txt As String
+    txt = doc.Content.text
+
+    Dim folder As String
+    folder = modConfig.DesktopPath() & "\Macro VBA\Outlook"
+    Dim p As String
+    p = folder & "\rdv_word.txt"
+
+    Dim f As Integer
+    f = FreeFile
+    Open p For Output As #f
+
+    Print #f, "=== TEXTE INTEGRAL VU PAR WORD (doc.Content.text) ==="
+    Print #f, "Longueur totale : " & Len(txt) & " caracteres"
+    Print #f, "Contient 'teams.microsoft.com' : " & (InStr(1, txt, "teams.microsoft.com", vbTextCompare) > 0)
+    Print #f, "Contient 'Microsoft Teams' : " & (InStr(1, txt, "Microsoft Teams", vbTextCompare) > 0)
+    Print #f, "Nb underscores '_' dans tout le texte : " & CountChar(txt, "_")
+    Print #f, ""
+    Print #f, "=== ANALYSE LIGNE PAR LIGNE ==="
+    Print #f, "(format : [no] len=NN code1er=CCC | contenu tronque)"
+    Print #f, ""
+
+    ' Word utilise generalement vbCr (Chr 13) comme separateur de paragraphe.
+    ' On decoupe sur vbCr ET vbLf pour etre robuste.
+    Dim norm As String
+    norm = Replace(txt, vbCrLf, vbLf)
+    norm = Replace(norm, vbCr, vbLf)
+    Dim lines() As String
+    lines = Split(norm, vbLf)
+
+    Dim i As Long
+    For i = LBound(lines) To UBound(lines)
+        Dim line As String
+        line = lines(i)
+        Dim code1 As String
+        code1 = FirstNonSpaceChar(line)
+        Print #f, "[" & i & "] len=" & Len(line) & " code1er=" & code1 & _
+                  " | " & Left(line, 60)
+    Next i
+
+    Close #f
+
+    modDebugLog.DInfo MOD_NAME, "DiagWordBody ecrit " & Len(txt) & " chars dans rdv_word.txt"
+
+    Shell "notepad.exe """ & p & """", vbNormalFocus
+    Exit Sub
+
+ErrH:
+    modDebugLog.DError MOD_NAME, "DiagWordBody err " & Err.Number & " - " & Err.Description
+    MsgBox T("Erreur : ", "Error: ") & Err.Number & " - " & Err.Description, vbExclamation, T("Diag corps Word", "Diag Word body")
+End Sub
+
+' Compte les occurrences d'un caractere dans une chaine.
+Private Function CountChar(ByVal s As String, ByVal c As String) As Long
+    Dim n As Long, p As Long
+    n = 0
+    p = InStr(1, s, c)
+    Do While p > 0
+        n = n + 1
+        p = InStr(p + 1, s, c)
+    Loop
+    CountChar = n
+End Function
+
+' Renvoie une description du 1er caractere non-espace d'une ligne :
+' "vide" si la ligne est vide/espaces, sinon "'X'(code)".
+Private Function FirstNonSpaceChar(ByVal line As String) As String
+    Dim i As Long
+    For i = 1 To Len(line)
+        Dim c As String
+        c = Mid$(line, i, 1)
+        If c <> " " And c <> vbTab Then
+            FirstNonSpaceChar = "'" & c & "'(" & AscW(c) & ")"
+            Exit Function
+        End If
+    Next i
+    FirstNonSpaceChar = "vide"
+End Function

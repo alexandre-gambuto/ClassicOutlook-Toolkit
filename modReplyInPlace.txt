@@ -1,0 +1,843 @@
+Option Explicit
+
+' =====================================================================
+' modReplyInPlace v12
+' Purpose (EN): files sent Reply/ReplyAll/Forward messages into the parent
+'   mail's folder. On draft creation it records the parent folder (resolved
+'   from the Explorer selection, open inspectors, or the conversation tree)
+'   keyed by ConversationIndex; on send, TryMoveSentItem moves the item there
+'   and shows a non-blocking toast. System folders (Sent/Drafts/...) are
+'   excluded via a cached set of EntryIDs for O(1) checks.
+'   v10: when no folder was memorized (state lost to a VBE recompile or an
+'   Outlook restart, draft sent later, mail sent from a phone...), falls
+'   back to the folder of the most recent ALREADY-FILED message of the same
+'   thread, via the server-side Exchange conversation index
+'   (Conversation.GetTable - same pattern as modMailResponseTracker v4.5).
+'
+' Range les Reply/ReplyAll/Forward dans le dossier du mail parent.
+' Le dossier parent est memorise au brouillon (cle ConversationIndex) puis
+' le message envoye y est deplace par TryMoveSentItem.
+' v10 : si aucun post-it memorise (etat perdu : Ctrl+S VBE, redemarrage,
+' brouillon tardif, envoi depuis le telephone), repli sur le dossier du
+' message deja classe le plus recent du MEME FIL (index de conversations
+' Exchange, cote serveur). Le classement par code et le prompt QuickMove
+' restent les replis suivants, inchanges.
+'
+' v12 (2026-06-16) : deux toasts manquants corriges sur les envois.
+'   (Trou A) ResolveMemorizedTarget consommait le post-it (gTargets.Remove)
+'     AVANT de valider le dossier. Si la resolution echouait (cible
+'     introuvable ou jugee exclue), le post-it etait perdu et on basculait
+'     sur le repli ThreadTargetFolder, plus fragile -> deplacement parfois
+'     rate -> pas de toast. Desormais la cle n'est retiree qu'apres avoir
+'     confirme un dossier valide et non exclu.
+'   (Trou B) ThreadTargetFolder ne classait QUE sur ReceivedTime ; un mail
+'     ENVOYE (ReceivedTime vide) deja range dans le dossier n'etait jamais
+'     retenu comme cible. Un fil constitue uniquement de nos propres envois
+'     ne donnait donc aucune cible -> ni deplacement ni toast. On prend une
+'     date de repli (SentOn, CreationTime, LastModificationTime).
+' (Historique des versions -> CHANGELOG.)
+' =====================================================================
+
+Private Const MOD_NAME As String = "ReplyInPlace"
+Private Const MOD_VERSION As String = "v12 - 2026-06-16"
+Private Const CATCHUP_HOURS As Long = 48      ' fenetre du rattrapage des envoyes (iOS)
+
+Private gTargets As Object
+Private gDefaultStoreID As String
+
+' v8 : cache des EntryID des 8 dossiers systeme (Dictionary EntryID -> True)
+' et des 5 dossiers racines a tester via IsDescendantOf.
+' Invalides en cas de RebindEvents (cache repeuple a l'EnsureInit suivant).
+Private gSysIDsCache As Object
+Private gSentRoot As Object, gDraftRoot As Object, gDelRoot As Object
+Private gJunkRoot As Object, gOutRoot As Object
+
+' Pack v3 (C8) : MULTIBOITE. Les post-its memorisent EntryID + StoreID du
+' dossier parent (cle "eid|sid") et l'exclusion des dossiers systeme est
+' calculee PAR BOITE (gSysByStore : StoreID -> Dictionary EntryID->True ;
+' gRootsByStore : StoreID & "|" & type -> dossier racine pour IsDescendantOf).
+' Avant : tout dossier hors boite par defaut etait exclu, donc une reponse a
+' un mail range dans une boite partagee n'etait jamais classee.
+Private gSysByStore As Object
+Private gRootsByStore As Object
+Private Const SYS_TYPES As String = "6,5,16,3,23,4,9,10"    ' Inbox,Sent,Drafts,Deleted,Junk,Outbox,Calendar,Contacts
+Private Const DESC_TYPES As String = "5,16,3,23,4"           ' racines testees par descendance
+
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+Public Sub EnsureInit()
+    If gTargets Is Nothing Then
+        Set gTargets = CreateObject("Scripting.Dictionary")
+    End If
+    If Len(gDefaultStoreID) = 0 Then
+        On Error Resume Next
+        gDefaultStoreID = Application.GetNamespace("MAPI").GetDefaultFolder(olFolderInbox).StoreID
+        On Error GoTo 0
+    End If
+    If gSysIDsCache Is Nothing Then
+        EnsureSysCache
+    End If
+End Sub
+
+'=============================================================================
+' EnsureSysCache - v8
+' Initialise (ou re-initialise) le cache des EntryID systeme et des
+' dossiers racines a tester par IsDescendantOf. Tolere les exceptions
+' individuelles : si un dossier systeme est inaccessible, son slot reste
+' vide et IsExcludedFolder fonctionne quand meme sur les autres.
+'=============================================================================
+Public Sub EnsureSysCache()
+    On Error Resume Next
+    Dim ns As Object
+    Set ns = Application.GetNamespace("MAPI")
+
+    Set gSysIDsCache = CreateObject("Scripting.Dictionary")
+    gSysIDsCache.CompareMode = 0  ' BinaryCompare (EntryID exact)
+
+    Dim folderTypes As Variant
+    folderTypes = Array(olFolderInbox, olFolderSentMail, olFolderDrafts, _
+                        olFolderDeletedItems, olFolderJunk, olFolderOutbox, _
+                        olFolderCalendar, olFolderContacts)
+
+    Dim i As Long, fld As Object, eid As String
+    For i = LBound(folderTypes) To UBound(folderTypes)
+        Set fld = Nothing
+        Set fld = ns.GetDefaultFolder(CLng(folderTypes(i)))
+        If Not fld Is Nothing Then
+            eid = fld.entryID
+            If Len(eid) > 0 Then
+                If Not gSysIDsCache.Exists(eid) Then gSysIDsCache.Add eid, True
+            End If
+        End If
+    Next i
+
+    ' Racines pour les tests IsDescendantOf
+    Set gSentRoot = ns.GetDefaultFolder(olFolderSentMail)
+    Set gDraftRoot = ns.GetDefaultFolder(olFolderDrafts)
+    Set gDelRoot = ns.GetDefaultFolder(olFolderDeletedItems)
+    Set gJunkRoot = ns.GetDefaultFolder(olFolderJunk)
+    Set gOutRoot = ns.GetDefaultFolder(olFolderOutbox)
+
+    modDebugLog.DInfo MOD_NAME, "SysCache initialise (" & gSysIDsCache.count & " EntryID systeme)"
+    On Error GoTo 0
+End Sub
+
+'=============================================================================
+' InvalidateSysCache - v8
+' Invalide le cache pour forcer une reinitialisation au prochain EnsureInit.
+' Appelable depuis VBE si on suspecte un cache obsolete (rare : les
+' EntryID systeme ne changent pas en cours de session).
+'=============================================================================
+Public Sub InvalidateSysCache()
+    Set gSysByStore = Nothing
+    Set gRootsByStore = Nothing
+    Set gSysIDsCache = Nothing
+    Set gSentRoot = Nothing
+    Set gDraftRoot = Nothing
+    Set gDelRoot = Nothing
+    Set gJunkRoot = Nothing
+    Set gOutRoot = Nothing
+    modDebugLog.DInfo MOD_NAME, "SysCache invalide"
+End Sub
+
+Public Sub OnNewInspector(ByVal Inspector As Object)
+    On Error GoTo ErrH
+    If Inspector Is Nothing Then Exit Sub
+    Dim itm As Object
+    Set itm = Inspector.CurrentItem
+    If itm Is Nothing Then Exit Sub
+    ProcessDraft itm, Inspector, "NewInspector"
+    Exit Sub
+ErrH:
+    modDebugLog.DError MOD_NAME, "OnNewInspector error " & Err.Number & _
+        " - " & Err.Description
+End Sub
+
+Public Sub OnInlineResponse(ByVal Item As Object)
+    On Error GoTo ErrH
+    If Item Is Nothing Then Exit Sub
+    ProcessDraft Item, Nothing, "InlineResponse"
+    Exit Sub
+ErrH:
+    modDebugLog.DError MOD_NAME, "OnInlineResponse error " & Err.Number & _
+        " - " & Err.Description
+End Sub
+
+Private Sub ProcessDraft(ByVal itm As Object, ByVal Inspector As Object, _
+                         ByVal source As String)
+    On Error GoTo ErrH
+    EnsureInit
+    
+    If Not (TypeOf itm Is Outlook.MailItem) Then Exit Sub
+    
+    Dim mi As Outlook.MailItem
+    Set mi = itm
+    
+    If Len(mi.entryID) > 0 Then Exit Sub
+    
+    Dim draftCI As String
+    draftCI = mi.ConversationIndex
+    If Len(draftCI) <= 44 Then Exit Sub
+    
+    modDebugLog.DTrace MOD_NAME, source & " - draft CI=" & Left(draftCI, 60) & _
+        IIf(Len(draftCI) > 60, "...", "")
+    
+    Dim parentItem As Object
+    Set parentItem = Nothing
+    
+    Set parentItem = FindParentFromExplorer(draftCI)
+    If Not parentItem Is Nothing Then
+        modDebugLog.DTrace MOD_NAME, "  parent via Explorer : " & parentItem.subject
+    End If
+    
+    If parentItem Is Nothing Then
+        Set parentItem = FindParentFromInspectors(Inspector, draftCI)
+        If Not parentItem Is Nothing Then
+            modDebugLog.DTrace MOD_NAME, "  parent via Inspectors : " & parentItem.subject
+        End If
+    End If
+    
+    If parentItem Is Nothing Then
+        Set parentItem = FindParentInConversation(mi)
+        If Not parentItem Is Nothing Then
+            modDebugLog.DTrace MOD_NAME, "  parent via Conversation : " & parentItem.subject
+        End If
+    End If
+    
+    If parentItem Is Nothing Then
+        modDebugLog.DDebug MOD_NAME, "  Aucun parent trouve, abandon"
+        Exit Sub
+    End If
+    
+    Dim parentFolder As Object
+    On Error Resume Next
+    Set parentFolder = parentItem.parent
+    On Error GoTo ErrH
+    If parentFolder Is Nothing Then Exit Sub
+    
+    If IsExcludedFolder(parentFolder) Then
+        modDebugLog.DDebug MOD_NAME, "  Dossier parent exclu : " & parentFolder.FolderPath
+        Exit Sub
+    End If
+    
+    Dim parentCI As String
+    parentCI = ""
+    On Error Resume Next
+    parentCI = parentItem.ConversationIndex
+    On Error GoTo ErrH
+    If Len(parentCI) = 0 Then Exit Sub
+    
+    ' Pack v3 (C8) : EntryID + StoreID (le dossier peut vivre dans une autre boite).
+    Dim parentSID As String
+    parentSID = ""
+    On Error Resume Next
+    parentSID = parentFolder.StoreID
+    On Error GoTo ErrH
+    gTargets(parentCI) = parentFolder.entryID & "|" & parentSID
+    modDebugLog.DInfo MOD_NAME, "Memorise parentCI=" & Left(parentCI, 44) & _
+        "... -> " & parentFolder.FolderPath
+    Exit Sub
+
+ErrH:
+    modDebugLog.DError MOD_NAME, "ProcessDraft error " & Err.Number & _
+        " - " & Err.Description
+End Sub
+
+Private Function FindParentFromExplorer(ByVal draftCI As String) As Object
+    Set FindParentFromExplorer = Nothing
+    On Error GoTo Done
+    Dim exp As Object
+    Set exp = Application.ActiveExplorer
+    If exp Is Nothing Then Exit Function
+    Dim sel As Object
+    Set sel = exp.Selection
+    If sel Is Nothing Then Exit Function
+    If sel.count = 0 Then Exit Function
+    Dim i As Long
+    Dim candidate As Object
+    For i = 1 To sel.count
+        Set candidate = Nothing
+        On Error Resume Next
+        Set candidate = sel.Item(i)
+        On Error GoTo Done
+        If Not candidate Is Nothing Then
+            If TypeOf candidate Is Outlook.MailItem Then
+                If IsDraftChildOf(draftCI, candidate.ConversationIndex) Then
+                    Set FindParentFromExplorer = candidate
+                    Exit Function
+                End If
+            End If
+        End If
+    Next i
+Done:
+End Function
+
+Private Function FindParentFromInspectors(ByVal currentInsp As Object, _
+                                          ByVal draftCI As String) As Object
+    Set FindParentFromInspectors = Nothing
+    On Error GoTo Done
+    Dim insps As Object
+    Set insps = Application.Inspectors
+    If insps Is Nothing Then Exit Function
+    Dim i As Long
+    Dim insp As Object
+    Dim itm As Object
+    For i = 1 To insps.count
+        Set insp = Nothing
+        On Error Resume Next
+        Set insp = insps.Item(i)
+        On Error GoTo Done
+        If insp Is Nothing Then GoTo ContinueLoop
+        If Not currentInsp Is Nothing Then
+            If insp Is currentInsp Then GoTo ContinueLoop
+        End If
+        Set itm = Nothing
+        On Error Resume Next
+        Set itm = insp.CurrentItem
+        On Error GoTo Done
+        If itm Is Nothing Then GoTo ContinueLoop
+        If Not (TypeOf itm Is Outlook.MailItem) Then GoTo ContinueLoop
+        If Len(itm.entryID) = 0 Then GoTo ContinueLoop
+        If IsDraftChildOf(draftCI, itm.ConversationIndex) Then
+            Set FindParentFromInspectors = itm
+            Exit Function
+        End If
+ContinueLoop:
+    Next i
+Done:
+End Function
+
+Private Function IsDraftChildOf(ByVal draftCI As String, ByVal parentCI As String) As Boolean
+    IsDraftChildOf = False
+    If Len(parentCI) = 0 Or Len(draftCI) = 0 Then Exit Function
+    If Len(parentCI) >= Len(draftCI) Then Exit Function
+    If StrComp(Left(draftCI, Len(parentCI)), parentCI, vbBinaryCompare) <> 0 Then Exit Function
+    IsDraftChildOf = True
+End Function
+
+Private Function FindParentInConversation(ByVal draftItem As Object) As Object
+    Dim conv As Object, rootItems As Object
+    Dim draftCI As String, parentCI As String
+    Dim bestMatch As Object
+    Dim bestLen As Long
+    
+    Set FindParentInConversation = Nothing
+    On Error GoTo Done
+    
+    draftCI = draftItem.ConversationIndex
+    If Len(draftCI) < 44 Then Exit Function
+    parentCI = Left(draftCI, Len(draftCI) - 10)
+    Set conv = draftItem.GetConversation
+    If conv Is Nothing Then Exit Function
+    Set rootItems = conv.GetRootItems
+    If rootItems Is Nothing Then Exit Function
+    
+    bestLen = 0
+    Set bestMatch = Nothing
+    Dim i As Long
+    For i = 1 To rootItems.count
+        ScanConversationBranch conv, rootItems.Item(i), parentCI, bestMatch, bestLen
+    Next i
+    Set FindParentInConversation = bestMatch
+Done:
+End Function
+
+Private Sub ScanConversationBranch(ByVal conv As Object, ByVal node As Object, _
+                                   ByVal parentCI As String, _
+                                   ByRef bestMatch As Object, ByRef bestLen As Long)
+    On Error GoTo Skip
+    If node Is Nothing Then Exit Sub
+    If Not (TypeOf node Is Outlook.MailItem) Then GoTo Children
+    
+    Dim mi As Outlook.MailItem
+    Set mi = node
+    Dim ci As String
+    ci = mi.ConversationIndex
+    
+    If Len(ci) > 0 And Len(ci) <= Len(parentCI) Then
+        If StrComp(Left(parentCI, Len(ci)), ci, vbBinaryCompare) = 0 Then
+            If Len(ci) > bestLen Then
+                Dim pf As Object
+                Set pf = mi.parent
+                If Not pf Is Nothing Then
+                    If Not IsExcludedFolder(pf) Then
+                        Set bestMatch = mi
+                        bestLen = Len(ci)
+                    End If
+                End If
+            End If
+        End If
+    End If
+Children:
+    Dim kids As Object
+    Set kids = conv.GetChildren(node)
+    If kids Is Nothing Then Exit Sub
+    Dim j As Long
+    For j = 1 To kids.count
+        ScanConversationBranch conv, kids.Item(j), parentCI, bestMatch, bestLen
+    Next j
+    Exit Sub
+Skip:
+End Sub
+
+Public Function TryMoveSentItem(ByVal Item As Object, _
+                                Optional ByVal suppressToast As Boolean = False) As Boolean
+    TryMoveSentItem = False
+    On Error GoTo ErrH
+    EnsureInit
+
+    If Not (TypeOf Item Is Outlook.MailItem) Then Exit Function
+
+    Dim mi As Outlook.MailItem
+    Set mi = Item
+
+    ' --- Strategie 1 (v9) : dossier memorise au brouillon (post-it) ---
+    Dim targetFolder As Object
+    Set targetFolder = ResolveMemorizedTarget(mi.ConversationIndex)
+
+    ' --- Strategie 2 (v10) : dossier du fil (index de conversations) ---
+    ' Couvre : post-it perdu (Ctrl+S VBE / redemarrage Outlook), brouillon
+    ' envoye plus tard, envoi depuis un autre appareil (synchro),
+    ' ConversationIndex non derive par certains clients. Ne renvoie que des
+    ' dossiers NON EXCLUS : un fil entierement en Reception ou un mail neuf
+    ' ne donnent rien et la chaine continue (classement par code puis
+    ' prompt, inchanges).
+    If targetFolder Is Nothing Then
+        Set targetFolder = ThreadTargetFolder(mi)
+        If Not targetFolder Is Nothing Then
+            modDebugLog.DInfo MOD_NAME, "Cible via fil : " & targetFolder.FolderPath
+        End If
+    End If
+
+    If targetFolder Is Nothing Then
+        modDebugLog.DTrace MOD_NAME, "TryMoveSentItem : ni post-it ni fil deja classe"
+        Exit Function
+    End If
+
+    TryMoveSentItem = MoveAndNotify(mi, targetFolder, suppressToast)
+    Exit Function
+ErrH:
+    modDebugLog.DError MOD_NAME, "TryMoveSentItem error " & Err.Number & _
+        " - " & Err.Description
+End Function
+
+'=============================================================================
+' ResolveMemorizedTarget - v10 (extraction de la logique v9, inchangee)
+' Match de prefixe ConversationIndex sur les post-its memorises au brouillon
+' (gTargets). Consomme la cle trouvee. Renvoie le dossier cible valide
+' (resolu dans le store par defaut, non exclu) ou Nothing.
+'=============================================================================
+Private Function ResolveMemorizedTarget(ByVal sentCI As String) As Object
+    Set ResolveMemorizedTarget = Nothing
+    On Error GoTo Done
+
+    If gTargets Is Nothing Then Exit Function
+    If gTargets.count = 0 Then Exit Function
+    If Len(sentCI) = 0 Then Exit Function
+
+    Dim bestKey As String
+    Dim bestKeyLen As Long
+    Dim k As Variant
+    bestKey = ""
+    bestKeyLen = 0
+    For Each k In gTargets.Keys
+        If Len(CStr(k)) < Len(sentCI) Then
+            If StrComp(Left(sentCI, Len(CStr(k))), CStr(k), vbBinaryCompare) = 0 Then
+                If Len(CStr(k)) > bestKeyLen Then
+                    bestKey = CStr(k)
+                    bestKeyLen = Len(CStr(k))
+                End If
+            End If
+        End If
+    Next k
+
+    If Len(bestKey) = 0 Then
+        modDebugLog.DTrace MOD_NAME, "ResolveMemorizedTarget : aucun post-it"
+        Exit Function
+    End If
+
+    Dim targetEntryID As String, targetStoreID As String, sepPos As Long
+    targetEntryID = CStr(gTargets(bestKey))
+    ' Pack v3 (C8) : "eid|sid" ; un post-it ancien (eid seul) -> boite par defaut.
+    targetStoreID = gDefaultStoreID
+    sepPos = InStr(targetEntryID, "|")
+    If sepPos > 0 Then
+        targetStoreID = Mid$(targetEntryID, sepPos + 1)
+        targetEntryID = Left$(targetEntryID, sepPos - 1)
+        If Len(targetStoreID) = 0 Then targetStoreID = gDefaultStoreID
+    End If
+
+    ' v12 (Trou A) : NE PAS consommer le post-it avant d'avoir valide le
+    ' dossier. Avant, gTargets.Remove etait appele ici inconditionnellement ;
+    ' si la resolution echouait (GetFolderFromID -> Nothing) ou si le dossier
+    ' etait juge exclu, on renvoyait Nothing MAIS le post-it etait deja
+    ' detruit, forcant le repli fragile ThreadTargetFolder. Desormais on ne
+    ' retire la cle qu'apres avoir confirme un dossier valide et non exclu.
+    If Len(targetEntryID) = 0 Then
+        gTargets.Remove bestKey   ' cle vide : inutile, on la purge
+        Exit Function
+    End If
+
+    Dim ns As Object
+    Set ns = Application.GetNamespace("MAPI")
+    Dim f As Object
+    On Error Resume Next
+    Set f = ns.GetFolderFromID(targetEntryID, targetStoreID)
+    On Error GoTo Done
+    If f Is Nothing Then Exit Function          ' post-it CONSERVE (cible non resolue)
+    If IsExcludedFolder(f) Then Exit Function   ' post-it CONSERVE (dossier exclu)
+
+    ' Cible valide : on consomme le post-it puis on la renvoie.
+    gTargets.Remove bestKey
+    Set ResolveMemorizedTarget = f
+Done:
+End Function
+
+'=============================================================================
+' ThreadTargetFolder - v10
+' Dossier du message DEJA CLASSE le plus recent du meme fil, ou Nothing.
+' "Deja classe" = IsExcludedFolder = False (hors Reception / Envoyes /
+' Brouillons / Indesirables / Supprimes / Boite d'envoi, store par defaut).
+' Mecanique : MailItem.GetConversation -> Conversation.GetTable (index de
+' conversations Exchange : enumeration COTE SERVEUR limitee aux items du
+' fil) - pattern valide en production par modMailResponseTracker v4.5.
+' Erreurs par item non fatales ; garde anti-boucle 500 lignes.
+' PUBLIC : reutilisable (ex. future commande "=" de QuickMove).
+'=============================================================================
+Public Function ThreadTargetFolder(ByVal mi As Object) As Object
+    Set ThreadTargetFolder = Nothing
+    On Error GoTo Done
+    EnsureInit
+
+    Dim conv As Object
+    Set conv = mi.GetConversation
+    If conv Is Nothing Then Exit Function   ' index de conversations indisponible
+
+    Dim tbl As Object
+    Set tbl = conv.GetTable
+    If tbl Is Nothing Then Exit Function
+
+    Dim ns As Object
+    Set ns = Application.GetNamespace("MAPI")
+    Dim storeID As String
+    storeID = mi.Parent.StoreID
+    Dim selfEID As String
+    selfEID = CStr(mi.EntryID)
+
+    Dim bestFolder As Object
+    Dim bestTime As Date
+    Dim guard As Long
+    Dim r As Object
+    Dim eid As String
+    Dim itm As Object
+    Dim pf As Object
+    Dim rt As Date
+
+    Set bestFolder = Nothing
+    bestTime = 0
+    guard = 0
+
+    On Error Resume Next   ' un item capricieux ne tue pas le balayage du fil
+    Do Until tbl.EndOfTable
+        guard = guard + 1
+        If guard > 500 Then Exit Do
+
+        Set r = Nothing
+        Set r = tbl.GetNextRow
+        If r Is Nothing Then Exit Do
+
+        eid = ""
+        eid = CStr(r("EntryID"))
+        If Len(eid) > 0 Then
+            If StrComp(eid, selfEID, vbBinaryCompare) <> 0 Then
+                Set itm = Nothing
+                Set itm = ns.GetItemFromID(eid, storeID)
+                If Not itm Is Nothing Then
+                    If itm.Class = 43 Then          ' 43 = olMail
+                        Set pf = Nothing
+                        Set pf = itm.Parent
+                        If Not pf Is Nothing Then
+                            If Not IsExcludedFolder(pf) Then
+                                ' v12 (Trou B) : ReceivedTime n'existe que pour
+                                ' les mails RECUS ; un mail ENVOYE classe dans
+                                ' le dossier (ex. une relance precedente) a un
+                                ' ReceivedTime vide (0) et n'etait JAMAIS retenu.
+                                ' Un fil compose uniquement de nos propres envois
+                                ' ne fournissait donc aucune cible -> pas de
+                                ' deplacement, pas de toast. On prend une date de
+                                ' repli : SentOn, puis CreationTime, puis
+                                ' LastModificationTime, garantissant > 0.
+                                rt = 0
+                                rt = itm.ReceivedTime
+                                If rt = 0 Then rt = itm.SentOn
+                                If rt = 0 Then rt = itm.CreationTime
+                                If rt = 0 Then rt = itm.LastModificationTime
+                                If rt > bestTime Then
+                                    bestTime = rt
+                                    Set bestFolder = pf
+                                End If
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    Loop
+    On Error GoTo Done
+
+    Set ThreadTargetFolder = bestFolder
+Done:
+End Function
+
+'=============================================================================
+' MoveAndNotify - v10 (extraction de la fin v9 de TryMoveSentItem)
+' Deplace le mail puis notifie (barre d'etat + toast). Renvoie True si le
+' Move a reussi ; les notifications sont en best-effort.
+'=============================================================================
+Private Function MoveAndNotify(ByVal mi As Object, ByVal targetFolder As Object, _
+                               Optional ByVal suppressToast As Boolean = False) As Boolean
+    MoveAndNotify = False
+    On Error GoTo ErrH
+
+    Dim toastFolderName As String
+    Dim targetPath As String
+    toastFolderName = targetFolder.Name
+    targetPath = targetFolder.FolderPath
+
+    mi.Move targetFolder
+    MoveAndNotify = True
+
+    On Error Resume Next
+    ' Pack v3 (A4) : l'ecriture Explorer.StatusBar (propriete inexistante
+    ' dans Outlook, no-op silencieux) est retiree ; le toast fait foi.
+
+    ' Notification toast non bloquante (mshta externe, auto-fermee).
+    ' Supprimee pour le rattrapage de masse (un seul toast resume a la place).
+    If Not suppressToast Then modNotify.NotifyFiled toastFolderName
+
+    modDebugLog.DInfo MOD_NAME, "Range '" & mi.subject & "' -> " & targetPath
+    Exit Function
+ErrH:
+    modDebugLog.DError MOD_NAME, "MoveAndNotify error " & Err.Number & _
+        " - " & Err.Description
+End Function
+
+'=============================================================================
+' CatchUpRecentSent - v11
+' Rattrapage des courriels ENVOYES depuis un autre appareil (iOS) pendant
+' qu'Outlook etait ferme : la synchro differee n'emet aucun ItemAdd, donc
+' TryMoveSentItem n'a jamais ete appele sur ces messages. On balaie les
+' Elements envoyes des dernieres CATCHUP_HOURS et on range ceux dont le fil
+' est deja classe (post-it absent -> repli sur ThreadTargetFolder).
+'
+' Deux phases obligatoires : Item.Move sur Exchange est ASYNCHRONE et fait
+' muter la collection. On COLLECTE d'abord les EntryID (sans deplacer), puis
+' on resout + range par EntryID. Un seul toast resume (suppressToast sur
+' chaque Move) au lieu d'une rafale au demarrage.
+'=============================================================================
+Public Sub CatchUpRecentSent()
+    On Error GoTo ErrH
+    EnsureInit
+
+    Dim ns As Object
+    Set ns = Application.GetNamespace("MAPI")
+    Dim sentFld As Object
+    Set sentFld = ns.GetDefaultFolder(olFolderSentMail)
+    If sentFld Is Nothing Then Exit Sub
+
+    Dim itms As Object
+    Set itms = sentFld.items
+    itms.Sort "[SentOn]", True            ' du plus recent au plus ancien
+
+    Dim cutoff As Date
+    cutoff = Now - (CATCHUP_HOURS / 24#)
+
+    ' --- Phase 1 : collecter les EntryID dans la fenetre (PAS de Move ici) ---
+    Dim eids As Collection
+    Set eids = New Collection
+    Dim itm As Object
+    Set itm = itms.GetFirst
+    Dim guard As Long
+    guard = 0
+    Do While Not itm Is Nothing
+        guard = guard + 1
+        If guard > 3000 Then Exit Do      ' garde-fou volume
+        If TypeOf itm Is Outlook.MailItem Then
+            Dim so As Date
+            so = 0
+            On Error Resume Next
+            so = itm.SentOn
+            On Error GoTo ErrH
+            If so < cutoff Then Exit Do    ' tries par date : plus rien apres
+            eids.Add itm.entryID
+        End If
+        Set itm = itms.GetNext
+    Loop
+
+    If eids.count = 0 Then Exit Sub
+
+    ' --- Phase 2 : ranger ceux dont le fil est deja classe (sans toast/mail) ---
+    Dim filed As Long
+    filed = 0
+    Dim e As Variant
+    For Each e In eids
+        Dim m As Object
+        Set m = Nothing
+        On Error Resume Next
+        Set m = ns.GetItemFromID(CStr(e))
+        On Error GoTo ErrH
+        If Not m Is Nothing Then
+            If TryMoveSentItem(m, True) Then filed = filed + 1
+        End If
+    Next e
+
+    If filed > 0 Then
+        modNotify.Notify T("Rattrapage : ", "Catch-up: ") & filed & _
+            T(" courriel(s) envoy~e(s) rang~e(s).", " sent mail(s) filed.")
+        modDebugLog.DInfo MOD_NAME, "CatchUpRecentSent : " & filed & _
+            " range(s) sur " & eids.count & " candidat(s)"
+    Else
+        modDebugLog.DInfo MOD_NAME, "CatchUpRecentSent : 0 range sur " & _
+            eids.count & " candidat(s)"
+    End If
+    Exit Sub
+ErrH:
+    modDebugLog.DError MOD_NAME, "CatchUpRecentSent error " & Err.Number & _
+        " - " & Err.Description
+End Sub
+
+'=============================================================================
+' IsExcludedFolder - v8
+' Renvoie True si le dossier est :
+'   - hors du store par defaut
+'   - un dossier systeme (Inbox, Sent, Drafts, DeletedItems, Junk, Outbox,
+'     Calendar, Contacts) du store par defaut
+'   - un descendant de Sent / Drafts / DeletedItems / Junk / Outbox
+'
+' v8 : utilise gSysIDsCache (Dictionary EntryID -> True) et gSentRoot/etc.
+' caches dans le module, initialises par EnsureSysCache(). Gain :
+' O(1) au lieu de 13 appels MAPI par invocation. Sur conversation longue
+' (50 noeuds) on passait de 650 appels a quasi-zero.
+'=============================================================================
+Public Function IsExcludedFolder(ByVal f As Object) As Boolean
+    IsExcludedFolder = True
+    On Error GoTo Bad
+    If f Is Nothing Then Exit Function
+
+    ' Pack v3 (C8) : exclusion PAR BOITE (dossiers systeme de la boite du
+    ' dossier teste) ; les dossiers publics restent exclus.
+    Dim sid As String
+    sid = CStr(f.StoreID)
+    If Len(sid) = 0 Then Exit Function
+
+    Dim sysIDs As Object
+    Set sysIDs = SysIDsForStore(sid, f)
+    If sysIDs Is Nothing Then Exit Function   ' boite illisible / publique : defensif
+
+    Dim fid As String
+    fid = f.entryID
+    If Len(fid) > 0 Then
+        If sysIDs.Exists(fid) Then Exit Function
+    End If
+
+    ' Descendance des racines systeme de CETTE boite.
+    Dim types() As String, i As Long
+    types = Split(DESC_TYPES, ",")
+    For i = LBound(types) To UBound(types)
+        If IsDescendantOf(f, RootForStore(sid, CLng(types(i)))) Then Exit Function
+    Next i
+
+    IsExcludedFolder = False
+    Exit Function
+Bad:
+    IsExcludedFolder = True
+End Function
+
+'=============================================================================
+' SysIDsForStore (pack v3) : Dictionary des EntryID systeme d'une boite
+' (calcule une fois par boite et par session). Nothing pour les dossiers
+' publics ou si la boite est illisible.
+'=============================================================================
+Private Function SysIDsForStore(ByVal sid As String, ByVal anyFolder As Object) As Object
+    On Error Resume Next
+    Set SysIDsForStore = Nothing
+    If gSysByStore Is Nothing Then
+        Set gSysByStore = CreateObject("Scripting.Dictionary")
+        gSysByStore.CompareMode = 0
+    End If
+    If gRootsByStore Is Nothing Then
+        Set gRootsByStore = CreateObject("Scripting.Dictionary")
+        gRootsByStore.CompareMode = 0
+    End If
+    If gSysByStore.Exists(sid) Then
+        Set SysIDsForStore = gSysByStore(sid)
+        Exit Function
+    End If
+
+    Dim st As Object
+    Set st = anyFolder.Store
+    If st Is Nothing Then Exit Function
+    Dim stType As Long
+    stType = -1
+    stType = st.ExchangeStoreType
+    If stType = 2 Then Exit Function          ' dossiers publics : jamais cible
+
+    Dim d As Object
+    Set d = CreateObject("Scripting.Dictionary")
+    d.CompareMode = 0
+    Dim types() As String, i As Long, fld As Object, eid As String, tp As Long
+    types = Split(SYS_TYPES, ",")
+    For i = LBound(types) To UBound(types)
+        tp = CLng(types(i))
+        Set fld = Nothing
+        Set fld = st.GetDefaultFolder(tp)
+        If Not fld Is Nothing Then
+            eid = ""
+            eid = fld.entryID
+            If Len(eid) > 0 Then
+                If Not d.Exists(eid) Then d.Add eid, True
+            End If
+            If InStr("," & DESC_TYPES & ",", "," & types(i) & ",") > 0 Then
+                gRootsByStore.Add sid & "|" & tp, fld
+            End If
+        End If
+    Next i
+    gSysByStore.Add sid, d
+    Set SysIDsForStore = d
+    modDebugLog.DDebug MOD_NAME, "SysCache boite (" & d.count & " EntryID systeme) : " & st.DisplayName
+End Function
+
+Private Function RootForStore(ByVal sid As String, ByVal folderType As Long) As Object
+    On Error Resume Next
+    Set RootForStore = Nothing
+    If gRootsByStore Is Nothing Then Exit Function
+    If gRootsByStore.Exists(sid & "|" & folderType) Then Set RootForStore = gRootsByStore(sid & "|" & folderType)
+End Function
+
+Private Function IsDescendantOf(ByVal child As Object, ByVal root As Object) As Boolean
+    IsDescendantOf = False
+    On Error GoTo Done
+    If child Is Nothing Or root Is Nothing Then Exit Function
+    Dim rootID As String
+    rootID = root.entryID
+    If Len(rootID) = 0 Then Exit Function
+    Dim f As Object
+    Set f = child
+    Do While Not f Is Nothing
+        If f.entryID = rootID Then
+            IsDescendantOf = True
+            Exit Function
+        End If
+        On Error Resume Next
+        Set f = f.parent
+        If Err.Number <> 0 Then Exit Do
+        On Error GoTo Done
+        If TypeOf f Is Outlook.folder Then
+        Else
+            Exit Do
+        End If
+    Loop
+Done:
+End Function

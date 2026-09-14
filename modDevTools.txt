@@ -1,0 +1,134 @@
+Option Explicit
+
+' =====================================================================
+' modDevTools v8  (2026-08-22)
+' Purpose (EN): VBA dev utilities. Reinit re-binds all Outlook event
+'   handlers after a VBE recompile (Ctrl+S resets module-level WithEvents),
+'   without restarting Outlook. ReinitSilent is the no-UI-if-OK variant
+'   used by the ThisOutlookSession bindings watchdog.
+'
+' Utilitaires de developpement VBA. Logs via modDebugLog.
+' Reinit rejoue les liaisons d'evenements apres un Ctrl+S dans le VBE
+' (qui remet a zero les WithEvents module-level), sans redemarrer Outlook.
+'
+' v8 (2026-08-22) : revue UX pop-ups.
+'   (a) PrepareForEdit passe en TOAST (modUi.Toast). C'est une confirmation
+'       de routine, sans decision : elle annonce que les timers sont annules
+'       et rappelle de lancer Reinit apres la sauvegarde. Elle bloquait le
+'       fil au moment precis ou l'utilisateur s'appretait a basculer vers le
+'       VBE - le pire moment pour une modale. Le toast, issu d'un processus
+'       mshta separe, reste visible meme apres le passage dans l'editeur,
+'       ce qui sert justement de pense-bete pour le Reinit.
+'   (b) L'erreur Reinit passe par modUi.Fail (garantie de premier plan).
+'       Elle reste MODALE : un rebind rate laisse Outlook sans handlers
+'       d'evenements - plus de classement auto, plus de tag, plus de
+'       coloration - et l'utilisateur doit le savoir avant de continuer a
+'       travailler. C'est exactement le cas ou un toast serait une
+'       regression.
+'   (c) Titres de fenetre passes par T() (ils etaient en dur : "DevTools").
+'   Dependance ajoutee : modUi.
+'
+' v7 (2026-07-05) : PrepareForEdit() - a lancer AVANT d'editer dans le VBE :
+' annule les timers modDefer en attente (un Ctrl+S invalide leurs pointeurs
+' AddressOf -> crash possible a l'echeance). Preventif uniquement : apres
+' le Ctrl+S, la table des timers est deja perdue. Apres l'edition : Reinit.
+' v6 (2026-06-13) : ReinitSilent() pour le watchdog de ThisOutlookSession
+' (auto-reparation pendant un evenement Application_*) : silencieux si le
+' rebind aboutit, alerte AssertBindings conservee si des bindings restent
+' morts ; pas de MsgBox d'erreur en mode silencieux (log seul). Corps
+' commun DoReinit(silentIfOk).
+' v5 (2026-06-10) : Reinit recharge d'abord la config (modConfig.LoadConfig).
+' Un Ctrl+S VBE remet a zero TOUTES les variables module-level, y compris
+' les globales g_* de modConfig : tout module qui les lit en direct
+' fonctionnait sur des valeurs nulles jusqu'au redemarrage d'Outlook.
+' v4 (2026-06-10) : Reinit se termine par une verification REELLE des
+' bindings (modMaintenance.AssertBindings) au lieu d'une MsgBox statique
+' qui affirmait sans verifier. OK -> MsgBoxC auto-fermee 5 s ; KO ->
+' alerte listant les bindings encore morts.
+' (Historique des versions -> CHANGELOG.)
+' =====================================================================
+
+Private Const MOD_NAME As String = "DevTools"
+Private Const MOD_VERSION As String = "v8 - 2026-08-22"
+
+' ---------------------------------------------------------------------
+' ModVersion - version REELLEMENT chargee dans le VBE.
+' ---------------------------------------------------------------------
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+' ---------------------------------------------------------------------
+' UiTitle - titre de fenetre localise (etait en dur "DevTools").
+' ---------------------------------------------------------------------
+Private Function UiTitle() As String
+    UiTitle = T("Outils de d~eveloppement", "Dev tools")
+End Function
+
+Public Sub Reinit()
+    ' Mode manuel (menu Maintenance / VBE) : rapport systematique.
+    DoReinit False
+End Sub
+
+Public Sub ReinitSilent()
+    ' v6 : mode watchdog (appel automatique depuis ThisOutlookSession).
+    ' Aucun rapport si tout est OK apres rebind ; l'alerte AssertBindings
+    ' reste affichee si des bindings sont ENCORE morts apres reparation.
+    DoReinit True
+End Sub
+
+Public Sub PrepareForEdit()
+    ' v7 : a lancer AVANT d'ouvrir/editer le VBE. Tue les timers modDefer
+    ' en attente : un Ctrl+S invalide leurs pointeurs AddressOf (crash
+    ' possible a l'echeance). Apres la sauvegarde : lancer Reinit.
+    On Error Resume Next
+    modDefer.CancelAll
+    modDebugLog.DInfo MOD_NAME, "PrepareForEdit : timers differes annules"
+
+    ' v8 : toast au lieu d'une modale. Reste affiche pendant la bascule
+    ' vers le VBE (processus mshta separe) : sert de pense-bete Reinit.
+    modUi.Toast T("Timers diff~er~es annul~es. Tu peux ~editer le code." & vbLf & _
+                  "Apr~fs la sauvegarde : lancer Reinit.", _
+                  "Deferred timers cancelled. You can edit the code." & vbLf & _
+                  "After saving: run Reinit."), uiInfo, True
+    On Error GoTo 0
+End Sub
+
+Private Sub DoReinit(ByVal silentIfOk As Boolean)
+    On Error GoTo ErrH
+
+    modDebugLog.DInfo MOD_NAME, "Reinit lance (silentIfOk=" & silentIfOk & ")"
+
+    ' v5 : recharger la config AVANT de rebrancher quoi que ce soit
+    ' (les globales g_* sont remises a zero par le meme Ctrl+S qui a
+    ' tue les WithEvents). Couvre tous les lecteurs directs de g_*.
+    modConfig.LoadConfig
+
+    modNewMeetingDefault.InitEvents
+    modReplyInPlace.EnsureInit
+    modProjectTag.InitProjectTag
+    ThisOutlookSession.RebindEvents
+
+    modDebugLog.DInfo MOD_NAME, "Reinit OK"
+
+    ' v4 : verification REELLE post-rebind (remplace la MsgBox statique).
+    modMaintenance.AssertBindings silentIfOk
+    Exit Sub
+
+ErrH:
+    modDebugLog.DError MOD_NAME, "Reinit error " & Err.Number & _
+        " - " & Err.Description
+    If Not silentIfOk Then
+        ' v8 : reste MODAL a dessein - un rebind rate laisse Outlook sans
+        ' handlers (ni classement auto, ni tag, ni coloration). Un toast
+        ' serait une regression ici.
+        modUi.Fail T("Erreur Reinit : ", "Reinit error: ") & Err.Number & _
+                   " - " & Err.Description & vbCrLf & vbCrLf & _
+                   T("Les liaisons d'~ev~enements peuvent ~xtre inactives : " & _
+                     "classement auto, tag et coloration ne fonctionneront pas " & _
+                     "tant qu'Outlook n'aura pas red~emarr~e.", _
+                     "Event bindings may be inactive: auto-filing, tagging and " & _
+                     "colouring will not work until Outlook is restarted."), _
+                   UiTitle()
+    End If
+End Sub

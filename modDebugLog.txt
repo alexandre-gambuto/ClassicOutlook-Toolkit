@@ -1,0 +1,309 @@
+Option Explicit
+
+' =====================================================================
+' modDebugLog v2.1
+' Purpose (EN): centralized file logger shared by all modules. 4 levels
+'   (ERROR/INFO/DEBUG/TRACE), per-module filtering, automatic size rotation.
+'
+' Logger fichier centralise pour tous les modules du projet.
+'
+' v2.1 (2026-07-05) : (a) un seul Open rate ne coupe plus le log pour
+'   toute la session (le fichier vit sous le Bureau OneDrive : un verrou
+'   de synchronisation est souvent TRANSITOIRE) -> suspension apres 3
+'   echecs consecutifs seulement, re-sondage automatique apres 5 min.
+'   (b) perf : verification du dossier 1x/session et test de rotation
+'   1x/50 ecritures (3 acces disque par ligne auparavant).
+'   (c) commentaire d'echo VBE aligne sur le comportement reel.
+'
+' 4 niveaux :
+'   ERROR (0) : erreurs/exceptions
+'   INFO  (1) : evenements metier (RDV decale, mail range, categorie posee)
+'   DEBUG (2) : details pour diagnostic (valeurs intermediaires)
+'   TRACE (3) : trace fine (entree/sortie de fonctions)
+'
+' Controle via 2 mecanismes combines :
+'   1. Niveau global minimal : LOG_GLOBAL_LEVEL dans ce module.
+'      Seuls les messages >= ce niveau sortent.
+'   2. Filtre par module : LOG_ENABLED_MODULES liste des prefixes actifs.
+'      Si vide -> tous actifs. Sinon -> seulement ceux listes.
+'
+' Par defaut : LOG_GLOBAL_LEVEL = ERROR (0) -> seules les erreurs sortent.
+' Pour une session de debug : passer a DEBUG (2) ou TRACE (3).
+'
+' Ecrit dans : <Bureau>\Macro VBA\Outlook\debug.log
+' Rotation automatique a LOG_MAX_SIZE octets : debug.log -> debug.log.old
+'
+' API :
+'   DLog(moduleName, level, msg)    - log unitaire
+'   DError(module, msg)             - raccourci ERROR
+'   DInfo(module, msg)              - raccourci INFO
+'   DDebug(module, msg)             - raccourci DEBUG
+'   DTrace(module, msg)             - raccourci TRACE
+'   DLogSection(title)              - separateur visuel
+'   OpenLog                       - ouvre debug.log dans Notepad
+'   ClearLog                        - remet le fichier a zero
+'   LogFilePath                     - chemin complet
+'   SetGlobalLevel(level)           - change LOG_GLOBAL_LEVEL a chaud
+' =====================================================================
+
+' === Configuration par defaut ===
+' Passer a LOG_DEBUG ou LOG_TRACE pour une session de diagnostic.
+Private m_GlobalLevel As Long   ' initialise au premier appel
+
+' Niveaux (constantes publiques pour que les modules les utilisent)
+Public Const LOG_ERROR As Long = 0
+Public Const LOG_INFO As Long = 1
+Public Const LOG_DEBUG As Long = 2
+Public Const LOG_TRACE As Long = 3
+
+' Rotation : taille max avant rotation (2 Mo)
+Private Const LOG_MAX_SIZE As Long = 2097152
+
+Private Const LOG_FILENAME As String = "debug.log"
+Private Const LOG_FILENAME_OLD As String = "debug.log.old"
+' Pack v3 (D7) : le sous-dossier n'est plus duplique ici ; le chemin vient
+' de modConfig.MacroVBADir() (source unique du "Macro VBA\Outlook").
+Private Const MOD_VERSION As String = "v2.1 - 2026-07-05"
+
+' Liste des modules actifs (vide = tous). Exemple : "AntiChev|NewMeeting"
+Private m_EnabledModules As String
+
+' Anti-spam d'erreurs disque (v2.1). AVANT : un seul Open rate desactivait
+' le log pour TOUTE la session. APRES : suspension apres LOG_FAIL_MAX
+' echecs CONSECUTIFS, puis re-sondage automatique apres LOG_RETRY_MINUTES.
+Private m_LogDisabled As Boolean
+Private m_OpenFailStreak As Long
+Private m_RetryAt As Date
+Private Const LOG_FAIL_MAX As Long = 3
+Private Const LOG_RETRY_MINUTES As Long = 5
+
+' Perf (v2.1) : Dir/MkDir/FileLen a chaque ligne = 3 acces disque par
+' message. Dossier verifie une fois par session ; rotation testee toutes
+' les ROTATION_CHECK_EVERY ecritures (depassement max ~50 lignes).
+Private m_DirEnsured As Boolean
+Private m_WritesSinceCheck As Long
+Private Const ROTATION_CHECK_EVERY As Long = 50
+
+' ---------------------------------------------------------------------
+' Accesseurs de configuration
+' ---------------------------------------------------------------------
+Public Property Get GlobalLevel() As Long
+    GlobalLevel = m_GlobalLevel
+End Property
+
+Public Sub SetGlobalLevel(ByVal level As Long)
+    m_GlobalLevel = level
+    DLog "modDebugLog", LOG_INFO, "GlobalLevel -> " & LevelName(level)
+End Sub
+
+Public Sub SetEnabledModules(ByVal list As String)
+    ' list = "ModA|ModB" pour filtrer, "" pour tout autoriser
+    m_EnabledModules = list
+    DLog "modDebugLog", LOG_INFO, "EnabledModules -> " & _
+         IIf(Len(list) = 0, "(tous)", list)
+End Sub
+
+' ---------------------------------------------------------------------
+' API principale
+' ---------------------------------------------------------------------
+Public Sub DLog(ByVal moduleName As String, ByVal level As Long, _
+                ByVal msg As String)
+    On Error Resume Next
+    If m_LogDisabled Then
+        If Now < m_RetryAt Then Exit Sub
+        ' v2.1 : re-sondage apres suspension (verrou OneDrive transitoire).
+        m_LogDisabled = False
+        m_OpenFailStreak = 0
+        m_DirEnsured = False
+    End If
+    
+    ' Filtre par niveau
+    If level > m_GlobalLevel Then Exit Sub
+    
+    ' Filtre par module (si liste non vide)
+    If Len(m_EnabledModules) > 0 Then
+        If InStr(1, "|" & m_EnabledModules & "|", "|" & moduleName & "|", _
+                 vbTextCompare) = 0 Then
+            Exit Sub
+        End If
+    End If
+    
+    Dim path As String
+    path = LogFilePath()
+    
+    If Not m_DirEnsured Then
+        EnsureLogDir
+        m_DirEnsured = True
+    End If
+    m_WritesSinceCheck = m_WritesSinceCheck - 1
+    If m_WritesSinceCheck <= 0 Then
+        m_WritesSinceCheck = ROTATION_CHECK_EVERY
+        CheckRotation path
+    End If
+    
+    Dim f As Integer
+    f = FreeFile
+    Err.Clear
+    Open path For Append As #f
+    If Err.Number <> 0 Then
+        ' v2.1 : suspension apres LOG_FAIL_MAX echecs consecutifs seulement.
+        m_OpenFailStreak = m_OpenFailStreak + 1
+        If m_OpenFailStreak >= LOG_FAIL_MAX Then
+            m_LogDisabled = True
+            m_RetryAt = DateAdd("n", LOG_RETRY_MINUTES, Now)
+            Debug.Print "[modDebugLog] Log suspendu " & LOG_RETRY_MINUTES & _
+                        " min (Open KO x" & m_OpenFailStreak & ") : " & path
+        End If
+        Err.Clear
+        Exit Sub
+    End If
+    m_OpenFailStreak = 0
+    Print #f, Format(Now, "yyyy-mm-dd hh:nn:ss") & " | " & _
+              LevelShort(level) & " | " & Left(moduleName & "               ", 15) & " | " & msg
+    Close #f
+    
+    ' Echo vers la fenetre Execution du VBE pour ERROR/INFO/DEBUG. TRACE
+    ' est volontairement EXCLU (trop bavard pour le buffer limite de la
+    ' fenetre). (v2.1 : commentaire aligne sur le comportement reel.)
+    If level <= LOG_DEBUG Then
+        Debug.Print "[" & moduleName & "/" & LevelShort(level) & "] " & msg
+    End If
+End Sub
+
+Public Sub DError(ByVal moduleName As String, ByVal msg As String)
+    DLog moduleName, LOG_ERROR, msg
+End Sub
+
+Public Sub DInfo(ByVal moduleName As String, ByVal msg As String)
+    DLog moduleName, LOG_INFO, msg
+End Sub
+
+Public Sub DDebug(ByVal moduleName As String, ByVal msg As String)
+    DLog moduleName, LOG_DEBUG, msg
+End Sub
+
+Public Sub DTrace(ByVal moduleName As String, ByVal msg As String)
+    DLog moduleName, LOG_TRACE, msg
+End Sub
+
+Public Sub DLogSection(ByVal title As String)
+    DLog "system", LOG_INFO, String(60, "=")
+    DLog "system", LOG_INFO, title
+    DLog "system", LOG_INFO, String(60, "=")
+End Sub
+
+' ---------------------------------------------------------------------
+' Utilitaires
+' ---------------------------------------------------------------------
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+Public Function LogFilePath() As String
+    LogFilePath = modConfig.MacroVBADir() & "\" & LOG_FILENAME
+End Function
+
+Private Function LogFilePathOld() As String
+    LogFilePathOld = modConfig.MacroVBADir() & "\" & LOG_FILENAME_OLD
+End Function
+
+Public Sub OpenLog()
+    Dim path As String
+    path = LogFilePath()
+    If Dir(path) = "" Then
+        MsgBox T("Aucun fichier log pour l'instant : ", "No log file yet: ") & path, _
+               vbInformation, "modDebugLog"
+        Exit Sub
+    End If
+    Shell "notepad.exe """ & path & """", vbNormalFocus
+End Sub
+
+Public Sub ClearLog()
+    On Error GoTo ErrH
+    Dim path As String
+    path = LogFilePath()
+    EnsureLogDir
+    Dim f As Integer
+    f = FreeFile
+    Open path For Output As #f
+    Close #f
+    m_LogDisabled = False
+    m_OpenFailStreak = 0
+    m_DirEnsured = False
+    MsgBox T("Log vide : ", "Log cleared: ") & path, vbInformation, "modDebugLog"
+    Exit Sub
+ErrH:
+    MsgBox T("Erreur : ", "Error: ") & Err.Number & " - " & Err.Description, _
+           vbExclamation, "modDebugLog"
+End Sub
+
+' ---------------------------------------------------------------------
+' Commandes rapides (a lancer depuis VBE fenetre Execution)
+' ---------------------------------------------------------------------
+Public Sub LogOff()
+    SetGlobalLevel LOG_ERROR
+End Sub
+
+Public Sub LogInfoMode()
+    SetGlobalLevel LOG_INFO
+End Sub
+
+Public Sub LogDebugMode()
+    SetGlobalLevel LOG_DEBUG
+End Sub
+
+Public Sub LogTraceMode()
+    SetGlobalLevel LOG_TRACE
+End Sub
+
+' ---------------------------------------------------------------------
+' Internes
+' ---------------------------------------------------------------------
+Private Sub EnsureLogDir()
+    On Error Resume Next
+    ' Pack v3 : creation segment par segment du chemin MacroVBADir (parent
+    ' puis sous-dossier), sans dupliquer les noms de dossiers.
+    Dim subDir As String, baseDir As String, p As Long
+    subDir = modConfig.MacroVBADir()
+    p = InStrRev(subDir, "\")
+    If p > 0 Then
+        baseDir = Left$(subDir, p - 1)
+        If Dir(baseDir, vbDirectory) = "" Then MkDir baseDir
+    End If
+    If Dir(subDir, vbDirectory) = "" Then MkDir subDir
+    On Error GoTo 0
+End Sub
+
+Private Sub CheckRotation(ByVal path As String)
+    On Error Resume Next
+    If Dir(path) = "" Then Exit Sub
+    Dim size As Long
+    size = FileLen(path)
+    If size < LOG_MAX_SIZE Then Exit Sub
+    
+    Dim oldPath As String
+    oldPath = LogFilePathOld()
+    If Dir(oldPath) <> "" Then Kill oldPath
+    Name path As oldPath
+    On Error GoTo 0
+End Sub
+
+Private Function LevelName(ByVal level As Long) As String
+    Select Case level
+        Case LOG_ERROR: LevelName = "ERROR"
+        Case LOG_INFO: LevelName = "INFO"
+        Case LOG_DEBUG: LevelName = "DEBUG"
+        Case LOG_TRACE: LevelName = "TRACE"
+        Case Else: LevelName = "LVL" & level
+    End Select
+End Function
+
+Private Function LevelShort(ByVal level As Long) As String
+    Select Case level
+        Case LOG_ERROR: LevelShort = "ERR "
+        Case LOG_INFO: LevelShort = "INFO"
+        Case LOG_DEBUG: LevelShort = "DBG "
+        Case LOG_TRACE: LevelShort = "TRC "
+        Case Else: LevelShort = "????"
+    End Select
+End Function

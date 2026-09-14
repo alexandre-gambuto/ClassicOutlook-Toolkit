@@ -1,0 +1,404 @@
+Option Explicit
+
+'=============================================================================
+' modReplyGreeting v1  (2026-07-09)
+' Purpose (EN): when a Reply draft has exactly ONE recipient in the To field,
+'   inserts a greeting line at the top of the body with the recipient's FIRST
+'   NAME, extracted from the SMTP address (firstname.lastname@domain). If a
+'   mail of the SAME thread was already sent TODAY containing the greeting
+'   word, only "FirstName," is inserted (no repeated greeting within a day).
+'
+' Insere automatiquement "Bonjour Prenom," en tete des reponses quand le
+' champ A ne contient qu'UNE personne. Le prenom est la partie situee avant
+' le premier point de l'adresse SMTP (prenom.nom@domaine). Si un mail du
+' MEME fil a deja ete envoye AUJOURD'HUI avec le mot de salutation, seul
+' "Prenom," est insere (pas de double Bonjour dans la journee).
+'
+' DECLENCHEMENT : relaye par clsAppEvents (NewInspector + InlineResponse),
+' comme modReplyInPlace. L'insertion reelle est DIFFEREE de ~1 s via
+' modDefer (cle "ReplyGreeting") : au moment de l'evenement, l'editeur
+' Word du brouillon (signature comprise) n'est pas encore pret.
+'
+' PERIMETRE / EXCLUSIONS :
+'   - Reponses uniquement. Un transfert (Forward) s'ouvre avec 0
+'     destinataire -> exclu naturellement par la regle "exactement 1 A".
+'   - Reponse a tous avec plusieurs A -> exclue. Les CC sont ignores.
+'   - Adresse sans forme prenom.nom (contact@, noreply@, j.dupont@,
+'     token avec chiffres) -> aucune insertion (trace DEBUG).
+'   - Reponse a soi-meme -> exclue.
+'   - Anti double insertion : si le prenom figure deja en tete du corps
+'     (inline puis pop-out, double evenement), on ne reinsere pas.
+'
+' CONFIG (config.ini) :
+'   GreetingEnabled = 1|0  (defaut 1)
+'   GreetingWord    = mot de salutation. Vide = suit la langue de
+'                     l'interface (Bonjour si FR, Hello si EN).
+'
+' NB : l'insertion marque le brouillon comme modifie ; fermer une reponse
+' sans l'envoyer declenchera la question "Enregistrer ?" d'Outlook.
+'=============================================================================
+
+Private Const MOD_NAME As String = "ReplyGreet"
+Private Const MOD_VERSION As String = "v1 - 2026-07-09"
+
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+' Adresse SMTP propre (cache session) pour exclure les reponses a soi-meme.
+
+'=============================================================================
+' OnNewInspector / OnInlineResponse - relais depuis clsAppEvents.
+' Valident le brouillon puis arment l'insertion differee (~1 s).
+'=============================================================================
+Public Sub OnNewInspector(ByVal Inspector As Object)
+    On Error GoTo ErrH
+    If Inspector Is Nothing Then Exit Sub
+    If Not modConfig.CfgB("GreetingEnabled", True) Then Exit Sub
+    If Not IsReplyCandidate(Inspector.CurrentItem) Then Exit Sub
+    modDefer.Arm "ReplyGreeting", 1, "insp"
+    Exit Sub
+ErrH:
+    modDebugLog.DError MOD_NAME, "OnNewInspector error " & Err.Number & _
+        " - " & Err.Description
+End Sub
+
+Public Sub OnInlineResponse(ByVal Item As Object)
+    On Error GoTo ErrH
+    If Item Is Nothing Then Exit Sub
+    If Not modConfig.CfgB("GreetingEnabled", True) Then Exit Sub
+    If Not IsReplyCandidate(Item) Then Exit Sub
+    modDefer.Arm "ReplyGreeting", 1, "inline"
+    Exit Sub
+ErrH:
+    modDebugLog.DError MOD_NAME, "OnInlineResponse error " & Err.Number & _
+        " - " & Err.Description
+End Sub
+
+'=============================================================================
+' InsertGreetingDeferred - cible modDefer (cle "ReplyGreeting").
+' source = "insp" (fenetre) ou "inline" (volet de lecture). Le brouillon
+' est re-resolu au moment de l'echeance (pas de reference stockee : plus
+' sur vis-a-vis des resets d'etat VBE).
+'=============================================================================
+Public Sub InsertGreetingDeferred(ByVal source As String)
+    On Error GoTo ErrH
+    If Not modConfig.CfgB("GreetingEnabled", True) Then Exit Sub
+
+    Dim mi As Object
+    Dim wd As Object
+    Set mi = Nothing
+    Set wd = Nothing
+
+    On Error Resume Next
+    If source = "inline" Then
+        If Not Application.ActiveExplorer Is Nothing Then
+            Set mi = Application.ActiveExplorer.ActiveInlineResponse
+            Set wd = Application.ActiveExplorer.ActiveInlineResponseWordEditor
+        End If
+    Else
+        If Not Application.ActiveInspector Is Nothing Then
+            Set mi = Application.ActiveInspector.CurrentItem
+            Set wd = Application.ActiveInspector.WordEditor
+        End If
+    End If
+    On Error GoTo ErrH
+
+    If mi Is Nothing Or wd Is Nothing Then
+        modDebugLog.DDebug MOD_NAME, "Brouillon/editeur introuvable a l'echeance (" & source & ")"
+        Exit Sub
+    End If
+    If Not IsReplyCandidate(mi) Then Exit Sub
+
+    ' --- Destinataire unique -> SMTP -> prenom ---
+    Dim smtp As String
+    smtp = SingleToSmtp(mi)
+    If Len(smtp) = 0 Then
+        modDebugLog.DDebug MOD_NAME, "SMTP destinataire non resolu"
+        Exit Sub
+    End If
+    If LCase$(smtp) = LCase$(MySmtp()) Then Exit Sub    ' reponse a soi-meme
+
+    ' Pack v3 (C18) : prenom lu dans l'annuaire Exchange (GetExchangeUser.
+    ' FirstName) quand le destinataire y figure - fiable, couvre les adresses
+    ' sans forme prenom.nom ; la deduction depuis l'adresse reste le repli.
+    Dim firstName As String
+    firstName = GalFirstName(mi)
+    If Len(firstName) = 0 Then firstName = FirstNameFromSmtp(smtp)
+    If Len(firstName) = 0 Then
+        modDebugLog.DDebug MOD_NAME, "Pas de prenom (annuaire / forme prenom.nom) : " & smtp
+        Exit Sub
+    End If
+
+    ' --- Anti double insertion (inline puis pop-out, double evenement) ---
+    Dim bodyHead As String
+    On Error Resume Next
+    bodyHead = Left$(mi.Body, 80)
+    On Error GoTo ErrH
+    If InStr(1, bodyHead, firstName & ",", vbTextCompare) > 0 Then Exit Sub
+
+    ' --- Bonjour ou prenom seul (deja salue aujourd'hui dans ce fil ?) ---
+    Dim greetWord As String
+    greetWord = Trim$(modConfig.Cfg("GreetingWord", ""))
+    If Len(greetWord) = 0 Then greetWord = modConfig.T("Bonjour", "Hello")
+
+    Dim greetLine As String
+    If GreetedTodayInThread(Left$(mi.ConversationIndex, 44), greetWord) Then
+        greetLine = firstName & ","
+    Else
+        greetLine = greetWord & " " & firstName & ","
+    End If
+
+    ' --- Insertion en tete via l'editeur Word, curseur sous la salutation ---
+    Dim rng As Object
+    Set rng = wd.Range(0, 0)
+    rng.InsertBefore greetLine & vbCr & vbCr
+    On Error Resume Next
+    wd.Application.Selection.SetRange rng.End, rng.End
+    On Error GoTo ErrH
+
+    modDebugLog.DInfo MOD_NAME, "Insere '" & greetLine & "' (" & source & ")"
+    Exit Sub
+ErrH:
+    modDebugLog.DError MOD_NAME, "InsertGreetingDeferred error " & Err.Number & _
+        " - " & Err.Description
+End Sub
+
+'=============================================================================
+' IsReplyCandidate - brouillon neuf (EntryID vide), enfant d'un fil
+' (ConversationIndex > 44 chars, meme test que modReplyInPlace), avec
+' EXACTEMENT un destinataire dans le champ A (les CC sont ignores).
+'=============================================================================
+Private Function IsReplyCandidate(ByVal itm As Object) As Boolean
+    IsReplyCandidate = False
+    On Error GoTo Done
+    If itm Is Nothing Then Exit Function
+    If Not (TypeOf itm Is Outlook.MailItem) Then Exit Function
+
+    Dim mi As Outlook.MailItem
+    Set mi = itm
+    If Len(mi.entryID) > 0 Then Exit Function
+    If Len(mi.ConversationIndex) <= 44 Then Exit Function
+    If CountToRecipients(mi) <> 1 Then Exit Function
+
+    IsReplyCandidate = True
+Done:
+End Function
+
+Private Function CountToRecipients(ByVal mi As Object) As Long
+    CountToRecipients = 0
+    On Error GoTo Done
+    Dim r As Object
+    Dim nb As Long
+    nb = 0
+    For Each r In mi.Recipients
+        If r.Type = 1 Then nb = nb + 1      ' 1 = olTo
+    Next r
+    CountToRecipients = nb
+Done:
+End Function
+
+'=============================================================================
+' SingleToSmtp - adresse SMTP du (seul) destinataire A. Resout les adresses
+' Exchange (type EX) via PR_SMTP_ADDRESS puis GetExchangeUser en repli.
+' Appel unique par reponse : pas d'enjeu de throttling.
+'=============================================================================
+Private Function SingleToSmtp(ByVal mi As Object) As String
+    SingleToSmtp = ""
+    On Error GoTo Done
+    Const PR_SMTP As String = "http://schemas.microsoft.com/mapi/proptag/0x39FE001F"
+
+    Dim r As Object
+    Dim toRecip As Object
+    Set toRecip = Nothing
+    For Each r In mi.Recipients
+        If r.Type = 1 Then
+            Set toRecip = r
+            Exit For
+        End If
+    Next r
+    If toRecip Is Nothing Then Exit Function
+
+    Dim addr As String
+    addr = ""
+    On Error Resume Next
+    addr = toRecip.Address
+    On Error GoTo Done
+
+    If InStr(addr, "@") > 0 Then
+        SingleToSmtp = addr
+        Exit Function
+    End If
+
+    ' Adresse Exchange (EX) : resolution SMTP
+    On Error Resume Next
+    Dim ae As Object
+    Set ae = toRecip.AddressEntry
+    If Not ae Is Nothing Then
+        addr = ae.PropertyAccessor.GetProperty(PR_SMTP)
+        If InStr(addr, "@") = 0 Then
+            Dim exu As Object
+            Set exu = ae.GetExchangeUser
+            If Not exu Is Nothing Then addr = exu.PrimarySmtpAddress
+        End If
+    End If
+    On Error GoTo Done
+    If InStr(addr, "@") > 0 Then SingleToSmtp = addr
+Done:
+End Function
+
+'=============================================================================
+' MySmtp - adresse SMTP du compte courant (cache session), pour exclure
+' les reponses a soi-meme.
+'=============================================================================
+Private Function MySmtp() As String
+    ' Pack v3 (C2/B8) : identite mise en cache par modSmtp.
+    MySmtp = modSmtp.MySmtp()
+End Function
+
+'=============================================================================
+' GalFirstName (pack v3 - C18) - prenom du (seul) destinataire A depuis
+' l'annuaire Exchange (AddressEntry.GetExchangeUser.FirstName), "" sinon.
+' Capitalisation conservee telle que dans l'annuaire ; chiffres refuses.
+'=============================================================================
+Private Function GalFirstName(ByVal mi As Object) As String
+    GalFirstName = ""
+    On Error Resume Next
+    Dim r As Object, toRecip As Object
+    For Each r In mi.Recipients
+        If r.Type = 1 Then
+            Set toRecip = r
+            Exit For
+        End If
+    Next r
+    If toRecip Is Nothing Then Exit Function
+    Dim ae As Object, exu As Object, fn As String
+    Set ae = toRecip.AddressEntry
+    If ae Is Nothing Then Exit Function
+    Set exu = ae.GetExchangeUser
+    If exu Is Nothing Then Exit Function
+    fn = Trim$(CStr(exu.FirstName))
+    If Len(fn) < 2 Then Exit Function
+    Dim i As Long
+    For i = 1 To Len(fn)
+        If Mid$(fn, i, 1) Like "#" Then Exit Function
+    Next i
+    GalFirstName = fn
+End Function
+
+'=============================================================================
+' FirstNameFromSmtp - extrait le prenom d'une adresse prenom.nom@domaine.
+' Renvoie "" si la forme ne colle pas : pas de point avant l'arobase,
+' token < 2 caracteres (initiale type j.dupont), token contenant un
+' chiffre. Capitalise chaque segment separe par un tiret
+' (jean-pierre.durand@ -> Jean-Pierre).
+'=============================================================================
+Private Function FirstNameFromSmtp(ByVal smtp As String) As String
+    FirstNameFromSmtp = ""
+    On Error GoTo Done
+
+    Dim p As Long
+    p = InStr(smtp, "@")
+    If p < 2 Then Exit Function
+
+    Dim localPart As String
+    localPart = Left$(smtp, p - 1)
+
+    Dim q As Long
+    q = InStr(localPart, ".")
+    If q < 3 Then Exit Function             ' pas de point, ou initiale seule
+
+    Dim tok As String
+    tok = LCase$(Left$(localPart, q - 1))
+
+    Dim i As Long
+    For i = 1 To Len(tok)
+        If Mid$(tok, i, 1) Like "#" Then Exit Function
+    Next i
+
+    ' Capitalisation par segment (tirets conserves : jean-pierre -> Jean-Pierre)
+    Dim parts() As String
+    parts = Split(tok, "-")
+    For i = LBound(parts) To UBound(parts)
+        If Len(parts(i)) > 0 Then
+            parts(i) = UCase$(Left$(parts(i), 1)) & Mid$(parts(i), 2)
+        End If
+    Next i
+
+    FirstNameFromSmtp = Join(parts, "-")
+Done:
+End Function
+
+'=============================================================================
+' GreetedTodayInThread - True si un mail du MEME fil (44 premiers chars du
+' ConversationIndex) a deja ete ENVOYE AUJOURD'HUI avec le mot de
+' salutation dans SA partie redigee (le corps est tronque au premier
+' marqueur de citation pour ne pas compter le "Bonjour" de l'interlocuteur
+' dans le fil cite). Items.Restrict sur [SentOn] (format date US en dur,
+' cf. piege DASL), garde-fou 300 items.
+'=============================================================================
+Private Function GreetedTodayInThread(ByVal threadKey As String, _
+                                      ByVal greetWord As String) As Boolean
+    GreetedTodayInThread = False
+    On Error GoTo Done
+    If Len(threadKey) < 44 Then Exit Function
+
+    Dim ns As Object
+    Set ns = Application.GetNamespace("MAPI")
+    Dim sentFld As Object
+    Set sentFld = ns.GetDefaultFolder(olFolderSentMail)
+    If sentFld Is Nothing Then Exit Function
+
+    Dim filterStr As String
+    filterStr = "[SentOn] >= '" & Month(Date) & "/" & Day(Date) & "/" & _
+                Year(Date) & " 12:00 AM'"
+
+    Dim itms As Object
+    Set itms = sentFld.items.Restrict(filterStr)
+
+    Dim itm As Object
+    Dim guard As Long
+    guard = 0
+    For Each itm In itms
+        guard = guard + 1
+        If guard > 300 Then Exit For
+        If TypeOf itm Is Outlook.MailItem Then
+            If Left$(itm.ConversationIndex, 44) = threadKey Then
+                If InStr(1, OwnTextHead(itm), greetWord, vbTextCompare) > 0 Then
+                    GreetedTodayInThread = True
+                    Exit Function
+                End If
+            End If
+        End If
+    Next itm
+Done:
+End Function
+
+'=============================================================================
+' OwnTextHead - debut de la partie REDIGEE d'un mail envoye : le corps est
+' tronque au premier marqueur de citation ("De :", "From:",
+' "-----Message d'origine") puis plafonne a 400 caracteres.
+'=============================================================================
+Private Function OwnTextHead(ByVal itm As Object) As String
+    OwnTextHead = ""
+    On Error GoTo Done
+
+    Dim body As String
+    body = Left$(itm.body, 2000)
+
+    Dim cutPos As Long
+    cutPos = Len(body) + 1
+
+    Dim markers As Variant
+    markers = Array("De :", "From:", "-----")
+    Dim i As Long
+    Dim p As Long
+    For i = LBound(markers) To UBound(markers)
+        p = InStr(1, body, CStr(markers(i)), vbBinaryCompare)
+        If p > 0 And p < cutPos Then cutPos = p
+    Next i
+
+    If cutPos > 400 Then cutPos = 400
+    OwnTextHead = Left$(body, cutPos - 1)
+Done:
+End Function

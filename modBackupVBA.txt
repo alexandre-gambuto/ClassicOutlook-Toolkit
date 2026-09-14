@@ -1,0 +1,261 @@
+Option Explicit
+
+'=============================================================================
+' modBackupVBA (v3 - 2026-08-22)
+'
+' v3 (2026-08-22) : revue UX pop-ups + traduction.
+'   (a) Le recapitulatif de SUCCES passe en toast : aucune decision a
+'       prendre. Le chemin complet et les details (taille, duree) partent
+'       dans debug.log. Les ECHECS (OTM introuvable, dossier non creable,
+'       copie ratee, copie non materialisee) restent MODAUX a dessein - un
+'       backup qui n'a pas eu lieu doit etre vu.
+'   (b) Le titre de fenetre "Backup VBA Outlook" etait en dur a 7 endroits :
+'       factorise dans UiTitle() et passe par T().
+'   (c) MOD_VERSION / ModVersion ajoutes (le module n'en avait pas).
+'   Dependance ajoutee : modUi.
+'
+' v2
+' Purpose (EN): backs up VbaProject.OTM (the whole Outlook VBA environment:
+'   modules, classes, UserForms, references) into a timestamped subfolder of
+'   the Desktop. BackupVBA is interactive (confirmation + result MsgBox);
+'   BackupVBASilent runs quietly (used at startup). Note: do Ctrl+S in the
+'   VBE first so the latest unsaved edits are included in the copy.
+'
+' Sauvegarde le fichier VbaProject.OTM (qui contient TOUT l'environnement
+' VBA Outlook : modules, classes, UserForms, references) dans :
+'     Bureau\Macro VBA\Outlook\Sauvegardes\
+'
+' Nom du backup : VbaProject_YYYY-MM-DD_HH-MM-SS.otm
+'
+' Points d'entree publics :
+'   - BackupVBA       : sauvegarde interactive (MsgBox a la fin)
+'   - BackupVBASilent : sauvegarde silencieuse (pas de MsgBox en cas de succes)
+'
+' IMPORTANT : le fichier source est VbaProject.OTM ouvert par Outlook.
+' La copie est faite via Scripting.FileSystemObject qui accepte la lecture
+' partagee, mais pour que les DERNIERES modifications non sauvees (dans VBE)
+' soient prises en compte, il faut avoir fait Ctrl+S dans l'editeur VBA
+' avant de lancer la macro.
+'
+'=============================================================================
+
+Private Const MOD_NAME As String = "BackupVBA"
+Private Const MOD_VERSION As String = "v3 - 2026-08-22"
+
+' Sous-dossier de backup, relatif au Bureau
+' Pack v3 (D11) : relatif a modConfig.MacroVBADir() (plus de segment duplique).
+Private Const BACKUP_SUBDIR As String = "Sauvegardes"
+Private Const OTM_NAME As String = "VbaProject.OTM"
+
+'=============================================================================
+' Point d'entree principal (interactif)
+'=============================================================================
+
+'=============================================================================
+' ModVersion - version REELLEMENT chargee dans le VBE.
+'=============================================================================
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+'=============================================================================
+' UiTitle - titre de fenetre localise (etait en dur "Backup VBA Outlook").
+'=============================================================================
+Private Function UiTitle() As String
+    UiTitle = T("Backup VBA Outlook", "Outlook VBA backup")
+End Function
+
+Public Sub BackupVBA()
+    Dim destFile As String
+    Dim okMsg As String
+    Dim destDir As String
+
+    On Error GoTo ErrHandler
+
+    ' Modal explicatif avant lancement (annulable).
+    destDir = modConfig.MacroVBADir() & "\" & BACKUP_SUBDIR
+    If MsgBox( _
+        T("Sauvegarde VBA (legere).", "VBA backup (lightweight).") & vbCrLf & vbCrLf & _
+        T("Sauvegarde uniquement VbaProject.OTM (ton code VBA,", "Backs up only VbaProject.OTM (your VBA code,") & vbCrLf & _
+        T("un seul fichier), dans un dossier horodate.", "a single file), into a timestamped folder.") & vbCrLf & _
+        T("Le filet rapide avant de modifier du code.", "The quick safety net before editing code.") & vbCrLf & vbCrLf & _
+        T("Destination :", "Destination:") & vbCrLf & destDir & vbCrLf & vbCrLf & _
+        T("Pense a faire Ctrl+S dans VBE avant, pour inclure", "Do Ctrl+S in the VBE first, to include") & vbCrLf & _
+        T("tes dernieres modifications non enregistrees.", "your latest unsaved changes.") & vbCrLf & vbCrLf & _
+        T("Lancer la sauvegarde ?", "Run the backup?"), _
+        vbQuestion + vbOKCancel + vbDefaultButton1, _
+        UiTitle()) <> vbOK Then
+        Exit Sub
+    End If
+
+    destFile = DoBackup(okMsg)
+    If Len(destFile) = 0 Then Exit Sub   ' erreur deja signalee
+
+    ' v3 : recapitulatif en toast - aucune decision a prendre. Le chemin
+    ' complet et les details (taille, duree) partent dans debug.log.
+    modDebugLog.DInfo MOD_NAME, "Backup OK : " & destFile & " | " & _
+        Replace(okMsg, vbCrLf, " | ")
+    modUi.Toast T("Sauvegarde VBA effectu~ee.", "VBA backup done."), uiSuccess, True
+    Exit Sub
+
+ErrHandler:
+    modDebugLog.DError MOD_NAME, "BackupVBA err " & Err.Number & " - " & Err.Description
+    MsgBox T("Erreur : ", "Error: ") & Err.Number & " - " & Err.Description, _
+           vbExclamation, UiTitle()
+End Sub
+
+'=============================================================================
+' Variante silencieuse (pas de MsgBox en cas de succes)
+'=============================================================================
+Public Sub BackupVBASilent()
+    Dim destFile As String
+    Dim okMsg As String
+
+    On Error Resume Next
+    destFile = DoBackup(okMsg)
+    If Len(destFile) > 0 Then
+        modDebugLog.DInfo MOD_NAME, "BackupVBASilent OK : " & destFile
+    Else
+        modDebugLog.DError MOD_NAME, "BackupVBASilent ECHEC"
+    End If
+    On Error GoTo 0
+End Sub
+
+'=============================================================================
+' Coeur : copie VbaProject.OTM vers le dossier de backup horodate.
+' Renvoie le chemin complet du fichier cree, ou "" en cas d'echec.
+' En sortie, okMsg contient des details (taille, duree) pour la MsgBox.
+'=============================================================================
+Private Function DoBackup(ByRef okMsg As String) As String
+    DoBackup = ""
+    okMsg = ""
+
+    ' --- 1. Trouver le VbaProject.OTM source ---
+    Dim srcPath As String
+    srcPath = GetOtmPath()
+    If Len(srcPath) = 0 Then
+        modDebugLog.DError MOD_NAME, "VbaProject.OTM introuvable dans %APPDATA%\Microsoft\Outlook"
+        MsgBox T("Fichier VbaProject.OTM introuvable dans %APPDATA%\Microsoft\Outlook.", "VbaProject.OTM file not found in %APPDATA%\Microsoft\Outlook."), _
+               vbExclamation, UiTitle()
+        Exit Function
+    End If
+
+    ' --- 2. Preparer le dossier de destination (v2 : via modConfig.DesktopPath) ---
+    Dim backupDir As String
+    backupDir = modConfig.MacroVBADir() & "\" & BACKUP_SUBDIR
+    If Not EnsureFolderRec(backupDir) Then
+        modDebugLog.DError MOD_NAME, "Impossible de creer " & backupDir
+        MsgBox T("Impossible de cr~eer le dossier de sauvegarde :", "Cannot create the backup folder:") & vbCrLf & _
+               backupDir, vbExclamation, UiTitle()
+        Exit Function
+    End If
+
+    ' --- 3. Nom du fichier destination horodate ---
+    Dim stamp As String
+    stamp = Format(Now, "YYYY-MM-DD_HH-NN-SS")
+    Dim destPath As String
+    destPath = backupDir & "\VbaProject_" & stamp & ".otm"
+
+    ' --- 4. Copie ---
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    Dim t0 As Double
+    t0 = Timer
+
+    On Error Resume Next
+    fso.CopyFile srcPath, destPath, True
+    If Err.Number <> 0 Then
+        Dim errDesc As String
+        errDesc = Err.Description
+        On Error GoTo 0
+        modDebugLog.DError MOD_NAME, "Echec copie " & srcPath & " -> " & destPath & " : " & errDesc
+        MsgBox T("~Echec de la copie :", "Copy failed:") & vbCrLf & errDesc & vbCrLf & vbCrLf & _
+               T("Source : ", "Source: ") & srcPath & vbCrLf & _
+               T("Dest : ", "Dest: ") & destPath, vbExclamation, UiTitle()
+        Exit Function
+    End If
+    On Error GoTo 0
+
+    ' --- 5. Verification et message recap ---
+    If Not fso.FileExists(destPath) Then
+        modDebugLog.DError MOD_NAME, "Copie materialisee absente : " & destPath
+        MsgBox T("La copie ne s'est pas materialisee :", "The copy did not materialize:") & vbCrLf & destPath, _
+               vbExclamation, UiTitle()
+        Exit Function
+    End If
+
+    Dim sizeKb As Long
+    sizeKb = CLng(fso.GetFile(destPath).size / 1024)
+    Dim dur As Double
+    dur = Timer - t0
+
+    okMsg = T("Taille : ", "Size: ") & Format(sizeKb, "#,##0") & T(" Ko", " KB") & vbCrLf & _
+            T("Duree : ", "Duration: ") & Format(dur, "0.00") & " s" & vbCrLf & vbCrLf & _
+            T("Conseil : avant tout refactor important, faire Ctrl+S dans", "Tip: before any major refactor, do Ctrl+S in") & vbCrLf & _
+            T("l'editeur VBA puis relancer cette sauvegarde.", "the VBA editor then run this backup again.")
+
+    modDebugLog.DInfo MOD_NAME, "Backup OK : " & destPath & " (" & sizeKb & " Ko, " & Format(dur, "0.00") & "s)"
+    DoBackup = destPath
+End Function
+
+'=============================================================================
+' Localise le VbaProject.OTM dans %APPDATA%\Microsoft\Outlook
+'=============================================================================
+Private Function GetOtmPath() As String
+    Dim candidate As String
+    candidate = modConfig.AppDataOutlookPath() & "\" & OTM_NAME
+
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    If fso.FileExists(candidate) Then
+        GetOtmPath = candidate
+    Else
+        GetOtmPath = ""
+    End If
+End Function
+
+'=============================================================================
+' Cree un dossier (et ses parents) si besoin. Renvoie True si OK.
+' v2 : renomme EnsureFolderRec pour eviter tout conflit avec un eventuel
+' EnsureFolder defini dans modBackupAuto (les deux modules ont leur propre
+' helper d'arborescence, on conserve la duplication intentionnelle).
+'=============================================================================
+Private Function EnsureFolderRec(ByVal path As String) As Boolean
+    EnsureFolderRec = False
+    If Len(path) = 0 Then Exit Function
+
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    On Error Resume Next
+
+    If fso.FolderExists(path) Then
+        EnsureFolderRec = True
+        Exit Function
+    End If
+
+    ' Creation recursive via accumulation depuis la racine
+    Dim parts() As String
+    parts = Split(path, "\")
+
+    Dim acc As String
+    Dim i As Long
+    acc = parts(0)   ' exemple : "C:"
+    For i = 1 To UBound(parts)
+        If Len(parts(i)) > 0 Then
+            acc = acc & "\" & parts(i)
+            If Not fso.FolderExists(acc) Then
+                fso.CreateFolder acc
+                If Err.Number <> 0 Then
+                    Err.Clear
+                    On Error GoTo 0
+                    Exit Function
+                End If
+            End If
+        End If
+    Next i
+
+    EnsureFolderRec = fso.FolderExists(path)
+    On Error GoTo 0
+End Function

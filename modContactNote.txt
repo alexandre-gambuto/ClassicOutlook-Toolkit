@@ -1,0 +1,109 @@
+Option Explicit
+
+'=============================================================================
+' modContactNote v1.0  (2026-08-20)
+' Purpose (EN): per-person journal. ContactAddNote prepends a dated entry
+'   ("[dd/mm/yyyy] text") under a "=== JOURNAL ===" section at the TOP of the
+'   Notes of the selected (explorer) or open (inspector) contact card. The
+'   section is created on first use; everything below (archived signatures,
+'   old notes) is preserved. The card is saved immediately.
+'
+' Journal par personne : ContactAddNote ajoute une entree datee en tete d'une
+' section "=== JOURNAL ===" dans les notes de la fiche contact selectionnee
+' (explorateur) ou ouverte (inspecteur). La section est creee au premier
+' usage ; tout ce qui est dessous (signatures archivees, anciennes notes)
+' est conserve. La fiche est ENREGISTREE aussitot (ajout pur, rien d'ecrase),
+' et la note se synchronise partout ou la fiche se synchronise (iPhone...).
+'
+' SUB PUBLIQUE (epinglable au QAT / ruban) : ContactAddNote
+'
+' Dependances : modConfig (T, A), modDebugLog, modCommon (SetStatus).
+' Aucune cle config.ini.
+'=============================================================================
+
+Private Const MOD_NAME As String = "ContNote"
+Private Const MOD_VERSION As String = "v1.0 - 2026-08-20"
+
+' Marqueur de section (fonctionnel, hors T() : identique dans les 2 langues).
+Private Const JOURNAL_MARK As String = "=== JOURNAL ==="
+
+'=============================================================================
+' ModVersion - version REELLEMENT chargee dans le VBE.
+'=============================================================================
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+'=============================================================================
+' ContactAddNote  (epinglable au QAT / ruban)
+'=============================================================================
+Public Sub ContactAddNote()
+    Dim errNo As Long, errDesc As String
+    On Error GoTo ErrH
+
+    Dim ct As Outlook.ContactItem
+    Set ct = SourceContact()
+    If ct Is Nothing Then
+        MsgBox T("S~electionne ou ouvre d'abord une fiche contact.", _
+                 "Select or open a contact card first."), vbInformation, UiTitle()
+        Exit Sub
+    End If
+
+    Dim txt As String
+    txt = Trim$(InputBox(T("Note pour ", "Note for ") & ct.FullName & " :" & vbCrLf & vbCrLf & _
+                         T("(ajout~ee dat~ee en t~xte du journal de la fiche)", _
+                           "(added with today's date at the top of the card's journal)"), UiTitle()))
+    If Len(txt) = 0 Then Exit Sub
+
+    Dim entry As String, body As String, pos As Long
+    entry = "[" & Format$(Date, "dd/mm/yyyy") & "] " & txt
+    body = ct.Body
+    pos = InStr(1, body, JOURNAL_MARK, vbTextCompare)
+    If pos > 0 Then
+        ' Insertion juste sous la ligne du marqueur existant.
+        body = Left$(body, pos + Len(JOURNAL_MARK) - 1) & vbCrLf & entry & _
+               Mid$(body, pos + Len(JOURNAL_MARK))
+    Else
+        body = JOURNAL_MARK & vbCrLf & entry & vbCrLf & _
+               IIf(Len(Trim$(body)) > 0, vbCrLf & body, "")
+    End If
+    ct.Body = body
+    ct.Save
+
+    modDebugLog.DInfo MOD_NAME, "Note ajoutee : " & ct.FullName
+    modCommon.SetStatus MOD_NAME, T("Note ajout~ee ~a la fiche ", "Note added to the card of ") & ct.FullName
+    Exit Sub
+ErrH:
+    errNo = Err.Number
+    errDesc = Err.Description
+    On Error Resume Next
+    modDebugLog.DError MOD_NAME, "ContactAddNote err " & errNo & " - " & errDesc
+    MsgBox T("Erreur : ", "Error: ") & errNo & " - " & errDesc, vbExclamation, UiTitle()
+End Sub
+
+'=============================================================================
+' Fiche source : inspecteur ouvert, sinon selection de l'explorateur.
+'=============================================================================
+Private Function SourceContact() As Outlook.ContactItem
+    On Error Resume Next
+    Dim insp As Outlook.Inspector
+    Set insp = Application.ActiveInspector
+    If Not insp Is Nothing Then
+        If TypeName(insp.CurrentItem) = "ContactItem" Then
+            Set SourceContact = insp.CurrentItem
+            Exit Function
+        End If
+    End If
+    Dim sel As Outlook.Selection
+    Set sel = Application.ActiveExplorer.Selection
+    If Not sel Is Nothing Then
+        If sel.Count >= 1 Then
+            If TypeName(sel.Item(1)) = "ContactItem" Then Set SourceContact = sel.Item(1)
+        End If
+    End If
+    Err.Clear
+End Function
+
+Private Function UiTitle() As String
+    UiTitle = T("Note contact", "Contact note")
+End Function

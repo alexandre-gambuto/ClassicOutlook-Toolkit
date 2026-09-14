@@ -1,0 +1,534 @@
+Option Explicit
+
+'=============================================================================
+' modContactRelation v1.1  (2026-08-20)
+' Purpose (EN): "cooling relationships" report. One pass over the SENT ITEMS
+'   of every mailbox (or a configured subset) builds a dictionary "external
+'   address -> date of your last outgoing e-mail". It is then joined with the
+'   contact cards of all contact folders: every contact whose last outgoing
+'   e-mail is older than the threshold (or absent from the whole window) is
+'   listed in an HTML report sorted by delay. Internal / excluded domains are
+'   ignored. Manual command; no UserForm.
+'
+' Rapport "relations qui refroidissent". UNE passe sur les ELEMENTS ENVOYES
+' de chaque boite (ou d'un sous-ensemble configure) construit un dictionnaire
+' "adresse externe -> date de ton dernier mail sortant" - c'est ce qui evite
+' de fouiller les 1000+ dossiers par contact. Croisement ensuite avec les
+' fiches de tous les dossiers de contacts : chaque contact dont le dernier
+' mail sortant est plus vieux que le seuil (ou absent de toute la fenetre)
+' est liste dans un rapport HTML trie par retard decroissant.
+'
+'   - SORTANT UNIQUEMENT (v1.0) : le signal mesure = la derniere fois que TU
+'     as ecrit. Les mails recus, classes dans l'arborescence, ne sont pas
+'     balayes (trop couteux) ; un contact qui t'ecrit sans reponse de ta
+'     part apparait donc comme "a relancer", ce qui est voulu.
+'   - DOMAINES : seules les adresses EXTERNES comptent. InternalDomains
+'     (partagee) + RelationScanExcludeDomains sont ignores, cote envois ET
+'     cote fiches (fiche sans aucune adresse externe = hors perimetre).
+'   - MULTI-BAL : toutes les boites du profil par defaut ;
+'     RelationScanStores restreint (morceaux de nom, separes par |).
+'   - CADENCE PAR CONTACT : UserProperty "KeepInTouchDays" (nombre de jours)
+'     posee sur une fiche prioritaire ; sinon RelationScanThresholdDays.
+'
+' RAPPORT : <Bureau>\Macro VBA\Outlook\RelationScan-AAAAMMJJ-HHMMSS.html,
+' ecrit en UTF-8 via ADODB.Stream (v1.1 : accents et emojis des noms de
+' dossiers rendus correctement - Print # ecrivait en ANSI et cassait tout
+' caractere hors page de code). Ouverture proposee dans le navigateur.
+'   - En tete : liste des boites balayees (Elements envoyes) avec le nombre
+'     de mails chacune, et les boites hors perimetre (RelationScanStores).
+'     L'approche est MULTI-BOITES : envois ET fiches de toutes les boites
+'     retenues.
+'   - Tableau GROUPE par boite aux lettres puis par dossier, dans l'ordre
+'     de l'arborescence ; au sein d'un dossier, contacts tries par retard
+'     decroissant, les "jamais ecrit sur la fenetre" EN DERNIER (v1.1),
+'     tries par nom.
+'
+' SUB PUBLIQUE (epinglable au QAT / ruban) : RelationScan
+'
+' Dependances : modConfig (Cfg/CfgL, T, A, MacroVBADir), modDebugLog,
+'   modCommon (SetStatus, EscapeHTML), Scripting.Dictionary (late binding).
+' Cles config.ini (section CONTACTS - RELATIONS) :
+'   RelationScanMonths=48            fenetre balayee (mois)
+'   RelationScanThresholdDays=180    seuil par defaut (jours)
+'   RelationScanExcludeDomains=      domaines ignores en plus (a|b|c)
+'   RelationScanStores=              boites balayees (morceaux de nom, |) ;
+'                                    vide = toutes
+'   InternalDomains (partagee), ContactSkipFolders (partagee).
+'=============================================================================
+
+Private Const MOD_NAME As String = "ContRel"
+Private Const MOD_VERSION As String = "v1.1 - 2026-08-20"
+
+Private Const PROPTAG_HIDDEN As String = "http://schemas.microsoft.com/mapi/proptag/0x10F4000B"
+Private Const PROPTAG_RECIP_SMTP As String = "http://schemas.microsoft.com/mapi/proptag/0x39FE001F"
+Private Const DEFAULT_SKIP As String = "{*|Recipient Cache|*sugg*|GAL Contacts|Organizational Contacts|Companies|PeopleCentricConversation Buddies|*Lync*|*Skype*|ExternalContacts"
+' UserProperty de cadence par contact (fonctionnelle, hors T()).
+Private Const UP_KEEPDAYS As String = "KeepInTouchDays"
+Private Const NEVER_DAYS As Long = 99999
+
+' --- Reglages (LoadSettings) ---
+Private mMonths As Long
+Private mThreshold As Long
+Private mExclude As String        ' "|dom1|dom2|" (internes + exclus)
+Private mStoresWanted As String   ' filtre RelationScanStores brut
+Private mSkipFolders As String
+
+' --- Etat de la passe ---
+Private mLastSent As Object       ' Dictionary adresse -> Date du dernier envoi
+Private mMailsSeen As Long
+Private mContactsSeen As Long
+Private mStoreSummary As String   ' items HTML "<li>boite : N mails</li>"
+Private mGroupKeys As Collection  ' "store" & Chr$(7) & "dossier", ordre de parcours
+
+'=============================================================================
+' ModVersion - version REELLEMENT chargee dans le VBE.
+'=============================================================================
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+'=============================================================================
+' RelationScan  (epinglable au QAT / ruban)
+'=============================================================================
+Public Sub RelationScan()
+    Dim errNo As Long, errDesc As String
+    On Error GoTo ErrH
+    LoadSettings
+
+    Dim dFrom As Date
+    dFrom = DateAdd("m", -mMonths, Date)
+
+    If MsgBox(T("Balayer les ~el~ements envoy~es des ", "Scan the sent items of the ") & _
+              ScopeLabel() & vbCrLf & _
+              T("depuis le ", "since ") & Format$(dFrom, "dd/mm/yyyy") & _
+              T(" (fen~xtre ", " (window ") & mMonths & T(" mois), seuil par d~efaut ", " months), default threshold ") & _
+              mThreshold & T(" jours ?", " days?") & vbCrLf & vbCrLf & _
+              T("Le balayage peut prendre plusieurs minutes (progression sur la barre d'~etat).", _
+                "The scan can take several minutes (progress on the status bar)."), _
+              vbOKCancel + vbQuestion, UiTitle()) <> vbOK Then Exit Sub
+
+    Set mLastSent = CreateObject("Scripting.Dictionary")
+    mLastSent.CompareMode = vbTextCompare
+    mMailsSeen = 0
+    mContactsSeen = 0
+    mStoreSummary = ""
+    Set mGroupKeys = New Collection
+
+    ' Passe 1 : elements envoyes de chaque boite retenue (multi-boites).
+    Dim ns As Outlook.NameSpace, idx As Long, st As Outlook.Store, mailsBefore As Long
+    Set ns = Application.Session
+    For idx = 1 To ns.Stores.Count
+        Set st = ns.Stores(idx)
+        If StoreWanted(st.DisplayName) Then
+            mailsBefore = mMailsSeen
+            ScanSentItems st, dFrom
+            mStoreSummary = mStoreSummary & "<li>" & modCommon.EscapeHTML(st.DisplayName) & " : " & _
+                            (mMailsSeen - mailsBefore) & modCommon.EscapeHTML(T(" mails balay~es", " mails scanned")) & "</li>"
+        Else
+            mStoreSummary = mStoreSummary & "<li>" & modCommon.EscapeHTML(st.DisplayName) & " : " & _
+                            modCommon.EscapeHTML(T("hors p~erim~etre (RelationScanStores)", "out of scope (RelationScanStores)")) & "</li>"
+        End If
+    Next idx
+
+    ' Passe 2 : croisement avec les fiches de tous les dossiers de contacts.
+    Dim rows As Collection
+    Set rows = New Collection
+    For idx = 1 To ns.Stores.Count
+        ScanContactBranch ns.Stores(idx).GetRootFolder, rows
+    Next idx
+    modCommon.SetStatus MOD_NAME, ""
+
+    ' Rapport HTML trie par retard decroissant.
+    Dim outPath As String
+    outPath = WriteReport(rows, dFrom)
+    modDebugLog.DInfo MOD_NAME, "RelationScan : " & mMailsSeen & " mails, " & mContactsSeen & _
+                                " fiches, " & rows.Count & " a relancer -> " & outPath
+
+    If MsgBox(rows.Count & T(" contact(s) ~a relancer (sur ", " contact(s) to reconnect with (out of ") & _
+              mContactsSeen & T(" fiches externes examin~ees).", " external cards examined).") & vbCrLf & _
+              T("Rapport : ", "Report: ") & outPath & vbCrLf & vbCrLf & _
+              T("Ouvrir le rapport ?", "Open the report?"), vbYesNo + vbInformation, UiTitle()) = vbYes Then
+        CreateObject("Shell.Application").ShellExecute outPath
+    End If
+    Exit Sub
+ErrH:
+    errNo = Err.Number
+    errDesc = Err.Description
+    On Error Resume Next
+    modCommon.SetStatus MOD_NAME, ""
+    modDebugLog.DError MOD_NAME, "RelationScan err " & errNo & " - " & errDesc
+    MsgBox T("Erreur : ", "Error: ") & errNo & " - " & errDesc, vbExclamation, UiTitle()
+End Sub
+
+'=============================================================================
+' Reglages
+'=============================================================================
+Private Sub LoadSettings()
+    modConfig.EnsureLoaded
+    mMonths = modConfig.CfgL("RelationScanMonths", 48)
+    If mMonths < 1 Then mMonths = 48
+    mThreshold = modConfig.CfgL("RelationScanThresholdDays", 180)
+    If mThreshold < 1 Then mThreshold = 180
+    mExclude = "|" & LCase$(Replace(modConfig.Cfg("InternalDomains", ""), " ", "")) & "|" & _
+               LCase$(Replace(modConfig.Cfg("RelationScanExcludeDomains", ""), " ", "")) & "|"
+    mStoresWanted = Trim$(modConfig.Cfg("RelationScanStores", ""))
+    mSkipFolders = modConfig.Cfg("ContactSkipFolders", DEFAULT_SKIP)
+End Sub
+
+Private Function UiTitle() As String
+    UiTitle = T("Relations ~a relancer", "Relations to reconnect")
+End Function
+
+Private Function ScopeLabel() As String
+    If Len(mStoresWanted) = 0 Then
+        ScopeLabel = T("boites du profil (toutes)", "mailboxes of the profile (all)")
+    Else
+        ScopeLabel = T("boites correspondant ~a : ", "mailboxes matching: ") & mStoresWanted
+    End If
+End Function
+
+Private Function StoreWanted(ByVal displayName As String) As Boolean
+    If Len(mStoresWanted) = 0 Then
+        StoreWanted = True
+        Exit Function
+    End If
+    Dim parts() As String, idx As Long, nameLow As String
+    nameLow = LCase$(displayName)
+    parts = Split(mStoresWanted, "|")
+    For idx = LBound(parts) To UBound(parts)
+        If Len(Trim$(parts(idx))) > 0 Then
+            If InStr(nameLow, LCase$(Trim$(parts(idx)))) > 0 Then
+                StoreWanted = True
+                Exit Function
+            End If
+        End If
+    Next idx
+End Function
+
+'=============================================================================
+' Passe 1 : elements envoyes d'une boite, tries par date decroissante.
+' Acces INDEXE apres Items.Sort (l'ordre est respecte) + sortie de boucle
+' des que la fenetre est depassee : pas de filtre DASL, pas de piege de
+' format de date, cout borne par la fenetre.
+'=============================================================================
+Private Sub ScanSentItems(ByVal st As Outlook.Store, ByVal dFrom As Date)
+    On Error Resume Next
+    Dim fld As Outlook.MAPIFolder, itms As Outlook.Items, idx As Long
+    Dim itm As Object, sentOn As Date, total As Long
+    Set fld = st.GetDefaultFolder(olFolderSentMail)
+    If Err.Number <> 0 Or fld Is Nothing Then
+        Err.Clear
+        Exit Sub
+    End If
+    Set itms = fld.Items
+    itms.Sort "[SentOn]", True
+    total = itms.Count
+    For idx = 1 To total
+        Set itm = itms.Item(idx)
+        If Err.Number <> 0 Then Err.Clear: GoTo NextItem
+        If TypeName(itm) = "MailItem" Then
+            sentOn = itm.SentOn
+            If Err.Number <> 0 Then Err.Clear: GoTo NextItem
+            If sentOn < dFrom And sentOn > DateSerial(1990, 1, 1) Then Exit For
+            RecordRecipients itm, sentOn
+            mMailsSeen = mMailsSeen + 1
+            If (mMailsSeen Mod 200) = 0 Then _
+                modCommon.SetStatus MOD_NAME, T("Envoy~es : ", "Sent: ") & mMailsSeen & " (" & st.DisplayName & ")"
+        End If
+NextItem:
+    Next idx
+    Err.Clear
+End Sub
+
+Private Sub RecordRecipients(ByVal itm As Object, ByVal sentOn As Date)
+    On Error Resume Next
+    Dim rcp As Outlook.Recipient, idx As Long, addr As String
+    For idx = 1 To itm.Recipients.Count
+        Set rcp = itm.Recipients.Item(idx)
+        addr = LCase$(Trim$(CStr(rcp.PropertyAccessor.GetProperty(PROPTAG_RECIP_SMTP))))
+        If Err.Number <> 0 Or InStr(addr, "@") = 0 Then
+            Err.Clear
+            addr = LCase$(Trim$(rcp.Address))
+        End If
+        If InStr(addr, "@") > 0 Then
+            If Not IsExcluded(addr) Then
+                If mLastSent.Exists(addr) Then
+                    If sentOn > mLastSent(addr) Then mLastSent(addr) = sentOn
+                Else
+                    mLastSent(addr) = sentOn
+                End If
+            End If
+        End If
+    Next idx
+    Err.Clear
+End Sub
+
+' Adresse interne ou d'un domaine exclu ?
+Private Function IsExcluded(ByVal addr As String) As Boolean
+    If InStr(addr, "@") = 0 Then
+        IsExcluded = True
+        Exit Function
+    End If
+    Dim dom As String
+    dom = LCase$(Mid$(addr, InStr(addr, "@") + 1))
+    If Len(mExclude) > 2 Then IsExcluded = (InStr(mExclude, "|" & dom & "|") > 0)
+End Function
+
+'=============================================================================
+' Passe 2 : dossiers de contacts (recursif, exclusions partagees).
+'=============================================================================
+Private Sub ScanContactBranch(ByVal fld As Outlook.MAPIFolder, ByVal rows As Collection)
+    On Error Resume Next
+    Dim isContacts As Boolean
+    isContacts = (fld.DefaultItemType = olContactItem)
+    If Err.Number <> 0 Then isContacts = False: Err.Clear
+    If isContacts Then
+        If Not IsSkippedFolder(fld) Then ScanContactFolder fld, rows
+    End If
+    Dim child As Outlook.MAPIFolder
+    For Each child In fld.Folders
+        ScanContactBranch child, rows
+    Next child
+    Err.Clear
+End Sub
+
+Private Sub ScanContactFolder(ByVal fld As Outlook.MAPIFolder, ByVal rows As Collection)
+    On Error Resume Next
+    Dim itm As Object, k As Long, addr As String, bestAddr As String
+    Dim lastDate As Date, threshold As Long, daysSince As Long, hasExternal As Boolean
+    Dim keyAdded As Boolean
+    For Each itm In fld.Items
+        If TypeName(itm) = "ContactItem" Then
+            hasExternal = False
+            lastDate = 0
+            bestAddr = ""
+            For k = 1 To 3
+                addr = LCase$(Trim$(SafeStr(CallByName(itm, "Email" & k & "Address", VbGet))))
+                If InStr(addr, "@") > 0 Then
+                    If Not IsExcluded(addr) Then
+                        hasExternal = True
+                        If Len(bestAddr) = 0 Then bestAddr = addr
+                        If mLastSent.Exists(addr) Then
+                            If mLastSent(addr) > lastDate Then
+                                lastDate = mLastSent(addr)
+                                bestAddr = addr
+                            End If
+                        End If
+                    End If
+                End If
+            Next k
+            If hasExternal Then
+                mContactsSeen = mContactsSeen + 1
+                threshold = ContactThreshold(itm)
+                If lastDate = 0 Then
+                    daysSince = NEVER_DAYS
+                Else
+                    daysSince = DateDiff("d", lastDate, Date)
+                End If
+                If daysSince > threshold Then
+                    rows.Add MakeRow(itm, fld, bestAddr, lastDate, daysSince, threshold)
+                    If Not keyAdded Then
+                        mGroupKeys.Add fld.Store.DisplayName & Chr$(7) & fld.FolderPath
+                        keyAdded = True
+                    End If
+                End If
+                If (mContactsSeen Mod 100) = 0 Then _
+                    modCommon.SetStatus MOD_NAME, T("Fiches : ", "Cards: ") & mContactsSeen
+            End If
+        End If
+    Next itm
+    Err.Clear
+End Sub
+
+' Cadence propre a la fiche (UserProperty KeepInTouchDays), sinon defaut.
+Private Function ContactThreshold(ByVal ct As Object) As Long
+    On Error Resume Next
+    ContactThreshold = mThreshold
+    Dim up As Object
+    Set up = ct.UserProperties.Find(UP_KEEPDAYS)
+    If Not up Is Nothing Then
+        If IsNumeric(up.Value) Then
+            If CLng(up.Value) > 0 Then ContactThreshold = CLng(up.Value)
+        End If
+    End If
+    Err.Clear
+End Function
+
+' Ligne de rapport, champs separes par Chr$(7) (les noms de dossiers peuvent
+' contenir | et des emojis) : boite, dossier, jamais(0/1), jours (largeur
+' fixe pour le tri), nom, adresse, date ISO, seuil.
+Private Function MakeRow(ByVal ct As Object, ByVal fld As Outlook.MAPIFolder, _
+                         ByVal addr As String, ByVal lastDate As Date, _
+                         ByVal daysSince As Long, ByVal threshold As Long) As String
+    Dim nm As String
+    nm = SafeStr(ct.FileAs)
+    If Len(nm) = 0 Then nm = SafeStr(ct.FullName)
+    If Len(nm) = 0 Then nm = addr
+    MakeRow = fld.Store.DisplayName & Chr$(7) & fld.FolderPath & Chr$(7) & _
+              IIf(daysSince >= NEVER_DAYS, "1", "0") & Chr$(7) & _
+              Format$(daysSince, "000000") & Chr$(7) & nm & Chr$(7) & addr & Chr$(7) & _
+              IIf(lastDate > 0, Format$(lastDate, "yyyy-mm-dd"), "-") & Chr$(7) & threshold
+End Function
+
+'=============================================================================
+' Rapport HTML - UTF-8 (ADODB.Stream), groupe par boite aux lettres puis par
+' dossier dans l'ordre de parcours ; contacts tries par retard decroissant,
+' les "jamais ecrit sur la fenetre" en dernier (tries par nom).
+'=============================================================================
+Private Function WriteReport(ByVal rows As Collection, ByVal dFrom As Date) As String
+    Dim html As String, outPath As String
+    Dim ki As Long, ri As Long, sj As Long
+    Dim keyStr As String, keyParts() As String, storeName As String, folderPath As String
+    Dim lastStore As String, rowTxt As String, fields() As String
+    Dim overArr() As String, overCnt As Long, nevArr() As String, nevCnt As Long
+    Dim tmp As String
+
+    html = "<!DOCTYPE html><html><head><meta charset=""utf-8""><title>RelationScan</title>" & _
+           "<style>body{font-family:Segoe UI,Arial,sans-serif;font-size:13px;margin:20px}" & _
+           "h3{margin:24px 0 6px 0}table{border-collapse:collapse;width:100%}" & _
+           "th,td{border:1px solid #ccc;padding:4px 8px;text-align:left}" & _
+           "th{background:#f0f0f0}tr.folder td{background:#e8e8f4;font-weight:bold}" & _
+           ".never{color:#b00}</style></head><body>" & _
+           "<h2>" & modCommon.EscapeHTML(T("Relations ~a relancer", "Relations to reconnect")) & "</h2>" & _
+           "<p>" & modCommon.EscapeHTML(T("Approche multi-boites : ~el~ements envoy~es et fiches de toutes les boites retenues.", _
+                                          "Multi-mailbox approach: sent items and contact cards of all retained mailboxes.")) & "</p>" & _
+           "<p><b>" & modCommon.EscapeHTML(T("Boites balay~ees (~el~ements envoy~es)", "Mailboxes scanned (sent items)")) & _
+           "</b></p><ul>" & mStoreSummary & "</ul>" & _
+           "<p>" & modCommon.EscapeHTML(T("Fen~xtre : depuis le ", "Window: since ")) & Format$(dFrom, "dd/mm/yyyy") & _
+           " (" & mMonths & " " & modCommon.EscapeHTML(T("mois", "months")) & ") - " & _
+           modCommon.EscapeHTML(T("seuil par d~efaut ", "default threshold ")) & mThreshold & " j - " & _
+           mMailsSeen & " mails - " & mContactsSeen & " " & modCommon.EscapeHTML(T("fiches externes", "external cards")) & _
+           " - " & rows.Count & " " & modCommon.EscapeHTML(T("~a relancer", "to reconnect")) & "</p>"
+
+    Dim headerRow As String
+    headerRow = "<tr><th>" & modCommon.EscapeHTML(T("Contact", "Contact")) & "</th><th>" & _
+                modCommon.EscapeHTML(T("Adresse", "Address")) & "</th><th>" & _
+                modCommon.EscapeHTML(T("Dernier mail sortant", "Last outgoing e-mail")) & "</th><th>" & _
+                modCommon.EscapeHTML(T("Jours", "Days")) & "</th><th>" & _
+                modCommon.EscapeHTML(T("Seuil", "Threshold")) & "</th></tr>"
+
+    For ki = 1 To mGroupKeys.Count
+        keyStr = mGroupKeys(ki)
+        keyParts = Split(keyStr, Chr$(7))
+        storeName = keyParts(0)
+        folderPath = keyParts(1)
+
+        ' Lignes du groupe : en retard (tri jours decroissant) puis jamais (tri nom).
+        overCnt = 0: nevCnt = 0
+        ReDim overArr(1 To rows.Count + 1)
+        ReDim nevArr(1 To rows.Count + 1)
+        For ri = 1 To rows.Count
+            rowTxt = rows(ri)
+            If Left$(rowTxt, Len(keyStr) + 1) = keyStr & Chr$(7) Then
+                fields = Split(rowTxt, Chr$(7))
+                ' cle de tri en tete : jours (decroissant) ou nom (croissant)
+                If fields(2) = "1" Then
+                    nevCnt = nevCnt + 1
+                    nevArr(nevCnt) = LCase$(fields(4)) & Chr$(7) & fields(4) & Chr$(7) & fields(5) & Chr$(7) & fields(6) & Chr$(7) & fields(3) & Chr$(7) & fields(7)
+                Else
+                    overCnt = overCnt + 1
+                    overArr(overCnt) = fields(3) & Chr$(7) & fields(4) & Chr$(7) & fields(5) & Chr$(7) & fields(6) & Chr$(7) & fields(3) & Chr$(7) & fields(7)
+                End If
+            End If
+        Next ri
+        ' Tri par insertion : overArr DECROISSANT, nevArr CROISSANT.
+        For ri = 2 To overCnt
+            tmp = overArr(ri)
+            sj = ri - 1
+            Do While sj >= 1
+                If overArr(sj) < tmp Then
+                    overArr(sj + 1) = overArr(sj)
+                    sj = sj - 1
+                Else
+                    Exit Do
+                End If
+            Loop
+            overArr(sj + 1) = tmp
+        Next ri
+        For ri = 2 To nevCnt
+            tmp = nevArr(ri)
+            sj = ri - 1
+            Do While sj >= 1
+                If nevArr(sj) > tmp Then
+                    nevArr(sj + 1) = nevArr(sj)
+                    sj = sj - 1
+                Else
+                    Exit Do
+                End If
+            Loop
+            nevArr(sj + 1) = tmp
+        Next ri
+
+        ' Changement de boite -> nouvelle section + nouveau tableau.
+        If storeName <> lastStore Then
+            If Len(lastStore) > 0 Then html = html & "</table>"
+            html = html & "<h3>" & modCommon.EscapeHTML(storeName) & "</h3><table>" & headerRow
+            lastStore = storeName
+        End If
+        html = html & "<tr class=""folder""><td colspan=""5"">" & _
+               modCommon.EscapeHTML(FolderShort(storeName, folderPath)) & "</td></tr>"
+        For ri = 1 To overCnt
+            html = html & RowHTML(Split(overArr(ri), Chr$(7)), False)
+        Next ri
+        For ri = 1 To nevCnt
+            html = html & RowHTML(Split(nevArr(ri), Chr$(7)), True)
+        Next ri
+    Next ki
+    If Len(lastStore) > 0 Then html = html & "</table>"
+    If mGroupKeys.Count = 0 Then _
+        html = html & "<p>" & modCommon.EscapeHTML(T("Aucun contact ~a relancer sur la fen~xtre.", "No contact to reconnect with over the window.")) & "</p>"
+    html = html & "</body></html>"
+
+    outPath = modConfig.MacroVBADir() & "\RelationScan-" & Format$(Now, "yyyymmdd-hhnnss") & ".html"
+    ' Ecriture UTF-8 (Print # ecrirait en ANSI : accents et emojis casses).
+    Dim stm As Object
+    Set stm = CreateObject("ADODB.Stream")
+    stm.Type = 2
+    stm.Charset = "utf-8"
+    stm.Open
+    stm.WriteText html
+    stm.SaveToFile outPath, 2
+    stm.Close
+    WriteReport = outPath
+End Function
+
+' Cellules d'une ligne (Variant tableau issu de Split) :
+' cle de tri, nom, adresse, date, jours, seuil.
+Private Function RowHTML(ByVal cells As Variant, ByVal isNever As Boolean) As String
+    Dim daysTxt As String, dateTxt As String
+    If isNever Then
+        daysTxt = "<span class=""never"">" & modCommon.EscapeHTML(T("jamais (fen~xtre)", "never (window)")) & "</span>"
+        dateTxt = "-"
+    Else
+        daysTxt = CStr(CLng(cells(4)))
+        dateTxt = cells(3)
+    End If
+    RowHTML = "<tr><td>" & modCommon.EscapeHTML(cells(1)) & "</td><td>" & _
+              modCommon.EscapeHTML(cells(2)) & "</td><td>" & dateTxt & "</td><td>" & _
+              daysTxt & "</td><td>" & cells(5) & "</td></tr>"
+End Function
+
+' "\\Boite\Contacts\Reseau" -> "Contacts\Reseau" (prefixe boite retire).
+Private Function FolderShort(ByVal storeName As String, ByVal folderPath As String) As String
+    FolderShort = folderPath
+    If Left$(folderPath, Len("\\" & storeName & "\")) = "\\" & storeName & "\" Then _
+        FolderShort = Mid$(folderPath, Len("\\" & storeName & "\") + 1)
+End Function
+
+'=============================================================================
+' Exclusions de dossiers (motifs partages + masques + corbeille).
+'=============================================================================
+Private Function IsSkippedFolder(ByVal fld As Outlook.MAPIFolder) As Boolean
+    ' Pack v3 (C3) : delegation modContactCommon (helper partage).
+    IsSkippedFolder = modContactCommon.IsSkippedFolder(fld, mSkipFolders)
+End Function
+
+Private Function IsInDeletedItems(ByVal fld As Outlook.MAPIFolder) As Boolean
+    ' Pack v3 (C3) : delegation modContactCommon (helper partage).
+    IsInDeletedItems = modContactCommon.IsInDeletedItems(fld)
+End Function
+
+Private Function SafeStr(ByVal v As Variant) As String
+    ' Pack v3 (C3) : delegation modContactCommon (helper partage).
+    SafeStr = modContactCommon.SafeStr(v)
+End Function

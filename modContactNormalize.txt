@@ -1,0 +1,1386 @@
+Option Explicit
+
+'=============================================================================
+' modContactNormalize v1.5  (2026-08-20)
+' Purpose (EN): harmonise contact cards across ALL contact folders of a
+'   chosen store (or the current selection / open card): phone numbers to
+'   E.164 (+33...), names to "Firstname LASTNAME" (particles lower case),
+'   postal addresses (street in title case, city and country upper case),
+'   e-mails lower case, text fields trimmed. Dry-run first, per-field report,
+'   no UserForm.
+'
+' Harmonise les fiches contact de TOUS les dossiers de contacts du compte
+' choisi (ou de la selection courante / de la fiche ouverte) :
+'   - TELEPHONES en E.164 compact (+33612345678). 0X national -> +CC ;
+'     00 -> + ; "+33 (0)6" -> +336 ; 9 chiffres sans le 0 -> +CC (signale
+'     "suppose") ; numeros courts (<= 6 chiffres : 112, 3635) conserves ;
+'     toute valeur contenant des lettres (poste, ext.) est laissee intacte
+'     et signalee. Fax volontairement hors perimetre.
+'   - NOMS : Prenom "Jean-Baptiste", Nom "de CHAISEMARTIN" (particules en
+'     minuscules, liste config NameParticles). Une fiche dont le prenom OU
+'     le nom est vide est reputee ENTITE (societe, service) et n'est pas
+'     renommee. FileAs suit le motif deja en place ("Nom, Prenom" ou
+'     "Prenom Nom") ; un FileAs personnalise n'est pas touche. FullName est
+'     pose PUIS les composantes First/Middle/Last : resultat identique quel
+'     que soit le sens de recomposition d'Outlook, verifie apres Save.
+'   - ADRESSES : rue en casse de titre (1er mot alphabetique capitalise,
+'     mots-outils en minuscules : de, la, du... ; sigles BP, CS, CEDEX en
+'     majuscules ; jetons contenant des chiffres intacts), ville et pays en
+'     MAJUSCULES (config), "92320 Chatillon" saisi dans le champ Ville ->
+'     code postal + ville separes. Convention lisible, pas la norme postale
+'     AFNOR (tout en capitales sans accents), volontairement.
+'   - E-MAILS SMTP en minuscules ; champs texte (societe, fonction, service)
+'     debarrasses des espaces parasites.
+'   - CATEGORIES (v1.3) : NON traitees par l'harmonisation. Une purge est
+'     proposee A LA FIN de ContactNormalizeAll si des fiches en portent
+'     (confirmation TAPEE), ou lancable seule par ContactClearCategories.
+'     Motif : Outlook sur le web PROJETTE les dossiers de contacts du client
+'     lourd en categories. Une categorie stockee sur la fiche s'ajoute donc
+'     a celle du dossier - deux etiquettes pour un seul rangement. Vider les
+'     categories laisse le dossier faire foi.
+'   - FETE (v1.1) : date de la fete du prenom (calendrier des saints usuel,
+'     ~500 prenoms + equivalents italiens courants + config NameDayExtra)
+'     posee dans la UserProperty "NameDay" au format MM-JJ. Prenom compose :
+'     "Jean-X" / "Marie-X" se fetent au second prenom, les autres au premier
+'     (Jean-Baptiste, Jean-Marie, Marie-Madeleine ont leur entree). Prenom
+'     absent de la table = signale au rapport, rien n'est ecrit. Les entites
+'     ne sont pas concernees. Lue ensuite par modContactBirthday.
+'
+' RAPPORT : <Bureau>\Macro VBA\Outlook\ContactNormalize-AAAAMMJJ-HHMMSS.txt
+' (UTF-8) : une ligne par champ modifie (avant -> apres) + avertissements
+' (numeros non normalisables). Ouverture proposee dans Notepad.
+'
+' FONCTION PUBLIQUE PARTAGEE (v1.5) :
+'   PhoneFormatCanonical(raw) : formate un numero selon la convention du
+'   toolkit (E.164 + PhoneOutputSpaced), "" si non reconnu. Source de verite
+'   unique appelee par modContactFromMail (et tout futur module).
+'
+' SUBS PUBLIQUES (epinglables au QAT) :
+'   ContactClearCategories     vide le champ Categories de toutes les fiches
+'                              du compte choisi (Simulation / Appliquer)
+'   ContactNormalizeAll        tout le compte choisi (Simulation / Appliquer)
+'   ContactNormalizeSelected   la fiche ouverte ou la selection courante :
+'                              c'est la SONDE - lancer sur 1-2 fiches avant
+'                              le balayage complet
+'
+' A LANCER AVANT modContactBirthday (le sujet des evenements reprend
+' Prenom / NOM tels qu'ils sont dans la fiche).
+'
+' Dependances : modConfig (Cfg/CfgB, T, A, MacroVBADir), modDebugLog,
+'   modMsgBoxCustom.Confirm3.
+'
+' Cles config.ini (section CONTACTS - HARMONISATION) : NormalizeNames,
+'   NormalizePhones, NormalizeAddresses, NormalizeEmails, NormalizeNameDay,
+'   NameDayExtra, ClearCategoriesPrompt,
+'   PhoneDefaultCountryCode, PhoneOutputSpaced, NameParticles,
+'   ContactFileAsFormat, AddressLowercaseWords, AddressUppercaseWords,
+'   AddressCityUppercase, AddressCountryUppercase, AddressDefaultCountry,
+'   ContactSkipFolders (partagee avec modContactBirthday).
+'=============================================================================
+
+Private Const MOD_NAME As String = "ContNorm"
+Private Const MOD_VERSION As String = "v1.5 - 2026-08-20"
+
+Private Const PROPTAG_HIDDEN As String = "http://schemas.microsoft.com/mapi/proptag/0x10F4000B"
+Private Const DEFAULT_SKIP As String = "{*|Recipient Cache|*sugg*|GAL Contacts|Organizational Contacts|Companies|PeopleCentricConversation Buddies|*Lync*|*Skype*|ExternalContacts"
+Private Const DEFAULT_PARTICLES As String = "de|du|des|d|le|la|les|l|van|von|der|den|di|da|del|della|dell|el|al|ben"
+Private Const DEFAULT_LOWER_WORDS As String = "de|du|des|d|la|le|les|l|et|sur|sous|en|au|aux|a|bis|ter|quater"
+Private Const DEFAULT_UPPER_WORDS As String = "BP|CS|CEDEX|TSA|ZA|ZI|ZAC|ZAE|RN|RD|HLM|PA|PAE|CHU|CHR|II|III|IV|VI|VII|VIII|IX|XI|XII|XIII|XIV|XV|XVI|XX"
+' Champs telephone traites (fax, telex, pager, RNIS exclus - desuets).
+Private Const PHONE_PROPS As String = "MobileTelephoneNumber|HomeTelephoneNumber|Home2TelephoneNumber|BusinessTelephoneNumber|Business2TelephoneNumber|OtherTelephoneNumber|PrimaryTelephoneNumber|CompanyMainTelephoneNumber|AssistantTelephoneNumber|CarTelephoneNumber"
+Private Const ADDR_GROUPS As String = "Home|Business|Other"
+
+' Statuts de NormalizePhone
+Private Const PH_SAME As Long = 0
+Private Const PH_CHANGED As Long = 1
+Private Const PH_ASSUMED As Long = 2
+Private Const PH_SHORT As Long = 3
+Private Const PH_LETTERS As Long = 4
+Private Const PH_INVALID As Long = 5
+' UserProperty portant la fete du prenom (fonctionnelle, hors T()) : "MM-JJ"
+Private Const UP_NAMEDAY As String = "NameDay"
+
+Private Declare PtrSafe Sub Sleep Lib "kernel32" (ByVal dwMilliseconds As Long)
+
+' --- Reglages (LoadSettings) ---
+Private mDoNames As Boolean
+Private mDoPhones As Boolean
+Private mDoAddresses As Boolean
+Private mDoEmails As Boolean
+Private mCountryCode As String
+Private mSpaced As Boolean
+Private mParticles As String      ' "|de|du|...|" (delimite des deux cotes)
+Private mLowerWords As String
+Private mUpperWords As String
+Private mCityUpper As Boolean
+Private mCountryUpper As Boolean
+Private mDefaultCountry As String
+Private mFileAsFormat As String
+Private mSkipFolders As String
+Private mDoNameDay As Boolean
+Private mNameDays As Object       ' Dictionary prenom -> MM-JJ (table + NameDayExtra)
+Private mClearCatPrompt As Boolean
+Private mCatFound As Long         ' fiches portant au moins une categorie
+Private mCatCleared As Long
+Private mClearMode As Boolean     ' passe "purge des categories" en cours
+
+' --- Rapport ---
+Private mReport As String
+Private mReportPath As String
+
+' --- Compteurs ---
+Private mFolders As Long
+Private mScanned As Long
+Private mChanged As Long
+Private mFieldChanges As Long
+Private mEntities As Long
+Private mPhoneWarn As Long
+Private mErrors As Long
+Private mNameDaySet As Long
+Private mNameDayUnknown As Long
+
+' --- Scratch par fiche (controles apres Save) ---
+Private mExpFull As String
+Private mNewFirst As String
+Private mNewMiddle As String
+Private mNewLast As String
+Private mExpStreet(0 To 2) As String
+Private mExpCity(0 To 2) As String
+Private mExpPostal(0 To 2) As String
+Private mExpCountry(0 To 2) As String
+
+'=============================================================================
+' ModVersion - version REELLEMENT chargee dans le VBE.
+'=============================================================================
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+'=============================================================================
+' ContactNormalizeAll  (epinglable au QAT)
+' Compte -> Simulation / Appliquer -> tous les dossiers de contacts.
+'=============================================================================
+Public Sub ContactNormalizeAll()
+    Dim errNo As Long, errDesc As String
+    On Error GoTo ErrH
+    LoadSettings
+    ResetCounters
+
+    Dim st As Outlook.Store
+    Set st = PickStore()
+    If st Is Nothing Then Exit Sub
+
+    Dim choice As VbMsgBoxResult
+    choice = AskMode(T("Compte : ", "Account: ") & st.DisplayName)
+    If choice = vbCancel Then Exit Sub
+    Dim dryRun As Boolean
+    dryRun = (choice = vbYes)
+
+    modDebugLog.DInfo MOD_NAME, "NormalizeAll start store=" & st.DisplayName & " dryRun=" & dryRun
+    ReportHeader dryRun, "Compte : " & st.DisplayName
+    ProcessFolderTree st.GetRootFolder, dryRun
+    WriteReport
+    modDebugLog.DInfo MOD_NAME, "NormalizeAll end scanned=" & mScanned & " changed=" & mChanged & _
+        " fields=" & mFieldChanges & " errors=" & mErrors & " cats=" & mCatFound & " dryRun=" & dryRun
+    ShowSummary dryRun
+    If mClearCatPrompt And mCatFound > 0 Then OfferClearCategories st
+    Exit Sub
+ErrH:
+    errNo = Err.Number
+    errDesc = Err.Description
+    On Error Resume Next
+    modDebugLog.DError MOD_NAME, "ContactNormalizeAll err " & errNo & " - " & errDesc
+    ReportLine "!! ERREUR " & errNo & " - " & errDesc
+    WriteReport
+    MsgBox T("Erreur : ", "Error: ") & errNo & " - " & errDesc, vbExclamation, UiTitle()
+End Sub
+
+'=============================================================================
+' ContactNormalizeSelected  (epinglable au QAT) - la SONDE.
+' Fiche ouverte (inspecteur) sinon selection de l'explorateur.
+'=============================================================================
+Public Sub ContactNormalizeSelected()
+    Dim errNo As Long, errDesc As String
+    On Error GoTo ErrH
+    LoadSettings
+    ResetCounters
+
+    Dim picked As Collection
+    Set picked = New Collection
+    Dim insp As Outlook.Inspector
+    On Error Resume Next
+    Set insp = Application.ActiveInspector
+    On Error GoTo ErrH
+    If Not insp Is Nothing Then
+        If TypeName(insp.CurrentItem) = "ContactItem" Then picked.Add insp.CurrentItem
+    End If
+    If picked.Count = 0 Then
+        Dim sel As Outlook.Selection, idx As Long
+        On Error Resume Next
+        Set sel = Application.ActiveExplorer.Selection
+        On Error GoTo ErrH
+        If Not sel Is Nothing Then
+            For idx = 1 To sel.Count
+                If TypeName(sel.Item(idx)) = "ContactItem" Then picked.Add sel.Item(idx)
+            Next idx
+        End If
+    End If
+    If picked.Count = 0 Then
+        MsgBox T("Aucune fiche contact ouverte ni s~electionn~ee.", "No contact card open or selected."), _
+               vbInformation, UiTitle()
+        Exit Sub
+    End If
+
+    Dim choice As VbMsgBoxResult
+    choice = AskMode(picked.Count & T(" fiche(s) s~electionn~ee(s)", " selected card(s)"))
+    If choice = vbCancel Then Exit Sub
+    Dim dryRun As Boolean
+    dryRun = (choice = vbYes)
+
+    modDebugLog.DInfo MOD_NAME, "NormalizeSelected start n=" & picked.Count & " dryRun=" & dryRun
+    ReportHeader dryRun, "Selection : " & picked.Count & " fiche(s)"
+    Dim itm As Object
+    For Each itm In picked
+        NormalizeContact itm, "(selection)", dryRun
+    Next itm
+    WriteReport
+    ShowSummary dryRun
+    Exit Sub
+ErrH:
+    errNo = Err.Number
+    errDesc = Err.Description
+    On Error Resume Next
+    modDebugLog.DError MOD_NAME, "ContactNormalizeSelected err " & errNo & " - " & errDesc
+    ReportLine "!! ERREUR " & errNo & " - " & errDesc
+    WriteReport
+    MsgBox T("Erreur : ", "Error: ") & errNo & " - " & errDesc, vbExclamation, UiTitle()
+End Sub
+
+'=============================================================================
+' ContactClearCategories  (epinglable au QAT)
+' Vide le champ Categories de toutes les fiches du compte choisi. Les
+' dossiers de contacts font alors seuls office de rangement (Outlook sur le
+' web les projette deja en categories).
+'=============================================================================
+Public Sub ContactClearCategories()
+    Dim errNo As Long, errDesc As String
+    On Error GoTo ErrH
+    LoadSettings
+    ResetCounters
+    Dim st As Outlook.Store
+    Set st = PickStore()
+    If st Is Nothing Then Exit Sub
+    RunClearCategories st
+    Exit Sub
+ErrH:
+    errNo = Err.Number
+    errDesc = Err.Description
+    On Error Resume Next
+    modDebugLog.DError MOD_NAME, "ContactClearCategories err " & errNo & " - " & errDesc
+    ReportLine "!! ERREUR " & errNo & " - " & errDesc
+    WriteReport
+    MsgBox T("Erreur : ", "Error: ") & errNo & " - " & errDesc, vbExclamation, UiTitle()
+End Sub
+
+' Proposition en fin d'harmonisation (mCatFound fiches concernees).
+Private Sub OfferClearCategories(ByVal st As Outlook.Store)
+    Dim msg As String
+    msg = mCatFound & T(" fiche(s) portent encore une cat~egorie." & vbCrLf & vbCrLf & _
+          "Outlook sur le web projette d~ej~a tes DOSSIERS de contacts en cat~egories : " & _
+          "une cat~egorie stock~ee sur la fiche fait donc double emploi." & vbCrLf & vbCrLf & _
+          "Vider les cat~egories maintenant ?", _
+          " card(s) still carry a category." & vbCrLf & vbCrLf & _
+          "Outlook on the web already projects your contact FOLDERS as categories: " & _
+          "a category stored on the card is therefore redundant." & vbCrLf & vbCrLf & _
+          "Clear the categories now?")
+    If MsgBox(msg, vbYesNo + vbQuestion + vbDefaultButton2, UiTitle()) <> vbYes Then Exit Sub
+    RunClearCategories st
+End Sub
+
+' Passe de purge : Simulation / Appliquer, confirmation TAPEE avant ecriture.
+Private Sub RunClearCategories(ByVal st As Outlook.Store)
+    Dim choice As VbMsgBoxResult
+    choice = AskMode(T("Purge des cat~egories - compte : ", "Category purge - account: ") & st.DisplayName)
+    If choice = vbCancel Then Exit Sub
+    Dim dryRun As Boolean
+    dryRun = (choice = vbYes)
+    If Not dryRun Then
+        Dim word As String, typed As String
+        word = UCase$(T("VIDER", "CLEAR"))
+        typed = InputBox(T("Cette action retire la cat~egorie de TOUTES les fiches du compte." & vbCrLf & _
+                           "Les dossiers ne sont pas touch~es." & vbCrLf & vbCrLf & "Tape ", _
+                           "This removes the category from EVERY card of the account." & vbCrLf & _
+                           "Folders are not affected." & vbCrLf & vbCrLf & "Type ") & word & _
+                         T(" pour confirmer :", " to confirm:"), UiTitle())
+        If UCase$(Trim$(typed)) <> word Then Exit Sub
+    End If
+    ResetCounters
+    mClearMode = True
+    modDebugLog.DInfo MOD_NAME, "ClearCategories start store=" & st.DisplayName & " dryRun=" & dryRun
+    ReportLine "modContactNormalize " & MOD_VERSION & " - " & Format$(Now, "yyyy-mm-dd hh:nn:ss")
+    ReportLine IIf(dryRun, "MODE : SIMULATION (aucune modification)", "MODE : APPLIQUE")
+    ReportLine "PURGE DES CATEGORIES - compte : " & st.DisplayName
+    ReportLine String$(78, "-")
+    ProcessFolderTree st.GetRootFolder, dryRun
+    mClearMode = False
+    WriteReport
+    modDebugLog.DInfo MOD_NAME, "ClearCategories end found=" & mCatFound & " cleared=" & mCatCleared & _
+        " errors=" & mErrors & " dryRun=" & dryRun
+    MsgBox IIf(dryRun, T("SIMULATION - rien n'a ~et~e ~ecrit.", "DRY RUN - nothing was written."), _
+                       T("Termin~e.", "Done.")) & vbCrLf & vbCrLf & _
+           T("Fiches parcourues : ", "Cards scanned: ") & mScanned & vbCrLf & _
+           T("Fiches avec cat~egorie : ", "Cards with a category: ") & mCatFound & vbCrLf & _
+           T("Cat~egories vid~ees : ", "Categories cleared: ") & mCatCleared & vbCrLf & _
+           T("Erreurs : ", "Errors: ") & mErrors & vbCrLf & vbCrLf & _
+           T("Rapport : ", "Report: ") & mReportPath, vbInformation, UiTitle()
+End Sub
+
+'=============================================================================
+' Reglages / UI communs
+'=============================================================================
+Private Sub LoadSettings()
+    modConfig.EnsureLoaded
+    mDoNames = modConfig.CfgB("NormalizeNames", True)
+    mDoPhones = modConfig.CfgB("NormalizePhones", True)
+    mDoAddresses = modConfig.CfgB("NormalizeAddresses", True)
+    mDoEmails = modConfig.CfgB("NormalizeEmails", True)
+    mCountryCode = DigitsOnly(modConfig.Cfg("PhoneDefaultCountryCode", "33"))
+    If Len(mCountryCode) = 0 Then mCountryCode = "33"
+    mSpaced = modConfig.CfgB("PhoneOutputSpaced", False)
+    mParticles = "|" & LCase$(modConfig.Cfg("NameParticles", DEFAULT_PARTICLES)) & "|"
+    mLowerWords = "|" & StripAccents(LCase$(modConfig.Cfg("AddressLowercaseWords", DEFAULT_LOWER_WORDS))) & "|"
+    mUpperWords = "|" & StripAccents(LCase$(modConfig.Cfg("AddressUppercaseWords", DEFAULT_UPPER_WORDS))) & "|"
+    mCityUpper = modConfig.CfgB("AddressCityUppercase", True)
+    mCountryUpper = modConfig.CfgB("AddressCountryUppercase", True)
+    mDefaultCountry = Trim$(modConfig.Cfg("AddressDefaultCountry", ""))
+    mFileAsFormat = UCase$(Trim$(modConfig.Cfg("ContactFileAsFormat", "LastFirst")))
+    mSkipFolders = modConfig.Cfg("ContactSkipFolders", DEFAULT_SKIP)
+    mDoNameDay = modConfig.CfgB("NormalizeNameDay", True)
+    mClearCatPrompt = modConfig.CfgB("ClearCategoriesPrompt", True)
+    LoadNameDays modConfig.Cfg("NameDayExtra", "")
+End Sub
+
+' Table des fetes -> Dictionary ; NameDayExtra (prenom=MM-JJ|...) surcharge.
+Private Sub LoadNameDays(ByVal extra As String)
+    Set mNameDays = CreateObject("Scripting.Dictionary")
+    Dim parts() As String, idx As Long, kv() As String, k As String, v As String
+    parts = Split(NameDayTable() & extra, "|")
+    For idx = LBound(parts) To UBound(parts)
+        If InStr(parts(idx), "=") > 0 Then
+            kv = Split(parts(idx), "=")
+            k = StripAccents(LCase$(Trim$(kv(0))))
+            v = Trim$(kv(1))
+            If Len(k) > 0 And v Like "##-##" Then mNameDays.Item(k) = v
+        End If
+    Next idx
+End Sub
+
+Private Sub ResetCounters()
+    mReport = ""
+    mReportPath = ""
+    mFolders = 0: mScanned = 0: mChanged = 0: mFieldChanges = 0
+    mEntities = 0: mPhoneWarn = 0: mErrors = 0
+    mNameDaySet = 0: mNameDayUnknown = 0
+    mCatFound = 0: mCatCleared = 0
+End Sub
+
+Private Function UiTitle() As String
+    UiTitle = T("Harmonisation des fiches contact", "Contact card harmonisation")
+End Function
+
+Private Function AskMode(ByVal scopeTxt As String) As VbMsgBoxResult
+    AskMode = modMsgBoxCustom.Confirm3( _
+        scopeTxt & vbCrLf & vbCrLf & _
+        T("Simulation : rien n'est ~ecrit, le rapport liste champ par champ ce qui SERAIT chang~e." & vbCrLf & _
+          "Appliquer : ~ecrit les fiches (t~el~ephones E.164, noms Pr~enom NOM, adresses, e-mails)." & vbCrLf & _
+          "(Boutons natifs : Oui = Simulation, Non = Appliquer.)", _
+          "Dry run: nothing is written, the report lists field by field what WOULD change." & vbCrLf & _
+          "Apply: writes the cards (E.164 phones, Firstname LASTNAME, addresses, e-mails)." & vbCrLf & _
+          "(Native buttons: Yes = Dry run, No = Apply.)"), _
+        UiTitle(), T("&Simulation", "&Dry run"), T("&Appliquer", "&Apply"), T("A&nnuler", "&Cancel"))
+End Function
+
+Private Sub ReportHeader(ByVal dryRun As Boolean, ByVal scopeTxt As String)
+    ReportLine "modContactNormalize " & MOD_VERSION & " - " & Format$(Now, "yyyy-mm-dd hh:nn:ss")
+    ReportLine IIf(dryRun, "MODE : SIMULATION (aucune modification)", "MODE : APPLIQUE")
+    ReportLine scopeTxt
+    ReportLine "Noms=" & mDoNames & " Telephones=" & mDoPhones & " (+" & mCountryCode & _
+               IIf(mSpaced, ", espace", ", compact") & ") Adresses=" & mDoAddresses & _
+               " (ville maj=" & mCityUpper & ", pays maj=" & mCountryUpper & ") Emails=" & mDoEmails & _
+               " Fete=" & mDoNameDay
+    ReportLine String$(78, "-")
+End Sub
+
+'=============================================================================
+' Choix du compte (store). Defaut = store du dossier courant.
+'=============================================================================
+Private Function PickStore() As Outlook.Store
+    On Error GoTo ErrH
+    Dim ns As Outlook.NameSpace
+    Set ns = Application.Session
+    Dim cur As Outlook.Store
+    On Error Resume Next
+    Set cur = Application.ActiveExplorer.CurrentFolder.Store
+    On Error GoTo ErrH
+    Dim listTxt As String, idx As Long, defIdx As Long
+    For idx = 1 To ns.Stores.Count
+        listTxt = listTxt & idx & " - " & ns.Stores(idx).DisplayName & vbCrLf
+        If Not cur Is Nothing Then
+            If ns.Stores(idx).StoreID = cur.StoreID Then defIdx = idx
+        End If
+    Next idx
+    If defIdx = 0 Then defIdx = 1
+    Dim ans As String
+    ans = Trim$(InputBox(T("Compte dont les contacts sont ~a harmoniser (num~ero) :", _
+                           "Account whose contacts will be harmonised (number):") & _
+                         vbCrLf & vbCrLf & listTxt, UiTitle(), CStr(defIdx)))
+    If Len(ans) = 0 Then Exit Function
+    If Not IsNumeric(ans) Then GoTo BadChoice
+    Dim num As Long
+    num = CLng(ans)
+    If num < 1 Or num > ns.Stores.Count Then GoTo BadChoice
+    Set PickStore = ns.Stores(num)
+    Exit Function
+BadChoice:
+    MsgBox T("Choix invalide.", "Invalid choice."), vbExclamation, UiTitle()
+    Exit Function
+ErrH:
+    modDebugLog.DError MOD_NAME, "PickStore err " & Err.Number & " - " & Err.Description
+End Function
+
+'=============================================================================
+' Parcours recursif : chaque dossier de type Contact (non systeme, non
+' cache) est traite.
+'=============================================================================
+Private Sub ProcessFolderTree(ByVal fld As Outlook.MAPIFolder, ByVal dryRun As Boolean)
+    On Error Resume Next
+    Dim isContacts As Boolean
+    isContacts = (fld.DefaultItemType = olContactItem)
+    If Err.Number <> 0 Then isContacts = False: Err.Clear
+    If isContacts Then
+        If IsSkippedFolder(fld) Then
+            modDebugLog.DDebug MOD_NAME, "Dossier ignore : " & fld.FolderPath
+        Else
+            ProcessContacts fld, dryRun
+        End If
+    End If
+    Dim child As Outlook.MAPIFolder
+    For Each child In fld.Folders
+        ProcessFolderTree child, dryRun
+    Next child
+End Sub
+
+Private Function IsSkippedFolder(ByVal fld As Outlook.MAPIFolder) As Boolean
+    ' Pack v3 (C3) : delegation modContactCommon (helper partage).
+    IsSkippedFolder = modContactCommon.IsSkippedFolder(fld, mSkipFolders)
+End Function
+
+' Dossier situe sous les Elements supprimes de son compte (corbeille) ?
+Private Function IsInDeletedItems(ByVal fld As Outlook.MAPIFolder) As Boolean
+    ' Pack v3 (C3) : delegation modContactCommon (helper partage).
+    IsInDeletedItems = modContactCommon.IsInDeletedItems(fld)
+End Function
+
+
+Private Sub ProcessContacts(ByVal fld As Outlook.MAPIFolder, ByVal dryRun As Boolean)
+    On Error GoTo ErrH
+    mFolders = mFolders + 1
+    Dim before As Long, beforeC As Long
+    before = mScanned
+    beforeC = mChanged
+    ReportLine "=== Dossier " & fld.FolderPath & " ==="
+    Dim itm As Object, cnt As Long
+    For Each itm In fld.Items
+        cnt = cnt + 1
+        If TypeName(itm) = "ContactItem" Then NormalizeContact itm, fld.Name, dryRun
+        If (cnt Mod 20) = 0 Then DoEvents
+    Next itm
+    ReportLine "    -> " & (mScanned - before) & " contacts, " & (mChanged - beforeC) & " a modifier"
+    Exit Sub
+ErrH:
+    mErrors = mErrors + 1
+    modDebugLog.DError MOD_NAME, "ProcessContacts " & fld.FolderPath & " err " & Err.Number & " - " & Err.Description
+    ReportLine "!! Dossier " & fld.FolderPath & " : erreur " & Err.Number & " - " & Err.Description
+End Sub
+
+'=============================================================================
+' Traitement d'une fiche : chaque bloc calcule les valeurs cibles, les
+' compare, ecrit la ligne de rapport et (hors simulation) affecte le champ.
+' Un seul Save par fiche, puis controles de recomposition Outlook.
+'=============================================================================
+Private Sub NormalizeContact(ByVal ct As Outlook.ContactItem, ByVal fldName As String, ByVal dryRun As Boolean)
+    Dim errNo As Long, errDesc As String
+    Dim who As String
+    On Error GoTo ErrH
+    mScanned = mScanned + 1
+    ResetScratch
+
+    who = SafeProp(ct, "FullName")
+    If Len(who) = 0 Then who = SafeProp(ct, "FileAs")
+    If Len(who) = 0 Then who = SafeProp(ct, "CompanyName")
+
+    Dim lines As String, changes As Long
+    Dim cats As String
+    cats = Trim$(SafeProp(ct, "Categories"))
+    If Len(cats) > 0 Then mCatFound = mCatFound + 1
+    If mClearMode Then
+        If Len(cats) = 0 Then Exit Sub
+        ReportLine "[" & IIf(dryRun, "SIMUL ", "MODIF ") & "] " & who & "   (" & fldName & ")"
+        ReportLine "   " & T("Cat~egories", "Categories") & " : " & cats & "  ->  (vide)"
+        mChanged = mChanged + 1
+        mFieldChanges = mFieldChanges + 1
+        mCatCleared = mCatCleared + 1
+        If Not dryRun Then
+            ct.Categories = ""
+            If Not SafeSave(ct) Then
+                mErrors = mErrors + 1
+                ReportLine "   !! Save en echec"
+            End If
+        End If
+        Exit Sub
+    End If
+    If mDoNames Then changes = changes + DoNames(ct, lines, dryRun)
+    If mDoPhones Then changes = changes + DoPhones(ct, lines, dryRun)
+    If mDoAddresses Then changes = changes + DoAddresses(ct, lines, dryRun)
+    If mDoEmails Then changes = changes + DoEmails(ct, lines, dryRun)
+    changes = changes + DoTextFields(ct, lines, dryRun)
+    If mDoNameDay Then changes = changes + DoNameDay(ct, lines, dryRun)
+
+    If Len(lines) = 0 Then Exit Sub
+    ReportLine "[" & IIf(changes > 0, IIf(dryRun, "SIMUL ", "MODIF "), "NOTE  ") & "] " & who & "   (" & fldName & ")"
+    mReport = mReport & lines
+    If changes = 0 Then Exit Sub
+    mChanged = mChanged + 1
+    mFieldChanges = mFieldChanges + changes
+    If dryRun Then Exit Sub
+
+    If Not SafeSave(ct) Then
+        mErrors = mErrors + 1
+        ReportLine "   !! Save en echec, fiche non modifiee"
+        Exit Sub
+    End If
+    PostSaveChecks ct
+    Exit Sub
+ErrH:
+    errNo = Err.Number
+    errDesc = Err.Description
+    mErrors = mErrors + 1
+    modDebugLog.DError MOD_NAME, "NormalizeContact err " & errNo & " - " & errDesc & " (" & who & ")"
+    ReportLine "[ERREUR] " & who & " : " & errNo & " - " & errDesc
+End Sub
+
+Private Sub ResetScratch()
+    Dim gi As Long
+    mExpFull = "": mNewFirst = "": mNewMiddle = "": mNewLast = ""
+    For gi = 0 To 2
+        mExpStreet(gi) = "": mExpCity(gi) = "": mExpPostal(gi) = "": mExpCountry(gi) = ""
+    Next gi
+End Sub
+
+'-----------------------------------------------------------------------------
+' NOMS
+'-----------------------------------------------------------------------------
+Private Function DoNames(ByVal ct As Outlook.ContactItem, ByRef lines As String, ByVal dryRun As Boolean) As Long
+    On Error GoTo ErrH
+    Dim first As String, middle As String, last As String, civ As String, suffix As String
+    first = CollapseSpaces(Trim$(SafeProp(ct, "FirstName")))
+    middle = CollapseSpaces(Trim$(SafeProp(ct, "MiddleName")))
+    last = CollapseSpaces(Trim$(SafeProp(ct, "LastName")))
+    civ = Trim$(SafeProp(ct, "Title"))
+    suffix = Trim$(SafeProp(ct, "Suffix"))
+    If Len(first) = 0 Or Len(last) = 0 Then
+        ' Entite (societe, service, numero...) : jamais renommee.
+        mEntities = mEntities + 1
+        Exit Function
+    End If
+
+    Dim nFirst As String, nMiddle As String, nLast As String
+    nFirst = CapName(first)
+    nMiddle = CapName(middle)
+    nLast = UpperSurname(last)
+
+    Dim oldFull As String, newFull As String
+    oldFull = SafeProp(ct, "FullName")
+    newFull = JoinWords(civ, nFirst, nMiddle, nLast, suffix)
+
+    Dim oldFA As String, newFA As String
+    oldFA = SafeProp(ct, "FileAs")
+    newFA = RebuildFileAs(oldFA, first, middle, last, nFirst, nMiddle, nLast)
+
+    Dim cnt As Long
+    If StrComp(SafeProp(ct, "FirstName"), nFirst, vbBinaryCompare) <> 0 Then
+        cnt = cnt + 1
+        AddLine lines, T("Pr~enom", "First name"), SafeProp(ct, "FirstName"), nFirst
+    End If
+    If StrComp(SafeProp(ct, "MiddleName"), nMiddle, vbBinaryCompare) <> 0 Then
+        cnt = cnt + 1
+        AddLine lines, T("Deuxi~fme pr~enom", "Middle name"), SafeProp(ct, "MiddleName"), nMiddle
+    End If
+    If StrComp(SafeProp(ct, "LastName"), nLast, vbBinaryCompare) <> 0 Then
+        cnt = cnt + 1
+        AddLine lines, T("Nom", "Last name"), SafeProp(ct, "LastName"), nLast
+    End If
+    If StrComp(oldFA, newFA, vbBinaryCompare) <> 0 Then
+        cnt = cnt + 1
+        AddLine lines, "FileAs", oldFA, newFA
+    End If
+    If cnt = 0 Then Exit Function
+
+    mExpFull = newFull: mNewFirst = nFirst: mNewMiddle = nMiddle: mNewLast = nLast
+    If dryRun Then
+        DoNames = cnt
+        Exit Function
+    End If
+
+    ' FullName d'abord (Outlook le re-decoupe), puis les composantes qui
+    ' font foi, puis FileAs. Civilite / suffixe reposes a l'identique.
+    ct.FullName = newFull
+    ct.Title = civ
+    ct.FirstName = nFirst
+    ct.MiddleName = nMiddle
+    ct.LastName = nLast
+    ct.Suffix = suffix
+    ct.FileAs = newFA
+
+    ' Noms d'affichage des e-mails ("Ancien Nom (adresse)") suivent.
+    Dim idx As Long, dn As String
+    If Len(oldFull) > 0 And StrComp(oldFull, newFull, vbBinaryCompare) <> 0 Then
+        For idx = 1 To 3
+            dn = SafeProp(ct, "Email" & idx & "DisplayName")
+            If InStr(1, dn, oldFull, vbBinaryCompare) > 0 Then
+                CallByName ct, "Email" & idx & "DisplayName", VbLet, Replace(dn, oldFull, newFull)
+            End If
+        Next idx
+    End If
+    DoNames = cnt
+    Exit Function
+ErrH:
+    modDebugLog.DError MOD_NAME, "DoNames err " & Err.Number & " - " & Err.Description
+    AddNote lines, "!! noms : erreur " & Err.Number & " - " & Err.Description
+    DoNames = 0
+End Function
+
+' Prenom(s) : chaque mot capitalise, tirets et apostrophes respectes
+' ("jean-baptiste" -> "Jean-Baptiste", "d'angelo" -> "D'Angelo").
+Private Function CapName(ByVal s As String) As String
+    Dim words() As String, idx As Long
+    s = CollapseSpaces(Trim$(s))
+    If Len(s) = 0 Then Exit Function
+    words = Split(s, " ")
+    For idx = LBound(words) To UBound(words)
+        words(idx) = CapHyphenated(words(idx), False)
+    Next idx
+    CapName = Join(words, " ")
+End Function
+
+' Nom : MAJUSCULES, particules en minuscules ("de la fontaine" ->
+' "de la FONTAINE", "d'estaing" -> "d'ESTAING"). Un nom mono-mot n'est
+' jamais traite comme particule.
+Private Function UpperSurname(ByVal s As String) As String
+    Dim words() As String, idx As Long, w As String, base As String
+    Dim pos As Long, pre As String, apos As String, rest As String
+    s = CollapseSpaces(Trim$(s))
+    If Len(s) = 0 Then Exit Function
+    words = Split(s, " ")
+    For idx = LBound(words) To UBound(words)
+        w = words(idx)
+        base = StripAccents(LCase$(w))
+        If UBound(words) > LBound(words) And IsParticle(base) Then
+            words(idx) = LCase$(w)
+        Else
+            pos = ApostrophePos(w)
+            If pos > 1 And pos < Len(w) Then
+                pre = Left$(w, pos - 1)
+                apos = Mid$(w, pos, 1)
+                rest = Mid$(w, pos + 1)
+                If IsParticle(StripAccents(LCase$(pre))) Then
+                    words(idx) = LCase$(pre) & apos & UCase$(rest)
+                Else
+                    words(idx) = UCase$(w)
+                End If
+            Else
+                words(idx) = UCase$(w)
+            End If
+        End If
+    Next idx
+    UpperSurname = Join(words, " ")
+End Function
+
+Private Function IsParticle(ByVal base As String) As Boolean
+    IsParticle = (InStr(1, mParticles, "|" & base & "|", vbBinaryCompare) > 0)
+End Function
+
+' Reconstruit FileAs selon le motif deja en place ; un FileAs personnalise
+' (aucun motif reconnu) est laisse tel quel.
+Private Function RebuildFileAs(ByVal oldFA As String, ByVal oFirst As String, ByVal oMiddle As String, _
+                               ByVal oLast As String, ByVal nFirst As String, ByVal nMiddle As String, _
+                               ByVal nLast As String) As String
+    Dim oFM As String, nFM As String
+    oFM = JoinWords(oFirst, oMiddle, "", "", "")
+    nFM = JoinWords(nFirst, nMiddle, "", "", "")
+    RebuildFileAs = oldFA
+    If Len(Trim$(oldFA)) = 0 Then
+        If mFileAsFormat = "FIRSTLAST" Then
+            RebuildFileAs = nFM & " " & nLast
+        Else
+            RebuildFileAs = nLast & ", " & nFM
+        End If
+    ElseIf StrComp(oldFA, oLast & ", " & oFM, vbTextCompare) = 0 Then
+        RebuildFileAs = nLast & ", " & nFM
+    ElseIf StrComp(oldFA, oLast & "," & oFM, vbTextCompare) = 0 Then
+        RebuildFileAs = nLast & ", " & nFM
+    ElseIf StrComp(oldFA, oFM & " " & oLast, vbTextCompare) = 0 Then
+        RebuildFileAs = nFM & " " & nLast
+    ElseIf StrComp(oldFA, oLast & " " & oFM, vbTextCompare) = 0 Then
+        RebuildFileAs = nLast & " " & nFM
+    ElseIf StrComp(oldFA, oLast & ", " & oFirst, vbTextCompare) = 0 Then
+        RebuildFileAs = nLast & ", " & nFirst
+    ElseIf StrComp(oldFA, oFirst & " " & oLast, vbTextCompare) = 0 Then
+        RebuildFileAs = nFirst & " " & nLast
+    End If
+End Function
+
+'-----------------------------------------------------------------------------
+' TELEPHONES
+'-----------------------------------------------------------------------------
+Private Function DoPhones(ByVal ct As Outlook.ContactItem, ByRef lines As String, ByVal dryRun As Boolean) As Long
+    On Error GoTo ErrH
+    Dim props() As String, idx As Long, raw As String, newV As String, status As Long, cnt As Long
+    props = Split(PHONE_PROPS, "|")
+    For idx = LBound(props) To UBound(props)
+        raw = SafeProp(ct, props(idx))
+        If Len(Trim$(raw)) > 0 Then
+            newV = NormalizePhone(raw, status)
+            Select Case status
+                Case PH_CHANGED, PH_ASSUMED
+                    cnt = cnt + 1
+                    AddLine lines, PhoneLabel(props(idx)), raw, newV & IIf(status = PH_ASSUMED, T("  (0 initial suppos~e)", "  (leading 0 assumed)"), "")
+                    If Not dryRun Then CallByName ct, props(idx), VbLet, newV
+                Case PH_LETTERS
+                    mPhoneWarn = mPhoneWarn + 1
+                    AddNote lines, "!! " & PhoneLabel(props(idx)) & T(" contient du texte, laiss~e tel quel : ", " contains text, left as is: ") & raw
+                Case PH_INVALID
+                    mPhoneWarn = mPhoneWarn + 1
+                    AddNote lines, "!! " & PhoneLabel(props(idx)) & T(" non reconnu, laiss~e tel quel : ", " not recognised, left as is: ") & raw
+            End Select
+        End If
+    Next idx
+    DoPhones = cnt
+    Exit Function
+ErrH:
+    modDebugLog.DError MOD_NAME, "DoPhones err " & Err.Number & " - " & Err.Description
+    AddNote lines, "!! telephones : erreur " & Err.Number & " - " & Err.Description
+    DoPhones = cnt
+End Function
+
+Private Function PhoneLabel(ByVal propName As String) As String
+    Select Case propName
+        Case "MobileTelephoneNumber": PhoneLabel = T("T~el. mobile", "Mobile phone")
+        Case "HomeTelephoneNumber": PhoneLabel = T("T~el. domicile", "Home phone")
+        Case "Home2TelephoneNumber": PhoneLabel = T("T~el. domicile 2", "Home phone 2")
+        Case "BusinessTelephoneNumber": PhoneLabel = T("T~el. bureau", "Business phone")
+        Case "Business2TelephoneNumber": PhoneLabel = T("T~el. bureau 2", "Business phone 2")
+        Case "OtherTelephoneNumber": PhoneLabel = T("T~el. autre", "Other phone")
+        Case "PrimaryTelephoneNumber": PhoneLabel = T("T~el. principal", "Primary phone")
+        Case "CompanyMainTelephoneNumber": PhoneLabel = T("T~el. standard", "Company main phone")
+        Case "AssistantTelephoneNumber": PhoneLabel = T("T~el. assistant(e)", "Assistant phone")
+        Case "CarTelephoneNumber": PhoneLabel = T("T~el. voiture", "Car phone")
+        Case Else: PhoneLabel = propName
+    End Select
+End Function
+
+' E.164 : "+" & indicatif & numero national sans le 0. Statuts en tete.
+Private Function NormalizePhone(ByVal raw As String, ByRef status As Long) As String
+    Dim s As String, idx As Long, ch As String, digits As String
+    Dim hasPlus As Boolean, hasLetter As Boolean, cc As String, result As String
+    NormalizePhone = raw
+    status = PH_SAME
+    s = Trim$(raw)
+    If Len(s) = 0 Then Exit Function
+
+    For idx = 1 To Len(s)
+        ch = Mid$(s, idx, 1)
+        Select Case ch
+            Case "0" To "9"
+                digits = digits & ch
+            Case "+"
+                If Len(digits) = 0 And Not hasPlus Then
+                    hasPlus = True
+                Else
+                    hasLetter = True
+                End If
+            Case " ", ".", "-", "(", ")", "/", vbTab, ChrW$(160)
+                ' separateurs ignores
+            Case Else
+                hasLetter = True
+        End Select
+    Next idx
+    If hasLetter Then
+        status = PH_LETTERS
+        Exit Function
+    End If
+    cc = mCountryCode
+
+    If hasPlus Or (Left$(digits, 2) = "00" And Len(digits) >= 10) Then
+        If Not hasPlus Then digits = Mid$(digits, 3)
+        ' "+33 (0)6 12..." -> retirer le 0 national residuel
+        If Left$(digits, Len(cc)) = cc Then
+            If Mid$(digits, Len(cc) + 1, 1) = "0" And Len(digits) = Len(cc) + 10 Then
+                digits = cc & Mid$(digits, Len(cc) + 2)
+            End If
+        End If
+        If Len(digits) < 8 Or Len(digits) > 15 Then
+            status = PH_INVALID
+            Exit Function
+        End If
+        result = "+" & digits
+        status = PH_CHANGED
+    Else
+        If Len(digits) <= 6 Then
+            status = PH_SHORT
+            Exit Function
+        End If
+        If Len(digits) = 10 And Left$(digits, 1) = "0" Then
+            result = "+" & cc & Mid$(digits, 2)
+            status = PH_CHANGED
+        ElseIf Len(digits) = 9 And Left$(digits, 1) <> "0" And cc = "33" Then
+            result = "+" & cc & digits
+            status = PH_ASSUMED
+        Else
+            status = PH_INVALID
+            Exit Function
+        End If
+    End If
+
+    If mSpaced Then result = SpaceE164(result)
+    If StrComp(result, raw, vbBinaryCompare) = 0 Then status = PH_SAME
+    NormalizePhone = result
+End Function
+
+' "+33612345678" -> "+33 6 12 34 56 78" (francais uniquement, sinon intact).
+Private Function SpaceE164(ByVal e164 As String) As String
+    SpaceE164 = e164
+    If Left$(e164, 3) = "+33" And Len(e164) = 12 Then
+        SpaceE164 = "+33 " & Mid$(e164, 4, 1) & " " & Mid$(e164, 5, 2) & " " & Mid$(e164, 7, 2) & _
+                    " " & Mid$(e164, 9, 2) & " " & Mid$(e164, 11, 2)
+    End If
+End Function
+
+'-----------------------------------------------------------------------------
+' PhoneFormatCanonical (v1.5) - PUBLIQUE, sans etat : formate un numero brut
+' selon la convention du toolkit (E.164, espace si PhoneOutputSpaced=1).
+' Renvoie "" si le numero n'est pas reconnu (l'appelant garde alors sa
+' valeur ou l'ecarte). Recharge les 2 cles concernees a chaque appel : sur
+' d'etre a jour meme apres un Ctrl+S (globales remises a zero).
+'-----------------------------------------------------------------------------
+Public Function PhoneFormatCanonical(ByVal raw As String) As String
+    On Error Resume Next
+    mCountryCode = DigitsOnly(modConfig.Cfg("PhoneDefaultCountryCode", "33"))
+    If Len(mCountryCode) = 0 Then mCountryCode = "33"
+    mSpaced = modConfig.CfgB("PhoneOutputSpaced", False)
+    Dim status As Long, res As String
+    res = NormalizePhone(raw, status)
+    Select Case status
+        Case PH_SAME, PH_CHANGED, PH_ASSUMED
+            PhoneFormatCanonical = res
+        Case Else
+            PhoneFormatCanonical = ""
+    End Select
+    Err.Clear
+End Function
+
+'-----------------------------------------------------------------------------
+' ADRESSES
+'-----------------------------------------------------------------------------
+Private Function DoAddresses(ByVal ct As Outlook.ContactItem, ByRef lines As String, ByVal dryRun As Boolean) As Long
+    On Error GoTo ErrH
+    Dim groups() As String, gi As Long, grp As String, cnt As Long
+    Dim street As String, city As String, postal As String, country As String
+    Dim nStreet As String, nCity As String, nPostal As String, nCountry As String
+    groups = Split(ADDR_GROUPS, "|")
+    For gi = LBound(groups) To UBound(groups)
+        grp = groups(gi)
+        street = SafeProp(ct, grp & "AddressStreet")
+        city = SafeProp(ct, grp & "AddressCity")
+        postal = SafeProp(ct, grp & "AddressPostalCode")
+        country = SafeProp(ct, grp & "AddressCountry")
+        If Len(Trim$(street & city & postal & country)) > 0 Then
+            nStreet = NormalizeStreet(street)
+            nCity = CollapseSpaces(Trim$(city))
+            nPostal = CollapseSpaces(Trim$(postal))
+            nCountry = CollapseSpaces(Trim$(country))
+            ' "92320 Chatillon" saisi dans Ville, code postal vide -> separer
+            If Len(nPostal) = 0 And nCity Like "##### *" Then
+                nPostal = Left$(nCity, 5)
+                nCity = Trim$(Mid$(nCity, 6))
+            End If
+            If mCityUpper Then nCity = UCase$(nCity)
+            If mCountryUpper Then nCountry = UCase$(nCountry)
+            If Len(nCountry) = 0 And Len(mDefaultCountry) > 0 And Len(nCity) > 0 And nPostal Like "#####" Then
+                nCountry = IIf(mCountryUpper, UCase$(mDefaultCountry), mDefaultCountry)
+            End If
+            cnt = cnt + ApplyField(ct, grp & "AddressStreet", street, nStreet, GroupLabel(grp) & T(" - rue", " - street"), lines, dryRun)
+            cnt = cnt + ApplyField(ct, grp & "AddressPostalCode", postal, nPostal, GroupLabel(grp) & T(" - code postal", " - postal code"), lines, dryRun)
+            cnt = cnt + ApplyField(ct, grp & "AddressCity", city, nCity, GroupLabel(grp) & T(" - ville", " - city"), lines, dryRun)
+            cnt = cnt + ApplyField(ct, grp & "AddressCountry", country, nCountry, GroupLabel(grp) & T(" - pays", " - country"), lines, dryRun)
+            If StrComp(city, nCity, vbBinaryCompare) <> 0 Or StrComp(street, nStreet, vbBinaryCompare) <> 0 _
+               Or StrComp(postal, nPostal, vbBinaryCompare) <> 0 Or StrComp(country, nCountry, vbBinaryCompare) <> 0 Then
+                mExpStreet(gi) = nStreet: mExpCity(gi) = nCity
+                mExpPostal(gi) = nPostal: mExpCountry(gi) = nCountry
+            End If
+        End If
+    Next gi
+    DoAddresses = cnt
+    Exit Function
+ErrH:
+    modDebugLog.DError MOD_NAME, "DoAddresses err " & Err.Number & " - " & Err.Description
+    AddNote lines, "!! adresses : erreur " & Err.Number & " - " & Err.Description
+    DoAddresses = cnt
+End Function
+
+Private Function GroupLabel(ByVal grp As String) As String
+    Select Case grp
+        Case "Home": GroupLabel = T("Adresse domicile", "Home address")
+        Case "Business": GroupLabel = T("Adresse bureau", "Business address")
+        Case Else: GroupLabel = T("Adresse autre", "Other address")
+    End Select
+End Function
+
+' Rue : lignes multiples respectees ; par ligne, 1er mot alphabetique
+' capitalise, mots-outils en minuscules, sigles en majuscules, jetons a
+' chiffres intacts.
+Private Function NormalizeStreet(ByVal s As String) As String
+    Dim arr() As String, li As Long
+    s = Replace(s, vbCrLf, vbLf)
+    s = Replace(s, vbCr, vbLf)
+    arr = Split(s, vbLf)
+    For li = LBound(arr) To UBound(arr)
+        arr(li) = NormalizeStreetLine(CollapseSpaces(Trim$(arr(li))))
+    Next li
+    NormalizeStreet = Join(arr, vbCrLf)
+End Function
+
+Private Function NormalizeStreetLine(ByVal ln As String) As String
+    Dim words() As String, wi As Long, w As String, tail As String, base As String
+    Dim firstAlphaDone As Boolean
+    If Len(ln) = 0 Then Exit Function
+    words = Split(ln, " ")
+    For wi = LBound(words) To UBound(words)
+        w = words(wi)
+        tail = ""
+        Do While Len(w) > 0
+            If Right$(w, 1) = "," Or Right$(w, 1) = ";" Then
+                tail = Right$(w, 1) & tail
+                w = Left$(w, Len(w) - 1)
+            Else
+                Exit Do
+            End If
+        Loop
+        If Len(w) > 0 Then
+            base = StripAccents(LCase$(w))
+            If HasDigit(w) Then
+                ' 12B, 3eme, 1er : intact
+            ElseIf IsUpperWord(base) Then
+                w = UCase$(w)
+            ElseIf Not firstAlphaDone Then
+                w = CapHyphenated(w, True)
+                w = UCase$(Left$(w, 1)) & Mid$(w, 2)
+                firstAlphaDone = True
+            ElseIf IsLowerWord(base) Then
+                w = LCase$(w)
+            Else
+                w = CapHyphenated(w, True)
+            End If
+        End If
+        words(wi) = w & tail
+    Next wi
+    NormalizeStreetLine = Join(words, " ")
+End Function
+
+Private Function IsLowerWord(ByVal base As String) As Boolean
+    IsLowerWord = (InStr(1, mLowerWords, "|" & base & "|", vbBinaryCompare) > 0)
+End Function
+
+Private Function IsUpperWord(ByVal base As String) As Boolean
+    IsUpperWord = (InStr(1, mUpperWords, "|" & base & "|", vbBinaryCompare) > 0)
+End Function
+
+'-----------------------------------------------------------------------------
+' E-MAILS (SMTP uniquement) et champs texte
+'-----------------------------------------------------------------------------
+Private Function DoEmails(ByVal ct As Outlook.ContactItem, ByRef lines As String, ByVal dryRun As Boolean) As Long
+    On Error GoTo ErrH
+    Dim idx As Long, addr As String, typ As String, newV As String, cnt As Long
+    For idx = 1 To 3
+        addr = SafeProp(ct, "Email" & idx & "Address")
+        typ = UCase$(SafeProp(ct, "Email" & idx & "AddressType"))
+        If Len(addr) > 0 Then
+            If typ = "SMTP" Or InStr(addr, "@") > 0 Then
+                newV = LCase$(Trim$(addr))
+                cnt = cnt + ApplyField(ct, "Email" & idx & "Address", addr, newV, "E-mail " & idx, lines, dryRun)
+            End If
+        End If
+    Next idx
+    DoEmails = cnt
+    Exit Function
+ErrH:
+    modDebugLog.DError MOD_NAME, "DoEmails err " & Err.Number & " - " & Err.Description
+    AddNote lines, "!! e-mails : erreur " & Err.Number & " - " & Err.Description
+    DoEmails = cnt
+End Function
+
+Private Function DoTextFields(ByVal ct As Outlook.ContactItem, ByRef lines As String, ByVal dryRun As Boolean) As Long
+    On Error GoTo ErrH
+    Dim cnt As Long, v As String
+    v = SafeProp(ct, "CompanyName")
+    cnt = cnt + ApplyField(ct, "CompanyName", v, CollapseSpaces(Trim$(v)), T("Soci~et~e", "Company"), lines, dryRun)
+    v = SafeProp(ct, "JobTitle")
+    cnt = cnt + ApplyField(ct, "JobTitle", v, CollapseSpaces(Trim$(v)), T("Fonction", "Job title"), lines, dryRun)
+    v = SafeProp(ct, "Department")
+    cnt = cnt + ApplyField(ct, "Department", v, CollapseSpaces(Trim$(v)), T("Service", "Department"), lines, dryRun)
+    v = SafeProp(ct, "WebPage")
+    cnt = cnt + ApplyField(ct, "WebPage", v, Trim$(v), T("Page web", "Web page"), lines, dryRun)
+    DoTextFields = cnt
+    Exit Function
+ErrH:
+    modDebugLog.DError MOD_NAME, "DoTextFields err " & Err.Number & " - " & Err.Description
+    DoTextFields = cnt
+End Function
+
+'-----------------------------------------------------------------------------
+' FETE DU PRENOM -> UserProperty NameDay ("MM-JJ")
+'-----------------------------------------------------------------------------
+Private Function DoNameDay(ByVal ct As Outlook.ContactItem, ByRef lines As String, ByVal dryRun As Boolean) As Long
+    On Error GoTo ErrH
+    Dim first As String, last As String
+    first = Trim$(SafeProp(ct, "FirstName"))
+    last = Trim$(SafeProp(ct, "LastName"))
+    If Len(first) = 0 Or Len(last) = 0 Then Exit Function      ' entite : pas de fete
+    Dim mmdd As String
+    mmdd = NameDayFor(first)
+    If Len(mmdd) = 0 Then
+        mNameDayUnknown = mNameDayUnknown + 1
+        AddNote lines, T("f" & ChrW$(234) & "te : pr~enom absent du calendrier : ", "name day: first name not in the table: ") & first
+        Exit Function
+    End If
+    Dim up As Outlook.UserProperty, cur As String
+    Set up = ct.UserProperties.Find(UP_NAMEDAY)
+    If Not up Is Nothing Then cur = Trim$(CStr(up.Value))
+    If cur = mmdd Then Exit Function
+    AddLine lines, T("F" & ChrW$(234) & "te", "Name day"), cur, Mid$(mmdd, 4, 2) & "/" & Left$(mmdd, 2)
+    mNameDaySet = mNameDaySet + 1
+    If Not dryRun Then
+        If up Is Nothing Then Set up = ct.UserProperties.Add(UP_NAMEDAY, olText, False)
+        up.Value = mmdd
+    End If
+    DoNameDay = 1
+    Exit Function
+ErrH:
+    modDebugLog.DError MOD_NAME, "DoNameDay err " & Err.Number & " - " & Err.Description
+    AddNote lines, "!! fete : erreur " & Err.Number & " - " & Err.Description
+End Function
+
+' Prenom -> "MM-JJ" ou "". Compose : entree exacte, sinon second prenom si le
+' premier est Jean / Marie, sinon premier prenom.
+Private Function NameDayFor(ByVal firstName As String) As String
+    Dim k As String, parts() As String
+    k = StripAccents(LCase$(Trim$(firstName)))
+    k = Replace(k, " ", "-")
+    If mNameDays.Exists(k) Then
+        NameDayFor = mNameDays.Item(k)
+        Exit Function
+    End If
+    If InStr(k, "-") > 0 Then
+        parts = Split(k, "-")
+        If (parts(0) = "jean" Or parts(0) = "marie") And UBound(parts) >= 1 Then
+            If mNameDays.Exists(parts(1)) Then
+                NameDayFor = mNameDays.Item(parts(1))
+                Exit Function
+            End If
+        End If
+        If mNameDays.Exists(parts(0)) Then NameDayFor = mNameDays.Item(parts(0))
+    End If
+End Function
+
+' Table des fetes : prenom (minuscules, sans accent) -> MM-JJ.
+' Calendrier des saints usuel (type calendrier de La Poste). Completable
+' sans toucher au code via config NameDayExtra=prenom=MM-JJ|prenom=MM-JJ.
+Private Function NameDayTable() As String
+    Dim s As String
+    s = s & "|adelaide=12-16|adele=12-24|adeline=10-20|adrien=09-08|adrienne=09-08|agathe=02-05|agnes=01-21|aime=09-13|aimee=02-20|alain=09-09"
+    s = s & "|alan=09-09|alban=06-22|albert=11-15|alessandro=04-22|alexandra=03-20|alexandre=04-22|alexis=02-17|alice=12-16|aline=10-20|alix=01-09"
+    s = s & "|amandine=07-09|ambroise=12-07|anaelle=07-26|anais=07-26|andre=11-30|andrea=11-30|ange=10-02|angele=01-27|angelique=01-27|angelo=10-02"
+    s = s & "|anna=07-26|annabelle=07-26|anne=07-26|annick=07-26|annie=07-26|anselme=04-21|anthony=01-17|antoine=06-13|antonin=05-02|antonio=06-13"
+    s = s & "|apolline=02-09|armand=12-23|armelle=08-16|arnaud=02-10|arsene=07-19|arthur=11-15|aubin=03-01|aude=11-18|audrey=06-23|auguste=02-29"
+    s = s & "|augustin=08-28|aurelie=10-15|aurelien=06-16|axel=03-21|axelle=03-21|baptiste=06-24|barbara=12-04|barnabe=06-11|barthelemy=08-24|basile=01-02"
+    s = s & "|bastien=01-20|baudouin=10-17|beatrice=02-13|benedicte=03-16|benjamin=03-31|benoit=07-11|bernadette=02-18|bernard=08-20|berthe=07-04|bertrand=09-06"
+    s = s & "|blaise=02-03|blandine=06-02|boris=05-02|brice=11-13|brigitte=07-23|bruno=10-06|camille=07-14|carine=11-07|carlos=11-04|carole=07-17"
+    s = s & "|caroline=07-17|casimir=03-04|catherine=11-25|cecile=11-22|cedric=01-07|celia=10-21|celine=10-21|chantal=12-12|charles=11-04|charline=07-17"
+    s = s & "|charlotte=07-17|chiara=08-11|christel=07-24|christelle=07-24|christian=11-12|christiane=11-12|christine=07-24|christophe=08-21|claire=08-11|clara=08-11"
+    s = s & "|claude=02-15|claudine=02-15|clemence=03-21|clement=11-23|clementine=03-21|clotilde=06-04|colette=03-06|coline=03-06|come=09-26|constance=03-08"
+    s = s & "|constant=09-23|constantin=05-21|coralie=05-18|coraline=05-18|corentin=12-12|corinne=05-18|cyril=03-18|cyrille=03-18|damien=09-26|daniel=12-11"
+    s = s & "|daniele=12-11|danielle=12-11|david=12-29|delphine=11-26|denis=10-09|denise=05-15|desire=05-08|diane=06-09|didier=05-23|dimitri=10-26"
+    s = s & "|dominique=08-08|donald=07-15|edith=09-16|edmond=11-20|edouard=01-05|edwige=10-16|elena=08-18|eleonore=06-25|eliane=07-04|elie=07-20"
+    s = s & "|elisa=11-17|elisabeth=11-17|elise=11-17|elodie=10-22|eloise=02-11|emeline=10-27|emile=05-22|emilie=09-19|emilien=09-19|emma=04-19"
+    s = s & "|emmanuel=12-25|emmanuelle=12-25|enri=07-13|enrico=07-13|eric=05-18|erika=05-18|ernest=11-07|estelle=05-11|esther=07-01|etienne=12-26"
+    s = s & "|eugene=07-13|eugenie=02-07|eva=09-06|eve=09-06|evelyne=12-27|fabien=01-20|fabienne=01-20|fabrice=08-22|fanny=12-26|felix=02-12"
+    s = s & "|ferdinand=05-30|fernand=06-27|fernande=06-27|fiona=01-01|firmin=10-11|flavie=10-05|flora=11-24|flore=11-24|florence=12-01|florent=07-04"
+    s = s & "|florian=05-04|floriana=11-24|francesco=10-04|franck=10-04|francois=10-04|francoise=03-09|frank=10-04|frederic=07-18|frederique=07-18|gabin=02-19"
+    s = s & "|gabriel=09-29|gabrielle=09-29|gael=12-17|gaelle=12-17|gaetan=08-07|gaspard=12-28|gaston=02-06|gauthier=04-09|gautier=04-09|genevieve=01-03"
+    s = s & "|geoffrey=11-08|geoffroy=11-08|georges=04-23|gerald=12-05|geraldine=12-05|gerard=10-03|germain=05-28|germaine=06-15|ghislain=10-10|ghislaine=10-10"
+    s = s & "|gilbert=06-07|gilles=09-01|gisele=05-07|giulia=04-08|giuseppe=03-19|gonzague=06-21|gregoire=09-03|gregory=09-03|guenole=03-03|guillaume=01-10"
+    s = s & "|guillemette=01-10|gustave=10-07|guy=06-12|gwenael=11-03|gwenaelle=11-03|gwendoline=10-14|helene=08-18|henri=07-13|henriette=07-13|herve=06-17"
+    s = s & "|hilaire=01-13|honore=05-16|hubert=11-03|hugo=04-01|hugues=04-01|humbert=03-25|ida=04-13|ignace=07-31|igor=06-05|ines=09-10"
+    s = s & "|ingrid=09-02|irene=04-05|irenee=06-28|isabelle=02-22|isidore=04-04|jacky=07-25|jacqueline=02-08|jacques=07-25|jade=06-29|jean=12-27"
+    s = s & "|jean-baptiste=06-24|jean-marie=08-04|jeanine=05-30|jeanne=05-30|jeannine=05-30|jeremie=05-01|jeremy=05-01|jerome=09-30|jessica=11-04|joachim=07-26"
+    s = s & "|joel=07-13|joele=07-13|joelle=07-13|johan=12-27|jonathan=12-27|jordan=02-13|joseph=03-19|josephine=03-19|josette=03-19|jude=10-28"
+    s = s & "|judith=05-05|jules=04-12|julia=04-08|julie=04-08|julien=08-02|julienne=02-16|juliette=07-30|justin=06-01|justine=03-12|karine=11-07"
+    s = s & "|kevin=06-03|laetitia=08-18|landry=06-10|laura=10-19|laure=10-19|laurence=08-10|laurent=08-10|lazare=12-17|lea=03-22|lena=08-18"
+    s = s & "|leon=11-10|leonard=11-06|leonie=11-10|leopold=11-15|lila=03-22|liliane=07-04|lily=07-04|lionel=11-10|lise=11-17|loic=08-25"
+    s = s & "|lorenzo=08-10|louis=08-25|louise=03-15|luc=10-18|luca=10-18|lucas=10-18|lucie=12-13|lucien=01-08|lucienne=01-08|lucile=12-13"
+    s = s & "|ludivine=04-14|ludovic=08-25|lydia=08-03|lydie=08-03|lydwine=04-14|madeleine=07-22|maelle=05-13|magali=07-22|manon=08-15|marc=04-25"
+    s = s & "|marcel=01-16|marceline=01-31|marcella=01-31|marcelle=01-31|marco=04-25|margaux=11-16|margot=11-16|marguerite=11-16|maria=08-15|marianne=07-26"
+    s = s & "|marie=08-15|marie-madeleine=07-22|marielle=08-15|mariette=07-06|marina=07-20|marine=07-20|mario=01-19|marion=08-15|marius=01-19|marjorie=11-16"
+    s = s & "|marlene=07-22|marthe=07-29|martial=06-30|martin=11-11|martine=01-30|massimiliano=03-12|mathias=05-14|mathieu=09-21|mathilde=03-14|matteo=09-21"
+    s = s & "|matthias=05-14|matthieu=09-21|maud=03-14|maurice=09-22|maxence=04-14|maxime=04-14|maximilien=03-12|medard=06-08|melanie=01-26|melissa=01-26"
+    s = s & "|michael=09-29|michel=09-29|michele=09-29|micheline=09-29|mickael=09-29|monique=08-27|muriel=08-15|nadege=09-18|nadia=09-18|nadine=09-18"
+    s = s & "|nathalie=07-27|nathan=07-27|nelly=08-18|nicolas=12-06|nicole=03-06|nina=01-14|ninon=12-15|noel=12-25|noelle=12-25|noemie=08-21"
+    s = s & "|norbert=06-06|octave=11-20|odette=04-20|odile=12-14|olga=07-11|olivier=07-12|oscar=02-03|pacome=05-09|pascal=05-17|pascale=05-17"
+    s = s & "|patrice=03-17|patricia=03-17|patrick=03-17|paul=06-29|paule=01-26|paulette=01-26|pauline=01-26|perrine=05-31|philippe=05-03|philippine=05-03"
+    s = s & "|pierino=06-29|pierre=06-29|pierre-marie=06-29|pierrick=06-29|prosper=06-25|quentin=10-31|rachel=09-15|raoul=07-07|raphael=09-29|raphaelle=09-29"
+    s = s & "|raymond=01-07|raymonde=01-07|regine=09-07|regis=06-16|reine=09-07|remi=01-15|remy=01-15|renaud=09-17|rene=10-19|renee=10-19"
+    s = s & "|richard=04-03|robert=04-30|roberto=04-30|rodolphe=06-21|roger=12-30|roland=09-15|rolande=05-13|romain=02-28|romane=02-28|romeo=02-25"
+    s = s & "|romuald=06-19|rosa=08-23|rosalie=09-04|rosanna=08-23|rose=08-23|roseline=01-17|roxane=01-17|rudy=06-21|sabine=08-29|sabrina=08-29"
+    s = s & "|salome=10-22|samuel=08-20|sandra=04-02|sandrine=04-02|sarah=10-09|sebastien=01-20|serge=10-07|severin=11-27|severine=11-27|sidonie=11-14"
+    s = s & "|simon=10-28|simone=10-28|solange=05-10|solene=05-10|sonia=05-25|sophia=05-25|sophie=05-25|stanislas=04-11|stefano=12-26|stephane=12-26"
+    s = s & "|stephanie=12-26|suzanne=08-11|sylvain=05-04|sylvestre=12-31|sylvia=11-05|sylviane=11-05|sylvie=11-05|tanguy=11-19|tatiana=01-12|teresa=10-01"
+    s = s & "|theo=11-09|theodore=11-09|theophile=12-20|therese=10-01|thibaud=07-08|thibault=07-08|thibaut=07-08|thierry=07-01|thomas=07-03|timothee=01-26"
+    s = s & "|tiphaine=01-06|ulrich=07-10|umberto=03-25|urbain=12-19|valentin=02-14|valentine=02-14|valentino=02-14|valerie=04-28|vanessa=02-04|vera=09-18"
+    s = s & "|veronika=02-04|veronique=02-04|victoire=11-15|victor=07-21|victoria=11-15|vincent=01-22|violaine=12-13|violette=10-29|virginie=01-07|viviane=12-02"
+    s = s & "|vivien=03-10|walter=04-09|wilfried=10-12|william=01-10|xavier=12-03|yann=12-27|yannick=12-27|yolande=06-11|yves=05-19|yvette=01-13"
+    s = s & "|yvon=05-19|yvonne=05-19|zita=04-27|zoe=05-02"
+    NameDayTable = s & "|"
+End Function
+
+'-----------------------------------------------------------------------------
+' Controles apres Save : Outlook peut recomposer FullName et les blocs
+' d'adresse composites a sa maniere. On relit, et on force si besoin.
+'-----------------------------------------------------------------------------
+Private Sub PostSaveChecks(ByVal ct As Outlook.ContactItem)
+    On Error Resume Next
+    Dim needSave As Boolean
+    If Len(mExpFull) > 0 Then
+        If StrComp(SafeProp(ct, "FullName"), mExpFull, vbBinaryCompare) <> 0 Then
+            ct.FullName = mExpFull
+            ct.FirstName = mNewFirst
+            ct.MiddleName = mNewMiddle
+            ct.LastName = mNewLast
+            needSave = True
+            ReportLine "   ~ FullName force apres Save (Outlook l'avait recompose : " & SafeProp(ct, "FullName") & ")"
+            modDebugLog.DInfo MOD_NAME, "FullName force : " & mExpFull
+        End If
+    End If
+    Dim groups() As String, gi As Long, comp As String, comp2 As String
+    groups = Split(ADDR_GROUPS, "|")
+    For gi = LBound(groups) To UBound(groups)
+        If Len(mExpCity(gi)) > 0 Or Len(mExpStreet(gi)) > 0 Then
+            comp = SafeProp(ct, groups(gi) & "Address")
+            If (Len(mExpCity(gi)) > 0 And InStr(1, comp, mExpCity(gi), vbBinaryCompare) = 0) _
+               Or (Len(mExpStreet(gi)) > 0 And InStr(1, comp, mExpStreet(gi), vbBinaryCompare) = 0) Then
+                comp2 = mExpStreet(gi)
+                If Len(Trim$(mExpPostal(gi) & " " & mExpCity(gi))) > 0 Then
+                    comp2 = comp2 & IIf(Len(comp2) > 0, vbCrLf, "") & Trim$(mExpPostal(gi) & " " & mExpCity(gi))
+                End If
+                If Len(mExpCountry(gi)) > 0 Then comp2 = comp2 & vbCrLf & mExpCountry(gi)
+                CallByName ct, groups(gi) & "Address", VbLet, comp2
+                CallByName ct, groups(gi) & "AddressStreet", VbLet, mExpStreet(gi)
+                CallByName ct, groups(gi) & "AddressPostalCode", VbLet, mExpPostal(gi)
+                CallByName ct, groups(gi) & "AddressCity", VbLet, mExpCity(gi)
+                CallByName ct, groups(gi) & "AddressCountry", VbLet, mExpCountry(gi)
+                needSave = True
+                ReportLine "   ~ bloc adresse " & groups(gi) & " reconstruit apres Save"
+                modDebugLog.DInfo MOD_NAME, "Adresse composite reconstruite (" & groups(gi) & ")"
+            End If
+        End If
+    Next gi
+    If needSave Then
+        If Not SafeSave(ct) Then ReportLine "   !! Save de controle en echec"
+    End If
+End Sub
+
+'=============================================================================
+' Helpers generiques
+'=============================================================================
+' Compare, ecrit la ligne de rapport et (hors simulation) affecte via
+' CallByName. Renvoie 1 si le champ change, 0 sinon.
+Private Function ApplyField(ByVal ct As Outlook.ContactItem, ByVal propName As String, _
+                            ByVal oldV As String, ByVal newV As String, ByVal lbl As String, _
+                            ByRef lines As String, ByVal dryRun As Boolean) As Long
+    If StrComp(oldV, newV, vbBinaryCompare) = 0 Then Exit Function
+    AddLine lines, lbl, oldV, newV
+    If Not dryRun Then CallByName ct, propName, VbLet, newV
+    ApplyField = 1
+End Function
+
+Private Function SafeProp(ByVal ct As Object, ByVal propName As String) As String
+    On Error Resume Next
+    SafeProp = ""
+    SafeProp = CStr(CallByName(ct, propName, VbGet))
+    Err.Clear
+End Function
+
+Private Sub AddLine(ByRef lines As String, ByVal lbl As String, ByVal oldV As String, ByVal newV As String)
+    lines = lines & "   " & lbl & " : " & Flat(oldV) & "  ->  " & Flat(newV) & vbCrLf
+End Sub
+
+Private Sub AddNote(ByRef lines As String, ByVal txt As String)
+    lines = lines & "   " & Flat(txt) & vbCrLf
+End Sub
+
+Private Function Flat(ByVal s As String) As String
+    Flat = Replace(Replace(s, vbCrLf, " / "), vbLf, " / ")
+End Function
+
+Private Function JoinWords(ByVal p1 As String, ByVal p2 As String, ByVal p3 As String, _
+                           ByVal p4 As String, ByVal p5 As String) As String
+    JoinWords = CollapseSpaces(Trim$(p1 & " " & p2 & " " & p3 & " " & p4 & " " & p5))
+End Function
+
+' Capitalise un mot en respectant tirets et apostrophes. applyLower :
+' segments qui sont des mots-outils d'adresse laisses en minuscules
+' ("bourg-la-reine" -> "Bourg-la-Reine", "l'eglise" -> "l'Eglise").
+Private Function CapHyphenated(ByVal w As String, ByVal applyLower As Boolean) As String
+    Dim segs() As String, si As Long
+    segs = Split(w, "-")
+    For si = LBound(segs) To UBound(segs)
+        If applyLower And IsLowerWord(StripAccents(LCase$(segs(si)))) Then
+            segs(si) = LCase$(segs(si))
+        Else
+            segs(si) = CapApostrophe(segs(si), applyLower)
+        End If
+    Next si
+    CapHyphenated = Join(segs, "-")
+End Function
+
+Private Function CapApostrophe(ByVal seg As String, ByVal applyLower As Boolean) As String
+    Dim pos As Long, pre As String, apos As String, rest As String
+    pos = ApostrophePos(seg)
+    If pos > 1 And pos < Len(seg) Then
+        pre = Left$(seg, pos - 1)
+        apos = Mid$(seg, pos, 1)
+        rest = Mid$(seg, pos + 1)
+        If applyLower And IsLowerWord(StripAccents(LCase$(pre))) Then
+            CapApostrophe = LCase$(pre) & apos & CapSimple(rest)
+        Else
+            CapApostrophe = CapSimple(pre) & apos & CapSimple(rest)
+        End If
+    Else
+        CapApostrophe = CapSimple(seg)
+    End If
+End Function
+
+Private Function CapSimple(ByVal s As String) As String
+    If Len(s) = 0 Then Exit Function
+    CapSimple = UCase$(Left$(s, 1)) & LCase$(Mid$(s, 2))
+End Function
+
+' Position de la premiere apostrophe (droite ou typographique), 0 si aucune.
+Private Function ApostrophePos(ByVal s As String) As Long
+    Dim p1 As Long, p2 As Long
+    p1 = InStr(s, "'")
+    p2 = InStr(s, ChrW$(8217))
+    If p1 = 0 Then
+        ApostrophePos = p2
+    ElseIf p2 = 0 Then
+        ApostrophePos = p1
+    ElseIf p1 < p2 Then
+        ApostrophePos = p1
+    Else
+        ApostrophePos = p2
+    End If
+End Function
+
+Private Function HasDigit(ByVal s As String) As Boolean
+    ' Pack v3 (C3) : delegation modContactCommon (helper partage).
+    HasDigit = modContactCommon.HasDigit(s)
+End Function
+
+Private Function DigitsOnly(ByVal s As String) As String
+    ' Pack v3 (C3) : delegation modContactCommon (helper partage).
+    DigitsOnly = modContactCommon.DigitsOnly(s)
+End Function
+
+Private Function CollapseSpaces(ByVal s As String) As String
+    ' Pack v3 (C3) : delegation modContactCommon (helper partage).
+    CollapseSpaces = modContactCommon.CollapseSpaces(s)
+End Function
+
+Private Function StripAccents(ByVal s As String) As String
+    ' Pack v3 (C3) : delegation modContactCommon (helper partage).
+    StripAccents = modContactCommon.StripAccents(s)
+End Function
+
+' Save avec 3 essais (Exchange Online : erreurs transitoires).
+Private Function SafeSave(ByVal itm As Object) As Boolean
+    Dim tries As Long
+    On Error Resume Next
+    For tries = 1 To 3
+        Err.Clear
+        itm.Save
+        If Err.Number = 0 Then
+            SafeSave = True
+            Exit Function
+        End If
+        modDebugLog.DDebug MOD_NAME, "Save essai " & tries & " err " & Err.Number & " - " & Err.Description
+        Sleep 300 * tries
+    Next tries
+    SafeSave = False
+End Function
+
+'=============================================================================
+' Rapport
+'=============================================================================
+Private Sub ReportLine(ByVal s As String)
+    mReport = mReport & s & vbCrLf
+End Sub
+
+Private Sub WriteReport()
+    On Error Resume Next
+    Dim dirPath As String
+    dirPath = modConfig.MacroVBADir()
+    If Dir(dirPath, vbDirectory) = "" Then MkDir dirPath
+    mReportPath = dirPath & "\ContactNormalize-" & Format$(Now, "yyyymmdd-hhnnss") & ".txt"
+    Dim stm As Object
+    Set stm = CreateObject("ADODB.Stream")
+    stm.Type = 2
+    stm.Charset = "utf-8"
+    stm.Open
+    stm.WriteText mReport
+    stm.SaveToFile mReportPath, 2
+    stm.Close
+    If Err.Number <> 0 Then
+        modDebugLog.DError MOD_NAME, "WriteReport err " & Err.Number & " - " & Err.Description
+        Err.Clear
+    End If
+End Sub
+
+Private Sub ShowSummary(ByVal dryRun As Boolean)
+    Dim msg As String
+    msg = IIf(dryRun, T("SIMULATION - rien n'a ~et~e ~ecrit.", "DRY RUN - nothing was written."), _
+                      T("Termin~e.", "Done.")) & vbCrLf & vbCrLf & _
+          T("Dossiers de contacts : ", "Contact folders: ") & mFolders & vbCrLf & _
+          T("Fiches parcourues : ", "Cards scanned: ") & mScanned & vbCrLf & _
+          T("Fiches ~a modifier / modifi~ees : ", "Cards to change / changed: ") & mChanged & vbCrLf & _
+          T("Champs concern~es : ", "Fields concerned: ") & mFieldChanges & vbCrLf & _
+          T("Entit~es (non renomm~ees) : ", "Entities (not renamed): ") & mEntities & vbCrLf & _
+          T("Num~eros laiss~es tels quels (voir rapport) : ", "Numbers left as is (see report): ") & mPhoneWarn & vbCrLf & _
+          T("Fiches avec cat~egorie : ", "Cards with a category: ") & mCatFound & vbCrLf & _
+          T("F" & ChrW$(234) & "tes pos~ees : ", "Name days set: ") & mNameDaySet & "   " & _
+          T("pr~enoms inconnus : ", "unknown first names: ") & mNameDayUnknown & vbCrLf & _
+          T("Erreurs : ", "Errors: ") & mErrors & vbCrLf & vbCrLf & _
+          T("Rapport : ", "Report: ") & mReportPath & vbCrLf & vbCrLf & _
+          T("Ouvrir le rapport ?", "Open the report?")
+    If MsgBox(msg, vbYesNo + vbInformation, UiTitle()) = vbYes Then
+        If Dir(mReportPath) <> "" Then Shell "notepad.exe """ & mReportPath & """", vbNormalFocus
+    End If
+End Sub

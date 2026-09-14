@@ -1,0 +1,1272 @@
+Option Explicit
+
+' =====================================================================
+' modMeetingColor v13.3
+' v13.3 (2026-09-01) : CRENEAU PERSONNEL. (a) DetermineCategory : un
+' RENDEZ-VOUS (olNonMeeting) dont je suis l'organisateur (ou sans
+' organisateur) n'a aucune couleur auto, quel que soit l'etat residuel de
+' Recipients (une reunion videe de ses invites puis convertie garde parfois
+' l'organisateur en destinataire). Un RDV transfere par un tiers (Organizer
+' externe) reste evalue. (b) Nouvelle fonction publique ClearAutoCategory :
+' retire la categorie auto sans passer par le verdict ni le cooldown ;
+' appelee par modMeetingToAppointment.DemoteIfEmptyMeeting apres la
+' conversion (la couleur posee quand l'item etait encore olMeeting restait,
+' le cooldown d'ApplyCategory ecartant l'ItemChange suivant). (c) SetStatus
+' passe par modCommon.SetStatus (Explorer.StatusBar n'est pas inscriptible).
+' (d) MOD_VERSION / ModVersion ajoutes.
+' v13.2 (2026-07-05) : lecture config via getters modConfig (EnsureLoaded-
+' safe) au lieu des globales g_ en direct (InternalDomains, categories
+' interne/externe) : domaines vides apres un Ctrl+S VBE = tous les RDV
+' juges "externes".
+' v13.1 (2026-07-05) : les 3 filtres DASL construisaient la date via
+' Format("mm/dd/yyyy hh:nn AM/PM") dont les jetons / et : suivent les
+' reglages regionaux Windows (separateur personnalise = filtre casse en
+' silence) -> modCommon.FormatDaslDate (construction manuelle,
+' locale-proof, meme logique que le helper prive de modAntiOverlap).
+' Purpose (EN): auto-colors appointments by participant nature (internal vs
+'   external) using the configured internal domains, and provides manual batch
+'   coloring/tagging over a recent window. Organizer and recipients are both
+'   resolved to SMTP; a single external participant flips the verdict to
+'   "external". Category comparison is set-based (order/separator/case
+'   insensitive) to avoid the Outlook ListSeparator re-normalization loop.
+'   Calendar events are suspended during batch loops (see ThisOutlookSession).
+'
+' Coloration auto des RDV selon la nature des participants (interne /
+' externe), d'apres les domaines internes configures. Comparaison de
+' categories ensembliste (ordre/separateur/casse ignores) pour eviter la
+' boucle de re-normalisation du ListSeparator Outlook.
+' (Historique des versions -> CHANGELOG.)
+' =====================================================================
+
+Private Const MOD_NAME As String = "MeetingColor"
+Private Const MOD_VERSION As String = "v13.3 - 2026-09-01"
+
+' Parametres externalises dans config.ini (lus via modConfig.g_*) :
+'   g_InternalDomains          (cle InternalDomains)          - domaines internes
+'   g_ExternalMeetingCategory  (cle ExternalMeetingCategory)  - nom categorie externe
+'   g_InternalMeetingCategory  (cle InternalMeetingCategory)  - nom categorie interne
+
+' Garde anti-reentrance asynchrone : on memorise le dernier EntryID sauve
+' et l'instant. Si le meme item revient dans les COOLDOWN_SEC, on skippe.
+Private Const COOLDOWN_SEC As Long = 5
+
+Private bApplyingNow As Boolean
+Private gLastEntryID As String
+Private gLastSaveAt As Date
+
+'=============================================================================
+' ModVersion - version reellement chargee dans le VBE (modMaintenance).
+'=============================================================================
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+Private Sub SetStatus(ByVal msg As String)
+    On Error Resume Next
+    modCommon.SetStatus MOD_NAME, msg
+    On Error GoTo 0
+End Sub
+
+Private Function AutoCategories() As Variant
+    AutoCategories = Array(modConfig.ExternalMeetingCategory(), modConfig.InternalMeetingCategory())
+End Function
+
+Private Function IsInternalDomain(ByVal domain As String) As Boolean
+    ' Pack v3 (C2) : delegation modSmtp (egalite OU sous-domaine).
+    IsInternalDomain = modSmtp.IsInternalDomain(domain)
+End Function
+
+'=============================================================================
+' Parser tolerant : accepte ',' et ';' comme separateur.
+' Outlook ecrit normalement ", " mais selon les parametres regionaux et les
+' RDV issus d'iCal/Google, on peut trouver "; ".
+'=============================================================================
+Private Function SplitCategories(ByVal cats As String) As Variant
+    If Len(cats) = 0 Then
+        SplitCategories = Array()
+        Exit Function
+    End If
+    
+    Dim normalized As String
+    normalized = Replace(cats, ";", ",")
+    
+    Dim raw() As String
+    raw = Split(normalized, ",")
+    
+    Dim clean() As String
+    ReDim clean(0 To UBound(raw) - LBound(raw))
+    
+    Dim n As Long, i As Long, c As String
+    n = 0
+    For i = LBound(raw) To UBound(raw)
+        c = Trim(raw(i))
+        If Len(c) > 0 Then
+            clean(n) = c
+            n = n + 1
+        End If
+    Next i
+    
+    If n = 0 Then
+        SplitCategories = Array()
+    Else
+        ReDim Preserve clean(0 To n - 1)
+        SplitCategories = clean
+    End If
+End Function
+
+'=============================================================================
+' Comparaison ENSEMBLISTE de deux strings de categories.
+' Ignore : l'ordre des elements, la casse, le separateur (',' vs ';'),
+'          les doublons internes, les espaces autour.
+'
+' C'est LE garde central anti-boucle : meme si Outlook normalise notre
+' ", " en "; " apres le Save, cette fonction renverra True et on ne
+' re-sauvera pas l'item.
+'=============================================================================
+Private Function CategoriesAreEquivalent(ByVal catsA As String, _
+                                            ByVal catsB As String) As Boolean
+    CategoriesAreEquivalent = False
+    
+    Dim arrA As Variant, arrB As Variant
+    arrA = SplitCategories(catsA)
+    arrB = SplitCategories(catsB)
+    
+    Dim setA As Object, setB As Object
+    Set setA = CreateObject("Scripting.Dictionary")
+    Set setB = CreateObject("Scripting.Dictionary")
+    setA.CompareMode = 1   ' vbTextCompare (insensible a la casse)
+    setB.CompareMode = 1
+    
+    Dim i As Long, c As String
+    For i = LBound(arrA) To UBound(arrA)
+        c = CStr(arrA(i))
+        If Len(c) > 0 Then
+            If Not setA.Exists(c) Then setA.Add c, True
+        End If
+    Next i
+    For i = LBound(arrB) To UBound(arrB)
+        c = CStr(arrB(i))
+        If Len(c) > 0 Then
+            If Not setB.Exists(c) Then setB.Add c, True
+        End If
+    Next i
+    
+    If setA.count <> setB.count Then Exit Function
+    
+    Dim k As Variant
+    For Each k In setA.Keys
+        If Not setB.Exists(k) Then Exit Function
+    Next k
+    
+    CategoriesAreEquivalent = True
+End Function
+
+Public Sub ApplyCategory(ByVal appt As Object)
+    ' Garde 1 : reentrance synchrone (Save -> ItemChange dans la meme pile)
+    If bApplyingNow Then
+        modDebugLog.DDebug MOD_NAME, "Skip : reentrance synchrone"
+        Exit Sub
+    End If
+    
+    On Error GoTo ErrH
+    
+    If appt Is Nothing Then Exit Sub
+    If Not (TypeOf appt Is Outlook.AppointmentItem) Then Exit Sub
+    
+    Dim a As Outlook.AppointmentItem
+    Set a = appt
+    
+    ' Garde 2 : reentrance asynchrone (Save -> ItemChange poste apres
+    ' depilage). Si on vient de sauver ce meme item, on skippe.
+    If Len(gLastEntryID) > 0 And Len(a.EntryID) > 0 Then
+        If StrComp(gLastEntryID, a.EntryID, vbBinaryCompare) = 0 Then
+            If DateDiff("s", gLastSaveAt, Now) < COOLDOWN_SEC Then
+                modDebugLog.DDebug MOD_NAME, _
+                    "Skip : cooldown asynchrone (" & _
+                    DateDiff("s", gLastSaveAt, Now) & "s) sur '" & _
+                    a.subject & "'"
+                Exit Sub
+            End If
+        End If
+    End If
+    
+    modDebugLog.DTrace MOD_NAME, "ApplyCategory '" & a.subject & "'"
+    
+    ' --- Opt-out 1 : RDV prive ou confidentiel ---
+    If a.Sensitivity = olPrivate Or a.Sensitivity = olConfidential Then
+        modDebugLog.DDebug MOD_NAME, "  Skip : Sensitivity=" & a.Sensitivity
+        Exit Sub
+    End If
+    
+    ' --- Opt-out 2 : categorie Personnel ---
+    If HasPersonalCategory(a.Categories) Then
+        modDebugLog.DDebug MOD_NAME, "  Skip : categorie Personnel presente"
+        Exit Sub
+    End If
+    
+    bApplyingNow = True
+    
+    Dim newCat As String
+    newCat = DetermineCategory(a)
+    
+    Dim currentCats As String
+    currentCats = a.Categories
+    
+    ' Detection de pollution anterieure (item deja corrompu par le bug
+    ' de boucle des versions precedentes).
+    If IsSaturated(currentCats) Then
+        modDebugLog.DInfo MOD_NAME, "Pollution detectee sur '" & a.subject & _
+            "' (" & Len(currentCats) & " chars) - nettoyage agressif"
+    End If
+    
+    Dim newCats As String
+    If Len(newCat) = 0 Then
+        newCats = StripAutoCategories(currentCats)
+    Else
+        newCats = ReplaceAutoCategory(currentCats, newCat)
+    End If
+    
+    ' GARDE CENTRAL ANTI-BOUCLE : comparaison ensembliste.
+    ' StrComp ne suffit pas car Outlook re-normalise le separateur ';' / ','
+    ' selon ListSeparator regional, ce qui rendait l'inegalite permanente.
+    If CategoriesAreEquivalent(currentCats, newCats) Then
+        modDebugLog.DTrace MOD_NAME, "  pas de changement (ensembles egaux)"
+        bApplyingNow = False
+        Exit Sub
+    End If
+    
+    a.Categories = newCats
+    a.Save
+    
+    ' Memoriser pour la garde asynchrone
+    On Error Resume Next
+    gLastEntryID = a.EntryID
+    gLastSaveAt = Now
+    On Error GoTo ErrH
+    
+    modDebugLog.DInfo MOD_NAME, "'" & a.subject & "' : '" & _
+        TruncLog(currentCats) & "' -> '" & newCats & "'"
+    
+    bApplyingNow = False
+    Exit Sub
+
+ErrH:
+    bApplyingNow = False
+    modDebugLog.DError MOD_NAME, "ApplyCategory error " & Err.Number & _
+        " - " & Err.Description
+End Sub
+
+'=============================================================================
+' ClearAutoCategory (v13.3) : retire les categories AUTO (reunion interne /
+' externe) d'un RDV devenu creneau personnel, SANS passer par
+' DetermineCategory ni par le cooldown. Appele par
+' modMeetingToAppointment.DemoteIfEmptyMeeting juste apres la conversion
+' reunion -> rendez-vous : la couleur posee quelques instants plus tot
+' (item encore olMeeting) resterait sinon, le cooldown anti-reentrance
+' d'ApplyCategory ecartant l'ItemChange qui suit. Les autres categories
+' (projet, Personnel...) sont conservees. Save fait ici si modification.
+' Renvoie True si l'item a ete modifie. N'echoue jamais vers l'appelant.
+'=============================================================================
+Public Function ClearAutoCategory(ByVal appt As Object) As Boolean
+    ClearAutoCategory = False
+    On Error GoTo ErrH
+
+    If appt Is Nothing Then Exit Function
+    If Not (TypeOf appt Is Outlook.AppointmentItem) Then Exit Function
+
+    Dim ap As Outlook.AppointmentItem
+    Set ap = appt
+
+    Dim currentCats As String
+    currentCats = ap.Categories
+    If Len(currentCats) = 0 Then Exit Function
+
+    Dim newCats As String
+    newCats = StripAutoCategories(currentCats)
+    If CategoriesAreEquivalent(currentCats, newCats) Then Exit Function
+
+    bApplyingNow = True
+    ap.Categories = newCats
+    ap.Save
+    bApplyingNow = False
+
+    On Error Resume Next
+    gLastEntryID = ap.EntryID
+    gLastSaveAt = Now
+    On Error GoTo ErrH
+
+    modDebugLog.DInfo MOD_NAME, "'" & ap.subject & "' : categorie auto retiree " & _
+        "(creneau personnel) : '" & TruncLog(currentCats) & "' -> '" & newCats & "'"
+    ClearAutoCategory = True
+    Exit Function
+
+ErrH:
+    bApplyingNow = False
+    modDebugLog.DError MOD_NAME, "ClearAutoCategory error " & Err.Number & _
+        " - " & Err.Description
+End Function
+
+' Detecte une string 'Categories' ou une meme auto-categorie apparait
+' plusieurs fois (signal de pollution anterieure).
+Private Function IsSaturated(ByVal cats As String) As Boolean
+    IsSaturated = False
+    If Len(cats) = 0 Then Exit Function
+    
+    Dim arr As Variant
+    arr = SplitCategories(cats)
+    If UBound(arr) < LBound(arr) Then Exit Function
+    
+    Dim extCount As Long, intCount As Long, i As Long
+    For i = LBound(arr) To UBound(arr)
+        If StrComp(CStr(arr(i)), modConfig.ExternalMeetingCategory(), vbTextCompare) = 0 Then
+            extCount = extCount + 1
+        ElseIf StrComp(CStr(arr(i)), modConfig.InternalMeetingCategory(), vbTextCompare) = 0 Then
+            intCount = intCount + 1
+        End If
+    Next i
+    
+    If extCount > 1 Or intCount > 1 Then IsSaturated = True
+End Function
+
+' Tronquer une string pour le log (evite d'ecrire un log de 60k chars
+' quand on rencontre un item deja pollue).
+Private Function TruncLog(ByVal s As String) As String
+    Const LIM As Long = 200
+    If Len(s) <= LIM Then
+        TruncLog = s
+    Else
+        TruncLog = Left(s, LIM) & "... [" & Len(s) & " chars tronques]"
+    End If
+End Function
+
+Public Sub ColorRecentItems()
+    ColorRecentItemsCore ASK_CONFIRM:=True, SHOW_FINAL_MSGBOX:=True
+End Sub
+
+'=============================================================================
+' Tag projet sur les RDV recents (parcourt 1er janvier -> aujourd'hui).
+' Popup projet par RDV non-tague, idempotent : ContainsTag deja-fait dans
+' modProjectTag.CheckAssignment evite les re-demandes.
+'=============================================================================
+Public Sub TagRecentItems()
+    TagRecentItemsCore ASK_CONFIRM:=True, SHOW_FINAL_MSGBOX:=True
+End Sub
+
+'=============================================================================
+' Coloration + Tag en sequence. Une seule confirmation au debut, un seul
+' rapport final.
+'=============================================================================
+Public Sub ColorAndTagRecentItems()
+    Dim cutoff As Date
+    cutoff = DateSerial(Year(Now), 1, 1)
+    
+    Dim confirmation As VbMsgBoxResult
+    confirmation = MsgBox( _
+        T("Coloration + tag projet des RDV depuis ", "Color + project-tag appointments since ") & _
+        Format(cutoff, "dd/mm/yyyy") & " ?" & vbCrLf & vbCrLf & _
+        T("1) Coloration (Interne / Externe) - silencieux.", "1) Coloring (Internal / External) - silent.") & vbCrLf & _
+        T("2) Tag projet - popup projet pour chaque RDV non-tagu~e.", "2) Project tag - a popup for each untagged appointment.") & vbCrLf & vbCrLf & _
+        T("Les RDV avec la cat~egorie 'Personnel' sont pr~eserv~es.", "Appointments with the 'Personnel' category are preserved.") & vbCrLf & _
+        T("Les RDV r~ecurrents ne sont pas modifi~es.", "Recurring appointments are not modified."), _
+        vbYesNo + vbQuestion, T("Colorer + Taguer RDV r~ecents", "Color + tag recent appointments"))
+    If confirmation <> vbYes Then Exit Sub
+    
+    modDebugLog.DInfo MOD_NAME, "Batch ColorAndTagRecentItems demarre"
+    
+    ColorRecentItemsCore ASK_CONFIRM:=False, SHOW_FINAL_MSGBOX:=False
+    TagRecentItemsCore ASK_CONFIRM:=False, SHOW_FINAL_MSGBOX:=True
+End Sub
+
+'=============================================================================
+' Implementation interne de la coloration. Parametres :
+'   ASK_CONFIRM       : afficher la MsgBox de confirmation initiale
+'   SHOW_FINAL_MSGBOX : afficher le rapport en fin de traitement
+' Le combo (False, False) sert quand on chaine avec un autre batch.
+'
+' Pendant la boucle : ThisOutlookSession.SuspendCalendarEvents = True
+' bloque les ItemChange async declenches par les a.Save. Sans ca, chaque
+' RDV non-tague declencherait une popup projet via modProjectTag.
+'=============================================================================
+Private Sub ColorRecentItemsCore(ByVal ASK_CONFIRM As Boolean, _
+                                     ByVal SHOW_FINAL_MSGBOX As Boolean)
+    On Error GoTo ErrH
+    
+    Dim cutoff As Date
+    cutoff = DateSerial(Year(Now), 1, 1)
+    
+    If ASK_CONFIRM Then
+        Dim confirmation As VbMsgBoxResult
+        confirmation = MsgBox( _
+            T("Coloration auto des RDV a partir du ", "Auto-color appointments from ") & _
+            Format(cutoff, "dd/mm/yyyy") & T(" (d~ebut d'ann~ee) ?", " (start of year)?") & vbCrLf & vbCrLf & _
+            T("Les RDV avec la cat~egorie 'Personnel' sont pr~eserv~es.", "Appointments with the 'Personnel' category are preserved.") & vbCrLf & _
+            T("Les RDV r~ecurrents ne sont pas modifi~es.", "Recurring appointments are not modified.") & vbCrLf & vbCrLf & _
+            T("Note : la coloration ne declenche PAS le tag projet.", "Note: coloring does NOT trigger project tagging.") & vbCrLf & _
+            T("Pour tagger, utiliser 'Taguer RDV r~ecents'.", "To tag, use 'Tag recent appointments'."), _
+            vbYesNo + vbQuestion, T("Colorer RDV r~ecents", "Color recent appointments"))
+        If confirmation <> vbYes Then Exit Sub
+    End If
+    
+    modDebugLog.DInfo MOD_NAME, "Batch ColorRecentItems depuis " & _
+        Format(cutoff, "dd/mm/yyyy")
+    
+    ' Suspendre les events calendar pendant la boucle pour empecher
+    ' modProjectTag.CheckReTag de tourner sur chaque a.Save.
+    ThisOutlookSession.SuspendCalendarEvents = True
+    
+    Dim calFolder As Outlook.folder
+    Set calFolder = Application.Session.GetDefaultFolder(olFolderCalendar)
+    
+    Dim items As Outlook.items
+    Set items = calFolder.items
+    items.Sort "[Start]"
+    items.IncludeRecurrences = False
+    
+    Dim dasl As String
+    dasl = "[Start] >= '" & modCommon.FormatDaslDate(cutoff) & "'"
+    
+    Dim filtered As Outlook.items
+    Set filtered = items.Restrict(dasl)
+    
+    Dim total As Long
+    total = filtered.count
+    
+    SetStatus T("Coloration en cours : ", "Coloring: ") & total & T(" RDV a examiner...", " appointments to examine...")
+    
+    Dim modifiedCount As Long, skippedCount As Long, errs As Long
+    Dim i As Long
+    Dim itm As Object
+    Dim a As Outlook.AppointmentItem
+    Dim catsBefore As String
+    
+    For i = 1 To total
+        DoEvents
+        On Error Resume Next
+        Set itm = filtered.Item(i)
+        On Error GoTo ErrH
+        
+        If itm Is Nothing Then GoTo Continue
+        If Not (TypeOf itm Is Outlook.AppointmentItem) Then GoTo Continue
+        
+        Set a = itm
+        
+        If a.IsRecurring Then
+            skippedCount = skippedCount + 1
+            GoTo Continue
+        End If
+        If IsTechnical(a) Then
+            skippedCount = skippedCount + 1
+            GoTo Continue
+        End If
+        If a.Sensitivity = olPrivate Or a.Sensitivity = olConfidential Then
+            skippedCount = skippedCount + 1
+            GoTo Continue
+        End If
+        If HasPersonalCategory(a.Categories) Then
+            skippedCount = skippedCount + 1
+            GoTo Continue
+        End If
+        
+        catsBefore = a.Categories
+        
+        On Error Resume Next
+        ApplyCategory a
+        If Err.Number = 0 Then
+            If Not CategoriesAreEquivalent(catsBefore, a.Categories) Then
+                modifiedCount = modifiedCount + 1
+            End If
+        Else
+            errs = errs + 1
+            Err.Clear
+        End If
+        On Error GoTo ErrH
+        
+        If i Mod 50 = 0 Then
+            SetStatus T("Coloration : ", "Coloring: ") & i & "/" & total & _
+                      " (" & modifiedCount & T(" modifi~es)", " modified)")
+        End If
+        
+Continue:
+    Next i
+    
+    ' Restaurer le flag - critique meme en cas d'erreur (gere par ErrH)
+    ThisOutlookSession.SuspendCalendarEvents = False
+    SetStatus ""
+    
+    modDebugLog.DInfo MOD_NAME, "Batch Coloration termine : " & modifiedCount & _
+        " modifies, " & skippedCount & " ignores, " & errs & " erreurs"
+    
+    If SHOW_FINAL_MSGBOX Then
+        MsgBox T("Coloration termin~ee.", "Coloring complete.") & vbCrLf & vbCrLf & _
+               T("RDV examin~es : ", "Appointments examined: ") & total & vbCrLf & _
+               T("RDV modifi~es : ", "Appointments modified: ") & modifiedCount & vbCrLf & _
+               T("RDV ignores  : ", "Appointments skipped:  ") & skippedCount & vbCrLf & _
+               T("Erreurs      : ", "Errors:                ") & errs, _
+               vbInformation, T("Colorer RDV r~ecents", "Color recent appointments")
+    End If
+    Exit Sub
+
+ErrH:
+    ' Restauration imperative meme en erreur, sinon les events restent
+    ' suspendus pour le reste de la session Outlook.
+    On Error Resume Next
+    ThisOutlookSession.SuspendCalendarEvents = False
+    SetStatus ""
+    modDebugLog.DError MOD_NAME, "ColorRecentItems error " & Err.Number & _
+        " - " & Err.Description
+    MsgBox T("Erreur : ", "Error: ") & Err.Number & " - " & Err.Description, _
+           vbExclamation, T("Colorer RDV r~ecents", "Color recent appointments")
+End Sub
+
+'=============================================================================
+' Implementation interne du tag projet en batch. Parametres identiques a
+' ColorRecentItemsCore.
+'
+' Note : les events ne sont PAS suspendus, parce que CheckAssignment
+' est volontairement interactif. La popup projet est attendue ici.
+' Cependant, on positionne un garde anti-reentree pour eviter les re-entries
+' croisees avec modMeetingColor.ApplyCategory qui sauverait l'item
+' et reposterait un ItemChange (ce qui ne ferait pas de mal mais ajouterait
+' du bruit dans la pile).
+'=============================================================================
+Private Sub TagRecentItemsCore(ByVal ASK_CONFIRM As Boolean, _
+                                    ByVal SHOW_FINAL_MSGBOX As Boolean)
+    On Error GoTo ErrH
+    
+    Dim cutoff As Date
+    cutoff = DateSerial(Year(Now), 1, 1)
+    
+    If ASK_CONFIRM Then
+        Dim confirmation As VbMsgBoxResult
+        confirmation = MsgBox( _
+            T("Tag projet sur les RDV depuis ", "Project tag on appointments since ") & _
+            Format(cutoff, "dd/mm/yyyy") & T(" (d~ebut d'ann~ee) ?", " (start of year)?") & vbCrLf & vbCrLf & _
+            T("Une popup projet s'ouvrira pour chaque RDV non-tagu~e.", "A popup will open for each untagged appointment.") & vbCrLf & _
+            T("R~epondre Non ~a la popup pour passer au RDV suivant.", "Answer No to the popup to skip to the next appointment.") & vbCrLf & vbCrLf & _
+            T("Les RDV d~ej~a tagu~es, r~ecurrents, priv~es ou Personnel", "Appointments already tagged, recurring, private or Personnel") & vbCrLf & _
+            T("sont ignores automatiquement.", "are skipped automatically."), _
+            vbYesNo + vbQuestion, T("Taguer RDV r~ecents", "Tag recent appointments"))
+        If confirmation <> vbYes Then Exit Sub
+    End If
+    
+    modDebugLog.DInfo MOD_NAME, "Batch TagRecentItems depuis " & _
+        Format(cutoff, "dd/mm/yyyy")
+    
+    Dim calFolder As Outlook.folder
+    Set calFolder = Application.Session.GetDefaultFolder(olFolderCalendar)
+    
+    Dim items As Outlook.items
+    Set items = calFolder.items
+    items.Sort "[Start]"
+    items.IncludeRecurrences = False
+    
+    Dim dasl As String
+    dasl = "[Start] >= '" & modCommon.FormatDaslDate(cutoff) & "'"
+    
+    Dim filtered As Outlook.items
+    Set filtered = items.Restrict(dasl)
+    
+    Dim total As Long
+    total = filtered.count
+    
+    SetStatus T("Tag en cours : ", "Tagging: ") & total & T(" RDV a examiner...", " appointments to examine...")
+    
+    Dim taggedCount As Long, skippedCount As Long, errs As Long, refusedCount As Long
+    Dim i As Long
+    Dim itm As Object
+    Dim a As Outlook.AppointmentItem
+    Dim subjBefore As String
+    
+    For i = 1 To total
+        DoEvents
+        On Error Resume Next
+        Set itm = filtered.Item(i)
+        On Error GoTo ErrH
+        
+        If itm Is Nothing Then GoTo Continue
+        If Not (TypeOf itm Is Outlook.AppointmentItem) Then GoTo Continue
+        
+        Set a = itm
+        
+        ' Filtres analogues a CheckAssignment, sauf qu'on traque ici
+        ' aussi les recurrents (le master apparait, mais on ne touche pas)
+        If a.IsRecurring Then
+            skippedCount = skippedCount + 1
+            GoTo Continue
+        End If
+        If a.AllDayEvent Then
+            skippedCount = skippedCount + 1
+            GoTo Continue
+        End If
+        If a.Sensitivity = olPrivate Or a.Sensitivity = olConfidential Then
+            skippedCount = skippedCount + 1
+            GoTo Continue
+        End If
+        If modConfig.ContainsPersonalCategory(a.Categories) Then
+            skippedCount = skippedCount + 1
+            GoTo Continue
+        End If
+        
+        subjBefore = a.subject
+        
+        On Error Resume Next
+        Dim tagged As Boolean
+        tagged = modProjectTag.CheckAssignment(a)
+        If Err.Number <> 0 Then
+            errs = errs + 1
+            modDebugLog.DError MOD_NAME, "CheckAssignment '" & _
+                Left(subjBefore, 60) & "' err " & Err.Number & " - " & Err.Description
+            Err.Clear
+        Else
+            If tagged Then
+                taggedCount = taggedCount + 1
+            Else
+                ' CheckAssignment renvoie False soit si deja tague,
+                ' soit si l'utilisateur a repondu Non. Pour distinguer,
+                ' on regarde si le sujet a change.
+                If StrComp(a.subject, subjBefore, vbBinaryCompare) = 0 Then
+                    ' Sujet inchange : soit deja tague, soit refus
+                    If InStr(a.subject, "[") > 0 Then
+                        skippedCount = skippedCount + 1
+                    Else
+                        refusedCount = refusedCount + 1
+                    End If
+                Else
+                    taggedCount = taggedCount + 1
+                End If
+            End If
+        End If
+        On Error GoTo ErrH
+        
+        If i Mod 50 = 0 Then
+            SetStatus T("Tag : ", "Tag: ") & i & "/" & total & " (" & taggedCount & T(" tagu~es)", " tagged)")
+        End If
+        
+Continue:
+    Next i
+    
+    SetStatus ""
+    
+    modDebugLog.DInfo MOD_NAME, "Batch Tag termine : " & taggedCount & _
+        " tagues, " & refusedCount & " refuses, " & skippedCount & " ignores, " & _
+        errs & " erreurs"
+    
+    If SHOW_FINAL_MSGBOX Then
+        MsgBox T("Tag termin~e.", "Tagging complete.") & vbCrLf & vbCrLf & _
+               T("RDV examin~es : ", "Appointments examined: ") & total & vbCrLf & _
+               T("RDV tagu~es   : ", "Appointments tagged:   ") & taggedCount & vbCrLf & _
+               T("Refuses      : ", "Refused:               ") & refusedCount & vbCrLf & _
+               T("RDV ignores  : ", "Appointments skipped:  ") & skippedCount & vbCrLf & _
+               T("Erreurs      : ", "Errors:                ") & errs, _
+               vbInformation, T("Taguer RDV r~ecents", "Tag recent appointments")
+    End If
+    Exit Sub
+
+ErrH:
+    SetStatus ""
+    modDebugLog.DError MOD_NAME, "TagRecentItems error " & Err.Number & _
+        " - " & Err.Description
+    MsgBox T("Erreur : ", "Error: ") & Err.Number & " - " & Err.Description, _
+           vbExclamation, T("Taguer RDV r~ecents", "Tag recent appointments")
+End Sub
+
+Public Sub DiagnoseSelectedItem()
+    Dim exp As Outlook.Explorer
+    Set exp = Application.ActiveExplorer
+    If exp Is Nothing Then
+        MsgBox T("Pas d'Explorer actif.", "No active Explorer."), vbExclamation
+        Exit Sub
+    End If
+    If exp.Selection.count = 0 Then
+        MsgBox T("Aucun RDV s~electionn~e.", "No appointment selected."), vbExclamation
+        Exit Sub
+    End If
+    
+    Dim itm As Object
+    Set itm = exp.Selection.Item(1)
+    If Not (TypeOf itm Is Outlook.AppointmentItem) Then
+        MsgBox T("L'~el~ement s~electionn~e n'est pas un RDV.", "The selected item is not an appointment."), vbExclamation
+        Exit Sub
+    End If
+    
+    Dim a As Outlook.AppointmentItem
+    Set a = itm
+    
+    ' Force niveau INFO au minimum pour ce diagnostic unitaire
+    Dim oldLevel As Long
+    oldLevel = modDebugLog.GlobalLevel
+    If oldLevel < modDebugLog.LOG_INFO Then
+        modDebugLog.SetGlobalLevel modDebugLog.LOG_INFO
+    End If
+    
+    modDebugLog.DInfo MOD_NAME, String(60, "=")
+    modDebugLog.DInfo MOD_NAME, "DIAGNOSTIC : " & a.subject
+    modDebugLog.DInfo MOD_NAME, "  Start=" & Format(a.Start, "dd/mm/yyyy hh:nn") & _
+        " Organizer='" & a.Organizer & "' Recipients=" & a.Recipients.count
+    modDebugLog.DInfo MOD_NAME, "  MeetingStatus=" & a.MeetingStatus & _
+        " Sensitivity=" & a.Sensitivity & " Categories='" & _
+        TruncLog(a.Categories) & "'"
+    modDebugLog.DInfo MOD_NAME, "  modConfig.InternalDomains()=" & modConfig.InternalDomains()
+    
+    Dim mySMTP As String
+    mySMTP = GetCurrentUserSmtp()
+    modDebugLog.DInfo MOD_NAME, "  CurrentUser SMTP='" & mySMTP & "'"
+    
+    Dim rcp As Outlook.Recipient
+    Dim idx As Long
+    idx = 0
+    For Each rcp In a.Recipients
+        idx = idx + 1
+        Dim smtp As String, domain As String, userType As String, internal As Boolean
+        smtp = GetSmtpAddress(rcp)
+        domain = ExtractDomain(smtp)
+        userType = GetAddressEntryTypeName(rcp)
+        internal = Len(domain) = 0 Or IsInternalDomain(domain)
+        modDebugLog.DInfo MOD_NAME, "  [" & idx & "] " & rcp.name & _
+            " addr='" & rcp.Address & "' smtp='" & smtp & "' dom='" & _
+            domain & "' type=" & userType & " interne=" & internal
+    Next rcp
+    
+    Dim verdict As String
+    verdict = DetermineCategory(a)
+    modDebugLog.DInfo MOD_NAME, "  VERDICT : " & _
+        IIf(Len(verdict) = 0, "(aucune - solo)", verdict)
+    modDebugLog.DInfo MOD_NAME, String(60, "=")
+    
+    ' Restaurer niveau precedent
+    modDebugLog.SetGlobalLevel oldLevel
+    
+    MsgBox T("Diagnostic ~ecrit dans :", "Diagnostic written to:") & vbCrLf & _
+           modDebugLog.LogFilePath() & vbCrLf & vbCrLf & _
+           T("Verdict : ", "Verdict: ") & IIf(Len(verdict) = 0, T("(aucune - solo)", "(none - solo)"), verdict), _
+           vbInformation, T("Diagnostic RDV", "Appointment diagnostic")
+End Sub
+
+'=============================================================================
+' Utilitaire pour nettoyer un RDV pollue sans retrigger la logique d'auto-tag.
+' Selectionner le RDV dans le calendrier, lancer la macro, elle dedoublonne
+' les categories.
+'=============================================================================
+Public Sub CleanSelectedItem()
+    On Error GoTo ErrH
+    
+    Dim exp As Outlook.Explorer
+    Set exp = Application.ActiveExplorer
+    If exp Is Nothing Then
+        MsgBox T("Pas d'Explorer actif.", "No active Explorer."), vbExclamation
+        Exit Sub
+    End If
+    If exp.Selection.count = 0 Then
+        MsgBox T("Aucun RDV s~electionn~e.", "No appointment selected."), vbExclamation
+        Exit Sub
+    End If
+    
+    Dim itm As Object
+    Set itm = exp.Selection.Item(1)
+    If Not (TypeOf itm Is Outlook.AppointmentItem) Then
+        MsgBox T("L'~el~ement s~electionn~e n'est pas un RDV.", "The selected item is not an appointment."), vbExclamation
+        Exit Sub
+    End If
+    
+    Dim a As Outlook.AppointmentItem
+    Set a = itm
+    
+    Dim catsBefore As String
+    catsBefore = a.Categories
+    
+    ' Deduplication complete
+    Dim arr As Variant
+    arr = SplitCategories(catsBefore)
+    
+    Dim seen As Object
+    Set seen = CreateObject("Scripting.Dictionary")
+    seen.CompareMode = 1  ' vbTextCompare
+    
+    Dim newCats As String
+    Dim i As Long, c As String
+    For i = LBound(arr) To UBound(arr)
+        c = CStr(arr(i))
+        If Not seen.Exists(c) Then
+            seen.Add c, True
+            If Len(newCats) > 0 Then newCats = newCats & ", "
+            newCats = newCats & c
+        End If
+    Next i
+    
+    ' Activer les deux gardes pour eviter que l'event Change ne retrigge
+    bApplyingNow = True
+    a.Categories = newCats
+    a.Save
+    On Error Resume Next
+    gLastEntryID = a.EntryID
+    gLastSaveAt = Now
+    On Error GoTo ErrH
+    bApplyingNow = False
+    
+    modDebugLog.DInfo MOD_NAME, "NettoyerRDV '" & a.subject & _
+        "' : " & Len(catsBefore) & " chars -> " & Len(newCats) & " chars"
+    
+    MsgBox T("RDV nettoy~e.", "Appointment cleaned.") & vbCrLf & vbCrLf & _
+           T("Avant : ", "Before: ") & Len(catsBefore) & T(" caract~fres", " characters") & vbCrLf & _
+           T("Apr~fs : ", "After:  ") & Len(newCats) & T(" caract~fres", " characters") & vbCrLf & vbCrLf & _
+           T("Cat~egories : ", "Categories: ") & newCats, _
+           vbInformation, T("Nettoyer RDV", "Clean appointment")
+    Exit Sub
+
+ErrH:
+    bApplyingNow = False
+    modDebugLog.DError MOD_NAME, "CleanSelectedItem error " & _
+        Err.Number & " - " & Err.Description
+    MsgBox T("Erreur : ", "Error: ") & Err.Number & " - " & Err.Description, _
+           vbExclamation, T("Nettoyer RDV", "Clean appointment")
+End Sub
+
+Private Function DetermineCategory(ByVal a As Outlook.AppointmentItem) As String
+    Dim participantCount As Long
+    Dim externalCount As Long
+    Dim rcp As Outlook.Recipient
+    Dim smtp As String, domain As String
+    
+    Dim mySMTP As String
+    mySMTP = GetCurrentUserSmtp()
+    
+    ' v13.3 : un RENDEZ-VOUS (olNonMeeting) dont je suis l'organisateur (ou
+    ' sans organisateur) est un creneau personnel : aucune couleur auto,
+    ' quel que soit l'etat residuel de Recipients (une reunion videe de ses
+    ' invites puis convertie garde parfois l'organisateur en destinataire).
+    ' Un RDV transfere par un tiers (Organizer externe) reste evalue.
+    If IsOwnPlainAppointment(a, mySMTP) Then
+        modDebugLog.DDebug MOD_NAME, "  Decision : rendez-vous personnel " & _
+            "(olNonMeeting, organisateur = moi) -> aucune"
+        DetermineCategory = ""
+        Exit Function
+    End If
+    
+    participantCount = 0
+    externalCount = 0
+    
+    ' Dictionnaire des SMTP deja vus cote Recipients, pour eviter de
+    ' compter l'organisateur deux fois s'il figure aussi en destinataire.
+    Dim vus As Object
+    Set vus = CreateObject("Scripting.Dictionary")
+    vus.CompareMode = 1  ' vbTextCompare
+
+    For Each rcp In a.Recipients
+        participantCount = participantCount + 1
+        smtp = GetSmtpAddress(rcp)
+        domain = ExtractDomain(smtp)
+        
+        If Len(smtp) > 0 Then
+            If Not vus.Exists(smtp) Then vus.Add smtp, True
+        End If
+        
+        If Len(domain) > 0 Then
+            If Not IsInternalDomain(domain) Then
+                externalCount = externalCount + 1
+                modDebugLog.DTrace MOD_NAME, "    EXTERNE : '" & rcp.name & _
+                    "' @ " & domain
+            End If
+        End If
+    Next rcp
+    
+    ' --- Organisateur ---
+    ' L'Organizer n'est PAS dans Recipients. Sur un RDV transfere, il
+    ' est souvent le seul externe (organisateur externe, forward interne).
+    ' On le resout en SMTP et on le compte comme participant externe si
+    ' son domaine n'est pas interne et qu'il n'est ni l'utilisateur
+    ' courant ni un destinataire deja compte.
+    Dim orgSmtp As String
+    orgSmtp = GetOrganizerSmtp(a)
+    If Len(orgSmtp) > 0 Then
+        Dim orgDomain As String
+        orgDomain = ExtractDomain(orgSmtp)
+        Dim orgIsMe As Boolean
+        orgIsMe = (StrComp(orgSmtp, mySMTP, vbTextCompare) = 0)
+        
+        If Not orgIsMe And Not vus.Exists(orgSmtp) Then
+            participantCount = participantCount + 1
+            If Len(orgDomain) > 0 Then
+                If Not IsInternalDomain(orgDomain) Then
+                    externalCount = externalCount + 1
+                    modDebugLog.DTrace MOD_NAME, "    EXTERNE (organisateur) : '" & _
+                        a.Organizer & "' @ " & orgDomain
+                End If
+            End If
+        End If
+    End If
+    
+    If participantCount = 0 Then
+        DetermineCategory = ""
+        Exit Function
+    End If
+    
+    If participantCount = 1 Then
+        If a.Recipients.count = 1 Then
+            Dim only As Outlook.Recipient
+            Set only = a.Recipients(1)
+            If IsMe(only, mySMTP) Then
+                DetermineCategory = ""
+                Exit Function
+            End If
+        End If
+    End If
+    
+    If externalCount > 0 Then
+        DetermineCategory = modConfig.ExternalMeetingCategory()
+    Else
+        DetermineCategory = modConfig.InternalMeetingCategory()
+    End If
+    
+    modDebugLog.DDebug MOD_NAME, "  Decision : nbParticipants=" & _
+        participantCount & " nbExternes=" & externalCount & " -> '" & _
+        DetermineCategory & "'"
+End Function
+
+'=============================================================================
+' IsOwnPlainAppointment (v13.3) : True si l'item est un RENDEZ-VOUS
+' (MeetingStatus = olNonMeeting) dont l'organisateur est vide, porte mon nom
+' d'affichage, ou se resout en mon adresse SMTP. Un RDV transfere par un
+' tiers (organisateur externe) renvoie False et reste evalue normalement.
+'=============================================================================
+Private Function IsOwnPlainAppointment(ByVal a As Outlook.AppointmentItem, _
+                                       ByVal mySMTP As String) As Boolean
+    IsOwnPlainAppointment = False
+    On Error GoTo Done
+    
+    If a.MeetingStatus <> olNonMeeting Then Exit Function
+    
+    Dim orgName As String
+    orgName = CStr(a.Organizer)
+    If Len(Trim$(orgName)) = 0 Then
+        IsOwnPlainAppointment = True
+        Exit Function
+    End If
+    
+    Dim myName As String
+    myName = CStr(Application.Session.CurrentUser.name)
+    If Len(myName) > 0 Then
+        If StrComp(orgName, myName, vbTextCompare) = 0 Then
+            IsOwnPlainAppointment = True
+            Exit Function
+        End If
+    End If
+    
+    Dim orgSmtp As String
+    orgSmtp = GetOrganizerSmtp(a)
+    If Len(orgSmtp) > 0 And Len(mySMTP) > 0 Then
+        If StrComp(orgSmtp, mySMTP, vbTextCompare) = 0 Then IsOwnPlainAppointment = True
+    End If
+Done:
+End Function
+
+Private Function IsMe(ByVal rcp As Outlook.Recipient, _
+                        ByVal mySMTP As String) As Boolean
+    IsMe = False
+    On Error GoTo Done
+    
+    Dim rcpSMTP As String
+    rcpSMTP = GetSmtpAddress(rcp)
+    
+    If Len(mySMTP) > 0 And Len(rcpSMTP) > 0 Then
+        If StrComp(rcpSMTP, mySMTP, vbTextCompare) = 0 Then
+            IsMe = True
+            Exit Function
+        End If
+    End If
+    
+    Dim myName As String
+    myName = Application.Session.CurrentUser.name
+    If Len(myName) > 0 Then
+        If StrComp(rcp.name, myName, vbTextCompare) = 0 Then
+            IsMe = True
+        End If
+    End If
+Done:
+End Function
+
+Private Function GetCurrentUserSmtp() As String
+    ' Pack v3 (C2/B8) : identite mise en cache par modSmtp.
+    GetCurrentUserSmtp = modSmtp.MySmtp()
+End Function
+
+'=============================================================================
+' Resout l'organisateur d'un RDV en adresse SMTP. Best-effort :
+'   1) a.Organizer est un nom d'affichage, pas une adresse.
+'   2) On tente Session.CreateRecipient(Organizer).Resolve puis SMTP.
+'   3) Repli : si l'organisateur figure dans Recipients sous le meme nom,
+'      on recupere son adresse depuis ce Recipient.
+' Renvoie "" si non resolu (RDV ancien, organisateur hors GAL) : dans ce
+' cas DetermineCategory retombe sur le comportement Recipients-only.
+'=============================================================================
+Private Function GetOrganizerSmtp(ByVal a As Outlook.AppointmentItem) As String
+    ' Pack v3 (C2) : chaine de resolution unifiee (PR_SENT_REPRESENTING_SMTP,
+    ' GetOrganizer, CreateRecipient(Organizer), Recipients par nom), cachee.
+    GetOrganizerSmtp = modSmtp.OrganizerSmtp(a)
+End Function
+
+Private Function GetSmtpAddress(ByVal rcp As Outlook.Recipient) As String
+    ' Pack v3 (C2/B8) : resolution + cache par adresse (modSmtp).
+    GetSmtpAddress = modSmtp.RecipientSmtp(rcp)
+End Function
+
+Private Function GetAddressEntryTypeName(ByVal rcp As Outlook.Recipient) As String
+    GetAddressEntryTypeName = "(inconnu)"
+    On Error GoTo Done
+    If rcp.AddressEntry Is Nothing Then Exit Function
+    
+    Select Case rcp.AddressEntry.AddressEntryUserType
+        Case olExchangeUserAddressEntry: GetAddressEntryTypeName = "ExchangeUser"
+        Case olExchangeRemoteUserAddressEntry: GetAddressEntryTypeName = "ExchangeRemoteUser"
+        Case olExchangeDistributionListAddressEntry: GetAddressEntryTypeName = "ExchangeDL"
+        Case olExchangePublicFolderAddressEntry: GetAddressEntryTypeName = "ExchangePF"
+        Case olOutlookContactAddressEntry: GetAddressEntryTypeName = "OutlookContact"
+        Case olOutlookDistributionListAddressEntry: GetAddressEntryTypeName = "OutlookDL"
+        Case olSmtpAddressEntry: GetAddressEntryTypeName = "Smtp"
+        Case olLdapAddressEntry: GetAddressEntryTypeName = "Ldap"
+        Case olOtherAddressEntry: GetAddressEntryTypeName = "Other"
+        Case Else: GetAddressEntryTypeName = "T" & rcp.AddressEntry.AddressEntryUserType
+    End Select
+Done:
+End Function
+
+Private Function ExtractDomain(ByVal smtp As String) As String
+    ExtractDomain = modSmtp.ExtractDomain(smtp)
+End Function
+
+Private Function HasPersonalCategory(ByVal cats As String) As Boolean
+    ' Pack v3 (C10) : nom de categorie configurable (PersonalCategory /
+    ' PersonalCategoryAlt), test centralise dans modConfig.
+    HasPersonalCategory = modConfig.ContainsPersonalCategory(cats)
+End Function
+
+Private Function IsAutoCategory(ByVal c As String) As Boolean
+    IsAutoCategory = False
+    Dim autoList As Variant
+    autoList = AutoCategories()
+    Dim j As Long
+    For j = LBound(autoList) To UBound(autoList)
+        If StrComp(c, CStr(autoList(j)), vbTextCompare) = 0 Then
+            IsAutoCategory = True
+            Exit Function
+        End If
+    Next j
+End Function
+
+Private Function StripAutoCategories(ByVal cats As String) As String
+    StripAutoCategories = ""
+    If Len(cats) = 0 Then Exit Function
+    
+    Dim arr As Variant
+    arr = SplitCategories(cats)
+    Dim result As String
+    Dim i As Long, c As String
+    
+    ' Deduplication implicite : on ne conserve qu'une seule occurrence par cat
+    Dim seen As Object
+    Set seen = CreateObject("Scripting.Dictionary")
+    seen.CompareMode = 1  ' vbTextCompare
+    
+    result = ""
+    For i = LBound(arr) To UBound(arr)
+        c = CStr(arr(i))
+        If Len(c) > 0 Then
+            If Not IsAutoCategory(c) Then
+                If Not seen.Exists(c) Then
+                    seen.Add c, True
+                    If Len(result) > 0 Then result = result & ", "
+                    result = result & c
+                End If
+            End If
+        End If
+    Next i
+    StripAutoCategories = result
+End Function
+
+Private Function ReplaceAutoCategory(ByVal cats As String, _
+                                     ByVal newCat As String) As String
+    Dim result As String
+    result = StripAutoCategories(cats)
+    If Len(result) > 0 Then result = result & ", "
+    result = result & newCat
+    ReplaceAutoCategory = result
+End Function
+
+Private Function IsTechnical(ByVal a As Outlook.AppointmentItem) As Boolean
+    IsTechnical = False
+    If InStr(1, a.subject, "QuickMove_", vbTextCompare) > 0 Then
+        IsTechnical = True
+        Exit Function
+    End If
+    If InStr(1, a.Categories, "QuickMove", vbTextCompare) > 0 Then
+        IsTechnical = True
+    End If
+End Function
+
+'=============================================================================
+' RATTRAPAGE POST-STARTUP
+'=============================================================================
+' Probleme adresse :
+'   Quand Outlook PC est ferme et qu'on accepte une invitation sur iOS,
+'   la synchro initiale OST au prochain demarrage recupere le RDV deja
+'   accepte SANS declencher ItemAdd ni ItemChange. WithEvents ne voit
+'   que les modifs post-startup. Resultat : la coloration auto n'est
+'   jamais appliquee.
+'
+' Solution :
+'   Scanner les RDV recents [J-7 ; J+14] au demarrage et appliquer
+'   ApplyCategory sur ceux qui n'ont aucune categorie auto.
+'   Idempotent grace a CategoriesAreEquivalent.
+'
+' Branchement :
+'   Application.OnTime Now + TimeSerial(0,0,15), _
+'       "modMeetingColor.CatchUpUncolored_OnTime"
+'   Le delai de 15s laisse la synchro initiale finir avant le scan.
+'
+' Filtre rapide IsAutoCategorise() : on ne perd pas de temps a recharger
+' les Recipients d'un RDV deja correctement categorise.
+'=============================================================================
+
+Public Sub CatchUpUncolored_OnTime()
+    ' Wrapper sans parametre pour Application.OnTime (signature exigee)
+    On Error Resume Next
+    CatchUpUncolored 7, 14
+End Sub
+
+Public Sub CatchUpUncolored(ByVal joursArriere As Long, _
+                                  ByVal daysBack As Long)
+    On Error GoTo ErrH
+    
+    Dim dStart As Date, dEnd As Date
+    dStart = DateAdd("d", -Abs(joursArriere), Date)
+    dEnd = DateAdd("d", Abs(daysBack) + 1, Date)
+    
+    modDebugLog.DInfo MOD_NAME, "Rattrapage RDV non-colores [" & _
+        Format(dStart, "dd/mm/yyyy") & " ; " & _
+        Format(dEnd, "dd/mm/yyyy") & "]"
+    
+    ' Suspendre les events calendar pendant la boucle (cf. ColorRecentItems).
+    ' Sans ca, chaque RDV recolore declencherait une popup projet au demarrage.
+    ThisOutlookSession.SuspendCalendarEvents = True
+    
+    Dim calFolder As Outlook.folder
+    Set calFolder = Application.Session.GetDefaultFolder(olFolderCalendar)
+    
+    Dim items As Outlook.items
+    Set items = calFolder.items
+    items.Sort "[Start]"
+    items.IncludeRecurrences = False
+    
+    ' Filtre DASL : date construite a la main (modCommon.FormatDaslDate,
+    ' v13.1) - les jetons / et : de Format() suivent les reglages
+    ' regionaux Windows.
+    Dim dasl As String
+    dasl = "[Start] >= '" & modCommon.FormatDaslDate(dStart) & _
+           "' AND [Start] < '" & modCommon.FormatDaslDate(dEnd) & "'"
+    
+    Dim filtered As Outlook.items
+    Set filtered = items.Restrict(dasl)
+    
+    Dim total As Long, examinedCount As Long
+    Dim modifiedCount As Long, alreadyOkCount As Long, skippedCount As Long, errs As Long
+    total = filtered.count
+    
+    Dim i As Long
+    Dim itm As Object
+    Dim a As Outlook.AppointmentItem
+    
+    For i = 1 To total
+        DoEvents
+        On Error Resume Next
+        Set itm = filtered.Item(i)
+        On Error GoTo ErrH
+        
+        If itm Is Nothing Then GoTo Continue
+        If Not (TypeOf itm Is Outlook.AppointmentItem) Then GoTo Continue
+        
+        Set a = itm
+        examinedCount = examinedCount + 1
+        
+        ' Recurrents : on ne touche pas (cf. modProjectTag : le master
+        ' n'est pas necessairement dans la fenetre, et les occurrences
+        ' ne doivent pas etre modifiees directement)
+        If a.IsRecurring Then
+            skippedCount = skippedCount + 1
+            GoTo Continue
+        End If
+        If IsTechnical(a) Then
+            skippedCount = skippedCount + 1
+            GoTo Continue
+        End If
+        If a.Sensitivity = olPrivate Or a.Sensitivity = olConfidential Then
+            skippedCount = skippedCount + 1
+            GoTo Continue
+        End If
+        If HasPersonalCategory(a.Categories) Then
+            skippedCount = skippedCount + 1
+            GoTo Continue
+        End If
+        
+        ' Filtre rapide : si une categorie auto est deja posee, on
+        ' considere que le RDV a deja ete traite. On evite ainsi de
+        ' recharger les Recipients (lent en Exchange cache) pour rien.
+        If IsAlreadyAutoCategorized(a.Categories) Then
+            alreadyOkCount = alreadyOkCount + 1
+            GoTo Continue
+        End If
+        
+        ' Cas cible : pas de categorie auto -> on applique.
+        On Error Resume Next
+        Dim catsBefore As String
+        catsBefore = a.Categories
+        ApplyCategory a
+        If Err.Number = 0 Then
+            If Not CategoriesAreEquivalent(catsBefore, a.Categories) Then
+                modifiedCount = modifiedCount + 1
+                modDebugLog.DInfo MOD_NAME, "Rattrape '" & a.subject & _
+                    "' " & Format(a.Start, "dd/mm hh:nn") & " -> '" & _
+                    a.Categories & "'"
+            End If
+        Else
+            errs = errs + 1
+            modDebugLog.DError MOD_NAME, "Rattrapage '" & a.subject & _
+                "' err " & Err.Number & " - " & Err.Description
+            Err.Clear
+        End If
+        On Error GoTo ErrH
+        
+Continue:
+    Next i
+    
+    ThisOutlookSession.SuspendCalendarEvents = False
+    
+    modDebugLog.DInfo MOD_NAME, "Rattrapage termine : examines=" & examinedCount & _
+        " modifies=" & modifiedCount & " dejaOk=" & alreadyOkCount & _
+        " ignores=" & skippedCount & " erreurs=" & errs
+    Exit Sub
+
+ErrH:
+    ' Restauration imperative meme en erreur, sinon les events restent
+    ' suspendus pour le reste de la session Outlook.
+    On Error Resume Next
+    ThisOutlookSession.SuspendCalendarEvents = False
+    modDebugLog.DError MOD_NAME, "CatchUpUncolored err " & _
+        Err.Number & " - " & Err.Description
+End Sub
+
+' Vrai si la string Categories contient au moins une des categories
+' auto-gerees (Reunion interne / Reunion externe).
+Private Function IsAlreadyAutoCategorized(ByVal cats As String) As Boolean
+    IsAlreadyAutoCategorized = False
+    If Len(cats) = 0 Then Exit Function
+    
+    Dim arr As Variant
+    arr = SplitCategories(cats)
+    Dim i As Long, c As String
+    For i = LBound(arr) To UBound(arr)
+        c = CStr(arr(i))
+        If IsAutoCategory(c) Then
+            IsAlreadyAutoCategorized = True
+            Exit Function
+        End If
+    Next i
+End Function

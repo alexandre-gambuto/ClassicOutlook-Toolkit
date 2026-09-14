@@ -1,0 +1,452 @@
+Option Explicit
+
+'=============================================================================
+' modReplySuspicion  (v5 - 2026-08-22)
+'
+' v5 (2026-08-22) : revue UX pop-ups + traduction.
+'   (a) BUG CORRIGE : le sujet du mail etait concatene A L'INTERIEUR de T().
+'       T() applique A() a ses deux branches, donc tout sujet contenant
+'       "~e", "~a" ou "~o" - sequence parfaitement legitime dans un objet de
+'       mail - etait decode en accent et affiche faux. Le sujet passe
+'       desormais a l'exterieur de T(). Meme correctif que
+'       ThisOutlookSession v10.6 ; ce module etait l'un des 5 endroits
+'       restants (revue du 2026-08-22).
+'   (b) COMPTE A REBOURS RENDU SUR : les 8 s couraient meme quand la boite
+'       s'ouvrait DERRIERE une autre application - elle se fermait seule
+'       sans avoir ete vue et la proposition de suivi disparaissait en
+'       silence. C'est le pire cas possible pour ce module, dont toute la
+'       valeur tient a ne pas laisser passer un mail en attente. On tente
+'       modUi.BringOutlookToFront ; si Windows refuse le premier plan, le
+'       timeout est RETIRE (la boite attend un clic) plutot que de laisser
+'       expirer une decision que personne n'a lue.
+'   (c) Le libelle de bouton "&Non" etait en dur, jamais traduit.
+'   Dependance ajoutee : modUi.
+' v4.1 (2026-07-07) : (a) ANTI-COLLISION - le pop-up de suivi ne s'ouvre
+' plus PAR-DESSUS la fenetre de classement QuickMove des envoyes :
+' ProposeDeferredFollowup se re-arme (+5 s) tant que
+' ThisOutlookSession.QuickMovePromptBusy est vrai. (b) "Suivre" = VRAI
+' 1 clic : RecordSentMailQuick (delai par defaut ReplyDelayDays de config,
+' confirmation par toast) remplace RecordSentMail (InputBox du delai +
+' MsgBox de confirmation, soit 2 fenetres de plus apres le pop-up).
+' v4 (2026-07-05) : lecture config via getters modConfig (EnsureLoaded-safe)
+' au lieu des globales g_ en direct (SuspicionThreshold, KeywordsCap,
+' InternalDomains) : seuil a 0 apres un Ctrl+S VBE = TOUT mail suspect.
+' (v3 - 2026-06-13)
+' Purpose (EN): lightweight heuristic that flags sent mails likely awaiting a
+'   reply, to offer one-click tracking right after sending.
+'
+'   v2 FIX : the deferred handler used to re-locate the sent mail in the Sent
+'   Items folder BY SUBJECT. But modReplyInPlace.TryMoveSentItem (called from
+'   mSentItems_ItemAdd) moves the reply OUT of Sent Items into the parent
+'   folder in the same instant, BEFORE the +2s deferred fires. So the
+'   by-subject lookup either failed or matched a homonym (e.g. the original
+'   "TR:" / an unresolved draft) whose TO recipients = 0, raising the bogus
+'   "no TO recipient" dialog and breaking the whole follow-up flow. We now
+'   capture the real EntryID from mSentItems_ItemAdd (where the item is the
+'   actual sent mail, with a resolved EntryID) and resolve it later via
+'   GetItemFromID, which follows the mail into whatever folder it was filed.
+'
+' "Systeme expert" leger de detection des mails qui attendent probablement
+' une reponse, pour proposer un suivi en 1 clic juste apres l'envoi.
+'
+' PRINCIPE (non bloquant, par construction) :
+'   1. Application_ItemSend appelle EvaluateAndStore(Item) : calcul de score
+'      en LECTURE SEULE. Si le score franchit le seuil, on memorise le sujet
+'      dans un set de "candidats suspicion" (cle = sujet normalise). Pas
+'      d'EntryID ici : a l'envoi il est encore vide.
+'   2. mSentItems_ItemAdd appelle CaptureSentItem(Item) AVANT le deplacement
+'      ReplyInPlace : l'item a alors un EntryID stable. Si son sujet est un
+'      candidat, on stocke l'EntryID dans la file differee et on arme un
+'      differe modDefer +2s.
+'   3. +2s plus tard, ProposeDeferredFollowup depile la file, resout chaque
+'      mail via GetItemFromID (suit le mail meme deplace) et affiche un
+'      POP-UP AUTO-FERMANT 8 s (modMsgBoxCustom.MsgBoxC, compte a rebours
+'      visible sur le bouton Non). "Suivre" -> suivi via
+'      modMailResponseTracker.RecordSentMail.
+'
+' v2.1 (2026-06-10) : fix B10 - WScript.Shell.Popup remplace par
+'   modMsgBoxCustom.MsgBoxC. La sonde toasts (cf. modNotify) avait etabli
+'   que le timeout de Popup est NEUTRALISE dans cet environnement : le
+'   pop-up "auto-fermant 3 s" restait en realite affiche jusqu'au clic.
+'   MsgBoxC (hook Win32 valide par sonde) ferme reellement a l'echeance ;
+'   delai porte a 8 s reels (3 s ne fermait jamais en pratique, et 8 s
+'   laissent le temps de lire le sujet) ; timeout => vbNo => aucun suivi,
+'   meme semantique que l'ancien retour -1.
+'
+' v3 (2026-06-13) : le differe +2s passe par modDefer (Application.OnTime
+'   n'existe pas dans Outlook : erreur 438 avalee -> le pop-up de suivi ne
+'   s'affichait JAMAIS depuis la v2). Aucun autre changement.
+'
+' SCORING (seuil >= modConfig.SuspicionThreshold()) :
+'   +2  : "?" dans le sujet
+'   +1  : par mot-cle d'attente (sujet+corps), plafonne (g_KeywordsCap)
+'   +1  : au moins un destinataire externe
+'   Exclusions dures (score 0) : mail a soi-meme uniquement / aucun destinataire.
+'
+' DEPENDANCES : modMailResponseTracker, modMsgBoxCustom (v2), modDebugLog.
+' Late binding partout.
+'=============================================================================
+
+Private Const MOD_NAME As String = "ReplySusp"
+Private Const MOD_VERSION As String = "v5 - 2026-08-22"
+
+' Parametres externalises dans config.ini (lus via modConfig.g_*) :
+'   g_SuspicionThreshold   (SuspicionThreshold, defaut 3) - score declenchant
+'   g_KeywordsCap          (KeywordsCap, defaut 3)        - plafond mots-cles
+'   g_InternalDomains      (InternalDomains)              - partage modMeetingColor
+
+' --- Etat module-level (declare AVANT toute procedure) ---
+' mCandidates  : set des sujets normalises juges suspects a l'ItemSend.
+'                 cle = sujet normalise, valeur = True. Volatil (session).
+' mPending     : file des EntryID a traiter en differe (cle = EntryID).
+' mTimerArmed  : garde anti-double-armement du differe.
+Private mCandidates As Object             ' Scripting.Dictionary (sujet -> True)
+Private mPending As Object                ' Scripting.Dictionary (EntryID -> sujet)
+Private mTimerArmed As Boolean
+
+' Mots-cles d'attente de reponse (compares en LCase).
+
+'=============================================================================
+' ModVersion - version REELLEMENT chargee dans le VBE.
+'=============================================================================
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+Private Function AwaitKeywords() As Variant
+    ' Pack v3 (C17) : liste lue dans config.ini (SuspicionKeywords, separateur
+    ' |). Repli = la liste FR historique si la cle est vide : ce sont des
+    ' DONNEES utilisateur (vocabulaire), pas de l'interface -> config, pas T().
+    Dim raw As String
+    raw = Trim$(modConfig.SuspicionKeywords())
+    If Len(raw) > 0 Then
+        Dim arr() As String, i As Long
+        arr = Split(raw, "|")
+        For i = LBound(arr) To UBound(arr)
+            arr(i) = LCase$(Trim$(arr(i)))
+        Next i
+        AwaitKeywords = arr
+        Exit Function
+    End If
+    AwaitKeywords = Array( _
+        "merci de", "pouvez-vous", "pourriez-vous", "pouvez vous", _
+        "pourriez vous", "avant le", "d'ici", "dans l'attente", _
+        "retour", "confirmer", "confirmation", "validation", "valider", _
+        "votre avis", "vos disponibilites", "me dire", "repondre", _
+        "reponse", "feriez-vous", "serait-il possible")
+End Function
+
+'=============================================================================
+' POINT D'ENTREE 1 : Application_ItemSend (LECTURE SEULE).
+' Calcule le score. Si suspicion, memorise le SUJET comme candidat.
+' AUCUN pop-up, AUCUN Save, AUCUN deplacement, AUCUN EntryID (encore vide).
+'=============================================================================
+Public Sub EvaluateAndStore(ByVal Item As Object)
+    On Error Resume Next
+
+    If Item Is Nothing Then Exit Sub
+    If Item.Class <> 43 Then Exit Sub          ' 43 = olMail
+
+    Dim score As Long
+    score = ComputeScore(Item)
+
+    modDebugLog.DTrace MOD_NAME, "EvaluateAndStore score=" & score & _
+        " '" & Left(CStr(Item.subject), 50) & "'"
+
+    If score < modConfig.SuspicionThreshold() Then Exit Sub
+
+    EnsureCandidates
+    Dim key As String
+    key = NormSubject(CStr(Item.subject))
+    If Len(key) = 0 Then Exit Sub
+    mCandidates(key) = True
+
+    modDebugLog.DInfo MOD_NAME, "Suspicion attente reponse (score " & score & _
+        ") : '" & Left(CStr(Item.subject), 60) & "'"
+
+    On Error GoTo 0
+End Sub
+
+'=============================================================================
+' POINT D'ENTREE 2 : mSentItems_ItemAdd (AVANT le deplacement ReplyInPlace).
+' Si le sujet de l'item est un candidat memorise a l'ItemSend, on capture son
+' EntryID (stable a ce stade) et on arme le differe +2s. On consomme le
+' candidat (un seul suivi par envoi).
+'
+' IMPORTANT : appeler CaptureSentItem AVANT modReplyInPlace.TryMoveSentItem
+' dans mSentItems_ItemAdd, sinon l'item peut deja avoir change de dossier.
+' GetItemFromID survit au deplacement, mais on prend l'EntryID au plus tot
+' pour robustesse.
+'=============================================================================
+Public Sub CaptureSentItem(ByVal Item As Object)
+    On Error Resume Next
+
+    If mCandidates Is Nothing Then Exit Sub
+    If mCandidates.count = 0 Then Exit Sub
+    If Item Is Nothing Then Exit Sub
+    If Item.Class <> 43 Then Exit Sub
+
+    Dim key As String
+    key = NormSubject(CStr(Item.subject))
+    If Len(key) = 0 Then Exit Sub
+    If Not mCandidates.Exists(key) Then Exit Sub
+
+    ' Consomme le candidat (evite de re-suivre des homonymes ulterieurs).
+    mCandidates.Remove key
+
+    Dim eid As String
+    eid = CStr(Item.entryID)
+    If Len(eid) = 0 Then
+        ' Tres rare a ce stade ; sans EntryID on ne peut pas suivre proprement.
+        modDebugLog.DDebug MOD_NAME, "CaptureSentItem : EntryID vide, candidat abandonne"
+        Exit Sub
+    End If
+
+    EnsurePending
+    If Not mPending.Exists(eid) Then mPending(eid) = CStr(Item.subject)
+
+    modDebugLog.DTrace MOD_NAME, "CaptureSentItem : EntryID capture pour '" & _
+        Left(CStr(Item.subject), 50) & "'"
+
+    If Not mTimerArmed Then
+        mTimerArmed = True
+        modDefer.Arm "ReplySusp", 2
+    End If
+
+    On Error GoTo 0
+End Sub
+
+'=============================================================================
+' POINT D'ENTREE 3 : differe (+2s), appele par modDefer (cle ReplySusp).
+' Depile la file d'EntryID, resout chaque mail via GetItemFromID (suit le
+' mail meme s'il a ete deplace hors des Envoyes), et propose le suivi.
+'=============================================================================
+Public Sub ProposeDeferredFollowup()
+    On Error GoTo Done
+
+    ' v4.1 : anti-collision. Si la fenetre unique de classement QuickMove
+    ' est ouverte (PromptForSentItem), on ne s'ouvre PAS par-dessus : on se
+    ' re-arme +5 s (mTimerArmed reste vrai, la file mPending est intacte).
+    If ThisOutlookSession.QuickMovePromptBusy Then
+        modDefer.Arm "ReplySusp", 5
+        modDebugLog.DTrace MOD_NAME, "Prompt QuickMove occupe -> re-arme +5s"
+        Exit Sub
+    End If
+
+    mTimerArmed = False
+    If mPending Is Nothing Then Exit Sub
+    If mPending.count = 0 Then Exit Sub
+
+    Dim keyList As Variant
+    keyList = mPending.keys
+
+    Dim k As Variant
+    For Each k In keyList
+        Dim eid As String
+        eid = CStr(k)
+        mPending.Remove k
+        ProposeForEntryID eid
+    Next k
+    Exit Sub
+
+Done:
+    mTimerArmed = False
+    modDebugLog.DError MOD_NAME, "ProposeDeferredFollowup err " & Err.Number & _
+        " - " & Err.Description
+End Sub
+
+'=============================================================================
+' Resout le mail par EntryID, affiche le pop-up auto-fermant 8 s. Si
+' "Suivre", delegue au tracker en lui passant l'OBJET MAIL REEL
+' (recipients TO resolus). v4.1 : RecordSentMailQuick = enregistrement
+' IMMEDIAT (delai par defaut, toast) - le pop-up est la SEULE fenetre.
+'=============================================================================
+Private Sub ProposeForEntryID(ByVal entryID As String)
+    On Error Resume Next
+
+    If Len(entryID) = 0 Then Exit Sub
+
+    Dim itm As Object
+    Set itm = Application.Session.GetItemFromID(entryID)
+    If itm Is Nothing Then
+        modDebugLog.DDebug MOD_NAME, "ProposeForEntryID : item introuvable (EntryID perime)"
+        Exit Sub
+    End If
+    If itm.Class <> 43 Then Exit Sub
+
+    Dim subjectText As String
+    subjectText = CStr(itm.subject)
+
+    ' v2.1 (B10) : MsgBoxC remplace WScript.Shell.Popup, dont le timeout
+    ' est neutralise dans cet environnement (sonde modNotify) : le pop-up
+    ' restait affiche jusqu'au clic. MsgBoxC ferme reellement a 8 s, avec
+    ' compte a rebours visible sur le bouton par defaut (Non) ; un timeout
+    ' clique Non => aucun suivi (meme semantique que l'ancien retour -1).
+    ' v5 : le SUJET est concatene A L'EXTERIEUR de T(). T() applique A() a
+    ' ses deux branches : un sujet contenant "~e", "~a" ou "~o" (chaine de
+    ' caracteres parfaitement legitime dans un objet de mail) etait decode
+    ' en accent a l'affichage, donc affiche faux. Meme correctif que
+    ' ThisOutlookSession v10.6.
+    Dim msgText As String
+    msgText = T("Ce mail semble attendre une r~eponse :", _
+                "This mail seems to expect a reply:") & vbCrLf & vbCrLf & _
+              Left(subjectText, 70) & vbCrLf & vbCrLf & _
+              T("Enregistrer un rappel de suivi ?", _
+                "Save a follow-up reminder?")
+
+    ' v5 : le compte a rebours de 8 s courait meme quand la boite s'ouvrait
+    ' DERRIERE une autre application - elle se fermait alors toute seule sans
+    ' avoir jamais ete vue, et la proposition de suivi etait perdue en
+    ' silence. On remonte Outlook au premier plan d'abord ; si Windows
+    ' refuse, on retire le timeout (timeoutMs=0) : la boite attend un clic
+    ' plutot que de disparaitre inapercue.
+    Dim timeoutMs As Long
+    If modUi.BringOutlookToFront() Then
+        timeoutMs = 8000
+    Else
+        timeoutMs = 0
+        modDebugLog.DInfo MOD_NAME, "Premier plan refuse -> pop-up suivi sans timeout"
+    End If
+
+    Dim rep As VbMsgBoxResult
+    rep = modMsgBoxCustom.MsgBoxC(msgText, vbYesNo + vbQuestion, _
+            T("Suivi Mails - Attente de r" & Chr(233) & "ponse ?", "Mail Tracking - Awaiting reply?"), _
+            T("&Suivre", "&Track"), T("&Non", "&No"), "", timeoutMs, 2)
+
+    If rep = vbYes Then
+        ' On passe directement l'objet mail resolu : recipients TO intacts.
+        ' v4.1 : variante 1 clic (delai par defaut + toast, zero fenetre).
+        modMailResponseTracker.RecordSentMailQuick itm
+    Else
+        modDebugLog.DTrace MOD_NAME, "Pop-up non confirme (rep=" & rep & _
+            ", timeout=" & modMsgBoxCustom.LastResultWasTimeout() & ")"
+    End If
+
+    On Error GoTo 0
+End Sub
+
+'=============================================================================
+' Normalisation de sujet pour le matching candidat -> capture.
+' On compare en minuscule + trim ; on NE retire PAS les prefixes RE:/TR:
+' car CaptureSentItem voit exactement le meme item que celui evalue a
+' l'ItemSend (meme sujet litteral). La normalisation ne fait que neutraliser
+' la casse et les espaces parasites.
+'=============================================================================
+Private Function NormSubject(ByVal s As String) As String
+    NormSubject = LCase$(Trim$(CStr(s)))
+End Function
+
+'=============================================================================
+' Calcul du score de suspicion (lecture seule).
+'=============================================================================
+Private Function ComputeScore(ByVal Item As Object) As Long
+    ComputeScore = 0
+    On Error Resume Next
+
+    Dim subjectText As String, bodyText As String
+    subjectText = LCase$(CStr(Item.subject))
+    bodyText = LCase$(CStr(Item.body))
+
+    Dim nbDest As Long, nbExterne As Long, nbMoi As Long
+    CountRecipients Item, nbDest, nbExterne, nbMoi
+
+    If nbDest = 0 Then Exit Function                 ' aucun destinataire
+    If nbDest = nbMoi And nbMoi > 0 Then Exit Function ' a soi-meme uniquement
+
+    Dim score As Long
+    score = 0
+
+    If InStr(subjectText, "?") > 0 Then score = score + 2
+
+    Dim ptsMots As Long
+    ptsMots = 0
+    Dim mots As Variant
+    mots = AwaitKeywords()
+    Dim j As Long
+    For j = LBound(mots) To UBound(mots)
+        Dim mc As String
+        mc = CStr(mots(j))
+        If InStr(subjectText, mc) > 0 Or InStr(bodyText, mc) > 0 Then
+            ptsMots = ptsMots + 1
+            If ptsMots >= modConfig.KeywordsCap() Then Exit For
+        End If
+    Next j
+    score = score + ptsMots
+
+    If nbExterne > 0 Then score = score + 1
+
+    ComputeScore = score
+End Function
+
+'=============================================================================
+' Compte les destinataires : total (To+Cc), externes, et "moi".
+'=============================================================================
+Private Sub CountRecipients(ByVal Item As Object, _
+                                  ByRef nbDest As Long, _
+                                  ByRef nbExterne As Long, _
+                                  ByRef nbMoi As Long)
+    On Error Resume Next
+    nbDest = 0: nbExterne = 0: nbMoi = 0
+
+    Dim mySmtp As String
+    mySmtp = LCase$(GetMySmtp())
+
+    Dim rcp As Outlook.Recipient
+    For Each rcp In Item.recipients
+        If rcp.Type = olTo Or rcp.Type = olCC Then
+            nbDest = nbDest + 1
+
+            Dim smtp As String, domain As String
+            smtp = LCase$(ResolveSmtp(rcp))
+            domain = ExtractDomain(smtp)
+
+            If Len(mySmtp) > 0 And smtp = mySmtp Then
+                nbMoi = nbMoi + 1
+            End If
+
+            If Len(domain) > 0 Then
+                If Not IsInternalDomain(domain) Then
+                    nbExterne = nbExterne + 1
+                End If
+            End If
+        End If
+    Next rcp
+    On Error GoTo 0
+End Sub
+
+'=============================================================================
+' Helpers SMTP / domaine (autonomes).
+'=============================================================================
+Private Function ResolveSmtp(ByVal rcp As Outlook.Recipient) As String
+    ResolveSmtp = modSmtp.RecipientSmtp(rcp)
+End Function
+
+Private Function ExtractDomain(ByVal smtp As String) As String
+    ExtractDomain = modSmtp.ExtractDomain(smtp)
+End Function
+
+Private Function IsInternalDomain(ByVal domain As String) As Boolean
+    ' Pack v3 (C2) : egalite ou sous-domaine (avant : sous-chaine InStr).
+    IsInternalDomain = modSmtp.IsInternalDomain(domain)
+End Function
+
+Private Function GetMySmtp() As String
+    GetMySmtp = modSmtp.MySmtp()
+End Function
+
+'=============================================================================
+' Init paresseuse des dictionnaires.
+'=============================================================================
+Private Sub EnsureCandidates()
+    If mCandidates Is Nothing Then
+        Set mCandidates = CreateObject("Scripting.Dictionary")
+        mCandidates.CompareMode = 1   ' TextCompare (insensible casse)
+    End If
+End Sub
+
+Private Sub EnsurePending()
+    If mPending Is Nothing Then
+        Set mPending = CreateObject("Scripting.Dictionary")
+        mPending.CompareMode = 0      ' BinaryCompare (EntryID exact)
+    End If
+End Sub

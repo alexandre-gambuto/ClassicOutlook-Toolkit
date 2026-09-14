@@ -1,0 +1,1050 @@
+Option Explicit
+
+'=============================================================================
+' modOneNote - Moteur de reorganisation OneNote pilote par l'API Claude
+' Purpose (EN): OneNote reorganization engine. RunReorganization exports a JSON
+'   inventory of the three target notebooks (+ the time-tracking referential) to
+'   the Desktop; the user reviews it with an LLM and exports an action plan as
+'   JSON; ExecutePlanFromFile replays the rename/move/create/delete actions on
+'   OneNote via COM (late binding). FixTypeLibWin64_HKCU repairs the OneNote
+'   TypeLib registration under HKCU without admin rights. No UserForm.
+'
+' Architecture :
+'   1. RunReorganization  -> genere l'inventaire JSON des 3 blocs-notes
+'      cibles + referentiel Suivi de temps.xlsm dans onenote_exchange.json (Bureau)
+'   2. L'utilisateur ouvre chat_onenote.html, dialogue avec Claude, et exporte
+'      un plan d'action onenote_plan.json sur le Bureau
+'   3. ExecutePlanFromFile  -> rejoue les actions sur OneNote
+'
+' Prerequis :
+'   - Outlook Classic + VBA active
+'   - OneNote 2016+ installe et au moins lance une fois
+'   - LATE BINDING partout : AUCUNE reference COM a cocher dans Outils>References
+'   - Suivi de temps.xlsm sur le Bureau (detection auto OneDrive / Bureau FR)
+'
+' Macros a lancer depuis Outlook (Alt+F8) :
+'   * RunReorganization           -> production : inventaire + sauvegarde
+'   * ExecutePlanFromFile      -> production : execute un plan JSON
+'   * TestEnvironment              -> diagnostic : verifie que tout repond
+'=============================================================================
+
+' ---- Constantes ----
+' modConfig.TimeTrackingFilename() externalise : modConfig.TimeTrackingFilename()
+Private Const MOD_NAME As String = "OneNote"
+Private Const MOD_VERSION As String = "v1 - 2026-06-07"
+Private Const BACKUP_FOLDER       As String = "OneNote_Backups"
+Private Const JSON_INVENTORY_FILE As String = "onenote_exchange.json"
+Private Const JSON_PLAN_FILE      As String = "onenote_plan.json"
+
+' Cibles : les 3 blocs-notes a inventorier/sauvegarder.
+' Externalises dans config.ini :
+'   modConfig.g_OneNoteNotebook1 / 2 / 3 (OneNoteNotebook1/2/3)
+
+' OneNote constantes (late binding - on redeclare les enums)
+Private Const hsSelf          As Long = 0
+Private Const hsChildren      As Long = 1
+Private Const hsNotebooks     As Long = 1
+Private Const hsSections      As Long = 2
+Private Const hsPages         As Long = 4
+Private Const pfOneNotePackage As Long = 3
+Private Const ONE_NAMESPACE   As String = "http://schemas.microsoft.com/office/onenote/2013/onenote"
+
+' ---- Types ----
+Private Type DossierRef
+    Opportunite As String
+    contrat     As String
+    codeDV      As String
+    nomDossier  As String
+    partenaire  As String
+End Type
+
+' ---- Etat module ----
+Private m_onenoteApp    As Object
+Private m_referentiel() As DossierRef
+Private m_referentielCount As Long
+Private m_logPath       As String
+Private m_lastStep      As String
+
+
+'=============================================================================
+' POINT D'ENTREE 1 : generer l'inventaire + sauvegarde
+'=============================================================================
+'=============================================================================
+' UiTitle - titre de fenetre localise. Etait en dur ("OneNote Reorg") a
+' chaque boite ; convention titres du 2026-08-22 : une phrase, pas un nom
+' technique.
+'=============================================================================
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+Private Function UiTitle() As String
+    UiTitle = T("R~eorganisation OneNote", "OneNote reorganisation")
+End Function
+
+Public Sub RunReorganization()
+    On Error GoTo ErrHandler
+
+    m_lastStep = "Init log"
+    InitLog
+
+    m_lastStep = "Connexion OneNote"
+    If Not ConnectOneNote() Then Exit Sub
+
+    m_lastStep = "Sauvegarde .onepkg"
+    BackupNotebooks
+
+    m_lastStep = "Lecture Suivi de temps.xlsm"
+    LoadReferential
+
+    m_lastStep = "Generation inventaire JSON"
+    Dim inventaireJSON As String
+    inventaireJSON = GenerateInventoryJSON()
+
+    m_lastStep = "Ecriture fichier d'echange"
+    Dim outPath As String
+    outPath = GetDesktopPath() & "\" & JSON_INVENTORY_FILE
+    WriteFile outPath, inventaireJSON
+    LogMessage "Inventaire ecrit : " & outPath & " (" & Len(inventaireJSON) & " car.)"
+
+    ' v- 2026-08-22 : le CHEMIN sort de T() - A() decoderait un dossier
+    ' contenant "~e" ou "~a" et afficherait un chemin faux, alors que c'est
+    ' precisement le fichier que l'utilisateur doit aller ouvrir.
+    modUi.Inform T("Inventaire OneNote g~en~er~e.", _
+                   "OneNote inventory generated.") & vbCrLf & vbCrLf & _
+           T("Fichier : ", "File: ") & outPath & vbCrLf & vbCrLf & _
+           T("Etape suivante : ouvre chat_onenote.html, colle le contenu de " & _
+             "ce fichier dans le chat, puis exporte le plan d'action en " & _
+             "onenote_plan.json.", _
+             "Next step: open chat_onenote.html, paste the content of this " & _
+             "file into the chat, then export the action plan as " & _
+             "onenote_plan.json."), _
+           vbInformation, UiTitle()
+    Exit Sub
+
+ErrHandler:
+    FatalError "RunReorganization"
+End Sub
+
+
+'=============================================================================
+' POINT D'ENTREE 2 : executer un plan d'action JSON
+'=============================================================================
+Public Sub ExecutePlanFromFile()
+    On Error GoTo ErrHandler
+
+    m_lastStep = "Init log"
+    InitLog
+
+    Dim planPath As String
+    planPath = GetDesktopPath() & "\" & JSON_PLAN_FILE
+
+    If Dir(planPath) = "" Then
+        planPath = InputBox(T("Chemin du fichier plan JSON :", "Path to the JSON plan file:"), UiTitle(), planPath)
+        If planPath = "" Then Exit Sub
+    End If
+
+    m_lastStep = "Connexion OneNote"
+    If Not ConnectOneNote() Then Exit Sub
+
+    m_lastStep = "Lecture du plan"
+    Dim jsonContent As String
+    jsonContent = ReadFile(planPath)
+    If Len(jsonContent) = 0 Then
+        MsgBox T("Plan d'action vide ou introuvable : ", "Action plan empty or not found: ") & planPath, vbExclamation
+        Exit Sub
+    End If
+
+    ' Demander mode : dry-run ou execution reelle
+    Dim response As VbMsgBoxResult
+    ' v- 2026-08-22 : Confirm3 plutot qu'une MsgBox vbYesNoCancel dont les
+    ' boutons Oui/Non ne disent pas ce qu'ils font - il fallait lire le
+    ' corps du message pour savoir lequel simule et lequel modifie. Les
+    ' boutons portent desormais l'action ; Annuler reste en 3e position,
+    ' donc sur Echap et sur la croix. La taille du plan sort de T().
+    response = modMsgBoxCustom.Confirm3( _
+        T("Plan charg~e : ", "Plan loaded: ") & Len(jsonContent) & _
+        T(" caract~fres.", " characters."), _
+        T("Mode d'ex~ecution", "Execution mode"), _
+        T("&Simulation", "&Dry run"), _
+        T("&Ex~ecuter", "&Execute"), _
+        T("A&nnuler", "&Cancel"))
+    If response = vbCancel Then Exit Sub
+
+    Dim dryRun As Boolean
+    dryRun = (response = vbYes)
+
+    m_lastStep = "Parsing JSON"
+    Dim actions As Collection
+    Set actions = ParseActions(jsonContent)
+    LogMessage "Plan parse : " & actions.count & " action(s) - mode=" & IIf(dryRun, "DRY-RUN", "EXECUTION")
+
+    m_lastStep = "Execution"
+    Dim nOK As Long, nKO As Long
+    Dim i As Long
+    For i = 1 To actions.count
+        If ExecuteAction(actions(i), dryRun) Then
+            nOK = nOK + 1
+        Else
+            nKO = nKO + 1
+        End If
+    Next i
+
+    LogMessage "=== Fin : " & nOK & " OK, " & nKO & " erreurs - mode=" & IIf(dryRun, "DRY-RUN", "EXECUTION")
+
+    ' v- 2026-08-22 : compteurs, mode et chemin de log sortis de T().
+    modUi.Inform T("Plan trait~e : ", "Plan processed: ") & nOK & " OK, " & _
+           nKO & T(" erreur(s).", " error(s).") & vbCrLf & _
+           T("Mode : ", "Mode: ") & _
+           IIf(dryRun, T("SIMULATION (aucune modif)", "SIMULATION (no change)"), _
+                       T("Ex~ecution REELLE", "REAL execution")) & vbCrLf & vbCrLf & _
+           T("Log : ", "Log: ") & m_logPath, _
+           UiTitle()
+    Exit Sub
+
+ErrHandler:
+    FatalError "ExecutePlanFromFile"
+End Sub
+
+
+'=============================================================================
+' POINT D'ENTREE 3 : diagnostic complet
+'=============================================================================
+Public Sub TestEnvironment()
+    Dim msg As String
+    Dim ok As Boolean
+
+    msg = "=== Diagnostic environnement OneNote Reorg ===" & vbCrLf & vbCrLf
+
+    ' 1. OneNote COM
+    On Error Resume Next
+    Dim oApp As Object
+    Set oApp = CreateObject("OneNote.Application")
+    If Err.Number = 0 Then
+        Dim xmlOut As String
+        Err.Clear
+        oApp.GetHierarchy "", hsNotebooks, xmlOut
+        If Err.Number = 0 And Len(xmlOut) > 0 Then
+            msg = msg & "[OK] OneNote COM : " & Len(xmlOut) & " car. XML" & vbCrLf
+        Else
+            msg = msg & "[KO] OneNote GetHierarchy : " & Err.Description & vbCrLf
+        End If
+    Else
+        msg = msg & "[KO] OneNote COM : " & Err.Description & vbCrLf
+    End If
+    Set oApp = Nothing
+    Err.Clear
+
+    ' 2. Excel
+    Dim xl As Object
+    Set xl = CreateObject("Excel.Application")
+    If Err.Number = 0 Then
+        msg = msg & "[OK] Excel COM" & vbCrLf
+        xl.Quit
+    Else
+        msg = msg & "[KO] Excel : " & Err.Description & vbCrLf
+    End If
+    Set xl = Nothing
+    Err.Clear
+
+    ' 3. MSXML
+    Dim x As Object
+    Set x = CreateObject("MSXML2.DOMDocument.6.0")
+    If Err.Number = 0 Then
+        msg = msg & "[OK] MSXML 6.0" & vbCrLf
+    Else
+        msg = msg & "[KO] MSXML 6.0 : " & Err.Description & vbCrLf
+    End If
+    Err.Clear
+
+    ' 4. FileSystem
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    msg = msg & "[OK] Scripting.FileSystemObject" & vbCrLf
+
+    ' 5. Bureau
+    Dim desk As String: desk = GetDesktopPath()
+    msg = msg & "[--] Bureau : " & desk & vbCrLf
+    If fso.FolderExists(desk) Then
+        msg = msg & "[OK] Bureau accessible" & vbCrLf
+    Else
+        msg = msg & "[KO] Bureau introuvable" & vbCrLf
+    End If
+
+    ' 6. Suivi de temps.xlsm
+    Dim tempo As String: tempo = desk & "\" & modConfig.TimeTrackingFilename()
+    If fso.fileExists(tempo) Then
+        msg = msg & "[OK] Suivi de temps.xlsm present" & vbCrLf
+    Else
+        msg = msg & "[KO] Suivi de temps.xlsm manquant : " & tempo & vbCrLf
+    End If
+
+    On Error GoTo 0
+    MsgBox msg, vbInformation, "Diagnostic"
+End Sub
+
+
+'=============================================================================
+' CONNEXION ONENOTE
+'=============================================================================
+Private Function ConnectOneNote() As Boolean
+    On Error Resume Next
+    Set m_onenoteApp = CreateObject("OneNote.Application")
+    If Err.Number <> 0 Or m_onenoteApp Is Nothing Then
+        Dim msg As String
+        ' v- 2026-08-22 : Err.Description sort de T(). Un message d'erreur
+        ' systeme peut contenir n'importe quelle sequence, "~e" comprise :
+        ' le decoder produirait un diagnostic faux.
+        msg = T("Impossible de se connecter a OneNote.", _
+                "Cannot connect to OneNote.") & vbCrLf & _
+              T("Erreur : ", "Error: ") & Err.Number & " - " & Err.Description & _
+              vbCrLf & vbCrLf & _
+              T("Verifications :", "Checks:") & vbCrLf & _
+              T("1. OneNote Desktop est-il installe et lance ?", _
+                "1. Is OneNote Desktop installed and running?") & vbCrLf & _
+              T("2. Lancer TestEnvironment pour diagnostic complet", _
+                "2. Run TestEnvironment for a full diagnostic")
+        modUi.Fail msg, UiTitle(), vbCritical
+        ConnectOneNote = False
+        Err.Clear
+        On Error GoTo 0
+        Exit Function
+    End If
+
+    ' Test reel : GetHierarchy doit repondre
+    Dim xmlTest As String
+    Err.Clear
+    m_onenoteApp.GetHierarchy "", hsNotebooks, xmlTest
+    If Err.Number <> 0 Then
+        modUi.Fail T("OneNote instanci~e mais GetHierarchy a ~echou~e :", _
+                     "OneNote instantiated but GetHierarchy failed:") & vbCrLf & _
+               Err.Number & " - " & Err.Description & vbCrLf & vbCrLf & _
+               T("Si l'erreur est TYPE_E_CANTLOADLIBRARY, le registre " & _
+                 "HKLM\TypeLib de OneNote est probablement corrompu et doit " & _
+                 "~xtre r~epar~e par l'IT.", _
+                 "If the error is TYPE_E_CANTLOADLIBRARY, the HKLM\TypeLib " & _
+                 "registry for OneNote is probably corrupted and must be " & _
+                 "repaired by IT."), _
+               UiTitle(), vbCritical
+        ConnectOneNote = False
+        Err.Clear
+        On Error GoTo 0
+        Exit Function
+    End If
+
+    LogMessage "Connexion OneNote OK - " & Len(xmlTest) & " car."
+    ConnectOneNote = True
+    On Error GoTo 0
+End Function
+
+
+'=============================================================================
+' SAUVEGARDE .onepkg DES 3 BLOCS-NOTES
+'=============================================================================
+Private Sub BackupNotebooks()
+    Dim xml As String
+    m_onenoteApp.GetHierarchy "", hsNotebooks, xml
+
+    Dim doc As Object
+    Set doc = LoadXML(xml)
+
+    Dim backupDir As String
+    backupDir = GetDesktopPath() & "\" & BACKUP_FOLDER
+    CreateFolderIfAbsent backupDir
+
+    Dim targets As Variant
+    targets = Array(modConfig.OneNoteNotebook(1), modConfig.OneNoteNotebook(2), modConfig.OneNoteNotebook(3))
+
+    Dim notebooks As Object
+    Set notebooks = doc.SelectNodes("//one:Notebook")
+
+    Dim i As Long, j As Long
+    Dim nd As Object
+    For i = 0 To notebooks.length - 1
+        Set nd = notebooks.Item(i)
+        Dim nbName As String
+        nbName = nd.getAttribute("name")
+        For j = LBound(targets) To UBound(targets)
+            If nbName = targets(j) Then
+                Dim path As String
+                path = backupDir & "\" & SanitizeFileName(nbName) & "_" & _
+                       Format(Now, "yyyymmdd_hhnnss") & ".onepkg"
+                On Error Resume Next
+                m_onenoteApp.Publish nd.getAttribute("ID"), path, pfOneNotePackage, ""
+                If Err.Number = 0 Then
+                    LogMessage "Sauvegarde OK : " & nbName & " -> " & path
+                Else
+                    LogMessage "ATTENTION sauvegarde echouee : " & nbName & " - " & Err.Description
+                    Err.Clear
+                End If
+                On Error GoTo 0
+                Exit For
+            End If
+        Next j
+    Next i
+End Sub
+
+
+'=============================================================================
+' LECTURE Suivi de temps.xlsm
+'=============================================================================
+Private Sub LoadReferential()
+    Dim tempoPath As String
+    tempoPath = GetDesktopPath() & "\" & modConfig.TimeTrackingFilename()
+
+    If Dir(tempoPath) = "" Then
+        LogMessage "ATTENTION : Suivi de temps.xlsm introuvable -> " & tempoPath
+        m_referentielCount = 0
+        Exit Sub
+    End If
+
+    Dim xl As Object, wb As Object, ws As Object
+    Set xl = CreateObject("Excel.Application")
+    xl.Visible = False
+    xl.DisplayAlerts = False
+
+    Set wb = xl.Workbooks.Open(tempoPath, ReadOnly:=True)
+
+    ' Pre-dimensionnement large : on retaillera a la fin
+    ReDim m_referentiel(1 To 1000)
+    m_referentielCount = 0
+
+    ' Dico de deduplication : codeDV -> True (simple, pas de UDT)
+    Dim seen As Object
+    Set seen = CreateObject("Scripting.Dictionary")
+
+    ' Parcourir les feuilles mensuelles (nom qui commence par "20")
+    Dim sH As Object
+    For Each sH In wb.Sheets
+        If Left(sH.name, 2) = "20" Then
+            ReadMonthlySheet sH, seen
+        End If
+    Next sH
+
+    ' Retailler au nombre reel
+    If m_referentielCount > 0 Then
+        ReDim Preserve m_referentiel(1 To m_referentielCount)
+    Else
+        Erase m_referentiel
+    End If
+
+    wb.Close False
+    xl.Quit
+    Set xl = Nothing
+
+    LogMessage "Referentiel charge : " & m_referentielCount & " dossiers uniques"
+End Sub
+
+Private Sub ReadMonthlySheet(ws As Object, ByVal seen As Object)
+    ' Structure feuille mensuelle :
+    '   ligne 1 = totaux/ajuste
+    '   ligne 2 = en-tetes (Opportunite, Contrat, DV, ...)
+    '   ligne 3 et + = donnees
+    ' Colonnes : 2=Opportunite, 3=Contrat, 4=CodeDV, 5=NomDossier, 6=Partenaire
+    Const xlUp As Long = -4162
+
+    Dim lastRow As Long
+    lastRow = ws.Cells(ws.Rows.count, 4).End(xlUp).row
+    If lastRow < 3 Then Exit Sub
+
+    Dim r As Long
+    For r = 3 To lastRow
+        Dim codeDV As String
+        codeDV = Trim(CStr(ws.Cells(r, 4).Value))
+
+        If codeDV <> "" And Not seen.Exists(codeDV) Then
+            seen.Add codeDV, True
+
+            ' Agrandir le tableau si necessaire (par paquets de 500)
+            If m_referentielCount >= UBound(m_referentiel) Then
+                ReDim Preserve m_referentiel(1 To UBound(m_referentiel) + 500)
+            End If
+
+            m_referentielCount = m_referentielCount + 1
+            m_referentiel(m_referentielCount).Opportunite = Trim(CStr(ws.Cells(r, 2).Value))
+            m_referentiel(m_referentielCount).contrat = Trim(CStr(ws.Cells(r, 3).Value))
+            m_referentiel(m_referentielCount).codeDV = codeDV
+            m_referentiel(m_referentielCount).nomDossier = Trim(CStr(ws.Cells(r, 5).Value))
+            m_referentiel(m_referentielCount).partenaire = Trim(CStr(ws.Cells(r, 6).Value))
+        End If
+    Next r
+End Sub
+
+
+'=============================================================================
+' GENERATION DE L'INVENTAIRE JSON
+'=============================================================================
+Private Function GenerateInventoryJSON() As String
+    Dim xml As String
+    m_onenoteApp.GetHierarchy "", hsPages, xml
+
+    Dim doc As Object
+    Set doc = LoadXML(xml)
+
+    Dim sb As Object
+    Set sb = CreateObject("System.Collections.ArrayList")   ' fallback si indispo : concatenation
+    ' StringBuilder-like via collection : on collecte en String puis on joint
+
+    Dim out As String
+    out = "{" & vbCrLf
+    out = out & "  ""timestamp"": """ & Format(Now, "yyyy-mm-ddThh:nn:ss") & """," & vbCrLf
+    out = out & "  ""notebooks"": [" & vbCrLf
+
+    Dim targets As Variant
+    targets = Array(modConfig.OneNoteNotebook(1), modConfig.OneNoteNotebook(2), modConfig.OneNoteNotebook(3))
+
+    Dim notebooks As Object
+    Set notebooks = doc.SelectNodes("//one:Notebook")
+    Dim firstNb As Boolean: firstNb = True
+
+    Dim i As Long, T As Long
+    For i = 0 To notebooks.length - 1
+        Dim nd As Object: Set nd = notebooks.Item(i)
+        Dim nbName As String: nbName = nd.getAttribute("name")
+
+        Dim isTarget As Boolean: isTarget = False
+        For T = LBound(targets) To UBound(targets)
+            If nbName = targets(T) Then isTarget = True: Exit For
+        Next T
+        If isTarget Then
+            If Not firstNb Then out = out & "," & vbCrLf
+            firstNb = False
+            out = out & "    {" & vbCrLf
+            out = out & "      ""id"": """ & EscapeJSON(nd.getAttribute("ID")) & """," & vbCrLf
+            out = out & "      ""name"": """ & EscapeJSON(nbName) & """," & vbCrLf
+            out = out & "      ""children"": [" & vbCrLf
+            out = out & WalkChildren(nd, 8)
+            out = out & vbCrLf & "      ]" & vbCrLf
+            out = out & "    }"
+        End If
+    Next i
+
+    out = out & vbCrLf & "  ]," & vbCrLf
+    out = out & "  ""referentiel"": [" & vbCrLf
+    Dim ri As Long
+    For ri = 1 To m_referentielCount
+        If ri > 1 Then out = out & "," & vbCrLf
+        out = out & "    {"
+        out = out & """codeDV"": """ & EscapeJSON(m_referentiel(ri).codeDV) & """, "
+        out = out & """dossier"": """ & EscapeJSON(m_referentiel(ri).nomDossier) & """, "
+        out = out & """opportunite"": """ & EscapeJSON(m_referentiel(ri).Opportunite) & """, "
+        out = out & """partenaire"": """ & EscapeJSON(m_referentiel(ri).partenaire) & """"
+        out = out & "}"
+    Next ri
+    out = out & vbCrLf & "  ]" & vbCrLf
+    out = out & "}"
+
+    GenerateInventoryJSON = out
+End Function
+
+Private Function WalkChildren(parent As Object, ByVal indent As Long) As String
+    Dim result As String
+    Dim prefix As String: prefix = Space(indent)
+    Dim first As Boolean: first = True
+
+    ' Sections
+    Dim sec As Object
+    For Each sec In parent.SelectNodes("one:Section")
+        If Not first Then result = result & "," & vbCrLf
+        first = False
+        result = result & prefix & "{" & vbCrLf
+        result = result & prefix & "  ""type"": ""section""," & vbCrLf
+        result = result & prefix & "  ""id"": """ & EscapeJSON(sec.getAttribute("ID")) & """," & vbCrLf
+        result = result & prefix & "  ""name"": """ & EscapeJSON(sec.getAttribute("name")) & """," & vbCrLf
+        result = result & prefix & "  ""pages"": [" & vbCrLf
+
+        Dim firstPage As Boolean: firstPage = True
+        Dim pg As Object
+        For Each pg In sec.SelectNodes("one:Page")
+            If Not firstPage Then result = result & "," & vbCrLf
+            firstPage = False
+            result = result & prefix & "    {"
+            result = result & """id"": """ & EscapeJSON(pg.getAttribute("ID")) & """, "
+            result = result & """name"": """ & EscapeJSON(pg.getAttribute("name")) & """, "
+            Dim lvl As String: lvl = pg.getAttribute("pageLevel")
+            If lvl = "" Then lvl = "1"
+            result = result & """level"": " & lvl
+            result = result & "}"
+        Next pg
+
+        result = result & vbCrLf & prefix & "  ]" & vbCrLf
+        result = result & prefix & "}"
+    Next sec
+
+    ' Section groups (on ignore les systemes : prefix "_" ou corbeille)
+    Dim sg As Object
+    For Each sg In parent.SelectNodes("one:SectionGroup")
+        Dim sgName As String: sgName = sg.getAttribute("name")
+        If Left(sgName, 1) <> "_" And sgName <> "OneNote_RecycleBin" Then
+            If Not first Then result = result & "," & vbCrLf
+            first = False
+            result = result & prefix & "{" & vbCrLf
+            result = result & prefix & "  ""type"": ""sectionGroup""," & vbCrLf
+            result = result & prefix & "  ""id"": """ & EscapeJSON(sg.getAttribute("ID")) & """," & vbCrLf
+            result = result & prefix & "  ""name"": """ & EscapeJSON(sgName) & """," & vbCrLf
+            result = result & prefix & "  ""children"": [" & vbCrLf
+            result = result & WalkChildren(sg, indent + 4)
+            result = result & vbCrLf & prefix & "  ]" & vbCrLf
+            result = result & prefix & "}"
+        End If
+    Next sg
+
+    WalkChildren = result
+End Function
+
+
+'=============================================================================
+' EXECUTION D'UNE ACTION
+'=============================================================================
+Private Function ExecuteAction(ByVal act As Object, ByVal dryRun As Boolean) As Boolean
+    Dim actionType As String: actionType = act("action")
+    Dim prefix As String: prefix = IIf(dryRun, "[DRY-RUN] ", "")
+
+    On Error GoTo ErrHandler
+
+    Select Case actionType
+        Case "rename_section"
+            LogMessage prefix & "rename_section id=" & act("sectionId") & " -> " & act("newName")
+            If Not dryRun Then RenameSection act("sectionId"), act("newName")
+
+        Case "rename_page"
+            LogMessage prefix & "rename_page id=" & act("pageId") & " -> " & act("newName")
+            If Not dryRun Then RenamePage act("pageId"), act("newName")
+
+        Case "move_page"
+            LogMessage prefix & "move_page id=" & act("pageId") & " -> section=" & act("targetSectionId")
+            If Not dryRun Then MovePage act("pageId"), act("targetSectionId")
+
+        Case "create_section"
+            LogMessage prefix & "create_section parent=" & act("notebookId") & " name=" & act("name")
+            If Not dryRun Then CreateSection act("notebookId"), act("name")
+
+        Case "create_section_group"
+            LogMessage prefix & "create_section_group parent=" & act("parentId") & " name=" & act("name")
+            If Not dryRun Then CreateSectionGroup act("parentId"), act("name")
+
+        Case "delete_page"
+            LogMessage prefix & "delete_page id=" & act("pageId")
+            If Not dryRun Then DeleteHierarchy act("pageId")
+
+        Case "delete_section"
+            LogMessage prefix & "delete_section id=" & act("sectionId")
+            If Not dryRun Then DeleteHierarchy act("sectionId")
+
+        Case Else
+            LogMessage "ATTENTION action inconnue ignoree : " & actionType
+            ExecuteAction = False
+            Exit Function
+    End Select
+
+    ExecuteAction = True
+    Exit Function
+
+ErrHandler:
+    LogMessage "ERREUR action " & actionType & " : " & Err.Number & " - " & Err.Description
+    ExecuteAction = False
+End Function
+
+
+'=============================================================================
+' OPERATIONS ONENOTE UNITAIRES
+'=============================================================================
+Private Sub RenameSection(ByVal sectionId As String, ByVal newName As String)
+    Dim xml As String
+    m_onenoteApp.GetHierarchy sectionId, hsSelf, xml
+    Dim doc As Object: Set doc = LoadXML(xml)
+    doc.DocumentElement.setAttribute "name", newName
+    m_onenoteApp.UpdateHierarchy doc.xml
+End Sub
+
+Private Sub RenamePage(ByVal pageId As String, ByVal newName As String)
+    Dim xml As String
+    m_onenoteApp.GetPageContent pageId, xml, 0
+    Dim doc As Object: Set doc = LoadXML(xml)
+
+    Dim titleT As Object
+    Set titleT = doc.SelectSingleNode("//one:Title/one:OE/one:T")
+    If Not titleT Is Nothing Then
+        ' On supprime les enfants existants (CDATA / texte) puis on ajoute un CDATA propre
+        Do While titleT.HasChildNodes
+            titleT.RemoveChild titleT.FirstChild
+        Loop
+        Dim cdata As Object
+        Set cdata = doc.CreateCDATASection(newName)
+        titleT.AppendChild cdata
+    End If
+
+    m_onenoteApp.UpdatePageContent doc.xml
+End Sub
+
+Private Sub MovePage(ByVal pageId As String, ByVal targetSectionId As String)
+    ' OneNote COM : pas de methode directe "MovePage". Technique :
+    ' 1. Lire le XML de la page source (piAll = 7 pour tout recuperer)
+    ' 2. Creer une page vierge dans la section cible
+    ' 3. Reecrire le XML source avec l'ID de la nouvelle page
+    ' 4. UpdatePageContent sur la nouvelle
+    ' 5. Supprimer la page source
+    Const piAll As Long = 7
+
+    Dim xmlSrc As String
+    m_onenoteApp.GetPageContent pageId, xmlSrc, piAll
+
+    Dim newPageId As String
+    m_onenoteApp.CreateNewPage targetSectionId, newPageId
+
+    ' Remplacer l'ID dans le XML
+    Dim xmlDst As String
+    xmlDst = Replace(xmlSrc, "ID=""" & pageId & """", "ID=""" & newPageId & """")
+
+    m_onenoteApp.UpdatePageContent xmlDst
+    m_onenoteApp.DeleteHierarchy pageId
+End Sub
+
+Private Sub CreateSection(ByVal parentId As String, ByVal sectionName As String)
+    Dim xml As String
+    m_onenoteApp.GetHierarchy parentId, hsChildren, xml
+
+    Dim doc As Object: Set doc = LoadXML(xml)
+    Dim newSec As Object
+    Set newSec = doc.CreateNode(1, "one:Section", ONE_NAMESPACE)
+    newSec.setAttribute "name", sectionName
+    doc.DocumentElement.AppendChild newSec
+
+    m_onenoteApp.UpdateHierarchy doc.xml
+End Sub
+
+Private Sub CreateSectionGroup(ByVal parentId As String, ByVal groupName As String)
+    Dim xml As String
+    m_onenoteApp.GetHierarchy parentId, hsSections, xml
+
+    Dim doc As Object: Set doc = LoadXML(xml)
+    Dim newGrp As Object
+    Set newGrp = doc.CreateNode(1, "one:SectionGroup", ONE_NAMESPACE)
+    newGrp.setAttribute "name", groupName
+    doc.DocumentElement.AppendChild newGrp
+
+    m_onenoteApp.UpdateHierarchy doc.xml
+End Sub
+
+Private Sub DeleteHierarchy(ByVal objectId As String)
+    m_onenoteApp.DeleteHierarchy objectId
+End Sub
+
+
+'=============================================================================
+' PARSING JSON (minimaliste : pour les actions uniquement)
+'=============================================================================
+Private Function ParseActions(ByVal jsonStr As String) As Collection
+    Dim result As New Collection
+    Set ParseActions = result
+
+    ' On cherche "actions" : [
+    Dim posKey As Long: posKey = InStr(1, jsonStr, """actions""")
+    If posKey = 0 Then Exit Function
+
+    Dim posArr As Long: posArr = InStr(posKey, jsonStr, "[")
+    If posArr = 0 Then Exit Function
+
+    ' Parcourir les objets { ... } au niveau 1 dans ce tableau
+    Dim depth As Long: depth = 0
+    Dim objStart As Long: objStart = 0
+    Dim inStr_ As Boolean: inStr_ = False
+    Dim escaped As Boolean: escaped = False
+    Dim pos As Long: pos = posArr
+    Dim c As String
+
+    Do While pos <= Len(jsonStr)
+        c = Mid(jsonStr, pos, 1)
+
+        If inStr_ Then
+            If escaped Then
+                escaped = False
+            ElseIf c = "\" Then
+                escaped = True
+            ElseIf c = """" Then
+                inStr_ = False
+            End If
+        Else
+            If c = """" Then
+                inStr_ = True
+            ElseIf c = "{" Then
+                If depth = 0 Then objStart = pos
+                depth = depth + 1
+            ElseIf c = "}" Then
+                depth = depth - 1
+                If depth = 0 And objStart > 0 Then
+                    Dim objStr As String
+                    objStr = Mid(jsonStr, objStart, pos - objStart + 1)
+                    Dim dict As Object
+                    Set dict = ParseSimpleObject(objStr)
+                    If dict.count > 0 Then result.Add dict
+                    objStart = 0
+                End If
+            ElseIf c = "]" And depth = 0 Then
+                Exit Do
+            End If
+        End If
+
+        pos = pos + 1
+    Loop
+End Function
+
+Private Function ParseSimpleObject(ByVal objStr As String) As Object
+    Dim dict As Object
+    Set dict = CreateObject("Scripting.Dictionary")
+
+    Dim rx As Object
+    Set rx = CreateObject("VBScript.RegExp")
+    rx.Global = True
+    ' Capture "key" : "value" (avec escape \")
+    rx.Pattern = """([^""]+)""\s*:\s*""((?:\\.|[^""\\])*)"""
+
+    Dim matches As Object
+    Set matches = rx.Execute(objStr)
+
+    Dim m As Object
+    For Each m In matches
+        ' Dejouer les escapes JSON classiques
+        Dim v As String: v = m.SubMatches(1)
+        v = Replace(v, "\""", """")
+        v = Replace(v, "\\", "\")
+        v = Replace(v, "\n", vbLf)
+        v = Replace(v, "\t", vbTab)
+        dict(m.SubMatches(0)) = v
+    Next m
+
+    Set ParseSimpleObject = dict
+End Function
+
+
+'=============================================================================
+' CORRECTIF HKCU Win64 TypeLib (sans droits admin)
+'
+' Diagnostic : sur Outlook 64-bit, la TypeLib OneNote doit etre enregistree
+' sous HKLM\...\TypeLib\{GUID}\1.1\0\win64. Si win64 est absent, GetHierarchy
+' echoue avec TYPE_E_LIBNOTREGISTERED (0x8002801D) alors que CreateObject OK.
+'
+' HKCU\Software\Classes prime sur HKLM\Software\Classes pour la resolution COM.
+' On ecrit la cle manquante au niveau utilisateur sans admin.
+'
+' Technique : generation d'un fichier .reg importe via regedit /s. C'est la
+' seule methode fiable pour ecrire la valeur "(par defaut)" d'une cle en VBA.
+' WScript.Shell.RegWrite a un bug connu : si le nom de cle finit par \, il
+' cree une sous-cle numerotee au lieu d'ecrire la valeur par defaut.
+'=============================================================================
+Public Sub FixTypeLibWin64_HKCU()
+    On Error GoTo ErrHandler
+
+    Const GUID_ONENOTE As String = "{0EA692EE-BB50-4E3C-AEF0-356D91732725}"
+    Const ONENOTE_EXE As String = "C:\Program Files\Microsoft Office\root\Office16\ONENOTE.EXE"
+
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    If Not fso.fileExists(ONENOTE_EXE) Then
+        MsgBox T("ONENOTE.EXE introuvable :", "ONENOTE.EXE not found:") & vbCrLf & ONENOTE_EXE, _
+               vbCritical, T("R~eparation OneNote - registre", "OneNote repair - registry")
+        Exit Sub
+    End If
+
+    ' 1. Nettoyage prealable des eventuelles cles corrompues de la tentative
+    '    precedente (sous-cles "3", "1", "2" sous win32/win64)
+    CleanHKCUKey "Software\Classes\TypeLib\" & GUID_ONENOTE & "\1.1\0\win64\3"
+    CleanHKCUKey "Software\Classes\TypeLib\" & GUID_ONENOTE & "\1.1\0\win64\1"
+    CleanHKCUKey "Software\Classes\TypeLib\" & GUID_ONENOTE & "\1.1\0\win64\2"
+    CleanHKCUKey "Software\Classes\TypeLib\" & GUID_ONENOTE & "\1.1\0\win32\3"
+
+    ' 2. Generer le fichier .reg (format Unicode obligatoire depuis Win10)
+    '    Dans un .reg, les "\" du chemin doivent etre doubles : "\\"
+    Dim exeEchappe As String
+    exeEchappe = Replace(ONENOTE_EXE, "\", "\\")
+
+    Dim regContent As String
+    regContent = "Windows Registry Editor Version 5.00" & vbCrLf & vbCrLf
+    regContent = regContent & "[HKEY_CURRENT_USER\Software\Classes\TypeLib\" & GUID_ONENOTE & "]" & vbCrLf
+    regContent = regContent & "@=""Microsoft OneNote 15.0 Object Library""" & vbCrLf & vbCrLf
+    regContent = regContent & "[HKEY_CURRENT_USER\Software\Classes\TypeLib\" & GUID_ONENOTE & "\1.1]" & vbCrLf
+    regContent = regContent & "@=""Microsoft OneNote 15.0 Object Library""" & vbCrLf & vbCrLf
+    regContent = regContent & "[HKEY_CURRENT_USER\Software\Classes\TypeLib\" & GUID_ONENOTE & "\1.1\0]" & vbCrLf & vbCrLf
+    regContent = regContent & "[HKEY_CURRENT_USER\Software\Classes\TypeLib\" & GUID_ONENOTE & "\1.1\0\win32]" & vbCrLf
+    regContent = regContent & "@=""" & exeEchappe & """" & vbCrLf & vbCrLf
+    regContent = regContent & "[HKEY_CURRENT_USER\Software\Classes\TypeLib\" & GUID_ONENOTE & "\1.1\0\win64]" & vbCrLf
+    regContent = regContent & "@=""" & exeEchappe & """" & vbCrLf & vbCrLf
+    regContent = regContent & "[HKEY_CURRENT_USER\Software\Classes\TypeLib\" & GUID_ONENOTE & "\1.1\FLAGS]" & vbCrLf
+    regContent = regContent & "@=""0""" & vbCrLf & vbCrLf
+    regContent = regContent & "[HKEY_CURRENT_USER\Software\Classes\TypeLib\" & GUID_ONENOTE & "\1.1\HELPDIR]" & vbCrLf
+    regContent = regContent & "@=""""" & vbCrLf
+
+    ' 3. Ecrire en UTF-16 LE avec BOM (format exige par regedit pour les .reg)
+    Dim regPath As String
+    regPath = Environ("TEMP") & "\fix_onenote_typelib.reg"
+    WriteRegUnicodeFile regPath, regContent
+
+    ' 4. Importer via regedit /s (silencieux)
+    Dim sH As Object
+    Set sH = CreateObject("WScript.Shell")
+    Dim code As Long
+    code = sH.Run("regedit.exe /s """ & regPath & """", 0, True)
+
+    ' 5. Verifier le resultat
+    Dim verif As String
+    On Error Resume Next
+    verif = sH.RegRead("HKCU\Software\Classes\TypeLib\" & GUID_ONENOTE & "\1.1\0\win64\")
+    Dim errRead As Long: errRead = Err.Number
+    On Error GoTo ErrHandler
+    Err.Clear
+
+    Dim msg As String
+    msg = "Import .reg termine (code retour : " & code & ")." & vbCrLf & vbCrLf
+    msg = msg & "Verification HKCU\...\1.1\0\win64 :" & vbCrLf
+    If errRead <> 0 Then
+        msg = msg & "  ECHEC - cle introuvable" & vbCrLf
+    Else
+        msg = msg & "  Valeur lue : " & verif & vbCrLf
+        If verif = ONENOTE_EXE Then
+            msg = msg & "  STATUT : OK - valeur correcte" & vbCrLf & vbCrLf
+            msg = msg & "ETAPE SUIVANTE :" & vbCrLf
+            msg = msg & "1. FERMER Outlook completement (verifier Gestionnaire des taches)" & vbCrLf
+            msg = msg & "2. Relancer Outlook" & vbCrLf
+            msg = msg & "3. Alt+F11, puis TestEnvironment"
+        Else
+            msg = msg & "  STATUT : valeur incorrecte" & vbCrLf
+            msg = msg & "  Attendu : " & ONENOTE_EXE
+        End If
+    End If
+
+    ' Conserver le .reg pour inspection au cas ou
+    msg = msg & vbCrLf & vbCrLf & "Fichier .reg conserve : " & regPath
+
+    MsgBox msg, vbInformation, T("R~eparation OneNote - registre HKCU", "OneNote repair - HKCU registry")
+    Exit Sub
+
+ErrHandler:
+    MsgBox T("~Echec correction HKCU :", "HKCU fix failed:") & vbCrLf & _
+           "N " & Err.Number & " - " & Err.Description, _
+           vbCritical, T("R~eparation OneNote - registre", "OneNote repair - registry")
+End Sub
+
+Private Sub WriteRegUnicodeFile(ByVal path As String, ByVal content As String)
+    ' Un .reg Windows moderne exige UTF-16 LE avec BOM (FF FE)
+    ' ADODB.Stream est le seul moyen fiable en VBA pour ecrire en UTF-16 LE
+    Dim stream As Object
+    Set stream = CreateObject("ADODB.Stream")
+    stream.Type = 2  ' adTypeText
+    stream.Charset = "Unicode"  ' = UTF-16 LE avec BOM
+    stream.Open
+    stream.WriteText content
+    stream.SaveToFile path, 2  ' adSaveCreateOverWrite
+    stream.Close
+End Sub
+
+Private Sub CleanHKCUKey(ByVal subKey As String)
+    ' Supprime une cle HKCU si elle existe, via regedit /s avec directive -
+    On Error Resume Next
+    Dim sH As Object
+    Set sH = CreateObject("WScript.Shell")
+    Dim regPath As String
+    regPath = Environ("TEMP") & "\cleanup_onenote_" & Replace(Replace(subKey, "\", "_"), " ", "") & ".reg"
+    Dim c As String
+    c = "Windows Registry Editor Version 5.00" & vbCrLf & vbCrLf
+    c = c & "[-HKEY_CURRENT_USER\" & subKey & "]" & vbCrLf
+    WriteRegUnicodeFile regPath, c
+    sH.Run "regedit.exe /s """ & regPath & """", 0, True
+    On Error GoTo 0
+End Sub
+
+
+'=============================================================================
+' UTILITAIRES
+'=============================================================================
+Private Function LoadXML(ByVal xml As String) As Object
+    Dim doc As Object
+    Set doc = CreateObject("MSXML2.DOMDocument.6.0")
+    doc.async = False
+    doc.LoadXML xml
+    doc.setProperty "SelectionNamespaces", "xmlns:one='" & ONE_NAMESPACE & "'"
+    Set LoadXML = doc
+End Function
+
+Private Function EscapeJSON(ByVal s As String) As String
+    Dim r As String
+    r = Replace(s, "\", "\\")
+    r = Replace(r, """", "\""")
+    r = Replace(r, vbCr, "")
+    r = Replace(r, vbLf, "\n")
+    r = Replace(r, vbTab, "\t")
+    EscapeJSON = r
+End Function
+
+Private Function SanitizeFileName(ByVal s As String) As String
+    Dim r As String: r = s
+    Dim bads As Variant: bads = Array("\", "/", ":", "*", "?", """", "<", ">", "|", "@")
+    Dim b As Variant
+    For Each b In bads
+        r = Replace(r, b, "_")
+    Next b
+    SanitizeFileName = r
+End Function
+
+Private Sub CreateFolderIfAbsent(ByVal path As String)
+    Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
+    If Not fso.FolderExists(path) Then fso.CreateFolder path
+End Sub
+
+Private Sub WriteFile(ByVal path As String, ByVal content As String)
+    Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
+    Dim ts As Object
+    Set ts = fso.CreateTextFile(path, True, True) ' overwrite, unicode
+    ts.Write content
+    ts.Close
+End Sub
+
+Private Function ReadFile(ByVal path As String) As String
+    If Dir(path) = "" Then ReadFile = "": Exit Function
+    Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
+    Dim ts As Object
+    ' -2 = TriStateUseDefault : detection auto BOM
+    Set ts = fso.OpenTextFile(path, 1, False, -2)
+    ReadFile = ts.ReadAll
+    ts.Close
+End Function
+
+Private Function GetDesktopPath() As String
+    ' Pack v3 (A6) : source unique du chemin Bureau = modConfig.DesktopPath()
+    ' (redirection OneDrive Entreprise, config DesktopPath). L'ancienne
+    ' liste de repli locale (SpecialFolders + 6 chemins Environ) est retiree.
+    GetDesktopPath = modConfig.DesktopPath()
+End Function
+
+Private Sub InitLog()
+    Dim desk As String: desk = GetDesktopPath()
+    CreateFolderIfAbsent desk & "\" & BACKUP_FOLDER
+    m_logPath = desk & "\" & BACKUP_FOLDER & "\log_" & Format(Now, "yyyymmdd_hhnnss") & ".txt"
+    LogMessage "=== Demarrage OneNote Reorg ==="
+End Sub
+
+Private Sub LogMessage(ByVal msg As String)
+    On Error Resume Next
+    If Len(m_logPath) = 0 Then Exit Sub
+    Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
+    Dim parentDir As String
+    parentDir = Left(m_logPath, InStrRev(m_logPath, "\") - 1)
+    If Not fso.FolderExists(parentDir) Then fso.CreateFolder parentDir
+    Dim ts As Object
+    Set ts = fso.OpenTextFile(m_logPath, 8, True, -1) ' append, unicode
+    ts.WriteLine Format(Now, "hh:nn:ss") & " | " & msg
+    ts.Close
+    On Error GoTo 0
+End Sub
+
+Private Sub FatalError(ByVal ctx As String)
+    Dim msg As String
+    ' v- 2026-08-22 : contexte, Err.Description et derniere etape sortis de
+    ' T(). Ce message est le dernier recours d'un diagnostic : le decoder
+    ' produirait justement un diagnostic faux.
+    msg = T("Erreur dans ", "Error in ") & ctx & vbCrLf & _
+          "N " & Err.Number & vbCrLf & _
+          T("Description : ", "Description: ") & Err.Description & vbCrLf & _
+          T("Derniere etape : ", "Last step: ") & m_lastStep
+    LogMessage "ERREUR FATALE : " & msg
+    modUi.Fail msg, UiTitle(), vbCritical
+End Sub

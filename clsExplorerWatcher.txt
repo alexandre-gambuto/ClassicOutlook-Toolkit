@@ -1,0 +1,117 @@
+Option Explicit
+
+'=============================================================================
+' clsExplorerWatcher  (v1 - 2026-06-16)
+' Purpose (EN): watches ONE Explorer window (WithEvents) that has been given a
+'   stable role - "mail" or "calendar" - and reacts to its FolderSwitch event
+'   to keep that window pinned to its role. A mail window drifting toward a
+'   calendar folder is sent back to the inbox and the calendar window is
+'   activated/created instead; a calendar window drifting toward a non-calendar
+'   folder is sent back to the calendar and the mail window is activated/created
+'   instead. Net effect: one window is always the calendar, one is always the
+'   mail, each free to live on its own monitor.
+'
+' Surveille UNE fenetre Explorer (WithEvents) a laquelle on a donne un ROLE
+' stable ("mail" ou "calendar"), et reagit a son evenement FolderSwitch pour
+' la maintenir sur son role :
+'   - une fenetre "mail" qui derive vers un dossier calendrier est renvoyee
+'     sur la boite de reception, et la fenetre calendrier est activee/creee ;
+'   - une fenetre "calendar" qui derive vers un dossier non-calendrier est
+'     renvoyee sur le calendrier, et la fenetre mail est activee/creee.
+' Resultat : 1 fenetre porte toujours le calendrier, 1 porte toujours le
+' courrier, chacune libre sur son ecran.
+'
+' POURQUOI cette classe (et pas un WithEvents direct dans ThisOutlookSession) :
+'   l'ancienne version cablait UN seul Explorer (olMainExplorer) fige au
+'   demarrage. La fenetre calendrier ouverte en parallele n'etait surveillee
+'   par PERSONNE : un clic "Message" depuis elle n'etait pas intercepte, donc
+'   Outlook la transformait en 2e fenetre courrier (bug "on perd le calendrier").
+'   Il faut un WithEvents PAR fenetre a role ; une classe est le seul moyen
+'   propre d'avoir plusieurs instances WithEvents independantes. Meme pattern
+'   de cycle de vie que clsApptWatcher (instance gardee vivante dans une
+'   collection cote module, liberee sur Close).
+'
+' Cycle de vie : instanciee par ThisOutlookSession (EnsureMailExplorer /
+'   EnsureCalendarExplorer), stockee dans la collection mExplorerWatchers cote
+'   ThisOutlookSession (sinon le GC VBA detruit l'instance et le WithEvents
+'   meurt en silence). Liberee quand la fenetre se ferme (m_Explorer_Close ->
+'   ThisOutlookSession.OnExplorerWatcherClosed).
+'
+' Les fenetres ouvertes volontairement par l'utilisateur (clic droit dossier
+'   -> "Ouvrir dans une nouvelle fenetre") ne recoivent PAS de watcher : elles
+'   restent libres, jamais interceptees.
+'=============================================================================
+
+Private Const MOD_NAME As String = "ExplWatch"
+Private Const MOD_VERSION As String = "v1 - 2026-06-16"
+
+Private WithEvents m_Explorer As Outlook.Explorer
+Private m_Role As String          ' "mail" ou "calendar" (chaine fonctionnelle, hors T())
+Private m_Key As String           ' cle d'enregistrement dans la collection du module
+
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+'-----------------------------------------------------------------------------
+' Init - le module nous passe la fenetre, son role et la cle de collection.
+'-----------------------------------------------------------------------------
+Public Sub Init(ByVal exp As Outlook.Explorer, ByVal role As String, ByVal key As String)
+    On Error Resume Next
+    m_Role = role
+    m_Key = key
+    Set m_Explorer = exp
+    modDebugLog.DTrace MOD_NAME, "Watcher arme (role=" & role & ", key=" & key & ")"
+    On Error GoTo 0
+End Sub
+
+'-----------------------------------------------------------------------------
+' Accesseurs lus par ThisOutlookSession pour retrouver / valider une fenetre.
+'-----------------------------------------------------------------------------
+Public Property Get Explorer() As Outlook.Explorer
+    Set Explorer = m_Explorer
+End Property
+
+Public Property Get Role() As String
+    Role = m_Role
+End Property
+
+' True si la fenetre surveillee est encore vivante (un Explorer ferme leve une
+' erreur a la lecture d'une propriete : on s'en sert pour invalider l'instance).
+Public Property Get IsAlive() As Boolean
+    On Error Resume Next
+    IsAlive = False
+    If m_Explorer Is Nothing Then Exit Property
+    Dim dummy As Long
+    dummy = m_Explorer.Left
+    If Err.Number = 0 Then IsAlive = True
+    Err.Clear
+    On Error GoTo 0
+End Property
+
+'-----------------------------------------------------------------------------
+' FolderSwitch : la fenetre vient de changer de dossier. On regarde si elle a
+' derive hors de son role et, si oui, on demande au module de la rapatrier et
+' de basculer sur la fenetre de l'autre role.
+' Tout le travail est delegue a ThisOutlookSession (le module porte l'etat des
+' deux roles et la garde anti-rebond).
+'-----------------------------------------------------------------------------
+Private Sub m_Explorer_FolderSwitch()
+    On Error Resume Next
+    ThisOutlookSession.HandleExplorerSwitch m_Explorer, m_Role
+    On Error GoTo 0
+End Sub
+
+'-----------------------------------------------------------------------------
+' Close : la fenetre se ferme -> demander au module de liberer ce watcher et
+' d'oublier le role correspondant.
+'-----------------------------------------------------------------------------
+Private Sub m_Explorer_Close()
+    On Error Resume Next
+    ThisOutlookSession.OnExplorerWatcherClosed m_Key, m_Role
+    On Error GoTo 0
+End Sub
+
+Private Sub Class_Terminate()
+    Set m_Explorer = Nothing
+End Sub

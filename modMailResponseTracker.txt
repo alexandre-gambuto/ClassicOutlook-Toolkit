@@ -1,0 +1,3074 @@
+Option Explicit
+
+'=============================================================================
+' modMailResponseTracker v6.1  (2026-08-22)
+'
+' v6.1 (2026-08-22) : 5 T() contenant des donnees, detectes par validate.py
+'   (le controle TVAR). Sortis de T() : le CHEMIN du Bureau (L443 - un
+'   chemin faux rend inexploitable un diagnostic qui porte justement sur
+'   les chemins), le SUJET du mail dans le corps du BROUILLON de relance
+'   (enjeu double : le texte part a un tiers) et les compteurs des trois
+'   recapitulatifs de suivi. Ces trois recapitulatifs passent au passage en
+'   toast : ils confirment une action deja decidee.
+'
+' v6  (2026-08-22)
+'
+' v6 (2026-08-22) : revue UX pop-ups + bug de traduction.
+'   (a) BUG CORRIGE (RecordSentMail et RecordSentMailQuick) : le SUJET du
+'       mail et le libelle de CONTEXTE etaient concatenes A L'INTERIEUR de
+'       T(). T() applique A() a ses deux branches, donc tout objet de mail
+'       contenant "~e", "~a" ou "~o" etait decode en accent et affiche faux
+'       - or le sujet est le seul element qui permet a l'utilisateur de
+'       savoir de quel mail on lui parle avant de saisir un delai. Sortis
+'       de T(). Meme correctif que ThisOutlookSession v10.6.
+'   (b) RemindOverdue passe en TOAST. La boite Oui/Non s'ouvrait ~20 s
+'       apres le demarrage d'Outlook (differe "RemindOverdue"), en pleine
+'       mise en route de la journee : interruption la plus couteuse du
+'       toolkit, et la seule qui survienne sans que l'utilisateur ait rien
+'       demande. CONTREPARTIE ASSUMEE : on perd l'ouverture du tableau de
+'       bord en un clic - les toasts mshta ne sont pas cliquables et cabler
+'       un onclick a ete ecarte (probe HTA + risque EDR). Le message
+'       renvoie desormais vers le bouton ruban.
+'   (c) Les saisies passent par modUi.AskText (remontee au premier plan
+'       avant affichage : InputBox n'a aucun drapeau de premier plan).
+'   Dependance ajoutee : modUi.
+'
+' v5.9 (2026-08-17) :
+' Purpose (EN): tracks replies to mails sent to several recipients. "Mark for
+'   tracking" records a sent (or being-composed) mail with an expected reply
+'   delay into an Excel workbook on the Desktop; "Dashboard" recomputes each
+'   row status through the Exchange conversation index (a one-shot repair
+'   scan only runs when stored anchors are stale) and shows the workbook.
+'   RemindOverdue pops a once-a-day recap of overdue items at startup, and
+'   FollowUpSelected opens a pre-filled ReplyAll for the selected dashboard row.
+'
+' Suivi des reponses aux mails envoyes a plusieurs destinataires :
+'   - "Marquer Suivi" : enregistre un mail (avant ou apres envoi) avec un
+'     delai de reponse attendu, dans un classeur Excel sur le Bureau.
+'   - "Tableau de Bord" : recalcule les statuts via l'index de conversations
+'     (scan de reparation ponctuel si ancrage perime) et affiche le classeur.
+'   - RemindOverdue : rappel quotidien des retards au demarrage.
+'   - FollowUpSelected : brouillon ReplyAll pre-rempli pour la ligne selectionnee.
+'
+' v4.6 (2026-06-13) : (a) FIX du compteur de reponses (le "souvent 1") -
+'   on ne compte plus que les mails recus STRICTEMENT apres t0 et JAMAIS
+'   soi-meme (avant, le message du fil auquel on repondait, ou ses propres
+'   mails quand on figure dans les destinataires, etaient comptes).
+'   (b) Statut BINAIRE : Repondu / En retard / Relance / En attente (fini
+'   partielle/complete). (c) La date limite est DERIVEE du delai a chaque
+'   refresh (editer le delai + rouvrir la met a jour). (d) Colonnes
+'   reorganisees + colonnes de relance (derniere relance = nouveau t0, nb
+'   relances) + 4 colonnes d'action reservees (cliquables a l'etape .xlsm).
+'
+' v4.7 (2026-06-13) : MOTEUR DE RELANCES (FollowUpOverdue, a poser sur la
+'   barre d'acces rapide). Parcourt les suivis en retard et propose, par
+'   ligne, une boite Win32 a 3 boutons : Relancer (-> Envoi automatique /
+'   Personnaliser) ; Modifier le suivi (-> Prolonger / Marquer traite /
+'   Supprimer) ; Arreter. Envoi auto = .Send silencieux (garde hors
+'   connexion) avec mention "envoye automatiquement" ; Personnaliser =
+'   brouillon ReplyAll pre-rempli affiche pour edition. Apres relance :
+'   t0 avance (= maintenant), date limite = maintenant + delai, +1 relance,
+'   statut "Relance". Nouveau statut terminal "Traite" (suivi clos a la
+'   main, exclu du recalcul et des retards). Texte FR + EN via T().
+'
+' v4.8 (2026-06-13) : (a) Relance PERSONNALISEE robuste : le brouillon est
+'   tague (UserProperty FollowupConvID) et la ligne n'est mise a jour QUE si
+'   le mail est REELLEMENT envoye (via Application_ItemSend -> modDefer ->
+'   RegisterFollowupSent). Avant : ouvrir le brouillon comptait deja une
+'   relance meme sans envoi. (b) Libelles de boutons raccourcis. (c) Corps
+'   de relance resserre (pas de saut de ligne superflu avant la signature ;
+'   blancs de tete du brouillon supprimes).
+'
+' v4.9 (2026-06-14) : corrections de la gestion d'Excel. (a) Les ecritures
+'   en arriere-plan ne CACHENT plus l'instance Excel de l'utilisateur et
+'   REFERMENT le classeur si elles l'ont ouvert (sinon le fichier restait
+'   verrouille -> "ouvert dans une autre application"). (b) Le tableau de
+'   bord s'affiche en PLEIN ECRAN et au PREMIER PLAN. (c) Les liens des
+'   colonnes d'action sont (re)poses COTE OUTLOOK (StampRowActions) -
+'   robuste meme si les macros du classeur sont desactivees pendant
+'   l'automation : les nouvelles lignes sont cliquables immediatement.
+'   (d) MarkMailForTracking cible desormais la FENETRE ACTIVE (un mail
+'   ouvert en grand n'est plus marque a la place de la selection de la
+'   liste).
+' v5.0 (2026-06-28) : le rappel de demarrage (RemindOverdue) lit le classeur
+'   en arriere-plan SANS le faire apparaitre : la fenetre du classeur ouvert
+'   pour la lecture est masquee (Windows(1).Visible=False) et, si l'instance
+'   Excel a ete creee par nous, elle est forcee invisible (un Workbook_Open
+'   du .xlsm pouvait la rendre visible). Corrige : Excel surgissait sur Suivi
+'   des mails et restait affiche pendant la MsgBox de rappel. Le tableau de
+'   bord (OpenTrackingDashboard) reste affiche normalement.
+' v5.1 (2026-07-02) : cycle de vie Excel fiabilise + rappel de demarrage
+'   allege. (a) FUITE QUOTIDIENNE corrigee : les sorties de RemindOverdue
+'   hors des branches Oui/Non (zero retard, feuille vide, erreur) ne
+'   liberaient JAMAIS le classeur ouvert en coulisse -> classeur MASQUE
+'   (v5.0) et verrouille dans une instance Excel fantome ("fichier ouvert
+'   dans une autre application", fichiers ouverts par double-clic
+'   atterrissant dans l'instance invisible). Toutes les sorties passent
+'   par Done:, qui libere. (b) OpenTrackingDashboard re-affiche TOUJOURS
+'   la fenetre du classeur (Windows(1).Visible = True) : si un rappel
+'   l'avait masquee sans refermeture, Excel s'ouvrait VIDE. (c)
+'   HideBackgroundWorkbook ne masque plus TOUTE l'application si elle
+'   heberge d'autres classeurs que le tracker ; l'instance est alors
+'   reputee a l'utilisateur (mXlCreatedByUs = False). (d) PERF DEMARRAGE :
+'   pre-scan de la FEUILLE (zero acces Outlook) ; aucune ligne candidate
+'   au retard -> sortie immediate. Sinon recalcul LIMITE aux candidates
+'   (UpdateAllTrackingStatuses ws, True) au lieu du parcours des fils de
+'   TOUS les suivis actifs - principal responsable du gel ~20 s apres le
+'   lancement d'Outlook.
+' v5.1.1 (2026-07-03) : fix compile - variables eNum/eDesc renommees
+'   errNum/errDesc. eNum est identique au mot reserve VBA "Enum" (VBA
+'   insensible a la casse) => "Erreur de syntaxe", module non compilable,
+'   d'ou dialogues d'erreur puis fermeture d'Outlook a chaque tache differee.
+' v5.4 (2026-07-07) : RecordSentMailQuick - variante SANS fenetre de
+'   RecordSentMail pour le flux modReplySuspicion : delai = ReplyDelayDays
+'   (config), confirmation par TOAST (modNotify.Notify) au lieu de
+'   l'InputBox du delai + MsgBox de confirmation. Echecs logues + toast,
+'   jamais de MsgBox (appel depuis un differe). RecordSentMail inchange.
+' v5.3 (2026-07-05) : lecture config via getters modConfig
+'   (MailTrackingFilename/MailTrackingSheet/ReplyDelayDays, EnsureLoaded-
+'   safe) au lieu des globales g_ en direct : nom de classeur/feuille vides
+'   apres un Ctrl+S VBE -> echec silencieux d'acces au classeur de suivi.
+' v5.2 (2026-07-03) : instance Excel FANTOME (erreur 462) neutralisee +
+'   fin des fausses confirmations. (a) Le test de vitalite du cache Excel
+'   (lecture de .Version) pouvait reussir sur une instance MORTE (valeur
+'   servie localement par le proxy COM) : la premiere vraie ecriture
+'   echouait ensuite en 462 "Le serveur distant n'existe pas". Nouveau
+'   test ExcelAlive = aller-retour complet (Workbooks.Count). (b) Meme
+'   validation sur l'instance recuperee via GetObject : un EXCEL.EXE
+'   residuel sans fenetre (fuite pre-v5.1, crash) reste inscrit aupres de
+'   Windows et etait recupere tel quel. (c) SaveTrackingEntry devient une
+'   Function Boolean avec UNE nouvelle tentative sur instance neuve apres
+'   echec (auto-reparation) ; en cas d'echec definitif, les appelants
+'   (MarkMailForTracking, RecordSentMail) n'affichent PLUS la confirmation
+'   "Mail marque pour suivi" : avant, l'erreur 462 etait suivie du message
+'   de succes alors qu'AUCUNE ligne n'avait ete ecrite.
+' v5.5 (2026-07-11) : (a) l'etat "fenetre masquee" n'est PLUS JAMAIS
+'   enregistre DANS le fichier : toute sauvegarde passe par
+'   SaveWorkbookVisible (re-affiche la fenetre, ScreenUpdating coupe donc
+'   sans flash, sauvegarde, re-masque si besoin). Excel persiste la
+'   visibilite de la fenetre dans le classeur : un Save d'arriere-plan
+'   fenetre cachee rendait INVISIBLES les ouvertures suivantes (Excel
+'   "vide" ; recuperation manuelle : Affichage > Afficher). (b) Reponses :
+'   correspondance expediteur/destinataires attendus par EGALITE d'adresse
+'   (AddrInExpected, Split sur ";") au lieu d'une sous-chaine InStr
+'   ("paul@x.fr" validait "jean-paul@x.fr"). (c) TrackID unique en rafale
+'   (suffixe de sequence dans la meme seconde). (d) DisplayAlerts remis a
+'   True dans ReleaseBackground et en fin de dashboard.
+' (Historique des versions -> CHANGELOG.)
+'=============================================================================
+
+'=============================================================================
+' v5.8 (2026-07-25) : MOD_NAME. Les 30 appels au logger ecrivaient le nom court
+'   "MailTrack" EN DUR dans chaque ligne. Deux consequences :
+'   (a) une faute de frappe dans l'une de ces 30 chaines aurait rendu la
+'       ligne invisible du filtre, sans aucun signal ;
+'   (b) surtout, l'inventaire de modMaintenance declarait ce module sous le
+'       nom "MailTracker" alors que le logger ecrivait "MailTrack" : filtrer
+'       le log sur "MailTracker" ne remontait donc RIEN, sur le module qui
+'       fait 2800 lignes et dialogue avec Excel en cross-process - celui
+'       pour lequel le filtre est le plus utile. Nom aligne sur "MailTrack"
+'       (valeur reellement ecrite depuis toujours ; l'inventaire est corrige
+'       cote modMaintenance v3.1).
+'   MOD_VERSION / ModVersion ajoutes (rapport de versions non falsifiable).
+'=============================================================================
+
+'=============================================================================
+' v5.9 (2026-08-17) : CYCLE DE VIE EXCEL - fin des instances "fantomes"
+'   (EXCEL.EXE invisible qui survit, ou Excel visible mais VIDE : le classeur
+'   de suivi y est ouvert avec sa fenetre masquee). Causes trouvees :
+'   (a) IMBRICATION. Un differe modDefer (SetTimer) ou un evenement Outlook
+'       peut s'executer PENDANT une MsgBox captive ou un DoEvents d'une
+'       routine de ce module qui tient deja le classeur. L'appel imbrique
+'       retrouvait le classeur "deja ouvert", mettait mWbOpenedHere a False,
+'       et l'appel externe ne le refermait donc plus jamais.
+'       -> compteur d'imbrication mWbDepth : un appel imbrique partage le
+'       classeur et seul le DERNIER a sortir referme/quitte.
+'   (b) SORTIES SANS LIBERATION (Exit Sub anticipe, gestionnaire d'erreur)
+'       dans FlushUrgentTracking, TrySaveTrackingEntry, FollowUpOverdue,
+'       RegisterFollowupSent, OpenTrackingDashboard -> classeur laisse ouvert
+'       masque. -> ReleaseBackground sur TOUTES les sorties.
+'   (c) RemindOverdue tenait le classeur ouvert (masque, verrouille) pendant
+'       toute la MsgBox de rappel - parfois de longues minutes -, la fenetre
+'       ideale pour (a). -> le classeur est libere AVANT la MsgBox ; le
+'       tableau de bord le rouvre si l'utilisateur repond Oui.
+'   (d) ADOPTION. Une instance Excel trouvee par GetObject etait toujours
+'       reputee "a l'utilisateur" (jamais quittee), y compris un fantome
+'       invisible herite d'une session precedente ou d'un Ctrl+S VBE (qui
+'       remet les variables module a zero). -> une instance INVISIBLE est
+'       forcement une instance d'automation : elle est adoptee (mXlCreatedByUs)
+'       et quittee a la liberation si elle n'a plus de classeur. De meme, un
+'       classeur de suivi trouve deja ouvert MASQUE (ou dans une instance
+'       invisible) est adopte et referme : personne ne le regarde.
+'   Le tableau de bord, une fois affiche, CEDE le classeur a l'utilisateur
+'   (HandOverWorkbook) : les ecritures d'arriere-plan suivantes ne le
+'   referment pas.
+'=============================================================================
+
+Private Const MOD_NAME As String = "MailTrack"
+Private Const MOD_VERSION As String = "v6.1 - 2026-08-22"
+
+' v5.7 (2026-07-13) [PARTIE 2b] : tableau de bord. (a) Nouvelle colonne
+'   d'action "Valider reponse" (entre Prolonger et Supprimer) -> colonnes
+'   suivantes DECALEES (+1). Nouvelle colonne technique masquee AckCount
+'   (nb de reponses acquittees). (b) Fin de l'auto-cloture : une reponse
+'   NON acquittee met le statut a "Repondu ?" (orange, a valider) au lieu
+'   de "Repondu". Le bouton Valider (feuille) cloture ; relance/prolongation
+'   acquittent les reponses courantes ; une reponse SUPPLEMENTAIRE re-signale.
+'   (c) Tri automatique du classeur a l'ouverture du tableau de bord :
+'   Repondu ? (haut) / En retard / En attente / Relance / Repondu / Traite,
+'   puis date d'envoi croissante. (d) StampOneAction robuste (retire un lien
+'   perime avant de reposer) pour survivre a la migration des colonnes.
+' v5.6 (2026-07-13) [PARTIE 2a] : suivi AUTOMATIQUE des mails "Urgent".
+'   EnqueueUrgentTracking (appele par Application_ItemSend quand le bandeau
+'   Urgent est present) capture les champs SYNCHRONE ; FlushUrgentTracking
+'   (differe modDefer "UrgentFlush", ~2 s apres l'envoi) ecrit la ligne.
+'   UPSERT par conversation : un nouvel envoi urgent dans un fil DEJA suivi
+'   REMPLACE la ligne (nouveau depart : date d'envoi, date limite = date du
+'   bandeau, statut "En attente", compteurs a zero) au lieu d'en creer une
+'   seconde. (Historique -> CHANGELOG.)
+'=============================================================================
+' CONFIGURATION
+' v4.2 : chemin Bureau + nom de fichier deleges a modConfig (suit la
+' redirection OneDrive). Les constantes locales sont conservees en
+' alias pour limiter la difference avec la v4.1.
+'=============================================================================
+' modConfig.MailTrackingSheet() et modConfig.ReplyDelayDays() sont externalises dans config.ini :
+'   modConfig.MailTrackingSheet()  (MailTrackingSheet, defaut "Suivi")
+'   modConfig.ReplyDelayDays() (ReplyDelayDays, defaut 7)
+Private Const OL_MAIL_CLASS As Long = 43
+
+' Colonnes du fichier Excel (v4.6 : reorganisation lisible). Les 4 colonnes
+' d'action sont visibles des maintenant mais ne deviennent cliquables qu'au
+' passage en .xlsm (etape ulterieure) ; leurs indices sont FIXES des a
+' present pour ne pas avoir a redecaler le code plus tard.
+Private Const COL_STATUS As Long = 1
+Private Const COL_DEADLINE As Long = 2          ' "Echeance" : J-x / Retard Xj (calcule)
+Private Const COL_SUBJECT As Long = 3
+Private Const COL_RECIPIENTS As Long = 4
+Private Const COL_RESPONSE_COUNT As Long = 5
+Private Const COL_RESPONDERS As Long = 6
+Private Const COL_SENT_DATE As Long = 7
+Private Const COL_DELAY_DAYS As Long = 8         ' editable : pilote la date limite
+Private Const COL_DUE_DATE As Long = 9
+Private Const COL_LAST_FOLLOWUP As Long = 10     ' date derniere relance = nouveau t0
+Private Const COL_FOLLOWUP_COUNT As Long = 11    ' nb relances
+Private Const COL_ACT_FOLLOWUP As Long = 12      ' action : relancer
+Private Const COL_ACT_OPEN As Long = 13          ' action : ouvrir le dernier mail
+Private Const COL_ACT_EXTEND As Long = 14        ' action : prolonger
+Private Const COL_ACT_VALIDATE As Long = 15      ' v5.7 action : valider la reponse
+Private Const COL_ACT_DELETE As Long = 16        ' action : supprimer la ligne
+Private Const COL_ID As Long = 17                ' technique (masque)
+Private Const COL_CONV_ID As Long = 18           ' technique (masque)
+Private Const COL_ENTRY_ID As Long = 19          ' technique (masque)
+Private Const COL_ACK_COUNT As Long = 20         ' v5.7 technique (masque) : nb reponses acquittees
+Private Const LAST_COL As Long = 20
+
+' Pack v3 (A11) : CONTRAT DE COLONNES PUBLIE dans le classeur. La feuille
+' masquee "_Schema" (nom -> indice) est ecrite/rafraichie a chaque ouverture ;
+' le code VBA du classeur (feuille Suivi) lit ses indices PAR NOM au lieu de
+' porter sa propre copie des constantes (un decalage de colonne v5.7 avait
+' fait supprimer des lignes au lieu de les valider). Bumper SCHEMA_VERSION a
+' chaque changement de colonne.
+Private Const SCHEMA_SHEET As String = "_Schema"
+Private Const SCHEMA_VERSION As String = "2026-09-02/20"
+Private Const LAST_ACT_COL As Long = 16
+
+' Tag pose sur un brouillon de relance "Personnaliser" : le ConversationID
+' du suivi. Lu par Application_ItemSend pour mettre la ligne a jour A L'ENVOI.
+Private Const FOLLOWUP_PROP As String = "FollowupConvID" 
+
+' v4.4 : registre pour le garde-fou "une pop de rappel par jour" (2A).
+' Declarees ici, au niveau module avec les autres Const (robustesse au
+' collage VBE : un Const place entre deux procedures plus bas peut etre
+' mal interprete -> "Variable non definie").
+Private Const REG_TRACK_APP As String = "MailResponseTracker"
+Private Const REG_TRACK_SECTION As String = "Rappel"
+Private Const REG_KEY_LASTPOP As String = "LastPopupDate"
+
+' Variable module pour garder Excel en cache
+Private mXlApp As Object
+Private mXlCreatedByUs As Boolean
+Private mWbOpenedHere As Boolean      ' True si on a ouvert le classeur (a refermer)
+Private mWbDepth As Long              ' v5.9 : niveau d'imbrication des detenteurs du classeur
+
+' v5.6 : file d'attente des suivis URGENT a ecrire APRES l'envoi. Le bandeau
+' Urgent est detecte dans Application_ItemSend (ThisOutlookSession) mais
+' l'ecriture Excel est differee (pas de COM Excel synchrone dans ItemSend).
+' Chaque element = Array(subject, recipients, count, delayDays, sentDate,
+' dueDate, convID, entryID).
+Private mUrgentQueue As Collection
+
+' Mise au premier plan de la fenetre Excel (best effort).
+' Pack v3 (D1) : 64-bit seul, branche #Else supprimee.
+Private Declare PtrSafe Function SetForegroundWindow Lib "user32" (ByVal hwnd As LongPtr) As Long
+
+'=============================================================================
+' ModVersion - version REELLEMENT chargee dans le VBE.
+' PLACEE ICI, apres TOUTES les declarations de niveau module - Const, Dim,
+' ET le bloc Declare ci-dessus. Une declaration de niveau module situee
+' apres une procedure produit "Seuls des commentaires peuvent apparaitre
+' apres End Sub, End Function, ou End Property".
+'=============================================================================
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+'=============================================================================
+' CHEMIN COMPLET DU FICHIER TRACKER
+'=============================================================================
+Private Function GetTrackerFilePath() As String
+    GetTrackerFilePath = modConfig.MailTrackingPath()
+End Function
+
+'=============================================================================
+' OBTENIR UNE INSTANCE EXCEL (reutilise si possible)
+'=============================================================================
+Private Function GetExcelApp() As Object
+
+    ' v5.2 : test de vitalite REEL. Lire .Version pouvait reussir sur une
+    ' instance morte (valeur servie localement par le proxy COM) alors que
+    ' la premiere vraie ecriture echouait ensuite en erreur 462. On force
+    ' un aller-retour complet (ExcelAlive) ; en cas d'echec on jette le
+    ' cache et on repart proprement.
+    If Not mXlApp Is Nothing Then
+        If ExcelAlive(mXlApp) Then
+            Set GetExcelApp = mXlApp
+            Exit Function
+        End If
+        ResetExcelCache
+    End If
+
+    On Error Resume Next
+    Set mXlApp = GetObject(, "Excel.Application")
+    On Error GoTo 0
+
+    ' v5.2 : l'instance recuperee via GetObject peut ELLE AUSSI etre un
+    ' fantome (EXCEL.EXE residuel sans fenetre, encore inscrit aupres de
+    ' Windows). La valider avant usage ; sinon en creer une neuve.
+    If Not mXlApp Is Nothing Then
+        If Not ExcelAlive(mXlApp) Then
+            Set mXlApp = Nothing
+            modDebugLog.DInfo MOD_NAME, _
+                "GetExcelApp : instance GetObject morte ignoree (fantome)"
+        End If
+    End If
+
+    If mXlApp Is Nothing Then
+        Set mXlApp = CreateObject("Excel.Application")
+        mXlCreatedByUs = True
+    Else
+        ' v5.9 : une instance INVISIBLE n'est jamais celle de l'utilisateur
+        ' (Excel lance a la main est toujours visible) : c'est un reste
+        ' d'automation - la notre d'une session precedente, ou apres un
+        ' Ctrl+S VBE qui a remis mXlCreatedByUs a zero. On l'adopte : elle
+        ' sera quittee a la liberation si elle n'heberge plus de classeur.
+        Dim appVisible As Boolean
+        appVisible = True
+        On Error Resume Next
+        appVisible = CBool(mXlApp.Visible)
+        On Error GoTo 0
+        mXlCreatedByUs = Not appVisible
+        If mXlCreatedByUs Then
+            modDebugLog.DInfo MOD_NAME, "GetExcelApp : instance invisible existante adoptee"
+        End If
+    End If
+
+    Set GetExcelApp = mXlApp
+
+End Function
+
+'=============================================================================
+' v5.2 - L'instance Excel repond-elle VRAIMENT ? Workbooks.Count impose un
+' aller-retour complet vers le processus Excel (contrairement a .Version,
+' que le proxy COM peut servir de memoire meme apres la mort du processus).
+'=============================================================================
+Private Function ExcelAlive(xl As Object) As Boolean
+    ' Pack v3 : copie privee retiree, helper canonique modCommon.ExcelAlive.
+    ExcelAlive = modCommon.ExcelAlive(xl)
+End Function
+
+'=============================================================================
+' v5.2 - Oublier l'instance Excel cachee (apres detection d'un fantome).
+' Ne ferme rien : le processus mort ne repond de toute facon plus.
+'=============================================================================
+Private Sub ResetExcelCache()
+    Set mXlApp = Nothing
+    mXlCreatedByUs = False
+    mWbOpenedHere = False
+    mWbDepth = 0
+End Sub
+
+'=============================================================================
+' OBTENIR LE CLASSEUR TRACKER (ouvre ou cree si necessaire)
+'=============================================================================
+Private Function GetTrackerWorkbook(xlApp As Object) As Object
+
+    Dim filePath As String
+    filePath = GetTrackerFilePath()
+    Dim fileExists As Boolean
+    fileExists = (Dir(filePath) <> "")
+
+    Dim wb As Object
+    On Error Resume Next
+    Set wb = xlApp.Workbooks(modConfig.MailTrackingFilename())
+    On Error GoTo 0
+
+    If Not wb Is Nothing Then
+        ' v5.9 : trois cas pour un classeur DEJA ouvert.
+        If mWbDepth > 0 Then
+            ' 1) Appel IMBRIQUE : une routine de ce module tient deja le
+            '    classeur (differe/evenement survenu pendant sa MsgBox ou
+            '    son DoEvents). On partage ; seul le dernier sorti referme.
+            mWbDepth = mWbDepth + 1
+            mWbOpenedHere = True
+            modDebugLog.DDebug MOD_NAME, "GetTrackerWorkbook : appel imbrique, profondeur " & mWbDepth
+        ElseIf IsBackgroundOrphan(xlApp, wb) Then
+            ' 2) ORPHELIN : classeur masque, ou instance Excel invisible.
+            '    Personne ne le regarde ; il a ete laisse la par une sortie
+            '    anticipee ou une session precedente. On l'adopte pour le
+            '    refermer proprement a la liberation.
+            mWbDepth = 1
+            mWbOpenedHere = True
+            modDebugLog.DInfo MOD_NAME, "GetTrackerWorkbook : classeur orphelin (masque/invisible) adopte"
+        Else
+            ' 3) Classeur VISIBLE chez l'utilisateur (tableau de bord ouvert,
+            '    ou ouvert a la main) : on ne le refermera pas.
+            mWbOpenedHere = False
+        End If
+        Set GetTrackerWorkbook = wb
+        Exit Function
+    End If
+
+    ' Classeur absent de l'instance : une profondeur residuelle serait un
+    ' reliquat (Ctrl+S VBE, fermeture externe). On repart a zero.
+    If mWbDepth > 0 Then
+        modDebugLog.DDebug MOD_NAME, "GetTrackerWorkbook : profondeur residuelle " & mWbDepth & " remise a 0"
+        mWbDepth = 0
+    End If
+
+    If fileExists Then
+        Set wb = xlApp.Workbooks.Open(filePath)
+        EnsureSchemaSheet wb
+    Else
+        Dim desktopPath As String
+        desktopPath = modConfig.DesktopPath()
+        If Dir(desktopPath, vbDirectory) = "" Then
+            ' v6.1 : le CHEMIN sort de T() - A() decoderait un dossier
+            ' contenant "~e" ou "~a", et afficherait donc un chemin faux dans
+            ' le message meme qui sert a diagnostiquer un probleme de chemin.
+            modUi.Fail T("Le dossier Bureau n'est pas accessible :", _
+                         "The Desktop folder is not accessible:") & vbCrLf & _
+                       desktopPath & vbCrLf & vbCrLf & _
+                       T("V~erifiez la configuration OneDrive.", _
+                         "Check the OneDrive configuration."), _
+                       T("Suivi Mails", "Mail Tracking"), vbCritical
+            Set GetTrackerWorkbook = Nothing
+            Exit Function
+        End If
+        Set wb = xlApp.Workbooks.Add
+        wb.Sheets(1).name = modConfig.MailTrackingSheet()
+        CreateHeaders wb.Sheets(modConfig.MailTrackingSheet())
+        EnsureSchemaSheet wb
+        xlApp.DisplayAlerts = False
+        wb.SaveAs filePath
+        xlApp.DisplayAlerts = True
+    End If
+
+    mWbOpenedHere = True               ' on vient de l'ouvrir : a refermer
+    mWbDepth = 1
+    Set GetTrackerWorkbook = wb
+
+End Function
+
+'=============================================================================
+' v5.9 - Le classeur de suivi deja ouvert est-il un ORPHELIN d'arriere-plan ?
+' Oui si sa fenetre est masquee (seul ce module la masque) ou si l'instance
+' Excel est invisible (aucun utilisateur ne regarde une instance invisible).
+' En cas de doute (erreur COM), on repond Non : on ne referme jamais un
+' classeur qui pourrait etre sous les yeux de l'utilisateur.
+'=============================================================================
+Private Function IsBackgroundOrphan(xlApp As Object, wb As Object) As Boolean
+    On Error Resume Next
+    IsBackgroundOrphan = False
+    Dim appVisible As Boolean, winVisible As Boolean
+    appVisible = True
+    winVisible = True
+    appVisible = CBool(xlApp.Visible)
+    winVisible = CBool(wb.Windows(1).Visible)
+    If Err.Number <> 0 Then
+        Err.Clear
+        Exit Function
+    End If
+    IsBackgroundOrphan = (Not appVisible) Or (Not winVisible)
+End Function
+
+'=============================================================================
+' v5.9 - HandOverWorkbook : le tableau de bord vient d'etre AFFICHE ; le
+' classeur appartient desormais a l'utilisateur. Les routines d'arriere-plan
+' qui le retrouveront ouvert (visible) ne le refermeront pas.
+'=============================================================================
+Private Sub HandOverWorkbook()
+    mWbDepth = 0
+    mWbOpenedHere = False
+End Sub
+
+'=============================================================================
+' RESOUDRE LE MAIL CIBLE SELON LE CONTEXTE D'APPEL
+' Renvoie True si un mail a ete trouve, avec isComposing positionne.
+' Priorite : Inspector actif > Selection explorateur
+'=============================================================================
+Private Function ResolveTargetMail(ByRef oMail As Outlook.mailItem, _
+                                    ByRef isComposing As Boolean) As Boolean
+
+    On Error Resume Next
+
+    ResolveTargetMail = False
+    isComposing = False
+    Set oMail = Nothing
+
+    ' --- La FENETRE ACTIVE decide ---
+    ' Corrige le cas : un mail ouvert en grand pendant qu'on navigue dans
+    ' l'explorateur. On regarde quelle fenetre est reellement au premier
+    ' plan (Application.ActiveWindow), pas "y a-t-il un inspecteur ouvert".
+    Dim actWin As Object
+    Set actWin = Application.ActiveWindow
+
+    If TypeOf actWin Is Outlook.Inspector Then
+        ' Couvre : composition ET lecture d'un mail envoye deja ouvert
+        Dim inspItem As Object
+        Set inspItem = actWin.CurrentItem
+        If Not inspItem Is Nothing Then
+            If inspItem.Class = OL_MAIL_CLASS Then
+                Set oMail = inspItem
+                ' .Sent : True = deja envoye (suivi direct) ; False = brouillon
+                isComposing = Not oMail.Sent
+                ResolveTargetMail = True
+                Exit Function
+            End If
+        End If
+        ' Inspecteur actif mais pas un mail -> on ne devine pas.
+        Exit Function
+    End If
+
+    ' --- Explorateur actif : selection dans la liste ---
+    Dim olSelection As Outlook.Selection
+    Set olSelection = Application.ActiveExplorer.Selection
+
+    If Not olSelection Is Nothing Then
+        If olSelection.count > 0 Then
+            If olSelection.Item(1).Class = OL_MAIL_CLASS Then
+                Set oMail = olSelection.Item(1)
+                ' Dans l'explorateur, on ne traite que les mails envoyes
+                If oMail.Sent Then
+                    isComposing = False
+                    ResolveTargetMail = True
+                Else
+                    ' Brouillon selectionne dans l'explorateur : on refuse
+                    ' (il faudrait l'ouvrir en composition)
+                    Set oMail = Nothing
+                    ResolveTargetMail = False
+                End If
+                Exit Function
+            End If
+        End If
+    End If
+
+    On Error GoTo 0
+
+End Function
+
+'=============================================================================
+' POINT D'ENTREE 1 : MARQUER UN MAIL POUR SUIVI
+'=============================================================================
+Public Sub MarkMailForTracking()
+
+    On Error GoTo ErrorHandler
+
+    Dim oMail As Outlook.mailItem
+    Dim isComposing As Boolean
+    Dim foundMail As Boolean
+
+    foundMail = ResolveTargetMail(oMail, isComposing)
+
+    If Not foundMail Then
+        MsgBox T("Veuillez :" & vbCrLf & _
+               "  - ouvrir un mail en cours de r" & Chr(233) & "daction, ou" & vbCrLf & _
+               "  - ouvrir un mail d" & Chr(233) & "j" & Chr(224) & " envoy" & Chr(233) & " dans sa fen" & Chr(234) & "tre, ou" & vbCrLf & _
+               "  - s" & Chr(233) & "lectionner un mail envoy" & Chr(233) & " dans la liste.", _
+               "Please:" & vbCrLf & _
+               "  - open a mail being composed, or" & vbCrLf & _
+               "  - open an already-sent mail in its window, or" & vbCrLf & _
+               "  - select a sent mail in the list."), _
+               vbExclamation, T("Suivi Mails", "Mail Tracking")
+        Exit Sub
+    End If
+
+    ' --- Verifier qu'il y a des destinataires TO ---
+    Dim recipientCount As Long
+    recipientCount = CountTORecipients(oMail)
+
+    If recipientCount = 0 Then
+        MsgBox T("Ce mail n'a aucun destinataire en TO.", "This mail has no TO recipient."), vbExclamation, T("Suivi Mails", "Mail Tracking")
+        Exit Sub
+    End If
+
+    ' --- Lire l'objet du mail ---
+    Dim mailSubject As String
+    mailSubject = oMail.subject
+    If Len(Trim(mailSubject)) = 0 Then mailSubject = T("(sans objet)", "(no subject)")
+
+    ' --- Demander le delai ---
+    Dim contextLabel As String
+    If isComposing Then
+        contextLabel = T("Mail en cours de r" & Chr(233) & "daction", "Mail being composed")
+    Else
+        contextLabel = T("Mail d" & Chr(233) & "j" & Chr(224) & " envoy" & Chr(233), "Already-sent mail")
+    End If
+
+    Dim delayStr As String
+    ' v6 : le SUJET et le CONTEXTE sont concatenes A L'EXTERIEUR de T().
+    ' T() applique A() a ses deux branches : un objet de mail contenant
+    ' "~e", "~a" ou "~o" etait decode en accent et affiche faux - or c'est
+    ' le seul element qui permet d'identifier de quel mail on parle.
+    delayStr = modUi.AskText( _
+        T("R~eponse attendue sous combien de jours ?", _
+          "Reply expected within how many days?") & vbCrLf & vbCrLf & _
+        T("Contexte : ", "Context: ") & contextLabel & vbCrLf & _
+        T("Mail : ", "Mail: ") & Left(mailSubject, 80) & vbCrLf & _
+        T("Destinataires TO : ", "TO recipients: ") & recipientCount, _
+        T("Suivi Mails - D~elai", "Mail Tracking - Delay"), CStr(modConfig.ReplyDelayDays()))
+
+    If delayStr = "" Then Exit Sub
+
+    If Not IsNumeric(delayStr) Then
+        MsgBox T("Veuillez entrer un nombre de jours valide.", "Please enter a valid number of days."), vbExclamation, T("Suivi Mails", "Mail Tracking")
+        Exit Sub
+    End If
+
+    Dim delayDays As Long
+    delayDays = CLng(delayStr)
+
+    ' --- Recuperer les infos du mail ---
+    Dim mailRecipients As String
+    Dim mailConvID As String
+    Dim mailEntryID As String
+    Dim mailDate As Date
+
+    mailRecipients = GetTORecipientsList(oMail)
+
+    If isComposing Then
+        oMail.Save
+        mailConvID = oMail.ConversationID
+        mailEntryID = oMail.entryID
+        mailDate = Now
+    Else
+        mailConvID = oMail.ConversationID
+        mailEntryID = oMail.entryID
+        ' Pour un mail deja envoye, utiliser SentOn (pas Now)
+        If oMail.SentOn > #1/1/2000# Then
+            mailDate = oMail.SentOn
+        Else
+            mailDate = Now
+        End If
+    End If
+
+    ' --- Enregistrer dans Excel ---
+    ' v5.2 : pas de confirmation si l'ecriture a echoue (l'echec a deja
+    ' ete signale par SaveTrackingEntry).
+    If Not SaveTrackingEntry(mailSubject, mailRecipients, recipientCount, _
+                             delayDays, mailDate, mailConvID, mailEntryID) Then Exit Sub
+
+    ' --- Message de confirmation ---
+    If isComposing Then
+        modUi.Toast T("Mail marqu~e pour suivi (", "Mail flagged for tracking (") & _
+               delayDays & T(" jours).", " days).") & vbLf & _
+               T("Le suivi sera actif d~fs l'envoi.", _
+                 "Tracking will start as soon as you send."), uiSuccess, True
+    Else
+        modUi.Toast T("Mail marqu~e pour suivi (", "Mail flagged for tracking (") & _
+               delayDays & T(" jours).", " days).") & vbLf & _
+               T("Destinataires suivis : ", "Tracked recipients: ") & recipientCount & vbLf & _
+               T("Date d'envoi : ", "Sent date: ") & Format(mailDate, "dd/mm/yyyy hh:mm"), uiSuccess, True
+    End If
+
+    Exit Sub
+
+ErrorHandler:
+    MsgBox T("Erreur ", "Error ") & Err.Number & " : " & Err.Description, _
+           vbCritical, T("Suivi Mails - Erreur", "Mail Tracking - Error")
+End Sub
+
+'=============================================================================
+' POINT D'ENTREE (v4.4) : ENREGISTRER LE SUIVI D'UN MAIL ENVOYE FOURNI
+'
+' Variante de MarkMailForTracking qui prend directement un mailItem deja
+' envoye en parametre (au lieu de le resoudre depuis l'UI). Utilise par
+' modReplySuspicion apres confirmation du pop-up de suspicion.
+' Reproduit le flux delai + enregistrement, sans dependre de
+' ResolveTargetMail. Le mail est considere comme deja envoye (date = SentOn).
+'=============================================================================
+Public Sub RecordSentMail(ByVal oMail As Outlook.mailItem)
+    On Error GoTo ErrorHandler
+
+    If oMail Is Nothing Then Exit Sub
+
+    Dim recipientCount As Long
+    recipientCount = CountTORecipients(oMail)
+    If recipientCount = 0 Then
+        MsgBox T("Ce mail n'a aucun destinataire en TO.", "This mail has no TO recipient."), vbExclamation, T("Suivi Mails", "Mail Tracking")
+        Exit Sub
+    End If
+
+    Dim mailSubject As String
+    mailSubject = oMail.subject
+    If Len(Trim(mailSubject)) = 0 Then mailSubject = T("(sans objet)", "(no subject)")
+
+    Dim delayStr As String
+    ' v6 : sujet sorti de T() (cf. note ci-dessus).
+    delayStr = modUi.AskText( _
+        T("R~eponse attendue sous combien de jours ?", _
+          "Reply expected within how many days?") & vbCrLf & vbCrLf & _
+        T("Mail : ", "Mail: ") & Left(mailSubject, 80) & vbCrLf & _
+        T("Destinataires TO : ", "TO recipients: ") & recipientCount, _
+        T("Suivi Mails - D~elai", "Mail Tracking - Delay"), CStr(modConfig.ReplyDelayDays()))
+
+    If delayStr = "" Then Exit Sub
+    If Not IsNumeric(delayStr) Then
+        MsgBox T("Veuillez entrer un nombre de jours valide.", "Please enter a valid number of days."), vbExclamation, T("Suivi Mails", "Mail Tracking")
+        Exit Sub
+    End If
+
+    Dim delayDays As Long
+    delayDays = CLng(delayStr)
+
+    Dim mailRecipients As String
+    Dim mailConvID As String
+    Dim mailEntryID As String
+    Dim mailDate As Date
+
+    mailRecipients = GetTORecipientsList(oMail)
+    mailConvID = oMail.ConversationID
+    mailEntryID = oMail.entryID
+    If oMail.SentOn > #1/1/2000# Then
+        mailDate = oMail.SentOn
+    Else
+        mailDate = Now
+    End If
+
+    If Not SaveTrackingEntry(mailSubject, mailRecipients, recipientCount, _
+                             delayDays, mailDate, mailConvID, mailEntryID) Then Exit Sub
+
+    modUi.Toast T("Mail marqu~e pour suivi (", "Mail flagged for tracking (") & _
+           delayDays & T(" jours).", " days).") & vbLf & _
+           T("Destinataires suivis : ", "Tracked recipients: ") & recipientCount, uiSuccess, True
+    Exit Sub
+
+ErrorHandler:
+    modDebugLog.DError MOD_NAME, "RecordSentMail err " & _
+        Err.Number & " - " & Err.Description
+End Sub
+
+'=============================================================================
+' POINT D'ENTREE (v5.4) : SUIVI EN 1 CLIC D'UN MAIL ENVOYE FOURNI
+' Variante de RecordSentMail SANS AUCUNE fenetre : delai = ReplyDelayDays
+' (config, repli 7 j), confirmation par TOAST au lieu d'InputBox + MsgBox.
+' Appelee par modReplySuspicion v4.1 apres le pop-up "Suivre" : le clic
+' suffit, le pop-up 8 s reste la seule fenetre du flux. Echecs logues +
+' toast d'erreur, jamais de MsgBox (on est dans un differe, possiblement
+' au-dessus d'autres fenetres).
+'=============================================================================
+Public Sub RecordSentMailQuick(ByVal oMail As Outlook.mailItem)
+    On Error GoTo ErrorHandler
+
+    If oMail Is Nothing Then Exit Sub
+
+    Dim recipientCount As Long
+    recipientCount = CountTORecipients(oMail)
+    If recipientCount = 0 Then
+        modDebugLog.DInfo MOD_NAME, "RecordSentMailQuick : aucun destinataire TO, suivi ignore"
+        modNotify.Notify T("Suivi impossible : aucun destinataire TO", _
+                           "Tracking impossible: no TO recipient")
+        Exit Sub
+    End If
+
+    Dim delayDays As Long
+    delayDays = modConfig.ReplyDelayDays()
+    If delayDays <= 0 Then delayDays = 7
+
+    Dim mailSubject As String
+    mailSubject = oMail.subject
+    If Len(Trim(mailSubject)) = 0 Then mailSubject = T("(sans objet)", "(no subject)")
+
+    Dim mailRecipients As String
+    Dim mailConvID As String
+    Dim mailEntryID As String
+    Dim mailDate As Date
+
+    mailRecipients = GetTORecipientsList(oMail)
+    mailConvID = oMail.ConversationID
+    mailEntryID = oMail.entryID
+    If oMail.SentOn > #1/1/2000# Then
+        mailDate = oMail.SentOn
+    Else
+        mailDate = Now
+    End If
+
+    If Not SaveTrackingEntry(mailSubject, mailRecipients, recipientCount, _
+                             delayDays, mailDate, mailConvID, mailEntryID) Then Exit Sub
+
+    ' Confirmation NON bloquante (UI minimaliste : pas de MsgBox de routine).
+    modNotify.Notify T("Suivi enregistr~e (", "Tracking saved (") & _
+                     delayDays & T(" j)", " d)")
+    modDebugLog.DInfo MOD_NAME, "RecordSentMailQuick OK (" & delayDays & _
+        " j) '" & Left(mailSubject, 60) & "'"
+    Exit Sub
+
+ErrorHandler:
+    modDebugLog.DError MOD_NAME, "RecordSentMailQuick err " & _
+        Err.Number & " - " & Err.Description
+End Sub
+
+'=============================================================================
+' v5.6 - SUIVI AUTOMATIQUE DES MAILS "URGENT"
+' EnqueueUrgentTracking : capture SYNCHRONE des champs du mail (aucun COM
+'   Excel ici). La date limite est deja validee cote ThisOutlookSession.
+' FlushUrgentTracking : ecriture differee (modDefer "UrgentFlush"). UPSERT
+'   par conversation (ligne existante REMPLACEE = nouveau depart).
+'=============================================================================
+Public Sub EnqueueUrgentTracking(ByVal oMail As Outlook.mailItem, ByVal dueDate As Date)
+    On Error GoTo ErrH
+    If oMail Is Nothing Then Exit Sub
+
+    Dim recipCount As Long
+    recipCount = CountTORecipients(oMail)
+
+    Dim subj As String
+    subj = oMail.subject
+    If Len(Trim(subj)) = 0 Then subj = T("(sans objet)", "(no subject)")
+
+    Dim recips As String
+    recips = GetTORecipientsList(oMail)
+
+    Dim convID As String
+    convID = oMail.ConversationID
+
+    ' delai = (date limite - aujourd'hui), plancher 0 (une urgence datee
+    ' d'aujourd'hui ou anterieure reste due aujourd'hui).
+    Dim delayDays As Long
+    delayDays = DateDiff("d", Int(Now), Int(dueDate))
+    If delayDays < 0 Then delayDays = 0
+
+    If mUrgentQueue Is Nothing Then Set mUrgentQueue = New Collection
+    ' EntryID laisse vide : le brouillon change d'EntryID a l'envoi ;
+    ' l'ancrage sera retabli par conversation au premier recalcul.
+    mUrgentQueue.Add Array(subj, recips, recipCount, delayDays, Now, dueDate, convID, "")
+
+    modDebugLog.DInfo MOD_NAME, "EnqueueUrgentTracking : '" & Left(subj, 60) & _
+        "' due " & Format(dueDate, "dd/mm/yyyy") & " (delai " & delayDays & " j)"
+    Exit Sub
+ErrH:
+    modDebugLog.DError MOD_NAME, "EnqueueUrgentTracking err " & Err.Number & " - " & Err.Description
+End Sub
+
+Public Sub FlushUrgentTracking()
+    On Error GoTo ErrH
+    If mUrgentQueue Is Nothing Then Exit Sub
+    If mUrgentQueue.count = 0 Then Exit Sub
+
+    Dim xlApp As Object, wb As Object, ws As Object
+    Set xlApp = GetExcelApp()
+    If xlApp Is Nothing Then Exit Sub
+    xlApp.DisplayAlerts = False
+    Set wb = GetTrackerWorkbook(xlApp)
+    If wb Is Nothing Then Exit Sub
+    Set ws = wb.Sheets(modConfig.MailTrackingSheet())
+
+    Dim n As Long
+    n = 0
+    Do While mUrgentQueue.count > 0
+        Dim it As Variant
+        it = mUrgentQueue.Item(1)
+        mUrgentQueue.Remove 1
+
+        Dim subj As String, recips As String, convID As String, entryID As String
+        Dim recipCount As Long, delayDays As Long
+        Dim sentDate As Date, dueDate As Date
+        subj = CStr(it(0)): recips = CStr(it(1)): recipCount = CLng(it(2))
+        delayDays = CLng(it(3)): sentDate = CDate(it(4)): dueDate = CDate(it(5))
+        convID = CStr(it(6)): entryID = CStr(it(7))
+
+        Dim r As Long
+        r = 0
+        If Len(convID) > 0 Then r = FindRowByConv(ws, convID)
+
+        If r = 0 Then
+            r = ws.Cells(ws.Rows.count, COL_ID).End(-4162).row + 1
+            ws.Cells(r, COL_ID).Value = NewTrackID()
+            ws.Cells(r, COL_CONV_ID).Value = convID
+        End If
+
+        ' (Re)ecriture complete = nouveau depart.
+        ws.Cells(r, COL_STATUS).Value = "En attente"
+        ws.Cells(r, COL_SUBJECT).Value = subj
+        ws.Cells(r, COL_RECIPIENTS).Value = recips
+        ws.Cells(r, COL_RESPONSE_COUNT).Value = 0
+        ws.Cells(r, COL_RESPONDERS).Value = ""
+        ws.Cells(r, COL_SENT_DATE).Value = sentDate
+        ws.Cells(r, COL_SENT_DATE).NumberFormat = "dd/mm/yyyy hh:mm"
+        ws.Cells(r, COL_DELAY_DAYS).Value = delayDays
+        ws.Cells(r, COL_DUE_DATE).Value = DateAdd("d", delayDays, sentDate)
+        ws.Cells(r, COL_DUE_DATE).NumberFormat = "dd/mm/yyyy"
+        ws.Cells(r, COL_LAST_FOLLOWUP).Value = ""
+        ws.Cells(r, COL_FOLLOWUP_COUNT).Value = 0
+        ws.Cells(r, COL_ACK_COUNT).Value = 0
+        If Len(entryID) > 0 Then ws.Cells(r, COL_ENTRY_ID).Value = entryID
+
+        FormatStatusCell ws.Cells(r, COL_STATUS)
+        UpdateDeadlineCell ws, r
+        StampRowActions ws, r
+        n = n + 1
+    Loop
+
+    SaveWorkbookVisible xlApp, wb
+    ReleaseBackground xlApp, wb
+
+    If n > 0 Then
+        modNotify.Notify T("Suivi urgent enregistr~e", "Urgent tracking saved")
+        modDebugLog.DInfo MOD_NAME, "FlushUrgentTracking : " & n & " ligne(s) ecrite(s)/actualisee(s)"
+    End If
+    Exit Sub
+ErrH:
+    modDebugLog.DError MOD_NAME, "FlushUrgentTracking err " & Err.Number & " - " & Err.Description
+    ' v5.9 : ne jamais laisser le classeur ouvert masque apres une erreur.
+    On Error Resume Next
+    If Not wb Is Nothing Then ReleaseBackground xlApp, wb
+End Sub
+
+' Premiere ligne dont le ConversationID correspond (0 si aucune).
+Private Function FindRowByConv(ws As Object, ByVal convID As String) As Long
+    On Error Resume Next
+    FindRowByConv = 0
+    If Len(convID) = 0 Then Exit Function
+    Dim lastRow As Long
+    lastRow = ws.Cells(ws.Rows.count, COL_ID).End(-4162).row
+    Dim r As Long
+    For r = 2 To lastRow
+        If CStr(ws.Cells(r, COL_CONV_ID).Value) = convID Then
+            FindRowByConv = r
+            Exit Function
+        End If
+    Next r
+End Function
+
+' Identifiant de suivi unique (meme en rafale dans la meme seconde).
+Private Function NewTrackID() As String
+    Static lastStamp As String
+    Static sameSec As Long
+    Dim stamp As String
+    stamp = Format(Now, "yyyymmdd-hhnnss")
+    If stamp = lastStamp Then
+        sameSec = sameSec + 1
+    Else
+        sameSec = 0
+        lastStamp = stamp
+    End If
+    NewTrackID = "ST-" & stamp
+    If sameSec > 0 Then NewTrackID = NewTrackID & "-" & sameSec
+End Function
+
+'=============================================================================
+' POINT D'ENTREE 2 : OUVRIR LE TABLEAU DE BORD
+'=============================================================================
+Public Sub OpenTrackingDashboard()
+
+    On Error GoTo ErrorHandler
+
+    Dim trackingFile As String
+    trackingFile = GetTrackerFilePath()
+
+    If Dir(trackingFile) = "" Then
+        MsgBox T("Aucun suivi en cours." & vbCrLf & _
+               "Utilisez 'Marquer Suivi' sur un mail envoy" & Chr(233) & " pour commencer.", _
+               "No tracking in progress." & vbCrLf & _
+               "Use 'Mark for tracking' on a sent mail to start."), _
+               vbInformation, T("Suivi Mails", "Mail Tracking")
+        Exit Sub
+    End If
+
+    Dim xlApp As Object
+    Set xlApp = GetExcelApp()
+    xlApp.DisplayAlerts = False
+
+    Dim wb As Object
+    Set wb = GetTrackerWorkbook(xlApp)
+
+    If wb Is Nothing Then
+        MsgBox T("Impossible d'ouvrir le fichier de suivi.", "Cannot open the tracking file."), vbCritical, T("Suivi Mails", "Mail Tracking")
+        Exit Sub
+    End If
+
+    Dim ws As Object
+    Set ws = wb.Sheets(modConfig.MailTrackingSheet())
+
+    UpdateAllTrackingStatuses ws
+
+    SortDashboard ws
+
+    SaveWorkbookVisible xlApp, wb
+
+    ' --- Afficher et forcer le premier plan ---
+    xlApp.Visible = True
+
+    ' v5.1 : re-afficher la fenetre du classeur. Un rappel de demarrage a pu
+    ' la masquer (HideBackgroundWorkbook) sans refermeture (fuite corrigee
+    ' par ailleurs, mais un classeur herite d'une session precedente peut
+    ' encore etre cache) : sans ce geste, Excel apparaissait VIDE.
+    On Error Resume Next
+    wb.Windows(1).Visible = True
+    On Error GoTo ErrorHandler
+
+    ' v5.9 : le classeur est maintenant sous les yeux de l'utilisateur ; il
+    ' lui appartient. Les ecritures d'arriere-plan ne le refermeront pas.
+    HandOverWorkbook
+
+    If Not ws.AutoFilterMode Then
+        Dim lastDataRow As Long
+        lastDataRow = ws.Cells(ws.Rows.count, COL_ID).End(-4162).row
+        If lastDataRow > 1 Then
+            ws.Range(ws.Cells(1, COL_STATUS), ws.Cells(1, COL_FOLLOWUP_COUNT)).AutoFilter
+        End If
+    End If
+
+    ws.Range(ws.Columns(1), ws.Columns(LAST_ACT_COL)).AutoFit
+    ws.Columns(COL_ID).Hidden = True
+    ws.Columns(COL_CONV_ID).Hidden = True
+    ws.Columns(COL_ENTRY_ID).Hidden = True
+    ws.Columns(COL_ACK_COUNT).Hidden = True
+
+    ' (Re)poser les liens d'action sur toutes les lignes (les nouvelles
+    ' lignes ajoutees en arriere-plan n'ont pas encore leurs liens).
+    Dim sr As Long, lastSr As Long
+    lastSr = ws.Cells(ws.Rows.count, COL_ID).End(-4162).row
+    For sr = 2 To lastSr
+        StampRowActions ws, sr
+    Next sr
+    SaveWorkbookVisible xlApp, wb
+
+    ' Forcer l'affichage : plein ecran + premier plan
+    On Error Resume Next
+    xlApp.WindowState = -4137                 ' xlMaximized
+    wb.Activate
+    ws.Activate
+    AppActivate xlApp.Caption
+    SetForegroundWindow xlApp.hwnd
+    On Error GoTo ErrorHandler
+
+    xlApp.DisplayAlerts = True                ' v5.5
+
+    Exit Sub
+
+ErrorHandler:
+    Dim dashErrNum As Long, dashErrDesc As String
+    dashErrNum = Err.Number
+    dashErrDesc = Err.Description
+    ' v5.9 : erreur AVANT l'affichage -> le classeur ouvert en arriere-plan
+    ' est encore le notre : le liberer (sinon Excel fantome). Apres
+    ' l'affichage (HandOverWorkbook deja passe), il n'y a rien a refermer.
+    On Error Resume Next
+    If mWbDepth > 0 Then
+        If Not wb Is Nothing Then ReleaseBackground xlApp, wb
+    End If
+    MsgBox T("Erreur ", "Error ") & dashErrNum & " : " & dashErrDesc, _
+           vbCritical, T("Suivi Mails - Erreur", "Mail Tracking - Error")
+End Sub
+
+'=============================================================================
+' Liberer le classeur ouvert en arriere-plan : si NOUS l'avons ouvert, le
+' refermer (sinon le fichier reste verrouille -> "ouvert dans une autre
+' application"). Si l'utilisateur l'avait deja ouvert, on n'y touche pas.
+'=============================================================================
+Private Sub ReleaseBackground(xlApp As Object, wb As Object)
+    On Error Resume Next
+    xlApp.DisplayAlerts = True    ' v5.5 : ne jamais laisser l'instance muette
+    If Not mWbOpenedHere Then Exit Sub
+    ' v5.9 : appel imbrique -> on rend juste son niveau ; le detenteur
+    ' externe refermera.
+    If mWbDepth > 1 Then
+        mWbDepth = mWbDepth - 1
+        modDebugLog.DDebug MOD_NAME, "ReleaseBackground : niveau imbrique rendu, profondeur " & mWbDepth
+        Exit Sub
+    End If
+    mWbDepth = 0
+    wb.Close SaveChanges:=False              ' deja sauvegarde par l'appelant
+    mWbOpenedHere = False
+    If mXlCreatedByUs Then
+        If xlApp.Workbooks.count = 0 Then
+            xlApp.Quit
+            Set mXlApp = Nothing
+            mXlCreatedByUs = False
+        End If
+    End If
+End Sub
+
+'=============================================================================
+' SaveWorkbookVisible (v5.5) : sauvegarde SANS persister l'etat "fenetre
+' masquee" dans le fichier. Excel enregistre la visibilite de la fenetre
+' DANS le classeur : un Save d'arriere-plan fenetre cachee rendait toute
+' ouverture suivante invisible (Excel "vide"). On re-affiche la fenetre
+' (ScreenUpdating coupe : aucun flash), on sauvegarde, on re-masque.
+'=============================================================================
+Private Sub SaveWorkbookVisible(ByVal xlApp As Object, ByVal wb As Object)
+    On Error Resume Next
+    Dim w As Object
+    Set w = wb.Windows(1)
+    Dim wasHidden As Boolean
+    wasHidden = False
+    If Not w Is Nothing Then wasHidden = Not CBool(w.Visible)
+    If wasHidden Then
+        xlApp.ScreenUpdating = False
+        w.Visible = True
+    End If
+    wb.Save
+    If wasHidden Then
+        w.Visible = False
+        xlApp.ScreenUpdating = True
+    End If
+End Sub
+
+'=============================================================================
+' AddrInExpected (v5.5) : l'adresse appartient-elle a la liste attendue
+' (elements separes par ";") par EGALITE stricte, insensible a la casse ?
+' Remplace l'ancien test InStr par sous-chaine : "paul@x.fr" validait
+' "jean-paul@x.fr" comme repondant.
+'=============================================================================
+Private Function AddrInExpected(ByVal expectedList As String, ByVal addr As String) As Boolean
+    AddrInExpected = False
+    If Len(addr) = 0 Then Exit Function
+    Dim parts() As String
+    parts = Split(expectedList, ";")
+    Dim k As Long
+    For k = LBound(parts) To UBound(parts)
+        If StrComp(Trim$(parts(k)), addr, vbTextCompare) = 0 Then
+            AddrInExpected = True
+            Exit Function
+        End If
+    Next k
+End Function
+
+'=============================================================================
+' v5.0 - Masquer la fenetre du classeur ouvert pour une LECTURE de fond
+' (rappel de demarrage). On ne ferme rien : ReleaseBackground s'en charge
+' apres. But : Excel ne doit ni surgir, ni rester affiche sur le tracker.
+'   - On masque la fenetre du classeur (Windows(1).Visible = False). Si
+'     l'utilisateur avait deja Excel ouvert, sa propre fenetre reste devant.
+'   - Si l'instance Excel est la NOTRE (creee a la volee), on la force
+'     invisible : un Workbook_Open du .xlsm a pu la rendre visible.
+'=============================================================================
+Private Sub HideBackgroundWorkbook(xlApp As Object, wb As Object)
+    On Error Resume Next
+    Dim w As Object
+    Set w = wb.Windows(1)
+    If Not w Is Nothing Then w.Visible = False
+    ' v5.1 : ne JAMAIS masquer toute l'application si elle heberge d'autres
+    ' classeurs que le tracker. Un fichier ouvert par double-clic atterrit
+    ' dans l'instance en cours - la notre si elle a survecu : masquer
+    ' l'application faisait disparaitre les fichiers de l'utilisateur de
+    ' l'ecran (impression de "fichiers fermes"). Dans ce cas l'instance
+    ' est desormais reputee appartenir a l'utilisateur (plus de masquage,
+    ' et ReleaseBackground ne fera plus de Quit).
+    If mXlCreatedByUs Then
+        If xlApp.Workbooks.count <= 1 Then
+            xlApp.Visible = False
+        Else
+            mXlCreatedByUs = False
+        End If
+    End If
+End Sub
+
+'=============================================================================
+' (Re)pose les liens cliquables des 4 colonnes d'action sur une ligne.
+' Cote Outlook : robuste meme si les macros du classeur sont desactivees
+' pendant l'automation. Idempotent (saute une cellule deja liee).
+'=============================================================================
+Private Sub StampRowActions(ws As Object, ByVal r As Long)
+    On Error Resume Next
+    StampOneAction ws, r, COL_ACT_FOLLOWUP, T("Relancer", "Follow up")
+    StampOneAction ws, r, COL_ACT_OPEN, T("Ouvrir", "Open")
+    StampOneAction ws, r, COL_ACT_EXTEND, T("Prolonger", "Extend")
+    StampOneAction ws, r, COL_ACT_VALIDATE, T("Valider r~eponse", "Validate reply")
+    StampOneAction ws, r, COL_ACT_DELETE, T("Supprimer", "Delete")
+End Sub
+
+Private Sub StampOneAction(ws As Object, ByVal r As Long, ByVal col As Long, ByVal label As String)
+    On Error Resume Next
+    Dim c As Object
+    Set c = ws.Cells(r, col)
+    ' v5.7 : robuste - retire un lien perime (migration/ancien gabarit) puis
+    ' repose le bon, au lieu de sauter si un lien existe deja.
+    If c.Hyperlinks.count > 0 Then c.Hyperlinks.Delete
+    ws.Hyperlinks.Add Anchor:=c, Address:="", _
+        SubAddress:=modConfig.MailTrackingSheet() & "!" & c.Address(False, False), _
+        TextToDisplay:=label
+    c.Font.Underline = 2                      ' xlUnderlineStyleSingle
+    c.Font.Color = RGB(5, 99, 193)
+End Sub
+
+'=============================================================================
+' COMPTER LES DESTINATAIRES TO
+'=============================================================================
+Private Function CountTORecipients(oMail As Outlook.mailItem) As Long
+    Dim cnt As Long
+    Dim i As Long
+    cnt = 0
+    For i = 1 To oMail.recipients.count
+        If oMail.recipients.Item(i).Type = olTo Then
+            cnt = cnt + 1
+        End If
+    Next i
+    CountTORecipients = cnt
+End Function
+
+'=============================================================================
+' LISTE DES DESTINATAIRES TO (emails SMTP separes par ;)
+'=============================================================================
+Private Function GetTORecipientsList(oMail As Outlook.mailItem) As String
+    Dim result As String
+    Dim i As Long
+    Dim recip As Outlook.Recipient
+
+    For i = 1 To oMail.recipients.count
+        Set recip = oMail.recipients.Item(i)
+        If recip.Type = olTo Then
+            Dim smtpAddr As String
+            smtpAddr = GetRecipientSMTPAddress(recip)
+            If result <> "" Then result = result & "; "
+            result = result & smtpAddr
+        End If
+    Next i
+
+    GetTORecipientsList = result
+End Function
+
+'=============================================================================
+' RESOUDRE L'ADRESSE SMTP D'UN DESTINATAIRE
+'=============================================================================
+Private Function GetRecipientSMTPAddress(recip As Outlook.Recipient) As String
+    ' Pack v3 (C2/B8) : resolution + cache modSmtp (minuscules conservees).
+    On Error Resume Next
+    GetRecipientSMTPAddress = LCase(modSmtp.RecipientSmtp(recip))
+    If Len(GetRecipientSMTPAddress) = 0 Then GetRecipientSMTPAddress = LCase(recip.Address)
+End Function
+
+'=============================================================================
+' SAUVEGARDER UNE ENTREE DE SUIVI
+' v5.2 : Function Boolean. Un echec (instance Excel fantome -> erreur 462)
+' declenche UNE nouvelle tentative sur instance neuve ; l'erreur n'est
+' montree qu'en cas d'echec definitif. Les appelants ne confirment le
+' suivi QUE si le retour est True (avant : erreur 462 PUIS message de
+' succes, alors qu'aucune ligne n'avait ete ecrite).
+'=============================================================================
+Private Function SaveTrackingEntry(subject As String, _
+                              recipients As String, recipientCount As Long, _
+                              delayDays As Long, sentDate As Date, _
+                              convID As String, entryID As String) As Boolean
+
+    Dim errNum As Long, errDesc As String
+    Dim attempt As Long
+    For attempt = 1 To 2
+        errNum = 0: errDesc = ""
+        If TrySaveTrackingEntry(subject, recipients, recipientCount, _
+                                delayDays, sentDate, convID, entryID, _
+                                errNum, errDesc) Then
+            SaveTrackingEntry = True
+            Exit Function
+        End If
+        If errNum = -1 Then Exit Function    ' deja signale (Bureau inaccessible)
+        ' Echec probable sur instance morte : purger le cache et retenter
+        ' une seule fois sur une instance propre.
+        modDebugLog.DInfo MOD_NAME, "SaveTrackingEntry : tentative " & _
+            attempt & " KO (err " & errNum & "), purge du cache Excel"
+        ResetExcelCache
+    Next attempt
+
+    MsgBox T("Erreur lors de la sauvegarde du suivi :", "Error while saving the tracking:") & vbCrLf & _
+           T("Erreur ", "Error ") & errNum & " : " & errDesc & vbCrLf & vbCrLf & _
+           T("Le suivi n'a PAS " & Chr(233) & "t" & Chr(233) & " enregistr" & Chr(233) & ".", _
+             "The tracking was NOT recorded."), _
+           vbCritical, T("Suivi Mails", "Mail Tracking")
+End Function
+
+Private Function TrySaveTrackingEntry(subject As String, _
+                              recipients As String, recipientCount As Long, _
+                              delayDays As Long, sentDate As Date, _
+                              convID As String, entryID As String, _
+                              ByRef errNum As Long, ByRef errDesc As String) As Boolean
+
+    On Error GoTo SaveError
+
+    Dim xlApp As Object
+    Set xlApp = GetExcelApp()
+    xlApp.DisplayAlerts = False
+
+    Dim wb As Object
+    Set wb = GetTrackerWorkbook(xlApp)
+
+    If wb Is Nothing Then
+        errNum = -1                          ' message deja affiche, ne pas retenter
+        Exit Function
+    End If
+
+    Dim ws As Object
+    Set ws = wb.Sheets(modConfig.MailTrackingSheet())
+
+    Dim NextRow As Long
+    NextRow = ws.Cells(ws.Rows.count, COL_ID).End(-4162).row + 1
+
+    Dim trackID As String
+    ' v5.5 : ID unique meme si deux suivis naissent dans la meme seconde
+    ' (rafales RecordSentMailQuick) : suffixe de sequence.
+    Static lastStamp As String
+    Static sameSec As Long
+    Dim stamp As String
+    stamp = Format(Now, "yyyymmdd-hhnnss")
+    If stamp = lastStamp Then
+        sameSec = sameSec + 1
+    Else
+        sameSec = 0
+        lastStamp = stamp
+    End If
+    trackID = "ST-" & stamp
+    If sameSec > 0 Then trackID = trackID & "-" & sameSec
+
+    ws.Cells(NextRow, COL_STATUS).Value = "En attente"
+    ws.Cells(NextRow, COL_SUBJECT).Value = subject
+    ws.Cells(NextRow, COL_RECIPIENTS).Value = recipients
+    ws.Cells(NextRow, COL_RESPONSE_COUNT).Value = 0
+    ws.Cells(NextRow, COL_RESPONDERS).Value = ""
+    ws.Cells(NextRow, COL_SENT_DATE).Value = sentDate
+    ws.Cells(NextRow, COL_SENT_DATE).NumberFormat = "dd/mm/yyyy hh:mm"
+    ws.Cells(NextRow, COL_DELAY_DAYS).Value = delayDays
+    ws.Cells(NextRow, COL_DUE_DATE).Value = DateAdd("d", delayDays, sentDate)
+    ws.Cells(NextRow, COL_DUE_DATE).NumberFormat = "dd/mm/yyyy"
+    ws.Cells(NextRow, COL_LAST_FOLLOWUP).Value = ""
+    ws.Cells(NextRow, COL_FOLLOWUP_COUNT).Value = 0
+    ws.Cells(NextRow, COL_ACK_COUNT).Value = 0
+    ws.Cells(NextRow, COL_ID).Value = trackID
+    ws.Cells(NextRow, COL_CONV_ID).Value = convID
+    ws.Cells(NextRow, COL_ENTRY_ID).Value = entryID
+
+    FormatStatusCell ws.Cells(NextRow, COL_STATUS)
+    UpdateDeadlineCell ws, NextRow
+    StampRowActions ws, NextRow
+
+    SaveWorkbookVisible xlApp, wb
+    ReleaseBackground xlApp, wb
+
+    TrySaveTrackingEntry = True
+    Exit Function
+
+SaveError:
+    errNum = Err.Number
+    errDesc = Err.Description
+    modDebugLog.DError MOD_NAME, "SaveTrackingEntry err " & _
+        errNum & " - " & errDesc
+    ' v5.9 : liberer le classeur si l'erreur est survenue apres son ouverture.
+    On Error Resume Next
+    If Not wb Is Nothing Then ReleaseBackground xlApp, wb
+End Function
+
+'=============================================================================
+' CREER LES EN-TETES DU FICHIER EXCEL
+'=============================================================================
+Private Sub CreateHeaders(ws As Object)
+
+    ws.Cells(1, COL_STATUS).Value = T("Statut", "Status")
+    ws.Cells(1, COL_DEADLINE).Value = T("~Ech~eance", "Due in")
+    ws.Cells(1, COL_SUBJECT).Value = T("Objet", "Subject")
+    ws.Cells(1, COL_RECIPIENTS).Value = T("Destinataires (TO)", "Recipients (TO)")
+    ws.Cells(1, COL_RESPONSE_COUNT).Value = T("Nb r~eponses", "# replies")
+    ws.Cells(1, COL_RESPONDERS).Value = T("R~epondants", "Responders")
+    ws.Cells(1, COL_SENT_DATE).Value = T("Date envoi", "Sent date")
+    ws.Cells(1, COL_DELAY_DAYS).Value = T("D~elai (j)", "Delay (d)")
+    ws.Cells(1, COL_DUE_DATE).Value = T("Date limite", "Due date")
+    ws.Cells(1, COL_LAST_FOLLOWUP).Value = T("Derni~fre relance", "Last follow-up")
+    ws.Cells(1, COL_FOLLOWUP_COUNT).Value = T("Nb relances", "# follow-ups")
+    ws.Cells(1, COL_ACT_FOLLOWUP).Value = T("Relancer", "Follow up")
+    ws.Cells(1, COL_ACT_OPEN).Value = T("Ouvrir", "Open")
+    ws.Cells(1, COL_ACT_EXTEND).Value = T("Prolonger", "Extend")
+    ws.Cells(1, COL_ACT_VALIDATE).Value = T("Valider r~eponse", "Validate reply")
+    ws.Cells(1, COL_ACT_DELETE).Value = T("Supprimer", "Delete")
+    ws.Cells(1, COL_ID).Value = "ID"
+    ws.Cells(1, COL_CONV_ID).Value = "ConversationID"
+    ws.Cells(1, COL_ENTRY_ID).Value = "EntryID"
+    ws.Cells(1, COL_ACK_COUNT).Value = "AckCount"
+
+    Dim headerRange As Object
+    Set headerRange = ws.Range(ws.Cells(1, 1), ws.Cells(1, LAST_COL))
+    headerRange.Font.Bold = True
+    headerRange.Font.Size = 11
+    headerRange.Font.name = "Arial"
+    headerRange.Interior.Color = RGB(51, 102, 153)
+    headerRange.Font.Color = RGB(255, 255, 255)
+    headerRange.HorizontalAlignment = -4108
+
+    ws.Columns(COL_STATUS).ColumnWidth = 14
+    ws.Columns(COL_DEADLINE).ColumnWidth = 12
+    ws.Columns(COL_SUBJECT).ColumnWidth = 50
+    ws.Columns(COL_RECIPIENTS).ColumnWidth = 55
+    ws.Columns(COL_RESPONSE_COUNT).ColumnWidth = 11
+    ws.Columns(COL_RESPONDERS).ColumnWidth = 45
+    ws.Columns(COL_SENT_DATE).ColumnWidth = 16
+    ws.Columns(COL_DELAY_DAYS).ColumnWidth = 9
+    ws.Columns(COL_DUE_DATE).ColumnWidth = 12
+    ws.Columns(COL_LAST_FOLLOWUP).ColumnWidth = 16
+    ws.Columns(COL_FOLLOWUP_COUNT).ColumnWidth = 11
+    ws.Columns(COL_ACT_FOLLOWUP).ColumnWidth = 10
+    ws.Columns(COL_ACT_OPEN).ColumnWidth = 9
+    ws.Columns(COL_ACT_EXTEND).ColumnWidth = 10
+    ws.Columns(COL_ACT_VALIDATE).ColumnWidth = 14
+    ws.Columns(COL_ACT_DELETE).ColumnWidth = 10
+    ws.Columns(COL_ID).Hidden = True
+    ws.Columns(COL_CONV_ID).Hidden = True
+    ws.Columns(COL_ENTRY_ID).Hidden = True
+    ws.Columns(COL_ACK_COUNT).Hidden = True
+
+    On Error Resume Next
+    ws.Activate
+    ws.Range("A2").Select
+    ws.Application.ActiveWindow.FreezePanes = True
+    On Error GoTo 0
+
+End Sub
+
+'=============================================================================
+' EnsureSchemaSheet (pack v3 - A11) : ecrit la feuille masquee _Schema
+' (A = nom logique, B = indice de colonne) si absente ou d'une autre
+' version. Silencieux : un echec ne bloque jamais le suivi.
+'=============================================================================
+Private Sub EnsureSchemaSheet(ByVal wb As Object)
+    On Error Resume Next
+    If wb Is Nothing Then Exit Sub
+    Dim ws As Object
+    Set ws = Nothing
+    Set ws = wb.Worksheets(SCHEMA_SHEET)
+    Err.Clear
+    If Not ws Is Nothing Then
+        If CStr(ws.Cells(1, 2).Value) = SCHEMA_VERSION Then Exit Sub
+    Else
+        Set ws = wb.Worksheets.Add(After:=wb.Worksheets(wb.Worksheets.count))
+        If Err.Number <> 0 Then Err.Clear: Exit Sub
+        ws.name = SCHEMA_SHEET
+    End If
+    ws.Cells.ClearContents
+    Dim names As Variant, cols As Variant, i As Long
+    names = Array("SchemaVersion", "STATUS", "DEADLINE", "SUBJECT", "RECIPIENTS", "RESPONSE_COUNT", _
+                  "RESPONDERS", "SENT_DATE", "DELAY_DAYS", "DUE_DATE", "LAST_FOLLOWUP", _
+                  "FOLLOWUP_COUNT", "ACT_FOLLOWUP", "ACT_OPEN", "ACT_EXTEND", "ACT_VALIDATE", _
+                  "ACT_DELETE", "ID", "CONV_ID", "ENTRY_ID", "ACK_COUNT", "ARCHIVE")
+    cols = Array(SCHEMA_VERSION, COL_STATUS, COL_DEADLINE, COL_SUBJECT, COL_RECIPIENTS, COL_RESPONSE_COUNT, _
+                 COL_RESPONDERS, COL_SENT_DATE, COL_DELAY_DAYS, COL_DUE_DATE, COL_LAST_FOLLOWUP, _
+                 COL_FOLLOWUP_COUNT, COL_ACT_FOLLOWUP, COL_ACT_OPEN, COL_ACT_EXTEND, COL_ACT_VALIDATE, _
+                 COL_ACT_DELETE, COL_ID, COL_CONV_ID, COL_ENTRY_ID, COL_ACK_COUNT, LAST_COL + 1)
+    For i = LBound(names) To UBound(names)
+        ws.Cells(i + 1, 1).Value = names(i)
+        ws.Cells(i + 1, 2).Value = cols(i)
+    Next i
+    ws.Visible = 0                     ' xlSheetHidden (visible via Afficher)
+    modDebugLog.DInfo MOD_NAME, "Feuille _Schema ecrite (" & SCHEMA_VERSION & ")"
+    Err.Clear
+End Sub
+
+'=============================================================================
+' METTRE A JOUR TOUS LES STATUTS DE SUIVI
+'
+' v4.5 (2026-06-11) : REFONTE PERF #2 - fin du scan d'arbre systematique.
+'   La v4.3 avait remplace le quadratique (Restrict x lignes) par UNE passe
+'   sur l'arbre, mais cette passe restait proportionnelle au NOMBRE TOTAL de
+'   mails de la boite (2-3 appels COM par mail via items.Item(i)), et chaque
+'   item hors fenetre de cache Exchange ajoutait un aller-retour reseau.
+'   Maintenant : on ne parcourt plus la boite. Pour chaque suivi actif, on
+'   resout le mail d'ancrage via l'EntryID stocke (col L), puis
+'   MailItem.GetConversation -> Conversation.GetTable enumere UNIQUEMENT les
+'   items du fil (l'index de conversations Exchange fait le travail).
+'   Complexite O(suivis x taille de fil), independante de la taille de la
+'   boite et du nombre de dossiers.
+'   Ancrage perime (l'EntryID change quand le mail d'origine est deplace par
+'   QuickMove/ReplyInPlace) : scan de REPARATION unique facon v4.3, limite
+'   aux fils concernes, depuis la RACINE du store (dossiers non-mail
+'   elagues), avec arret des que tout est repare. Des qu'un mail du fil est
+'   croise, bascule immediate sur le chemin rapide ci-dessus et reecriture
+'   d'un EntryID frais en col L (auto-guerison : la ligne repasse par le
+'   chemin rapide aux ouvertures suivantes). Secours inline v4.3 conserve si
+'   l'index de conversations est indisponible sur le store.
+'   Effets de bord assumes : la detection couvre desormais le fil ENTIER du
+'   store (plus seulement le sous-arbre Boite de reception) ; la date d'un
+'   repondant est sa PREMIERE reponse (min ReceivedTime), plus celle du
+'   premier mail croise au hasard du parcours des dossiers.
+'=============================================================================
+Private Sub UpdateAllTrackingStatuses(ws As Object, _
+                                      Optional ByVal onlyOverdueCandidates As Boolean = False)
+
+    Dim lastRow As Long
+    lastRow = ws.Cells(ws.Rows.count, COL_ID).End(-4162).row
+
+    If lastRow < 2 Then Exit Sub
+
+    ' --- Phase 1 : collecter les convID actifs (status != Complete) ---
+    ' Dictionary PARALLELES indexes par convID (un Dictionary imbrique via
+    ' "Set dict(key) = obj" est fragile en late binding, cf. v4.3) :
+    '   dExpected(convID)    -> destinataires attendus (string, lower)
+    '   dRows(convID)        -> liste d'index de lignes "r1;r2;..."
+    '   dRespondents(convID) -> Dictionary (senderAddr -> date 1ere reponse)
+    '   dAnchor(convID)      -> EntryID d'ancrage stocke (col L)
+    Dim dExpected As Object: Set dExpected = CreateObject("Scripting.Dictionary")
+    Dim dRows As Object:     Set dRows = CreateObject("Scripting.Dictionary")
+    Dim dRespondents As Object: Set dRespondents = CreateObject("Scripting.Dictionary")
+    Dim dAnchor As Object:   Set dAnchor = CreateObject("Scripting.Dictionary")
+    Dim dFloor As Object:    Set dFloor = CreateObject("Scripting.Dictionary")
+
+    ' Pack v3 (B3) : la feuille est lue en UN bloc (lastRow x LAST_COL) ;
+    ' la phase 1 n'emet plus 2 a 6 lectures COM par ligne.
+    Dim blk As Variant
+    blk = modExcelBridge.ReadBlock(ws, 2, 1, lastRow, LAST_COL)
+
+    Dim row As Long
+    For row = 2 To lastRow
+        Dim convID As String
+        convID = CStr(SafeVal(blk, row - 1, COL_CONV_ID))
+        If Len(convID) = 0 Then GoTo NextCollect
+
+        Dim currentStatut As String
+        currentStatut = CStr(SafeVal(blk, row - 1, COL_STATUS))
+        ' Statuts terminaux : ni recalcules, ni relances.
+        If currentStatut = "R" & Chr(233) & "pondu" Then GoTo NextCollect
+        If currentStatut = "R" & Chr(233) & "pondu ?" Then GoTo NextCollect
+        If currentStatut = "Trait" & Chr(233) Then GoTo NextCollect
+
+        ' v5.1 : mode "candidates retard uniquement" (rappel de demarrage).
+        ' On ne parcourt le fil Outlook QUE des lignes deja "En retard" OU
+        ' dont la date limite est depassee : les autres ne peuvent pas etre
+        ' en retard aujourd'hui. Le tableau de bord garde le recalcul
+        ' complet (onlyOverdueCandidates = False par defaut).
+        If onlyOverdueCandidates Then
+            If InStr(1, currentStatut, "En retard", vbTextCompare) = 0 Then
+                Dim dueCand As Date
+                dueCand = 0
+                On Error Resume Next
+                dueCand = CDate(SafeVal(blk, row - 1, COL_DUE_DATE))
+                On Error GoTo 0
+                If dueCand = 0 Or dueCand >= Date Then GoTo NextCollect
+            End If
+        End If
+
+        If Not dExpected.Exists(convID) Then
+            dExpected(convID) = LCase(CStr(SafeVal(blk, row - 1, COL_RECIPIENTS)))
+            dRows(convID) = CStr(row)
+            dAnchor(convID) = CStr(SafeVal(blk, row - 1, COL_ENTRY_ID))
+            dFloor(convID) = RowFloorFromBlock(blk, row - 1)
+            ' sous-Dictionary repondants : ajout via .Add (syntaxe sure pour objets)
+            Dim newResp As Object
+            Set newResp = CreateObject("Scripting.Dictionary")
+            dRespondents.Add convID, newResp
+        Else
+            ' Plusieurs lignes peuvent partager un convID : on accumule, et on
+            ' garde le t0 le plus recent (la derniere relance fait foi).
+            dRows(convID) = dRows(convID) & ";" & CStr(row)
+            Dim rfloor As Date
+            rfloor = RowFloorFromBlock(blk, row - 1)
+            If rfloor > CDate(dFloor(convID)) Then dFloor(convID) = rfloor
+        End If
+NextCollect:
+    Next row
+
+    If dExpected.count = 0 Then Exit Sub
+
+    Dim olNS As Outlook.NameSpace
+    Set olNS = Application.GetNamespace("MAPI")
+
+    ' --- Phase 2a : CHEMIN RAPIDE par fil (index de conversations) ---
+    ' dDead : convID dont l'ancrage est mort / fil indisponible -> reparation
+    Dim dDead As Object:     Set dDead = CreateObject("Scripting.Dictionary")
+    Dim dRepaired As Object: Set dRepaired = CreateObject("Scripting.Dictionary")
+
+    ' v4.6 : proprietaire de la boite (jamais compte comme repondant).
+    Dim ownerSMTP As String
+    ownerSMTP = GetOwnerSMTP(olNS)
+
+    Dim convKey As Variant
+    Dim respD As Object
+    For Each convKey In dExpected.keys
+        Set respD = dRespondents(convKey)
+        Dim ok As Boolean
+        ok = CollectFromConversation(olNS, CStr(dAnchor(convKey)), _
+                                     CStr(convKey), CStr(dExpected(convKey)), respD, _
+                                     CDate(dFloor(convKey)), ownerSMTP)
+        If Not ok Then dDead(convKey) = True
+    Next convKey
+
+    modDebugLog.DDebug MOD_NAME, "MAJ statuts : " & _
+        (dExpected.count - dDead.count) & "/" & dExpected.count & _
+        " fil(s) via index de conversations"
+
+    ' --- Phase 2b : REPARATION (uniquement si necessaire) ---
+    ' Scan d'arbre unique facon v4.3, limite aux fils morts, depuis la
+    ' racine du store (l'ancrage d'origine a pu etre range n'importe ou,
+    ' y compris hors du sous-arbre Reception). Des qu'un mail d'un fil
+    ' mort est croise, on rebascule sur le chemin rapide et on memorise
+    ' son EntryID comme nouvel ancrage. Arret des que dDead est vide.
+    If dDead.count > 0 Then
+        modDebugLog.DInfo MOD_NAME, "MAJ statuts : " & dDead.count & _
+            " ancrage(s) perime(s), scan de reparation"
+
+        Dim rootFolder As Outlook.MAPIFolder
+        Set rootFolder = Nothing
+        On Error Resume Next
+        Set rootFolder = olNS.GetDefaultFolder(olFolderInbox).Store.GetRootFolder
+        On Error GoTo 0
+        If rootFolder Is Nothing Then Set rootFolder = olNS.GetDefaultFolder(olFolderInbox)
+
+        RepairScanTree rootFolder, olNS, dDead, dExpected, dRespondents, dRepaired, dFloor, ownerSMTP
+
+        modDebugLog.DInfo MOD_NAME, "Reparation : " & dRepaired.count & _
+            " ancrage(s) retrouve(s), " & dDead.count & " fil(s) introuvable(s)"
+    End If
+
+    ' --- Phase 3 : appliquer les resultats ligne par ligne ---
+    For Each convKey In dExpected.keys
+        Dim respDict As Object
+        Set respDict = dRespondents(convKey)
+
+        Dim responseCount As Long
+        responseCount = respDict.count
+
+        ' Chaine des repondants (date de PREMIERE reponse de chacun)
+        Dim respondents As String
+        respondents = ""
+        Dim rk As Variant
+        For Each rk In respDict.keys
+            If respondents <> "" Then respondents = respondents & "; "
+            respondents = respondents & rk & " (" & Format(respDict(rk), "dd/mm") & ")"
+        Next rk
+
+        Dim parts() As String
+        parts = Split(dRows(convKey), ";")
+        Dim pi As Long
+        For pi = LBound(parts) To UBound(parts)
+            If Len(parts(pi)) > 0 Then
+                Dim r As Long
+                r = CLng(parts(pi))
+
+                ws.Cells(r, COL_RESPONSE_COUNT).Value = responseCount
+                ws.Cells(r, COL_RESPONDERS).Value = respondents
+
+                ' v4.6 : date limite DERIVEE du delai a chaque refresh
+                ' (editer le delai + rouvrir => date limite recalculee).
+                ' t0 = derniere relance si presente, sinon date d'envoi.
+                Dim delayDays As Long
+                delayDays = 0
+                On Error Resume Next
+                delayDays = CLng(ws.Cells(r, COL_DELAY_DAYS).Value)
+                On Error GoTo 0
+
+                Dim dueDate As Date
+                dueDate = DateAdd("d", delayDays, RowFloorDate(ws, r))
+                ws.Cells(r, COL_DUE_DATE).Value = dueDate
+                ws.Cells(r, COL_DUE_DATE).NumberFormat = "dd/mm/yyyy"
+
+                ' v4.6 : statut BINAIRE (>= 1 reponse apres t0 => Repondu).
+                Dim followCount As Long
+                followCount = 0
+                On Error Resume Next
+                followCount = CLng(ws.Cells(r, COL_FOLLOWUP_COUNT).Value)
+                On Error GoTo 0
+
+                ' v5.7 : plus d'auto-cloture. ackCount = nb de reponses deja
+                ' acquittees. -1 = ligne rouverte -> acquitter le nb actuel.
+                Dim ackCount As Long
+                ackCount = 0
+                On Error Resume Next
+                ackCount = CLng(ws.Cells(r, COL_ACK_COUNT).Value)
+                On Error GoTo 0
+
+                Dim status As String
+                If ackCount = -1 Then
+                    ws.Cells(r, COL_ACK_COUNT).Value = responseCount
+                    status = CalculateStatus(False, (Now > dueDate), followCount)
+                ElseIf responseCount > ackCount Then
+                    status = "R" & Chr(233) & "pondu ?"
+                Else
+                    status = CalculateStatus(False, (Now > dueDate), followCount)
+                End If
+
+                ws.Cells(r, COL_STATUS).Value = status
+                FormatStatusCell ws.Cells(r, COL_STATUS)
+                UpdateDeadlineCell ws, r
+
+                ' Ancrage repare : reecrire l'EntryID frais (auto-guerison).
+                If dRepaired.Exists(convKey) Then
+                    ws.Cells(r, COL_ENTRY_ID).Value = CStr(dRepaired(convKey))
+                End If
+            End If
+        Next pi
+    Next convKey
+
+End Sub
+
+'=============================================================================
+' CHEMIN RAPIDE (v4.5) : collecte les repondants d'UN fil via l'index de
+' conversations Exchange, sans parcourir les dossiers.
+'   anchorEID : EntryID d'un mail quelconque du fil (col L) - GetItemFromID
+'               echoue si l'EntryID est perime (Move change l'EntryID).
+'   convID    : ConversationID attendu (controle de coherence)
+'   expected  : destinataires attendus (lower)
+'   respDict  : Dictionary (senderAddr -> date de PREMIERE reponse), mute
+'   floor     : t0 - on ne compte que les reponses recues STRICTEMENT apres
+'   ownerSMTP : adresse du proprietaire - jamais comptee (pas soi-meme)
+' Renvoie False si ancrage mort / fil indisponible -> passe de reparation.
+'=============================================================================
+Private Function CollectFromConversation(ByVal olNS As Outlook.NameSpace, _
+                                         ByVal anchorEID As String, _
+                                         ByVal convID As String, _
+                                         ByVal expected As String, _
+                                         ByVal respDict As Object, _
+                                         ByVal floor As Date, _
+                                         ByVal ownerSMTP As String) As Boolean
+    On Error GoTo Dead
+    CollectFromConversation = False
+
+    If Len(anchorEID) = 0 Then Exit Function
+
+    ' --- Resolution de l'ancrage ---
+    Dim anchorMail As Object
+    Set anchorMail = olNS.GetItemFromID(anchorEID)
+    If anchorMail Is Nothing Then Exit Function
+    If anchorMail.Class <> OL_MAIL_CLASS Then Exit Function
+
+    ' Controle de coherence : l'item resolu doit appartenir au bon fil
+    If StrComp(CStr(anchorMail.ConversationID), convID, vbBinaryCompare) <> 0 Then Exit Function
+
+    Dim conv As Object   ' Outlook.Conversation
+    Set conv = anchorMail.GetConversation
+    If conv Is Nothing Then Exit Function   ' store sans index de conversations
+
+    Dim storeID As String
+    storeID = anchorMail.Parent.StoreID
+
+    ' --- Table legere du fil : colonnes par defaut (dont EntryID), pas
+    ' d'hydratation d'objet pendant l'enumeration. On ne resout en item
+    ' complet que les quelques mails DU FIL. ---
+    Dim tbl As Object    ' Outlook.Table
+    Set tbl = conv.GetTable
+
+    ' Items individuels : un item capricieux ne doit pas tuer le fil entier.
+    ' Boucle bornee (garde anti-boucle si EndOfTable devient illisible).
+    On Error Resume Next
+    Dim guard As Long
+    guard = 0
+    Do Until tbl.EndOfTable
+        guard = guard + 1
+        If guard > 500 Then Exit Do
+
+        Dim tblRow As Object   ' Outlook.Row
+        Set tblRow = Nothing
+        Set tblRow = tbl.GetNextRow
+        If tblRow Is Nothing Then Exit Do
+
+        Dim itm As Object
+        Set itm = Nothing
+        Set itm = olNS.GetItemFromID(CStr(tblRow("EntryID")), storeID)
+        If Not itm Is Nothing Then
+            If itm.Class = OL_MAIL_CLASS Then
+                Dim oMail As Outlook.mailItem
+                Set oMail = itm
+
+                Dim senderAddr As String
+                senderAddr = LCase(GetMailSenderSMTP(oMail))
+                ' L'expediteur doit faire partie des destinataires attendus
+                ' (sinon ce n'est pas une "reponse" d'un destinataire suivi).
+                If Len(senderAddr) > 0 Then
+                    ' v4.6 : jamais soi-meme, et uniquement les mails recus
+                    ' STRICTEMENT apres t0 (sinon on compte le message du fil
+                    ' auquel on a repondu : d'ou le "souvent 1" historique).
+                    If StrComp(senderAddr, ownerSMTP, vbTextCompare) <> 0 Then
+                        If AddrInExpected(expected, senderAddr) Then
+                            If oMail.ReceivedTime > floor Then
+                                If Not respDict.Exists(senderAddr) Then
+                                    respDict.Add senderAddr, oMail.ReceivedTime
+                                ElseIf oMail.ReceivedTime < respDict(senderAddr) Then
+                                    respDict(senderAddr) = oMail.ReceivedTime
+                                End If
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    Loop
+    On Error GoTo 0
+
+    CollectFromConversation = True
+    Exit Function
+
+Dead:
+    modDebugLog.DDebug MOD_NAME, "Fil indisponible via ancrage (err " & _
+        Err.Number & ") convID=" & Left(convID, 16) & "..."
+    CollectFromConversation = False
+End Function
+
+'=============================================================================
+' REPARATION (v4.5) : scan recursif unique, limite aux fils dont l'ancrage
+' EntryID est perime. Reprend la mecanique v4.3 (test en memoire du
+' ConversationID, aucun Restrict), avec trois differences :
+'   - depart de la RACINE du store (l'ancrage a pu etre range hors du
+'     sous-arbre Reception), dossiers non-mail elagues (Calendrier,
+'     Contacts, Taches...) ;
+'   - des qu'un mail d'un fil mort est croise, bascule IMMEDIATE sur
+'     CollectFromConversation avec cet ancrage frais (n'importe quel
+'     membre du fil convient pour GetConversation), memorisation du
+'     nouvel EntryID dans dRepaired, retrait du fil de dDead ;
+'   - arret total des que dDead est vide.
+' Si l'index de conversations est indisponible (Collect echoue meme avec
+' un ancrage frais en main), collecte inline v4.3 en secours ultime.
+'=============================================================================
+Private Sub RepairScanTree(folder As Outlook.MAPIFolder, _
+                           ByVal olNS As Outlook.NameSpace, _
+                           ByRef dDead As Object, _
+                           ByRef dExpected As Object, _
+                           ByRef dRespondents As Object, _
+                           ByRef dRepaired As Object, _
+                           ByRef dFloor As Object, _
+                           ByVal ownerSMTP As String)
+    On Error Resume Next
+
+    If dDead.count = 0 Then Exit Sub
+
+    ' Elagage : dossiers non-mail ignores avec toute leur descendance.
+    ' (Si la lecture de DefaultItemType echoue, le If est saute sous
+    ' On Error Resume Next : on scanne, comportement v4.3 par defaut.)
+    If folder.DefaultItemType <> olMailItem Then Exit Sub
+
+    RepairScanFolder folder, olNS, dDead, dExpected, dRespondents, dRepaired, dFloor, ownerSMTP
+
+    Dim sub_ As Outlook.MAPIFolder
+    For Each sub_ In folder.Folders
+        DoEvents
+        RepairScanTree sub_, olNS, dDead, dExpected, dRespondents, dRepaired, dFloor, ownerSMTP
+        If dDead.count = 0 Then Exit Sub
+    Next sub_
+
+    On Error GoTo 0
+End Sub
+
+'=============================================================================
+' Scanne UN dossier (passe de reparation). Pour chaque mail dont le
+' ConversationID figure parmi les fils a reparer : tentative de bascule sur
+' le chemin rapide, sinon collecte inline (cf. en-tete RepairScanTree).
+'=============================================================================
+Private Sub RepairScanFolder(folder As Outlook.MAPIFolder, _
+                             ByVal olNS As Outlook.NameSpace, _
+                             ByRef dDead As Object, _
+                             ByRef dExpected As Object, _
+                             ByRef dRespondents As Object, _
+                             ByRef dRepaired As Object, _
+                             ByRef dFloor As Object, _
+                             ByVal ownerSMTP As String)
+    On Error Resume Next
+
+    Dim items As Outlook.items
+    Set items = folder.items
+
+    Dim cnt As Long
+    cnt = items.count
+    If cnt = 0 Then Exit Sub
+
+    Dim i As Long
+    For i = 1 To cnt
+        Dim Item As Object
+        Set Item = Nothing
+        Set Item = items.Item(i)
+        If Item Is Nothing Then GoTo NextItem
+        If Item.Class <> OL_MAIL_CLASS Then GoTo NextItem
+
+        Dim oMail As Outlook.mailItem
+        Set oMail = Item
+
+        Dim cID As String
+        cID = ""
+        cID = oMail.ConversationID
+        If Len(cID) = 0 Then GoTo NextItem
+        If Not dDead.Exists(cID) Then GoTo NextItem
+
+        Dim respD As Object
+        Set respD = dRespondents(cID)
+
+        ' --- Bascule immediate sur le chemin rapide avec cet ancrage frais ---
+        If CollectFromConversation(olNS, CStr(oMail.entryID), cID, _
+                                   CStr(dExpected(cID)), respD, _
+                                   CDate(dFloor(cID)), ownerSMTP) Then
+            dRepaired(cID) = CStr(oMail.entryID)
+            dDead.Remove cID
+            If dDead.count = 0 Then Exit Sub
+            GoTo NextItem
+        End If
+
+        ' --- Secours ultime (index de conversations indisponible) :
+        '     collecte inline v4.3 sur ce mail. Le fil reste dans dDead
+        '     (chaque mail du fil croise sera examine, comme en v4.3). ---
+        Dim senderAddr As String
+        senderAddr = LCase(GetMailSenderSMTP(oMail))
+        If Len(senderAddr) = 0 Then GoTo NextItem
+
+        ' v4.6 : meme filtre que le chemin rapide (pas soi-meme, apres t0).
+        If StrComp(senderAddr, ownerSMTP, vbTextCompare) <> 0 Then
+            If AddrInExpected(CStr(dExpected(cID)), senderAddr) Then
+                If oMail.ReceivedTime > CDate(dFloor(cID)) Then
+                    If Not respD.Exists(senderAddr) Then
+                        respD.Add senderAddr, oMail.ReceivedTime
+                    ElseIf oMail.ReceivedTime < respD(senderAddr) Then
+                        respD(senderAddr) = oMail.ReceivedTime
+                    End If
+                End If
+            End If
+        End If
+NextItem:
+    Next i
+
+    On Error GoTo 0
+End Sub
+
+'=============================================================================
+' RECUPERER L'ADRESSE SMTP DE L'EXPEDITEUR
+'=============================================================================
+Private Function GetMailSenderSMTP(oMail As Outlook.mailItem) As String
+    ' Pack v3 (C2) : chaine unifiee (PR_SENDER_SMTP, SenderEmailAddress, Sender Exchange).
+    GetMailSenderSMTP = modSmtp.SenderSmtp(oMail)
+End Function
+
+'=============================================================================
+' CALCULER LE STATUT DE SUIVI
+'=============================================================================
+Private Function CalculateStatus(hasReply As Boolean, isLate As Boolean, _
+                                 followupCount As Long) As String
+    ' v4.6 : modele BINAIRE. On ne distingue plus partielle/complete : des
+    ' qu'au moins une reponse (apres t0, hors soi-meme) est arrivee, le
+    ' suivi est "Repondu". Sinon : "En retard" si echeance depassee,
+    ' "Relance" si une relance est partie et qu'on attend de nouveau,
+    ' "En attente" sinon.
+    If hasReply Then
+        CalculateStatus = "R" & Chr(233) & "pondu"
+    ElseIf isLate Then
+        CalculateStatus = "En retard"
+    ElseIf followupCount > 0 Then
+        CalculateStatus = "Relanc" & Chr(233)
+    Else
+        CalculateStatus = "En attente"
+    End If
+End Function
+
+'=============================================================================
+' FORMATER LA CELLULE STATUT AVEC DES COULEURS
+'=============================================================================
+Private Sub FormatStatusCell(cell As Object)
+
+    Dim status As String
+    status = CStr(cell.Value)
+
+    cell.Font.Bold = True
+    cell.Font.name = "Arial"
+    cell.Font.Size = 11
+
+    Select Case True
+        Case status = "R" & Chr(233) & "pondu"
+            cell.Interior.Color = RGB(198, 239, 206)
+            cell.Font.Color = RGB(0, 97, 0)
+        Case status = "En retard"
+            cell.Interior.Color = RGB(255, 174, 174)
+            cell.Font.Color = RGB(156, 0, 0)
+        Case status = "R" & Chr(233) & "pondu ?"
+            cell.Interior.Color = RGB(255, 217, 179)
+            cell.Font.Color = RGB(197, 90, 17)
+        Case status = "Relanc" & Chr(233)
+            cell.Interior.Color = RGB(197, 217, 241)
+            cell.Font.Color = RGB(31, 73, 125)
+        Case status = "En attente"
+            cell.Interior.Color = RGB(230, 230, 230)
+            cell.Font.Color = RGB(89, 89, 89)
+        Case status = "Trait" & Chr(233)
+            cell.Interior.Color = RGB(217, 217, 217)
+            cell.Font.Color = RGB(64, 64, 64)
+    End Select
+
+End Sub
+
+'=============================================================================
+' v4.6 : HELPERS - t0 par ligne, echeance lisible, proprietaire de la boite.
+'=============================================================================
+' t0 d'une ligne : date de la derniere relance si presente, sinon date
+' d'envoi. Sert de plancher au comptage des reponses ET de base au calcul
+' de la date limite.
+' Pack v3 (B3) : variantes "bloc" (tableau 2D deja lu) de la lecture de ligne.
+Private Function SafeVal(ByRef blk As Variant, ByVal r As Long, ByVal c As Long) As Variant
+    On Error Resume Next
+    SafeVal = Empty
+    SafeVal = blk(r, c)
+End Function
+
+Private Function RowFloorFromBlock(ByRef blk As Variant, ByVal r As Long) As Date
+    On Error Resume Next
+    Dim lf As Date, sd As Date
+    lf = 0: sd = 0
+    sd = CDate(SafeVal(blk, r, COL_SENT_DATE))
+    Dim lfv As String
+    lfv = CStr(SafeVal(blk, r, COL_LAST_FOLLOWUP))
+    If Len(lfv) > 0 Then lf = CDate(SafeVal(blk, r, COL_LAST_FOLLOWUP))
+    If lf > sd Then RowFloorFromBlock = lf Else RowFloorFromBlock = sd
+End Function
+
+Private Function RowFloorDate(ws As Object, ByVal r As Long) As Date
+    On Error Resume Next
+    Dim lf As Date, sd As Date
+    lf = 0: sd = 0
+    sd = CDate(ws.Cells(r, COL_SENT_DATE).Value)
+    Dim lfv As String
+    lfv = CStr(ws.Cells(r, COL_LAST_FOLLOWUP).Value)
+    If Len(lfv) > 0 Then lf = CDate(ws.Cells(r, COL_LAST_FOLLOWUP).Value)
+    If lf > sd Then RowFloorDate = lf Else RowFloorDate = sd
+End Function
+
+' Colonne "Echeance" : J-x avant l'echeance, "Retard Xj" apres.
+Private Sub UpdateDeadlineCell(ws As Object, ByVal r As Long)
+    On Error Resume Next
+    Dim due As Date
+    due = 0
+    due = CDate(ws.Cells(r, COL_DUE_DATE).Value)
+    If due = 0 Then
+        ws.Cells(r, COL_DEADLINE).Value = ""
+        Exit Sub
+    End If
+    Dim d As Long
+    d = DateDiff("d", Int(Now), Int(due))
+    Dim txt As String
+    If d > 0 Then
+        txt = T("J-", "D-") & d
+    ElseIf d = 0 Then
+        txt = T("Aujourd'hui", "Today")
+    Else
+        txt = T("Retard ", "Overdue ") & (-d) & T(" j", " d")
+    End If
+    ws.Cells(r, COL_DEADLINE).Value = txt
+End Sub
+
+' Adresse SMTP du proprietaire de la boite (jamais comptee comme reponse).
+Private Function GetOwnerSMTP(ByVal olNS As Outlook.NameSpace) As String
+    On Error Resume Next
+    GetOwnerSMTP = LCase(modSmtp.MySmtp())
+    If Len(GetOwnerSMTP) = 0 Then GetOwnerSMTP = LCase(olNS.CurrentUser.Address)
+End Function
+
+'=============================================================================
+' v4.4 (2026-05-28) - 2A : RAPPEL AU DEMARRAGE DES SUIVIS EN RETARD
+'
+' Appele depuis ThisOutlookSession.Application_Startup via un
+' Application.OnTime differe (+20s, apres le rattrapage coloration a +15s).
+'
+' Comportement (cf. user story) :
+'   - Scan silencieux du tracker (reutilise le chemin rapide v4.5).
+'   - Si >= 1 suivi en retard (date limite < aujourd'hui ET reponses
+'     incompletes) : UNE seule MsgBox recap (nb + 3 premiers objets),
+'     proposant d'ouvrir le tableau de bord.
+'   - Si zero retard : RIEN (le silence est voulu, pas de bruit).
+'   - Garde-fou "une fois par jour" via registre (comme modBackupAuto) :
+'     ne re-pop pas si Outlook est redemarre plusieurs fois le meme jour.
+'   - Echec silencieux total si tracker/Excel absent (loggue en DEBUG).
+'
+' Point d'entree sans parametre, compatible Application.OnTime.
+' (Les constantes REG_*_SUIVI sont declarees en tete de module.)
+'=============================================================================
+Public Sub RemindOverdue()
+    On Error GoTo Done
+
+    ' Garde-fou : une seule pop par jour civil
+    Dim lastPop As String
+    lastPop = GetSetting(REG_TRACK_APP, REG_TRACK_SECTION, REG_KEY_LASTPOP, "")
+    Dim today As String
+    today = Format(Now, "YYYY-MM-DD")
+    If lastPop = today Then Exit Sub
+
+    ' Le fichier doit exister, sinon rien a faire (echec silencieux)
+    Dim trackingFile As String
+    trackingFile = GetTrackerFilePath()
+    If Dir(trackingFile) = "" Then Exit Sub
+
+    Dim xlApp As Object
+    Set xlApp = GetExcelApp()
+    If xlApp Is Nothing Then Exit Sub
+    xlApp.DisplayAlerts = False
+
+    Dim wb As Object
+    Set wb = GetTrackerWorkbook(xlApp)
+    If wb Is Nothing Then Exit Sub
+
+    ' v5.0 : lecture silencieuse. Si on vient d'ouvrir le classeur, masquer
+    ' sa fenetre pour qu'Excel ne saute pas dessus (et n'y reste pas affiche
+    ' pendant la MsgBox de rappel ci-dessous). Le dashboard, lui, l'affichera.
+    If mWbOpenedHere Then HideBackgroundWorkbook xlApp, wb
+
+    Dim ws As Object
+    Set ws = wb.Sheets(modConfig.MailTrackingSheet())
+
+    ' v5.1 : PRE-SCAN sur la FEUILLE (zero acces Outlook). Une ligne est
+    ' candidate au retard si son statut est deja "En retard" OU si sa date
+    ' limite est depassee (statuts terminaux exclus). Zero candidate ->
+    ' sortie immediate : le recalcul complet (un parcours de fil Outlook
+    ' par suivi actif) ne gele plus le demarrage les jours sans retard.
+    Dim lastRowPre As Long
+    lastRowPre = ws.Cells(ws.Rows.count, COL_ID).End(-4162).row
+    If lastRowPre < 2 Then GoTo Done
+
+    Dim candidateCount As Long, rPre As Long
+    candidateCount = 0
+    For rPre = 2 To lastRowPre
+        Dim stPre As String
+        stPre = CStr(ws.Cells(rPre, COL_STATUS).Value)
+        If stPre = "R" & Chr(233) & "pondu" Then GoTo NextPre
+        If stPre = "Trait" & Chr(233) Then GoTo NextPre
+        If InStr(1, stPre, "En retard", vbTextCompare) > 0 Then
+            candidateCount = candidateCount + 1
+        Else
+            Dim duePre As Date
+            duePre = 0
+            On Error Resume Next
+            duePre = CDate(ws.Cells(rPre, COL_DUE_DATE).Value)
+            On Error GoTo Done
+            If duePre > 0 And duePre < Date Then candidateCount = candidateCount + 1
+        End If
+NextPre:
+    Next rPre
+
+    If candidateCount = 0 Then
+        SaveSetting REG_TRACK_APP, REG_TRACK_SECTION, REG_KEY_LASTPOP, today
+        modDebugLog.DDebug MOD_NAME, "RemindOverdue : 0 candidat (pre-scan feuille)"
+        GoTo Done
+    End If
+
+    ' Recalcul LIMITE aux candidates (v5.1) : verifie qu'elles sont encore
+    ' reellement en attente (une reponse a pu arriver Outlook ferme).
+    UpdateAllTrackingStatuses ws, True
+    SaveWorkbookVisible xlApp, wb
+
+    ' Comptage des retards + collecte des 3 premiers objets
+    Dim lastRow As Long
+    lastRow = ws.Cells(ws.Rows.count, COL_ID).End(-4162).row
+    If lastRow < 2 Then GoTo Done
+
+    Dim overdueCount As Long
+    Dim preview As String
+    Dim row As Long
+    overdueCount = 0
+    preview = ""
+
+    For row = 2 To lastRow
+        Dim status As String
+        status = CStr(ws.Cells(row, COL_STATUS).Value)
+        ' v4.6 : le statut binaire "En retard" est l'unique etat de retard
+        If InStr(1, status, "En retard", vbTextCompare) > 0 Then
+            overdueCount = overdueCount + 1
+            If overdueCount <= 3 Then
+                Dim obj As String
+                obj = CStr(ws.Cells(row, COL_SUBJECT).Value)
+                If Len(obj) > 55 Then obj = Left(obj, 55) & "..."
+                preview = preview & "  - " & obj & vbCrLf
+            End If
+        End If
+    Next row
+
+    ' On marque la pop comme faite pour aujourd'hui (qu'il y ait des retards
+    ' ou non : si zero retard, on ne re-scannera pas inutilement aujourd'hui).
+    SaveSetting REG_TRACK_APP, REG_TRACK_SECTION, REG_KEY_LASTPOP, today
+
+    If overdueCount = 0 Then
+        modDebugLog.DDebug MOD_NAME, "RemindOverdue : 0 retard"
+        GoTo Done                          ' v5.1 : liberer le classeur (fuite)
+    End If
+
+    Dim msg As String
+    msg = overdueCount & T(" mail(s) en attente de r" & Chr(233) & "ponse, " & _
+          "d" & Chr(233) & "lai d" & Chr(233) & "pass" & Chr(233) & " :", _
+          " mail(s) awaiting a reply, overdue:") & vbCrLf & vbCrLf & _
+          preview
+    If overdueCount > 3 Then
+        msg = msg & T("  ... et ", "  ... and ") & (overdueCount - 3) & T(" autre(s)", " other(s)") & vbCrLf
+    End If
+    ' v6 : plus de question - le toast informe, il ne demande rien.
+    msg = msg & vbCrLf & T("Tableau de bord : bouton Suivi Mails du ruban.", _
+                           "Dashboard: Mail Tracking button on the ribbon.")
+
+    modDebugLog.DInfo MOD_NAME, "RemindOverdue : " & overdueCount & " retard(s)"
+
+    ' v5.9 : LIBERER AVANT la MsgBox. Le classeur restait ouvert (masque,
+    ' verrouille) tant que la boite captive n'etait pas fermee - parfois de
+    ' longues minutes -, fenetre pendant laquelle un differe ou un evenement
+    ' pouvait s'imbriquer et derober la propriete du classeur. Tout ce qu'il
+    ' faut afficher est deja dans msg ; le tableau de bord rouvrira lui-meme.
+    On Error Resume Next
+    ReleaseBackground xlApp, wb
+    Set wb = Nothing
+    On Error GoTo Done
+
+    ' v6 : TOAST au lieu d'une modale Oui/Non.
+    ' Cette boite s'ouvrait ~20 s apres le demarrage d'Outlook (differe
+    ' "RemindOverdue"), donc en plein milieu de la mise en route de la
+    ' journee : c'etait l'interruption la plus couteuse du toolkit, et la
+    ' seule qui arrive sans que l'utilisateur ait rien demande.
+    ' Le toast porte le nombre de retards et les premiers sujets ; le
+    ' tableau de bord reste accessible par le bouton ruban dedie.
+    ' CONTREPARTIE ASSUMEE : on perd l'ouverture en un clic. Les toasts de
+    ' ce toolkit ne sont pas cliquables (mshta, cf. modNotify) et cabler un
+    ' onclick a ete ecarte - probe HTA + risque EDR. Le compromis retenu est
+    ' l'information sans capture du fil.
+    modUi.Toast msg, uiSuccess, True
+    Exit Sub
+
+Done:
+    Dim errNum As Long, errDesc As String
+    errNum = Err.Number
+    errDesc = Err.Description
+    ' v5.1 : liberer le classeur sur TOUTES les sorties par Done (zero
+    ' candidat, feuille vide, erreur). Avant, seules les branches Oui/Non
+    ' liberaient : les autres laissaient un classeur ouvert MASQUE et
+    ' verrouille dans une instance Excel fantome.
+    On Error Resume Next
+    If Not wb Is Nothing Then ReleaseBackground xlApp, wb
+    If errNum <> 0 Then
+        modDebugLog.DDebug MOD_NAME, "RemindOverdue err " & _
+            errNum & " - " & errDesc
+    End If
+End Sub
+
+'=============================================================================
+' v4.4 (2026-05-28) - 2C : RELANCER LE SUIVI SELECTIONNE
+'
+' A lancer depuis le tableau de bord Excel : l'utilisateur selectionne une
+' ligne (n'importe quelle cellule de la ligne), puis declenche cette macro
+' (bouton ruban Excel, ou raccourci). On lit le ConversationID en colonne K,
+' on retrouve le fil dans Outlook, et on ouvre un brouillon ReplyAll
+' pre-rempli. Si le fil est introuvable, fallback : nouveau mail vers les
+' destinataires d'origine (colonne D).
+'
+' Note : cette macro vit cote Outlook (modMailResponseTracker) mais lit la
+' selection dans le classeur Excel deja ouvert par OpenTrackingDashboard.
+'=============================================================================
+Public Sub FollowUpSelected()
+    On Error GoTo ErrH
+
+    ' Recuperer l'instance Excel et la cellule active
+    Dim xlApp As Object
+    Set xlApp = GetExcelApp()
+    If xlApp Is Nothing Then
+        MsgBox T("Excel n'est pas accessible.", "Excel is not accessible."), vbExclamation, T("Suivi Mails", "Mail Tracking")
+        Exit Sub
+    End If
+
+    Dim sel As Object
+    On Error Resume Next
+    Set sel = xlApp.Selection
+    On Error GoTo ErrH
+    If sel Is Nothing Then
+        MsgBox T("S" & Chr(233) & "lectionnez d'abord une ligne dans le tableau de bord.", "Select a row in the dashboard first."), _
+               vbExclamation, T("Suivi Mails", "Mail Tracking")
+        Exit Sub
+    End If
+
+    Dim ws As Object
+    Set ws = sel.Worksheet
+
+    Dim row As Long
+    row = sel.row
+    If row < 2 Then
+        MsgBox T("S" & Chr(233) & "lectionnez une ligne de donn" & Chr(233) & "es " & _
+               "(pas l'en-t" & Chr(234) & "te).", "Select a data row (not the header)."), vbExclamation, T("Suivi Mails", "Mail Tracking")
+        Exit Sub
+    End If
+
+    Dim convID As String
+    Dim subjectText As String
+    Dim recipients As String
+    convID = CStr(ws.Cells(row, COL_CONV_ID).Value)
+    subjectText = CStr(ws.Cells(row, COL_SUBJECT).Value)
+    recipients = CStr(ws.Cells(row, COL_RECIPIENTS).Value)
+
+    ' --- Tenter de retrouver le mail d'origine via ConversationID ---
+    Dim originalMail As Outlook.mailItem
+    Set originalMail = Nothing
+    If Len(convID) > 0 Then
+        Set originalMail = FindMailByConversation(convID)
+    End If
+
+    Dim followUp As Outlook.mailItem
+    If Not originalMail Is Nothing Then
+        ' ReplyAll sur le fil : conserve le sujet, les destinataires, le fil
+        Set followUp = originalMail.ReplyAll
+        followUp.body = T("Bonjour," & vbCrLf & vbCrLf & _
+            "Je me permets de revenir vers vous concernant le message ci-dessous, " & _
+            "rest" & Chr(233) & " sans r" & Chr(233) & "ponse a ce jour." & vbCrLf & _
+            "Pourriez-vous m'indiquer ou en est ce point ?" & vbCrLf & vbCrLf & _
+            "Bien cordialement,", _
+            "Hello," & vbCrLf & vbCrLf & _
+            "I'm following up on the message below, which is still unanswered to date." & vbCrLf & _
+            "Could you let me know where this stands?" & vbCrLf & vbCrLf & _
+            "Best regards,") & vbCrLf & followUp.body
+    Else
+        ' Fallback : nouveau mail vers les destinataires d'origine
+        Set followUp = Application.CreateItem(olMailItem)
+        followUp.subject = T("Relance : ", "Follow-up: ") & subjectText
+        followUp.To = Replace(recipients, "; ", ";")
+        ' v6.1 : le SUJET sort de T(). Enjeu double ici : A() decoderait
+        ' "~e"/"~a" dans l'objet d'origine, ET ce texte part dans un
+        ' BROUILLON destine a un tiers - une corruption y coute bien plus
+        ' cher que dans une boite de dialogue.
+        followUp.body = T("Bonjour,", "Hello,") & vbCrLf & vbCrLf & _
+            T("Je me permets de revenir vers vous concernant ma sollicitation ", _
+              "I'm following up on my request ") & _
+            """" & subjectText & """" & _
+            T(", rest~ee sans r~eponse a ce jour.", ", still unanswered to date.") & vbCrLf & _
+            T("Pourriez-vous m'indiquer ou en est ce point ?", _
+              "Could you let me know where this stands?") & vbCrLf & vbCrLf & _
+            T("Bien cordialement,", "Best regards,")
+    End If
+
+    followUp.Display   ' on ouvre le brouillon, l'utilisateur relit et envoie
+    modDebugLog.DInfo MOD_NAME, "Relance preparee pour ligne " & row & _
+        " (convID " & IIf(Len(convID) > 0, "trouve", "absent") & ")"
+    Exit Sub
+
+ErrH:
+    modDebugLog.DError MOD_NAME, "FollowUpSelected err " & _
+        Err.Number & " - " & Err.Description
+    MsgBox T("Erreur lors de la pr" & Chr(233) & "paration de la relance :", "Error while preparing the follow-up:") & vbCrLf & _
+           Err.Number & " - " & Err.Description, vbExclamation, T("Suivi Mails", "Mail Tracking")
+End Sub
+
+'=============================================================================
+' Retrouve un mail du fil via son ConversationID, en parcourant l'arbre de
+' la boite de reception + les Envoyes. Renvoie le mail le plus pertinent
+' (le dernier recu, ou a defaut le premier trouve). Nothing si introuvable.
+'=============================================================================
+Private Function FindMailByConversation(ByVal convID As String) As Outlook.mailItem
+    On Error Resume Next
+    Set FindMailByConversation = Nothing
+    If Len(convID) = 0 Then Exit Function
+
+    Dim olNS As Outlook.NameSpace
+    Set olNS = Application.GetNamespace("MAPI")
+
+    Dim meilleur As Outlook.mailItem
+    Set meilleur = Nothing
+
+    ' On cherche d'abord dans la boite de reception (arbre complet),
+    ' puis dans les Envoyes : un mail du fil suffit pour faire ReplyAll.
+    SearchTree olNS.GetDefaultFolder(olFolderInbox), convID, meilleur
+    If meilleur Is Nothing Then
+        SearchTree olNS.GetDefaultFolder(olFolderSentMail), convID, meilleur
+    End If
+
+    Set FindMailByConversation = meilleur
+    On Error GoTo 0
+End Function
+
+Private Sub SearchTree(ByVal folder As Outlook.MAPIFolder, _
+                              ByVal convID As String, _
+                              ByRef meilleur As Outlook.mailItem)
+    On Error Resume Next
+
+    Dim items As Outlook.items
+    Set items = folder.items
+    Dim cnt As Long
+    cnt = items.count
+
+    Dim i As Long
+    For i = 1 To cnt
+        Dim itm As Object
+        Set itm = Nothing
+        Set itm = items.Item(i)
+        If Not itm Is Nothing Then
+            If itm.Class = OL_MAIL_CLASS Then
+                If StrComp(CStr(itm.ConversationID), convID, vbBinaryCompare) = 0 Then
+                    ' On garde le plus recent (ReceivedTime le plus grand)
+                    If meilleur Is Nothing Then
+                        Set meilleur = itm
+                    ElseIf itm.ReceivedTime > meilleur.ReceivedTime Then
+                        Set meilleur = itm
+                    End If
+                End If
+            End If
+        End If
+    Next i
+
+    ' Recursion sous-dossiers
+    Dim sub_ As Outlook.MAPIFolder
+    For Each sub_ In folder.Folders
+        DoEvents
+        SearchTree sub_, convID, meilleur
+    Next sub_
+
+    On Error GoTo 0
+End Sub
+
+'=============================================================================
+' v4.7 - MOTEUR DE RELANCES
+' Point d'entree a poser sur la barre d'acces rapide. Recalcule d'abord les
+' suivis (pour ne pas relancer quelqu'un qui vient de repondre), collecte les
+' lignes en retard (date limite depassee, statut non terminal) et propose,
+' ligne par ligne, une boite Win32 a 3 niveaux. Suppressions differees en fin
+' de passe (ordre descendant) pour ne pas decaler les lignes en cours.
+'=============================================================================
+Public Sub FollowUpOverdue()
+    On Error GoTo ErrH
+
+    Dim xlApp As Object, wb As Object, ws As Object
+    Set xlApp = GetExcelApp()
+    If xlApp Is Nothing Then Exit Sub
+    Set wb = GetTrackerWorkbook(xlApp)
+    If wb Is Nothing Then Exit Sub
+    Set ws = wb.Sheets(modConfig.MailTrackingSheet())
+
+    modCommon.SetStatus MOD_NAME, T("Mise a jour des suivis...", "Updating tracking...")
+    UpdateAllTrackingStatuses ws
+
+    Dim lastRow As Long
+    lastRow = ws.Cells(ws.Rows.count, COL_ID).End(-4162).row
+    If lastRow < 2 Then
+        ReleaseBackground xlApp, wb        ' v5.9 : pas de classeur laisse ouvert
+        MsgBox T("Aucun suivi enregistr" & Chr(233) & ".", "No tracked mail."), _
+               vbInformation, T("Suivi Mails", "Mail Tracking")
+        Exit Sub
+    End If
+
+    ' Lignes en retard : calcul LIVE (date limite < maintenant), statut non
+    ' terminal. Plus robuste que de se fier au libelle de statut stocke.
+    Dim overdue As Collection
+    Set overdue = New Collection
+    Dim r As Long
+    For r = 2 To lastRow
+        Dim st As String
+        st = CStr(ws.Cells(r, COL_STATUS).Value)
+        If st <> "R" & Chr(233) & "pondu" And st <> "Trait" & Chr(233) Then
+            Dim due As Date
+            due = 0
+            On Error Resume Next
+            due = CDate(ws.Cells(r, COL_DUE_DATE).Value)
+            On Error GoTo ErrH
+            If due > 0 And Now > due Then overdue.Add r
+        End If
+    Next r
+
+    If overdue.count = 0 Then
+        SaveWorkbookVisible xlApp, wb      ' v5.9 : statuts recalcules -> conserver
+        ReleaseBackground xlApp, wb        ' v5.9 : pas de classeur laisse ouvert
+        MsgBox T("Aucune relance en retard.", "No overdue follow-up."), _
+               vbInformation, T("Suivi Mails", "Mail Tracking")
+        Exit Sub
+    End If
+
+    Dim toDelete As Collection
+    Set toDelete = New Collection
+    Dim processed As Long
+    processed = 0
+
+    Dim idx As Long, sig As Long
+    For idx = 1 To overdue.count
+        r = overdue(idx)
+        sig = FollowupRowDialog(ws, r, toDelete)
+        If sig = -1 Then Exit For          ' Arreter (ou Echap au niveau 1)
+        processed = processed + 1
+    Next idx
+
+    ' Suppressions differees : de la derniere ligne ajoutee (la plus haute)
+    ' vers la premiere, pour ne pas decaler les numeros encore en attente.
+    Dim di As Long
+    For di = toDelete.count To 1 Step -1
+        ws.Rows(CLng(toDelete(di))).Delete
+    Next di
+
+    On Error Resume Next
+    SaveWorkbookVisible xlApp, wb
+    ReleaseBackground xlApp, wb
+    On Error GoTo 0
+
+    modCommon.SetStatus MOD_NAME, T("Relances : ", "Follow-ups: ") & processed & _
+        T(" ligne(s) trait" & Chr(233) & "e(s).", " row(s) processed.")
+    Exit Sub
+
+ErrH:
+    modDebugLog.DError MOD_NAME, "FollowUpOverdue err " & Err.Number & " - " & Err.Description
+    ' v5.9 : liberer le classeur sur erreur.
+    On Error Resume Next
+    If Not wb Is Nothing Then ReleaseBackground xlApp, wb
+End Sub
+
+'=============================================================================
+' Appele (en differe) par Application_ItemSend quand une relance PERSONNALISEE
+' a ete REELLEMENT envoyee. Retrouve la ligne par ConversationID et lui
+' applique la mise a jour de relance (t0, date limite, compteur, statut).
+'=============================================================================
+Public Sub RegisterFollowupSent(ByVal convID As String)
+    On Error GoTo ErrH
+    If Len(convID) = 0 Then Exit Sub
+
+    Dim xlApp As Object, wb As Object, ws As Object
+    Set xlApp = GetExcelApp()
+    If xlApp Is Nothing Then Exit Sub
+    Set wb = GetTrackerWorkbook(xlApp)
+    If wb Is Nothing Then Exit Sub
+    Set ws = wb.Sheets(modConfig.MailTrackingSheet())
+
+    Dim lastRow As Long
+    lastRow = ws.Cells(ws.Rows.count, COL_ID).End(-4162).row
+    If lastRow < 2 Then
+        ReleaseBackground xlApp, wb        ' v5.9 : pas de classeur laisse ouvert
+        Exit Sub
+    End If
+
+    Dim r As Long
+    For r = 2 To lastRow
+        If CStr(ws.Cells(r, COL_CONV_ID).Value) = convID Then
+            ApplyFollowupToRow ws, r
+            Exit For
+        End If
+    Next r
+
+    On Error Resume Next
+    SaveWorkbookVisible xlApp, wb
+    ReleaseBackground xlApp, wb
+    On Error GoTo 0
+    modDebugLog.DInfo MOD_NAME, "RegisterFollowupSent : relance personnalisee comptee"
+    Exit Sub
+
+ErrH:
+    modDebugLog.DError MOD_NAME, "RegisterFollowupSent err " & Err.Number & " - " & Err.Description
+    ' v5.9 : liberer le classeur sur erreur.
+    On Error Resume Next
+    If Not wb Is Nothing Then ReleaseBackground xlApp, wb
+End Sub
+
+'=============================================================================
+' Boite a 3 niveaux pour UNE ligne en retard.
+' Retour : 0 = traite (continuer) ; -1 = arreter la passe.
+' Une suppression demandee est ajoutee a toDelete (effectuee en fin de passe).
+'=============================================================================
+Private Function FollowupRowDialog(ws As Object, ByVal r As Long, _
+                                   ByRef toDelete As Collection) As Long
+    FollowupRowDialog = 0
+
+    Dim subj As String, recips As String, fcount As Long
+    subj = CStr(ws.Cells(r, COL_SUBJECT).Value)
+    recips = CStr(ws.Cells(r, COL_RECIPIENTS).Value)
+    fcount = 0
+    On Error Resume Next
+    fcount = CLng(ws.Cells(r, COL_FOLLOWUP_COUNT).Value)
+    On Error GoTo 0
+
+    Dim head As String
+    head = T("Objet : ", "Subject: ") & subj & vbCrLf & _
+           T("Destinataires : ", "Recipients: ") & recips & vbCrLf
+    If fcount > 0 Then
+        head = head & T("Relances d" & Chr(233) & "j" & Chr(224) & " envoy" & Chr(233) & "es : ", _
+                        "Follow-ups already sent: ") & fcount & vbCrLf
+    End If
+    head = head & vbCrLf
+
+    ' --- Niveau 1 : Relancer / Modifier le suivi / Arreter ---
+    Dim lvl1 As VbMsgBoxResult
+    lvl1 = modMsgBoxCustom.Confirm3( _
+        head & T("Que faire pour ce suivi en retard ?", "What to do with this overdue follow-up?"), _
+        T("Relance en retard", "Overdue follow-up"), _
+        T("Relancer", "Follow up"), _
+        T("Modifier", "Edit"), _
+        T("Arr" & Chr(234) & "ter", "Stop"), _
+        vbQuestion, 0, 3)
+
+    Select Case lvl1
+        Case vbCancel
+            FollowupRowDialog = -1          ' Arreter / Echap
+            Exit Function
+
+        Case vbNo
+            ' --- Niveau 2b : Modifier le suivi (Choose3, pas d'Echap-suppression) ---
+            Dim act As Long
+            act = modMsgBoxCustom.Choose3( _
+                head & T("Modifier le suivi :", "Edit tracking:"), _
+                T("Modifier le suivi", "Edit tracking"), _
+                T("Prolonger", "Extend"), _
+                T("Marquer trait" & Chr(233), "Mark done"), _
+                T("Suppr. suivi", "Delete"), _
+                vbQuestion, 0, 1)
+            Select Case act
+                Case 1
+                    ExtendRow ws, r
+                Case 2
+                    MarkRowDone ws, r
+                Case 3
+                    If MsgBox(T("Supprimer d" & Chr(233) & "finitivement ce suivi ?", _
+                                "Delete this tracking entry permanently?") & vbCrLf & subj, _
+                              vbQuestion + vbYesNo + vbDefaultButton2, _
+                              T("Suivi Mails", "Mail Tracking")) = vbYes Then
+                        toDelete.Add r
+                    End If
+            End Select
+
+        Case vbYes
+            ' --- Niveau 2a : type de relance ---
+            Dim lvl2 As VbMsgBoxResult
+            lvl2 = modMsgBoxCustom.Confirm3( _
+                head & T("Type de relance :", "Follow-up type:"), _
+                T("Relance", "Follow-up"), _
+                T("Automatique", "Automatic"), _
+                T("Personnaliser", "Customize"), _
+                T("Annuler", "Cancel"), _
+                vbQuestion, 0, 2)
+            Select Case lvl2
+                Case vbYes
+                    SendFollowup ws, r, True     ' auto (silencieux)
+                Case vbNo
+                    SendFollowup ws, r, False    ' personnaliser (affiche)
+                Case Else
+                    ' Annuler / Echap : passer cette ligne
+            End Select
+    End Select
+End Function
+
+'=============================================================================
+' Construit la relance (ReplyAll sur le mail du fil, repli = nouveau mail),
+' puis .Send (auto) ou .Display (personnaliser). Met la ligne a jour.
+'=============================================================================
+Private Sub SendFollowup(ws As Object, ByVal r As Long, ByVal autoSend As Boolean)
+    On Error GoTo ErrH
+
+    If autoSend And Not OutlookOnline() Then
+        MsgBox T("Outlook est hors connexion : l'envoi automatique est suspendu." & vbCrLf & _
+                 "Reconnectez-vous, ou utilisez Personnaliser.", _
+                 "Outlook is offline: automatic sending is paused." & vbCrLf & _
+                 "Reconnect, or use Customize."), _
+               vbExclamation, T("Suivi Mails", "Mail Tracking")
+        Exit Sub
+    End If
+
+    Dim convID As String, entryID As String, subj As String, recips As String
+    convID = CStr(ws.Cells(r, COL_CONV_ID).Value)
+    entryID = CStr(ws.Cells(r, COL_ENTRY_ID).Value)
+    subj = CStr(ws.Cells(r, COL_SUBJECT).Value)
+    recips = CStr(ws.Cells(r, COL_RECIPIENTS).Value)
+
+    Dim src As Outlook.mailItem
+    Set src = ResolveTrackedMail(entryID, convID)
+
+    Dim fu As Outlook.mailItem
+    If Not src Is Nothing Then
+        Set fu = src.ReplyAll
+        fu.HTMLBody = InsertFollowupHtml(fu.HTMLBody, FollowupBodyHtml(autoSend))
+    Else
+        ' Repli : nouveau mail vers les destinataires d'origine.
+        Set fu = Application.CreateItem(olMailItem)
+        fu.subject = T("Relance : ", "Follow-up: ") & subj
+        fu.To = Replace(recips, "; ", ";")
+        fu.HTMLBody = InsertFollowupHtml(fu.HTMLBody, FollowupBodyHtml(autoSend))
+    End If
+
+    If autoSend Then
+        fu.Send
+        ApplyFollowupToRow ws, r           ' envoi effectif -> maj immediate
+        modDebugLog.DInfo MOD_NAME, "Relance auto envoyee, ligne " & r
+    Else
+        ' Personnaliser : on tague le brouillon avec le ConversationID. La
+        ' ligne ne sera mise a jour QUE si le mail est REELLEMENT envoye
+        ' (Application_ItemSend -> modDefer -> RegisterFollowupSent). Tant
+        ' que le brouillon n'est pas envoye, AUCUNE relance n'est comptee.
+        Dim up As Object
+        Set up = fu.UserProperties.Find(FOLLOWUP_PROP)
+        If up Is Nothing Then Set up = fu.UserProperties.Add(FOLLOWUP_PROP, olText)
+        up.Value = convID
+        fu.Display
+        modDebugLog.DInfo MOD_NAME, "Relance personnalisee affichee (attente d'envoi), ligne " & r
+    End If
+
+    Exit Sub
+
+ErrH:
+    modDebugLog.DError MOD_NAME, "SendFollowup err " & Err.Number & " - " & Err.Description
+    MsgBox T("Erreur lors de la relance :", "Error while sending the follow-up:") & vbCrLf & _
+           Err.Number & " - " & Err.Description, vbExclamation, T("Suivi Mails", "Mail Tracking")
+End Sub
+
+'=============================================================================
+' Met la ligne a jour apres relance : t0 = maintenant, date limite =
+' maintenant + delai, +1 relance, statut "Relance".
+'=============================================================================
+Private Sub ApplyFollowupToRow(ws As Object, ByVal r As Long)
+    On Error Resume Next
+    Dim delayDays As Long
+    delayDays = 0
+    delayDays = CLng(ws.Cells(r, COL_DELAY_DAYS).Value)
+
+    ws.Cells(r, COL_LAST_FOLLOWUP).Value = Now
+    ws.Cells(r, COL_LAST_FOLLOWUP).NumberFormat = "dd/mm/yyyy hh:mm"
+
+    Dim fc As Long
+    fc = 0
+    fc = CLng(ws.Cells(r, COL_FOLLOWUP_COUNT).Value)
+    ws.Cells(r, COL_FOLLOWUP_COUNT).Value = fc + 1
+
+    Dim due As Date
+    due = DateAdd("d", delayDays, Now)
+    ws.Cells(r, COL_DUE_DATE).Value = due
+    ws.Cells(r, COL_DUE_DATE).NumberFormat = "dd/mm/yyyy"
+
+    ' v5.7 : une relance vaut "ces reponses ne suffisent pas" -> acquitter
+    ' le nb actuel (pas de "Repondu ?" immediat au prochain recalcul).
+    Dim rc As Long
+    rc = 0
+    On Error Resume Next
+    rc = CLng(ws.Cells(r, COL_RESPONSE_COUNT).Value)
+    On Error GoTo 0
+    ws.Cells(r, COL_ACK_COUNT).Value = rc
+
+    ws.Cells(r, COL_STATUS).Value = "Relanc" & Chr(233)
+    FormatStatusCell ws.Cells(r, COL_STATUS)
+    UpdateDeadlineCell ws, r
+End Sub
+
+'=============================================================================
+' Prolonge l'echeance de X jours. Comme la date limite est DERIVEE du delai
+' (cf. v4.6), on ajuste le DELAI pour que la prolongation survive au recalcul :
+' nouveau delai = (jours ecoules depuis t0) + X, d'ou date limite = t0 + delai
+' = aujourd'hui + X. La ligne sort de l'etat "en retard".
+'=============================================================================
+Private Sub ExtendRow(ws As Object, ByVal r As Long)
+    On Error Resume Next
+    Dim s As String
+    s = modUi.AskText(T("Prolonger de combien de jours ?", "Extend by how many days?"), _
+                 T("Prolonger", "Extend"), "7")
+    If Len(s) = 0 Then Exit Sub
+    Dim x As Long
+    x = 0
+    x = CLng(val(s))
+    If x <= 0 Then Exit Sub
+
+    Dim floor As Date
+    floor = RowFloorDate(ws, r)
+    Dim newDelay As Long
+    newDelay = DateDiff("d", Int(floor), Int(Now)) + x
+    If newDelay < 1 Then newDelay = x
+
+    ws.Cells(r, COL_DELAY_DAYS).Value = newDelay
+    Dim due As Date
+    due = DateAdd("d", newDelay, floor)
+    ws.Cells(r, COL_DUE_DATE).Value = due
+    ws.Cells(r, COL_DUE_DATE).NumberFormat = "dd/mm/yyyy"
+
+    ' v5.7 : prolonger = acquitter les reponses courantes.
+    Dim rcE As Long
+    rcE = 0
+    On Error Resume Next
+    rcE = CLng(ws.Cells(r, COL_RESPONSE_COUNT).Value)
+    On Error GoTo 0
+    ws.Cells(r, COL_ACK_COUNT).Value = rcE
+
+    Dim fc As Long
+    fc = 0
+    fc = CLng(ws.Cells(r, COL_FOLLOWUP_COUNT).Value)
+    If fc > 0 Then
+        ws.Cells(r, COL_STATUS).Value = "Relanc" & Chr(233)
+    Else
+        ws.Cells(r, COL_STATUS).Value = "En attente"
+    End If
+    FormatStatusCell ws.Cells(r, COL_STATUS)
+    UpdateDeadlineCell ws, r
+End Sub
+
+'=============================================================================
+' Marque le suivi comme traite (clos a la main) : statut terminal "Traite".
+' N'est plus recalcule ni relance.
+'=============================================================================
+Private Sub MarkRowDone(ws As Object, ByVal r As Long)
+    On Error Resume Next
+    ws.Cells(r, COL_STATUS).Value = "Trait" & Chr(233)
+    FormatStatusCell ws.Cells(r, COL_STATUS)
+    UpdateDeadlineCell ws, r
+End Sub
+
+'=============================================================================
+' Retrouve le mail suivi : EntryID (chemin rapide) puis repli ConversationID
+' (scan d'arbre). Nothing si introuvable.
+'=============================================================================
+Private Function ResolveTrackedMail(ByVal entryID As String, _
+                                    ByVal convID As String) As Outlook.mailItem
+    On Error Resume Next
+    Set ResolveTrackedMail = Nothing
+    If Len(entryID) > 0 Then
+        Set ResolveTrackedMail = Application.Session.GetItemFromID(entryID)
+    End If
+    If ResolveTrackedMail Is Nothing And Len(convID) > 0 Then
+        Set ResolveTrackedMail = FindMailByConversation(convID)
+    End If
+End Function
+
+'=============================================================================
+' Fragment HTML de la relance (texte FR/EN + mention auto facultative).
+'=============================================================================
+Private Function FollowupBodyHtml(ByVal autoSend As Boolean) As String
+    Dim bodyTxt As String
+    bodyTxt = T( _
+        "Bonjour," & vbCrLf & _
+        "Je me permets de revenir vers vous au sujet de ce message, rest" & Chr(233) & _
+        " sans retour " & Chr(224) & " ce jour. Auriez-vous pu en prendre connaissance, " & _
+        "ou avez-vous besoin d'un compl" & Chr(233) & "ment de ma part ?" & vbCrLf & _
+        "Je reste " & Chr(224) & " votre disposition et vous remercie par avance." & vbCrLf & _
+        "Bien cordialement,", _
+        "Hello," & vbCrLf & _
+        "I am following up on the message below, which is still awaiting a reply. " & _
+        "Have you had a chance to review it, or would you need any further information from me?" & vbCrLf & _
+        "I remain at your disposal and thank you in advance." & vbCrLf & _
+        "Best regards,")
+
+    Dim htmlOut As String
+    htmlOut = "<div>" & Replace(EncodeHtml(bodyTxt), vbCrLf, "<br>") & "</div>"
+    If autoSend Then
+        htmlOut = htmlOut & "<div style=""color:#888888;font-size:9pt;font-style:italic;margin-top:2px"">" & _
+                  EncodeHtml(T("Courriel de relance envoy" & Chr(233) & " automatiquement.", _
+                               "Automated follow-up message.")) & "</div>"
+    End If
+    FollowupBodyHtml = htmlOut
+End Function
+
+'=============================================================================
+' Insere un fragment juste apres <body...> ; le fil cite et la signature
+' (deja dans le HTMLBody du ReplyAll) restent en dessous. Repli : prepend.
+'=============================================================================
+Private Function InsertFollowupHtml(ByVal htmlBody As String, ByVal fragment As String) As String
+    ' Insere le fragment juste apres <body...> ; le fil cite et la signature
+    ' (la signature LetsignIt est injectee A L'ENVOI, sous le fragment)
+    ' restent en dessous. On supprime d'abord les paragraphes VIDES de tete
+    ' du brouillon ReplyAll (sinon plusieurs lignes blanches s'intercalent
+    ' entre le message et la signature). Repli : prepend simple.
+    Dim posBody As Long, posEnd As Long
+    posBody = InStr(1, htmlBody, "<body", vbTextCompare)
+    If posBody > 0 Then
+        posEnd = InStr(posBody, htmlBody, ">")
+        If posEnd > 0 Then
+            Dim headPart As String, tailPart As String
+            headPart = Left$(htmlBody, posEnd)
+            tailPart = StripLeadingBlanks(Mid$(htmlBody, posEnd + 1))
+            InsertFollowupHtml = headPart & fragment & tailPart
+            Exit Function
+        End If
+    End If
+    InsertFollowupHtml = fragment & StripLeadingBlanks(htmlBody)
+End Function
+
+' Retire en TETE de chaine les blancs et paragraphes vides les plus courants
+' d'un brouillon Outlook (espaces, <br>, <p>&nbsp;</p>, <o:p></o:p>, etc.).
+' S'arrete au premier contenu reel (la signature n'est pas vide).
+Private Function StripLeadingBlanks(ByVal s As String) As String
+    Dim pats() As String
+    pats = Split("<p class=MsoNormal><o:p>&nbsp;</o:p></p>|" & _
+                 "<p class=MsoNormal><o:p></o:p></p>|" & _
+                 "<p class=MsoNormal>&nbsp;</p>|<p class=MsoNormal></p>|" & _
+                 "<o:p>&nbsp;</o:p>|<o:p></o:p>|" & _
+                 "<div>&nbsp;</div>|<div><br></div>|<div><br/></div>|<div></div>|" & _
+                 "<p>&nbsp;</p>|<p></p>|&nbsp;|<br>|<br/>|<br />", "|")
+    Dim changed As Boolean
+    Do
+        changed = False
+        s = LTrimWS(s)
+        Dim i As Long
+        For i = LBound(pats) To UBound(pats)
+            Do While Len(s) >= Len(pats(i)) And _
+                     StrComp(Left$(s, Len(pats(i))), pats(i), vbTextCompare) = 0
+                s = Mid$(s, Len(pats(i)) + 1)
+                s = LTrimWS(s)
+                changed = True
+            Loop
+        Next i
+    Loop While changed
+    StripLeadingBlanks = s
+End Function
+
+Private Function LTrimWS(ByVal s As String) As String
+    Do While Len(s) > 0
+        Dim ch As String
+        ch = Left$(s, 1)
+        If ch = " " Or ch = vbCr Or ch = vbLf Or ch = vbTab Then
+            s = Mid$(s, 2)
+        Else
+            Exit Do
+        End If
+    Loop
+    LTrimWS = s
+End Function
+
+'=============================================================================
+' Echappe les caracteres HTML structurels (l'ordre & en premier).
+'=============================================================================
+Private Function EncodeHtml(ByVal s As String) As String
+    s = Replace(s, "&", "&amp;")
+    s = Replace(s, "<", "&lt;")
+    s = Replace(s, ">", "&gt;")
+    EncodeHtml = s
+End Function
+
+'=============================================================================
+' Outlook en ligne ? (sinon un .Send s'empile dans la boite d'envoi).
+'=============================================================================
+Private Function OutlookOnline() As Boolean
+    On Error Resume Next
+    OutlookOnline = True
+    Dim ns As Object
+    Set ns = Application.GetNamespace("MAPI")
+    If ns.Offline = True Then OutlookOnline = False
+End Function
+
+'=============================================================================
+' v4.5 - DIAGNOSTIC MANUEL : valider GetConversation sur le poste.
+' A lancer depuis la fenetre Execution VBE (ou un bouton temporaire), avec
+' un mail SELECTIONNE dans l'explorateur (ou ouvert dans sa fenetre).
+' Affiche : ConversationID, disponibilite du fil via GetConversation,
+' nombre d'items du fil, apercu des 8 premiers (dossier / expediteur /
+' date). Lecture seule : n'ecrit nulle part.
+'=============================================================================
+Public Sub DiagConversationLookup()
+    On Error GoTo ErrH
+
+    Dim oMail As Outlook.mailItem
+    Dim isComposing As Boolean
+    If Not ResolveTargetMail(oMail, isComposing) Then
+        MsgBox T("S" & Chr(233) & "lectionnez (ou ouvrez) un mail d'abord.", _
+                 "Select (or open) a mail first."), _
+               vbExclamation, T("Diagnostic - recherche de conversation", "Diagnostics - conversation lookup")
+        Exit Sub
+    End If
+
+    Dim olNS As Outlook.NameSpace
+    Set olNS = Application.GetNamespace("MAPI")
+
+    Dim cID As String
+    cID = CStr(oMail.ConversationID)
+
+    Dim conv As Object
+    Set conv = Nothing
+    On Error Resume Next
+    Set conv = oMail.GetConversation
+    On Error GoTo ErrH
+
+    Dim msg As String
+    msg = "=== Diag ConversationLookup ===" & vbCrLf & vbCrLf & _
+          T("Mail : ", "Mail: ") & Left(oMail.subject, 60) & vbCrLf & _
+          "ConversationID : " & Left(cID, 24) & "..." & vbCrLf & _
+          "GetConversation : " & IIf(conv Is Nothing, T("INDISPONIBLE", "UNAVAILABLE"), "OK")
+
+    If conv Is Nothing Then
+        msg = msg & vbCrLf & vbCrLf & T( _
+            "L'index de conversations n'est pas disponible sur ce store :" & vbCrLf & _
+            "le tableau de bord passera syst" & Chr(233) & "matiquement par le scan de secours.", _
+            "The conversation index is not available on this store:" & vbCrLf & _
+            "the dashboard will always fall back to the repair scan.")
+        modDebugLog.DInfo MOD_NAME, "DiagConversationLookup : GetConversation indisponible"
+        MsgBox msg, vbExclamation, T("Diagnostic - recherche de conversation", "Diagnostics - conversation lookup")
+        Exit Sub
+    End If
+
+    Dim storeID As String
+    storeID = oMail.Parent.StoreID
+
+    Dim tbl As Object
+    Set tbl = conv.GetTable
+
+    Dim total As Long
+    Dim preview As String
+    total = 0
+    preview = ""
+
+    On Error Resume Next
+    Dim guard As Long
+    guard = 0
+    Do Until tbl.EndOfTable
+        guard = guard + 1
+        If guard > 500 Then Exit Do
+
+        Dim tblRow As Object
+        Set tblRow = Nothing
+        Set tblRow = tbl.GetNextRow
+        If tblRow Is Nothing Then Exit Do
+        total = total + 1
+
+        If total <= 8 Then
+            Dim itm As Object
+            Set itm = Nothing
+            Set itm = olNS.GetItemFromID(CStr(tblRow("EntryID")), storeID)
+            If Not itm Is Nothing Then
+                If itm.Class = OL_MAIL_CLASS Then
+                    Dim fldName As String
+                    fldName = "?"
+                    fldName = itm.Parent.name
+                    preview = preview & "  - [" & fldName & "] " & _
+                              LCase(GetMailSenderSMTP(itm)) & " (" & _
+                              Format(itm.ReceivedTime, "dd/mm hh:nn") & ")" & vbCrLf
+                End If
+            End If
+        End If
+    Loop
+    On Error GoTo ErrH
+
+    msg = msg & vbCrLf & T("Items du fil : ", "Thread items: ") & total & vbCrLf & vbCrLf & preview
+    If total > 8 Then
+        msg = msg & T("  ... et ", "  ... and ") & (total - 8) & T(" autre(s)", " other(s)") & vbCrLf
+    End If
+
+    modDebugLog.DInfo MOD_NAME, "DiagConversationLookup : fil=" & total & " item(s)"
+    MsgBox msg, vbInformation, T("Diagnostic - recherche de conversation", "Diagnostics - conversation lookup")
+    Exit Sub
+
+ErrH:
+    modDebugLog.DError MOD_NAME, "DiagConversationLookup err " & _
+        Err.Number & " - " & Err.Description
+    MsgBox T("Erreur ", "Error ") & Err.Number & " : " & Err.Description, _
+           vbCritical, T("Diagnostic - recherche de conversation", "Diagnostics - conversation lookup")
+End Sub
+
+'=============================================================================
+' v5.7 - TRI DU TABLEAU DE BORD (a l'ouverture)
+' Ordre : Repondu ? (haut, action requise) / En retard / En attente /
+' Relance / Repondu / Traite, puis date d'envoi croissante dans chaque groupe.
+' Rang ecrit dans une colonne temporaire hors donnees, puis efface.
+'=============================================================================
+Private Sub SortDashboard(ws As Object)
+    On Error Resume Next
+    Dim lastRow As Long
+    lastRow = ws.Cells(ws.Rows.count, COL_ID).End(-4162).row
+    If lastRow < 3 Then Exit Sub
+
+    Dim helperCol As Long
+    helperCol = LAST_COL + 1
+    Dim r As Long
+    For r = 2 To lastRow
+        ws.Cells(r, helperCol).Value = StatusRank(CStr(ws.Cells(r, COL_STATUS).Value))
+    Next r
+
+    Dim rng As Object
+    Set rng = ws.Range(ws.Cells(1, 1), ws.Cells(lastRow, helperCol))
+    rng.Sort Key1:=ws.Cells(1, helperCol), Order1:=1, _
+             Key2:=ws.Cells(1, COL_SENT_DATE), Order2:=1, _
+             Header:=1
+    ws.Columns(helperCol).ClearContents
+End Sub
+
+Private Function StatusRank(ByVal st As String) As Long
+    Select Case st
+        Case "R" & Chr(233) & "pondu ?":  StatusRank = 0
+        Case "En retard":                 StatusRank = 1
+        Case "En attente":                StatusRank = 2
+        Case "Relanc" & Chr(233):         StatusRank = 3
+        Case "R" & Chr(233) & "pondu":    StatusRank = 4
+        Case "Trait" & Chr(233):          StatusRank = 5
+        Case Else:                        StatusRank = 6
+    End Select
+End Function

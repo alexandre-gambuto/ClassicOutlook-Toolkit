@@ -1,0 +1,413 @@
+Option Explicit
+
+'==============================================================================
+' modFolderMerge
+'==============================================================================
+' Purpose (EN): merges two folders in the current mailbox. All items from the
+'   CHILD folder (B) are moved into the PARENT folder (A, kept), then B is
+'   deleted. Reuses modQuickMove's folder index for selection. Destructive:
+'   requires confirmation. B must have no subfolders and not be an ancestor of A.
+'
+' Role
+'   Fusionne deux dossiers de la BAL currente : tous les elements du dossier
+'   ENFANT (B) sont deplaces dans le dossier PARENT (A, conserve), puis B est
+'   supprime. "Parent"/"enfant" est ici une convention semantique (A garde,
+'   B absorbe), independante de la hierarchie reelle des dossiers.
+'
+'------------------------------------------------------------------------------
+' Point d'entree (Public Sub)
+'   MergeFolders   Selecteur A (garde) -> selecteur B (absorbe) ->
+'                       confirmation -> deplacement de tous les elements ->
+'                       suppression de B. Utilise l'index de modQuickMove
+'                       (mFolders / FindMatchesLeaf) pour la selection.
+'
+'------------------------------------------------------------------------------
+' Fonctionnement
+'   - Reutilise l'index de dossiers de modQuickMove (SmartLoad si necessaire,
+'     FindMatchesLeaf pour la recherche par dernier segment).
+'   - Deplace TOUS les types d'elements de B (mails, RDV, contacts...), pas
+'     seulement les MailItem : iteration generique sur B.Items.
+'   - Deplacement compatible Exchange Online (v2) : Item.Move est
+'     ASYNCHRONE cote MAPI ; on prend toujours le PREMIER element restant,
+'     avec attente bornee de decrementation (Sleep+DoEvents), garde
+'     anti-boucle, et stabilisation bornee avant lecture du reliquat.
+'   - Suppression de B uniquement si 0 erreur de deplacement ET B vide ET B
+'     sans sous-dossier (sinon on conserve B et on previent l'utilisateur).
+'   - Apres fusion, on invalide le cache QuickMove (B n'existe plus) par
+'     appel DIRECT a modQuickMove.BackgroundReindex (v2 ; l'ancien
+'     Application.Run n'existe pas dans Outlook), repli SmartLoad.
+'
+'------------------------------------------------------------------------------
+' Garde-fous
+'   - A et B doivent etre distincts.
+'   - B ne doit pas etre un ANCETRE de A (on ne peut pas supprimer un dossier
+'     qui contient le dossier conserve).
+'   - B ne doit pas contenir de sous-dossiers (sinon refus : la fusion ne
+'     traite que les elements, pas la hierarchie). L'utilisateur fusionne
+'     d'abord les sous-dossiers s'il le souhaite.
+'   - Confirmation obligatoire avant suppression (action destructive).
+'
+'------------------------------------------------------------------------------
+' Contraintes / pieges
+'   - Late binding partout, pas de UserForm (InputBox/MsgBox). Une seule
+'     Declare API (kernel32.Sleep, PtrSafe) pour les attentes bornees (v2).
+'   - Dependances : modQuickMove (mFolders, mFolderCount, FindMatchesLeaf,
+'     SmartLoad, BackgroundReindex), modDebugLog, modConfig (indirect).
+'   - Le separateur " > " des FolderPath est celui de modQuickMove.
+'
+'------------------------------------------------------------------------------
+' v2 (2026-06-10) : deplacement asynchrone-safe (premier element restant +
+'   attentes bornees) ; reindexation par appel direct (Application.Run
+'   inexistant dans Outlook) ; suppression constante inutilisee.
+' Historique des versions -> CHANGELOG.
+'==============================================================================
+
+
+Private Const MOD_NAME As String = "FolderMerge"
+Private Const MOD_VERSION As String = "v2 - 2026-06-16"
+
+' --- API Win32 : attente courte non bloquante (Sleep + DoEvents) ---
+' Pack v3 (D1) : 64-bit seul, branche #Else supprimee.
+Private Declare PtrSafe Sub Sleep Lib "kernel32" (ByVal dwMilliseconds As Long)
+
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+' ============================================================================
+' POINT D'ENTREE
+' ============================================================================
+Public Sub MergeFolders()
+    On Error GoTo ErrH
+
+    Dim idxA As Long, idxB As Long
+    Dim folderA As Object, folderB As Object
+    Dim itemCount As Long
+    Dim movedCount As Long, errCount As Long
+
+    ' --- S'assurer que l'index QuickMove est charge ---
+    If modQuickMove.IndexCount() = 0 Then
+        modQuickMove.SmartLoad
+    End If
+    If modQuickMove.IndexCount() = 0 Then
+        MsgBox T("Aucun dossier indexe. Lance QuickMove une fois puis reessaie.", "No folder indexed. Run QuickMove once, then try again."), _
+               vbExclamation, T("Fusionner les dossiers", "Merge folders")
+        Exit Sub
+    End If
+
+    ' --- 1) Selection du dossier A (conserve) ---
+    idxA = ChooseIndexedFolder( _
+        T("ETAPE 1/2 - Dossier CONSERVE (A)", "STEP 1/2 - KEPT folder (A)") & vbCrLf & vbCrLf & _
+        T("C'est le dossier qui recevra les messages et sera garde.", "This folder will receive the items and be kept."), _
+        T("Fusion - Dossier conserve (A)", "Merge - Kept folder (A)"))
+    If idxA = 0 Then Exit Sub   ' annule
+
+    ' --- 2) Selection du dossier B (absorbe puis supprime) ---
+    idxB = ChooseIndexedFolder( _
+        T("ETAPE 2/2 - Dossier ABSORBE puis SUPPRIME (B)", "STEP 2/2 - ABSORBED then DELETED folder (B)") & vbCrLf & vbCrLf & _
+        T("Conserve (A) = ", "Kept (A) = ") & modQuickMove.IndexFolderPath(idxA) & vbCrLf & vbCrLf & _
+        T("Tous les elements de B iront dans A, puis B sera supprime.", "All items from B move into A, then B is deleted."), _
+        T("Fusion - Dossier absorbe (B)", "Merge - Absorbed folder (B)"))
+    If idxB = 0 Then Exit Sub   ' annule
+
+    ' --- Garde-fous ---
+    If idxA = idxB Then
+        MsgBox T("A et B sont le meme dossier. Fusion annulee.", "A and B are the same folder. Merge cancelled."), vbExclamation, _
+               T("Fusionner les dossiers", "Merge folders")
+        Exit Sub
+    End If
+
+    Set folderA = modQuickMove.IndexFolderObject(idxA)
+    Set folderB = modQuickMove.IndexFolderObject(idxB)
+
+    If folderA Is Nothing Or folderB Is Nothing Then
+        MsgBox T("Un des dossiers est introuvable (cache obsolete ?).", "One of the folders cannot be found (stale cache?).") & vbCrLf & _
+               T("Relance QuickMove (reindexation) puis reessaie.", "Re-run QuickMove (reindex), then try again."), _
+               vbCritical, T("Fusionner les dossiers", "Merge folders")
+        Exit Sub
+    End If
+
+    ' B ne doit pas etre un ancestor de A (sinon on supprimerait A avec B)
+    If IsAncestor(folderB, folderA) Then
+        MsgBox T("Le dossier B contient (directement ou non) le dossier A.", "Folder B contains folder A (directly or not).") & vbCrLf & _
+               T("Impossible de supprimer B sans detruire A. Fusion annulee.", "Cannot delete B without destroying A. Merge cancelled."), _
+               vbCritical, T("Fusionner les dossiers", "Merge folders")
+        Exit Sub
+    End If
+
+    ' B ne doit pas contenir de sous-dossiers
+    Dim subfolderCount As Long
+    subfolderCount = 0
+    On Error Resume Next
+    subfolderCount = folderB.Folders.count
+    On Error GoTo ErrH
+    If subfolderCount > 0 Then
+        MsgBox T("Le dossier B contient ", "Folder B contains ") & subfolderCount & T(" sous-dossier(s).", " subfolder(s).") & vbCrLf & _
+               T("La fusion ne traite que les elements, pas la hierarchie.", "Merge only handles items, not the folder hierarchy.") & vbCrLf & _
+               T("Fusionne ou deplace d'abord les sous-dossiers de B, puis reessaie.", "Merge or move B's subfolders first, then try again."), _
+               vbExclamation, T("Fusionner les dossiers", "Merge folders")
+        Exit Sub
+    End If
+
+    ' --- Comptage et confirmation ---
+    itemCount = 0
+    On Error Resume Next
+    itemCount = folderB.Items.count
+    On Error GoTo ErrH
+
+    Dim rep As VbMsgBoxResult
+    rep = MsgBox( _
+        T("Confirmer la fusion :", "Confirm the merge:") & vbCrLf & vbCrLf & _
+        T("  CONSERVE (A) : ", "  KEPT (A): ") & modQuickMove.IndexFolderPath(idxA) & vbCrLf & _
+        T("  SUPPRIME (B) : ", "  DELETED (B): ") & modQuickMove.IndexFolderPath(idxB) & vbCrLf & vbCrLf & _
+        itemCount & T(" element(s) de B seront deplaces vers A,", " item(s) from B will be moved into A,") & vbCrLf & _
+        T("puis le dossier B sera SUPPRIME.", "then folder B will be DELETED.") & vbCrLf & vbCrLf & _
+        T("Continuer ?", "Continue?"), _
+        vbYesNo + vbExclamation + vbDefaultButton2, T("Fusionner les dossiers", "Merge folders"))
+    If rep <> vbYes Then Exit Sub
+
+    ' --- Deplacement des elements (v2 : compatible Move asynchrone) ---
+    ' Item.Move est ASYNCHRONE cote MAPI/Exchange Online : une boucle en
+    ' index descendant lit des compteurs/positions perimes et saute des
+    ' elements. Pattern projet : toujours prendre le PREMIER element
+    ' restant, attendre (borne) que Count reflete le depart, garde
+    ' anti-boucle, puis stabilisation bornee avant de relire le reliquat.
+    ' Les elements en echec sont laisses en place (compteur skipped) et
+    ' bloquent la suppression de B, comme avant.
+    movedCount = 0
+    errCount = 0
+
+    Dim Item As Object
+    Dim col As Object
+    Set col = folderB.Items
+
+    Dim skipped As Long      ' elements en echec laisses dans B
+    Dim guard As Long
+    Dim cnt As Long
+
+    skipped = 0
+    guard = 0
+    Do
+        guard = guard + 1
+        If guard > itemCount * 2 + 50 Then
+            modDebugLog.DError MOD_NAME, "Garde anti-boucle atteinte (" & guard & ")"
+            Exit Do
+        End If
+
+        cnt = -1
+        On Error Resume Next
+        cnt = col.count
+        On Error GoTo ErrH
+        If cnt < 0 Then Exit Do
+        If cnt <= skipped Then Exit Do      ' plus rien a deplacer
+
+        Set Item = Nothing
+        On Error Resume Next
+        Set Item = col.Item(skipped + 1)
+        On Error GoTo ErrH
+
+        If Item Is Nothing Then
+            skipped = skipped + 1
+        Else
+            On Error Resume Next
+            Item.Move folderA
+            If Err.Number = 0 Then
+                On Error GoTo ErrH
+                movedCount = movedCount + 1
+                ' Attendre (borne) que la collection reflete le depart :
+                ' immediat en mode cache ; sinon evite de relire le meme
+                ' element et de generer des erreurs en cascade.
+                WaitCountBelow col, cnt, 1500
+            Else
+                errCount = errCount + 1
+                modDebugLog.DError MOD_NAME, "Move element " & (skipped + 1) & _
+                    " err " & Err.Number & " - " & Err.Description
+                Err.Clear
+                On Error GoTo ErrH
+                skipped = skipped + 1       ' on le laisse, on passe au suivant
+            End If
+        End If
+        DoEvents
+    Loop
+
+    ' Stabilisation finale (Move asynchrone) avant lecture du reliquat.
+    WaitItemsStable col, 3000
+
+    ' --- Suppression de B si tout est OK et B vide ---
+    Dim remainingB As Long
+    remainingB = 0
+    On Error Resume Next
+    remainingB = folderB.Items.count
+    On Error GoTo ErrH
+
+    Dim pathB As String
+    pathB = modQuickMove.IndexFolderPath(idxB)
+
+    If errCount = 0 And remainingB = 0 Then
+        On Error Resume Next
+        folderB.Delete
+        If Err.Number = 0 Then
+            On Error GoTo ErrH
+            modDebugLog.DInfo MOD_NAME, "Fusion OK : " & movedCount & _
+                " element(s) vers '" & modQuickMove.IndexFolderPath(idxA) & _
+                "', dossier '" & pathB & "' supprime."
+            ' Index QuickMove obsolete (B n'existe plus) -> reindexation
+            ReindexIfPossible
+            MsgBox movedCount & T(" element(s) deplace(s) vers A.", " item(s) moved into A.") & vbCrLf & _
+                   T("Dossier B supprime.", "Folder B deleted.") & vbCrLf & vbCrLf & _
+                   T("Fusion terminee.", "Merge complete."), vbInformation, T("Fusionner les dossiers", "Merge folders")
+        Else
+            modDebugLog.DError MOD_NAME, "Suppression dossier '" & pathB & _
+                "' err " & Err.Number & " - " & Err.Description
+            On Error GoTo ErrH
+            MsgBox movedCount & T(" element(s) deplace(s) vers A,", " item(s) moved into A,") & vbCrLf & _
+                   T("mais la SUPPRESSION du dossier B a echoue (err ", "but DELETING folder B failed (err ") & Err.Number & ")." & vbCrLf & _
+                   T("Le dossier B est vide ; supprime-le manuellement.", "Folder B is empty; delete it manually."), _
+                   vbExclamation, T("Fusionner les dossiers", "Merge folders")
+        End If
+    Else
+        ' On ne supprime pas : il reste des elements ou des erreurs.
+        modDebugLog.DError MOD_NAME, "Fusion partielle : moved=" & movedCount & _
+            " err=" & errCount & " reste=" & remainingB & " dossier '" & pathB & "' conserve."
+        MsgBox movedCount & T(" element(s) deplace(s).", " item(s) moved.") & vbCrLf & _
+               errCount & T(" erreur(s), ", " error(s), ") & remainingB & T(" element(s) restant(s) dans B.", " item(s) remaining in B.") & vbCrLf & vbCrLf & _
+               T("Le dossier B N'A PAS ete supprime (fusion incomplete).", "Folder B was NOT deleted (merge incomplete).") & vbCrLf & _
+               T("Verifie le contenu de B avant de reessayer.", "Check B's contents before retrying."), _
+               vbExclamation, T("Fusionner les dossiers", "Merge folders")
+    End If
+
+    Exit Sub
+
+ErrH:
+    modDebugLog.DError MOD_NAME, "MergeFolders error " & Err.Number & _
+        " - " & Err.Description
+    MsgBox T("Erreur pendant la fusion (", "Error during merge (") & Err.Number & T(") : ", "): ") & Err.Description, _
+           vbCritical, T("Fusionner les dossiers", "Merge folders")
+End Sub
+
+' ============================================================================
+' SELECTION D'UN DOSSIER via l'index QuickMove (recherche dernier segment)
+' Renvoie l'index dans modQuickMove.mFolders, ou 0 si annulation.
+' ============================================================================
+Private Function ChooseIndexedFolder(header As String, title As String) As Long
+    ' Pack v3 (C13) : boucle de selection partagee (modQuickMove.PickFolder),
+    ' sans re-scan propose ici (la fusion travaille sur l'index courant).
+    ChooseIndexedFolder = modQuickMove.PickFolder(header, title, "", False)
+End Function
+
+' ============================================================================
+' IsAncestor : True si 'ancestor' contient (recursivement) 'target'.
+' Remonte la chaine des parents de 'target' et compare les EntryID.
+' ============================================================================
+Private Function IsAncestor(ancestor As Object, target As Object) As Boolean
+    On Error GoTo ErrH
+    IsAncestor = False
+
+    Dim ancestorId As String
+    Dim current As Object
+    Dim parent As Object
+    Dim guard As Long
+
+    ancestorId = ""
+    On Error Resume Next
+    ancestorId = ancestor.EntryID
+    On Error GoTo ErrH
+    If Len(ancestorId) = 0 Then Exit Function
+
+    Set current = target
+    guard = 0
+    Do While Not current Is Nothing
+        guard = guard + 1
+        If guard > 200 Then Exit Do   ' securite anti-boucle
+
+        Dim currentId As String
+        currentId = ""
+        On Error Resume Next
+        currentId = current.EntryID
+        On Error GoTo ErrH
+        If Len(currentId) > 0 And currentId = ancestorId Then
+            IsAncestor = True
+            Exit Function
+        End If
+
+        Set parent = Nothing
+        On Error Resume Next
+        Set parent = current.parent
+        On Error GoTo ErrH
+        ' On s'arrete quand le parent n'est plus un Folder (Store/NameSpace)
+        If parent Is Nothing Then Exit Do
+        Dim cls As Long
+        cls = -1
+        On Error Resume Next
+        cls = parent.Class
+        On Error GoTo ErrH
+        ' 2 = olFolder
+        If cls <> 2 Then Exit Do
+        Set current = parent
+    Loop
+
+    Exit Function
+
+ErrH:
+    modDebugLog.DError MOD_NAME, "IsAncestor error " & Err.Number & _
+        " - " & Err.Description
+    IsAncestor = False
+End Function
+
+' ============================================================================
+' ATTENTES BORNEES (v2) - Item.Move asynchrone sur Exchange Online
+' ============================================================================
+' Attend (au plus maxMs) que itemsCol.Count passe SOUS threshold.
+Private Sub WaitCountBelow(ByVal itemsCol As Object, ByVal threshold As Long, ByVal maxMs As Long)
+    On Error Resume Next
+    Dim t0 As Single
+    t0 = Timer
+    Do While itemsCol.count >= threshold
+        Sleep 50
+        DoEvents
+        If TimerElapsedMs(t0) > maxMs Then Exit Do
+    Loop
+End Sub
+
+' Attend (au plus maxMs) que itemsCol.Count se stabilise (deux lectures
+' consecutives identiques, espacees de 250 ms).
+Private Sub WaitItemsStable(ByVal itemsCol As Object, ByVal maxMs As Long)
+    On Error Resume Next
+    Dim t0 As Single
+    Dim lastCount As Long, curCount As Long
+    t0 = Timer
+    lastCount = -1
+    Do
+        curCount = itemsCol.count
+        If curCount = lastCount Then Exit Do
+        lastCount = curCount
+        Sleep 250
+        DoEvents
+        If TimerElapsedMs(t0) > maxMs Then Exit Do
+    Loop
+End Sub
+
+' Millisecondes ecoulees depuis t0 (= Timer), robuste au passage de minuit.
+Private Function TimerElapsedMs(ByVal t0 As Single) As Long
+    Dim dt As Single
+    dt = Timer - t0
+    If dt < 0 Then dt = dt + 86400
+    TimerElapsedMs = CLng(dt * 1000)
+End Function
+
+' ============================================================================
+' Reindexation de l'index QuickMove apres suppression du dossier B.
+' v2 : appel DIRECT. L'ancien Application.Run "modQuickMove.BackgroundReindex"
+' echouait TOUJOURS (Application.Run est une methode Excel/Word, absente du
+' modele objet Outlook) : on retombait systematiquement sur le repli
+' SmartLoad SYNCHRONE. Repli SmartLoad conserve par securite.
+' ============================================================================
+Private Sub ReindexIfPossible()
+    On Error Resume Next
+    modQuickMove.BackgroundReindex
+    If Err.Number <> 0 Then
+        Err.Clear
+        modQuickMove.SmartLoad
+    End If
+    On Error GoTo 0
+End Sub

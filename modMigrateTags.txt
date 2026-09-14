@@ -1,0 +1,238 @@
+Option Explicit
+
+' ============================================================
+' modMigrateTags v2.0  (2026-08-22)
+' Purpose (EN): one-shot migration that renames the tag UserProperties on
+'   calendar appointments from their old names to the current generic ones,
+'   without losing tags already set. Idempotent and re-runnable. Edit MAP_TAGS
+'   to match the old names present in your environment.
+'
+' Migration ponctuelle des UserProperties de tag projet sur les RDV du
+' calendrier.
+'
+' OBJECTIF
+'   Renommer les anciennes UserProperties (heritage du nommage
+'   interne) vers les noms generiques, SANS perdre les tags deja
+'   poses sur les RDV existants. A lancer UNE FOIS, juste avant
+'   ou apres le deploiement du code renomme.
+'   Re-executable sans risque (idempotent : un RDV deja migre,
+'   ou sans ancien tag, est ignore).
+'
+' PORTEE
+'   Calendrier principal (dossier Calendrier par defaut).
+'   Les RDV recurrents sont traites sur leur master : l'iteration
+'   se fait avec IncludeRecurrences = False, qui renvoie les
+'   appointments master (et non les occurrences), donc on ecrit
+'   directement sur l'objet renvoye (pas de GetRecurrencePattern,
+'   qui pourrait reinitialiser les exceptions de serie).
+'
+' LANCEMENT
+'   Sub MigrateProjectTags  (a epingler sur la QAT ou a lancer
+'   depuis la fenetre Execution du VBE).
+'
+' ADAPTATION
+'   La table MAP_TAGS ci-dessous decrit les renommages a operer.
+'   Format : "ancien>nouveau" separes par ";". Ajoute / retire
+'   des paires si ton environnement a d'autres anciens noms.
+'   (AntiChevDecale n'est PAS migre : ce n'est pas du jargon.)
+'
+' v2.0 (2026-08-22) : revue UX pop-ups.
+'   (a) CONFIRMATION + MODE SIMULATION AJOUTES (manquaient). Le module
+'       ecrivait une UserProperty et faisait un .Save sur TOUS les RDV du
+'       calendrier sans rien demander - seul module de masse du toolkit sans
+'       garde-fou, alors que tous les modules Contacts ont un dry-run. Le
+'       choix passe par modMsgBoxCustom.Confirm3, avec la meme semantique
+'       que ces modules : Oui = Simulation, Non = Appliquer, Annuler =
+'       abandonner (issue inoffensive en 3e position, donc Echap/croix
+'       annulent).
+'   (b) Le recapitulatif de fin passe en TOAST : il n'appelle aucune
+'       decision. Le detail chiffre reste dans debug.log. En simulation, le
+'       toast le dit explicitement (rien n'a ete ecrit).
+'   (c) SUPPRESSION D'UN ANTI-PATRON : les compteurs etaient concatenes A
+'       L'INTERIEUR de T(). Comme T() applique A() a ses deux branches, tout
+'       contenu injecte dedans traverse le decodeur d'accents. Inoffensif
+'       pour des nombres, mais c'est le patron qui a corrompu des sujets
+'       ailleurs (cf. ThisOutlookSession v10.6) : il ne doit pas subsister
+'       comme modele a recopier.
+'   (d) Instrumentation de version ajoutee (MOD_VERSION / ModVersion) : le
+'       module n'en avait pas. Erreurs via modUi.Fail.
+'   Dependances ajoutees : modUi (Ask / Fail / Toast), modMsgBoxCustom.
+'
+' CHANGELOG
+'   v1.0 / 2026-06-06 - creation. Migration TempoTag->ProjectTag
+'                       et TempoDemande->ProjectAsk.
+'   (Historique complet -> CHANGELOG.)
+' ============================================================
+
+Private Const MOD_NAME As String = "MigrateTags"
+Private Const MOD_VERSION As String = "v2.0 - 2026-08-22"
+
+' Table de correspondance ANCIEN > NOUVEAU (paires ; separateur).
+' Pack v3 (D12) : la table de renommage vient de config.ini (cle
+' TagMigrationMap, format "Ancien>Nouveau;Ancien2>Nouveau2") ; la
+' constante ne sert que de valeur par defaut (heritage du nommage interne).
+Private Const MAP_TAGS_DEFAULT As String = "TempoTag>ProjectTag;TempoDemande>ProjectAsk"
+
+'=============================================================================
+' ModVersion - version REELLEMENT chargee dans le VBE.
+'=============================================================================
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+'=============================================================================
+' UiTitle - titre de fenetre localise.
+'=============================================================================
+Private Function TagMap() As String
+    TagMap = Trim$(modConfig.Cfg("TagMigrationMap", MAP_TAGS_DEFAULT))
+    If Len(TagMap) = 0 Then TagMap = MAP_TAGS_DEFAULT
+End Function
+
+Private Function UiTitle() As String
+    UiTitle = T("Migration tags projet", "Project tag migration")
+End Function
+
+'=============================================================================
+' MigrateProjectTags - point d'entree.
+'=============================================================================
+Public Sub MigrateProjectTags()
+    On Error GoTo ErrH
+
+    Dim ns As Object, cal As Object, items As Object
+    Dim i As Long, it As Object
+    Dim pairs() As String, p As Long, kv() As String
+    Dim oldName As String, newName As String
+    Dim upOld As Object, upNew As Object
+    Dim seenCount As Long, migratedCount As Long, skippedCount As Long
+    Dim migratedThis As Boolean
+    Dim dryRun As Boolean
+
+    Set ns = Application.GetNamespace("MAPI")
+    Set cal = ns.GetDefaultFolder(olFolderCalendar)
+    Set items = cal.items
+
+    ' Renvoie les masters des series (pas les occurrences) :
+    ' on ecrit donc la UserProperty directement sur le master.
+    items.IncludeRecurrences = False
+
+    ' --- v2.0 : confirmation + choix du mode ------------------------------
+    Dim choice As VbMsgBoxResult
+    choice = modMsgBoxCustom.Confirm3( _
+        T("Migration des UserProperties de tag projet sur le calendrier " & _
+          "principal.", _
+          "Migration of the project tag UserProperties on the main " & _
+          "calendar.") & vbCrLf & vbCrLf & _
+        T("Renommages : ", "Renames: ") & TagMap() & vbCrLf & _
+        T("~El~ements ~a parcourir : ", "Items to scan: ") & items.count & vbCrLf & vbCrLf & _
+        T("Simulation : rien n'est ~ecrit, le compte de ce qui SERAIT migr~e " & _
+          "est report~e.", _
+          "Dry run: nothing is written, the count of what WOULD be migrated " & _
+          "is reported.") & vbCrLf & _
+        T("Appliquer : ~ecrit la nouvelle propri~et~e et supprime l'ancienne " & _
+          "(un Save par RDV concern~e).", _
+          "Apply: writes the new property and deletes the old one (one Save " & _
+          "per affected appointment).") & vbCrLf & vbCrLf & _
+        T("Relance possible sans risque dans les deux cas (idempotent).", _
+          "Safe to run again in both cases (idempotent)."), _
+        UiTitle(), _
+        T("&Simulation", "&Dry run"), _
+        T("&Appliquer", "&Apply"), _
+        T("A&nnuler", "&Cancel"))
+
+    Select Case choice
+        Case vbYes: dryRun = True
+        Case vbNo:  dryRun = False
+        Case Else
+            modDebugLog.DInfo MOD_NAME, "Migration annulee par l'utilisateur"
+            Exit Sub
+    End Select
+
+    pairs = Split(TagMap(), ";")
+
+    modDebugLog.DInfo MOD_NAME, "Migration tags : debut, " & _
+        items.count & " elements dans le calendrier principal, dryRun=" & dryRun
+
+    ' Boucle inverse : on enregistre en place, l'index reste sain
+    ' meme si un Save provoquait un re-tri de la collection.
+    For i = items.count To 1 Step -1
+        Set it = items.Item(i)
+        seenCount = seenCount + 1
+        If (seenCount Mod 50) = 0 Then DoEvents
+
+        ' On ne traite que les RDV (le dossier ne devrait contenir
+        ' que des AppointmentItem, mais on se protege).
+        If TypeName(it) = "AppointmentItem" Then
+
+            migratedThis = False
+
+            For p = LBound(pairs) To UBound(pairs)
+                kv = Split(pairs(p), ">")
+                If UBound(kv) = 1 Then
+                    oldName = Trim$(kv(0))
+                    newName = Trim$(kv(1))
+
+                    Set upOld = it.UserProperties.Find(oldName)
+                    If Not upOld Is Nothing Then
+                        ' v2.0 : en simulation, on DETECTE sans ecrire.
+                        If Not dryRun Then
+                            Set upNew = it.UserProperties.Find(newName)
+                            If upNew Is Nothing Then
+                                ' Creer la nouvelle propriete avec la
+                                ' meme valeur ET le meme type que l'ancienne.
+                                Set upNew = it.UserProperties.Add(newName, upOld.Type, False)
+                                upNew.Value = upOld.Value
+                            End If
+                            ' Supprimer l'ancienne dans tous les cas
+                            ' (y compris si la nouvelle existait deja :
+                            ' nettoyage d'un doublon).
+                            upOld.Delete
+                        End If
+                        migratedThis = True
+                    End If
+                End If
+            Next p
+
+            If migratedThis Then
+                ' v2.0 : aucun Save en simulation.
+                If Not dryRun Then it.Save
+                migratedCount = migratedCount + 1
+            Else
+                skippedCount = skippedCount + 1
+            End If
+
+        End If
+
+        Set upOld = Nothing
+        Set upNew = Nothing
+        Set it = Nothing
+    Next i
+
+    modDebugLog.DInfo MOD_NAME, "Migration terminee : vus=" & seenCount & _
+        " migres=" & migratedCount & " ignores=" & skippedCount & _
+        " dryRun=" & dryRun
+
+    ' v2.0 : toast au lieu d'une MsgBox captive. Les compteurs sont
+    ' concatenes A L'EXTERIEUR de T() (cf. note (c) de l'en-tete).
+    Dim msg As String
+    If dryRun Then
+        msg = T("Simulation termin~ee (rien n'a ~et~e ~ecrit).", _
+                "Dry run done (nothing written).")
+    Else
+        msg = T("Migration des tags projet termin~ee.", _
+                "Project tag migration complete.")
+    End If
+    msg = msg & vbLf & migratedCount & _
+          T(" RDV migr~es sur ", " appointments migrated out of ") & seenCount
+
+    modUi.Toast msg, uiSuccess, True
+    Exit Sub
+
+ErrH:
+    modDebugLog.DError MOD_NAME, "MigrateProjectTags error " & _
+        Err.Number & " - " & Err.Description
+    modUi.Fail T("Erreur pendant la migration : ", "Error during migration: ") & _
+        Err.Number & " - " & Err.Description & vbCrLf & vbCrLf & _
+        T("~El~ement #", "Item #") & i & _
+        T(". Tu peux relancer apr~fs correction.", ". You can run it again after fixing."), _
+        UiTitle()
+End Sub

@@ -1,0 +1,1171 @@
+Option Explicit
+
+'=============================================================================
+' modContactImport v1.4  (2026-08-17)
+' Purpose (EN): re-import a contacts.csv produced by modContactExport (and
+'   edited in Excel or by batch) into the chosen store: matches each row to
+'   its card by ContactSyncID (then EntryID, then normalised name), updates
+'   only the differing fields, replaces / removes photos, moves cards
+'   between folders (_Folder), never deletes, refuses to overwrite a card
+'   modified in Outlook after the export (unless _Action=force). Dry-run
+'   first, per-field report. No UserForm.
+'
+' Reimporte un contacts.csv produit par modContactExport (edite dans Excel
+' ou par lot) dans le compte choisi.
+'   RAPPROCHEMENT : _SyncID (etiquette permanente) -> _EntryID -> nom
+'   normalise (Prenom+Nom ou FullName, s'il est unique dans le compte).
+'   Aucune correspondance = ligne signalee, JAMAIS creee sauf _Action=creer.
+'   Deux fiches de meme _SyncID = ambiguite signalee, ligne ignoree.
+'   CHAMPS : cellule vide = champ laisse tel quel ; "-" = champ vide.
+'   Colonne absente = champ non touche. Colonne inconnue = ignoree (note).
+'   Dates AAAA-MM-JJ (JJ/MM/AAAA accepte), Sensitivity 0..3, Categories
+'   separees par ";", Body compare a plat.
+'   PHOTO (_Photo) : nom de fichier dans photos\ = posee si la fiche n'en a
+'   pas ou si le fichier est plus recent que l'export ; "-" = retiree ;
+'   vide = inchangee.
+'   DOSSIER (_Folder) : different du dossier actuel = fiche DEPLACEE
+'   (dossier cree sous son parent s'il manque, ContactImportCreateFolders).
+'   CONFLIT : fiche modifiee dans Outlook APRES l'export (_Exported) =
+'   ligne ignoree, sauf _Action=force. Le CSV a-t-il ete edite plusieurs
+'   jours ? Les modifications faites sur le telephone entre-temps sont
+'   ainsi protegees.
+'   FETE (_NameDay) : "MM-JJ" = UserProperty NameDay posee ; "-" = retiree.
+'   MULTI-COMPTES (v1.3) : numeros separes par des virgules ("1,3") ; la
+'   colonne _Store rattache chaque ligne a son compte (dossier _Folder
+'   resolu dans ce compte, creation dans ce compte). Un seul compte choisi
+'   et _Store absent = ce compte. Deplacement d'un compte a l'autre refuse.
+'   JAMAIS DE SUPPRESSION : une fiche absente du CSV n'est pas touchee.
+'   Un seul Save par fiche modifiee (3 essais).
+'
+' FICHIER : InputBox pre-rempli avec le dernier dossier Contacts-* de
+' ContactExportDir. Separateur (; ou ,) et encodage (UTF-8 avec/sans BOM,
+' Windows-1252 apres un enregistrement Excel "CSV") detectes.
+'
+' RAPPORT : <Bureau>\Macro VBA\Outlook\ContactImport-AAAAMMJJ-HHMMSS.txt
+' (UTF-8) : par fiche, champ par champ "avant -> apres" ; conflits ; lignes
+' sans correspondance ; deplacements ; photos.
+'
+' SUB PUBLIQUE (epinglable au QAT) : ContactImportCsv
+'
+' Dependances : modConfig (Cfg/CfgB, T, A, MacroVBADir), modDebugLog,
+'   modMsgBoxCustom.Confirm3.
+' Cles config.ini : ContactExportDir, ContactImportAllowMove,
+'   ContactImportCreateFolders, ContactSkipFolders (partagee).
+'=============================================================================
+
+Private Const MOD_NAME As String = "ContImp"
+Private Const MOD_VERSION As String = "v1.4 - 2026-08-17"
+
+Private Const UP_SYNC As String = "ContactSyncID"
+Private Const UP_NAMEDAY As String = "NameDay"
+Private Const PROPTAG_HIDDEN As String = "http://schemas.microsoft.com/mapi/proptag/0x10F4000B"
+Private Const DEFAULT_SKIP As String = "{*|Recipient Cache|*sugg*|GAL Contacts|Organizational Contacts|Companies|PeopleCentricConversation Buddies|*Lync*|*Skype*|ExternalContacts"
+Private Const NO_DATE_YEAR As Long = 4500
+Private Const CLEAR_TOKEN As String = "-"
+' Tolerance (secondes) entre LastModificationTime et _Exported : le Save de
+' l'etiquette precede de peu l'horodatage de la ligne.
+Private Const CONFLICT_TOLERANCE_SEC As Long = 120
+
+' CONTRAT DE COLONNES - IDENTIQUE dans modContactExport (verifie au build).
+Private Const META_FIELDS As String = "_Store|_SyncID|_EntryID|_Folder|_Photo|_NameDay|_Modified|_Exported|_Action"
+Private Const FIELDS As String = "FullName|Title|FirstName|MiddleName|LastName|Suffix|NickName|FileAs|" & _
+    "CompanyName|JobTitle|Department|OfficeLocation|Profession|ManagerName|AssistantName|" & _
+    "Email1Address|Email1DisplayName|Email2Address|Email2DisplayName|Email3Address|Email3DisplayName|" & _
+    "MobileTelephoneNumber|HomeTelephoneNumber|Home2TelephoneNumber|BusinessTelephoneNumber|" & _
+    "Business2TelephoneNumber|OtherTelephoneNumber|PrimaryTelephoneNumber|CompanyMainTelephoneNumber|" & _
+    "AssistantTelephoneNumber|CarTelephoneNumber|PagerNumber|BusinessFaxNumber|HomeFaxNumber|OtherFaxNumber|" & _
+    "HomeAddressStreet|HomeAddressCity|HomeAddressPostalCode|HomeAddressState|HomeAddressCountry|" & _
+    "BusinessAddressStreet|BusinessAddressCity|BusinessAddressPostalCode|BusinessAddressState|BusinessAddressCountry|" & _
+    "OtherAddressStreet|OtherAddressCity|OtherAddressPostalCode|OtherAddressState|OtherAddressCountry|" & _
+    "Birthday|Anniversary|Spouse|Children|WebPage|IMAddress|Categories|Sensitivity|Body"
+Private Const DATE_FIELDS As String = "|Birthday|Anniversary|"
+Private Const LONG_FIELDS As String = "|Sensitivity|"
+
+Private Declare PtrSafe Sub Sleep Lib "kernel32" (ByVal dwMilliseconds As Long)
+
+' --- Reglages ---
+Private mExportDir As String
+Private mAllowMove As Boolean
+Private mCreateFolders As Boolean
+Private mSkipFolders As String
+
+' --- Etat de la passe ---
+Private mStores As Collection      ' comptes choisis (Outlook.Store)
+Private mStoreByName As Object     ' LCase(DisplayName) -> Store
+Private mCsvDir As String
+Private mReport As String
+Private mReportPath As String
+Private mHeader() As String
+Private mColIdx As Object          ' nom de colonne -> index (0-based)
+Private mBySync As Object          ' SyncID -> ContactItem ou "DUP"
+Private mByName As Object          ' cle nom -> ContactItem ou "DUP"
+Private mFolders As Object         ' LCase(store & "|" & chemin relatif) -> MAPIFolder
+Private mExportStamp As Date
+
+' --- Compteurs ---
+Private mRows As Long
+Private mUpdated As Long
+Private mUnchanged As Long
+Private mCreated As Long
+Private mMoved As Long
+Private mPhotos As Long
+Private mSkipped As Long
+Private mConflicts As Long
+Private mNoMatch As Long
+Private mAmbiguous As Long
+Private mErrors As Long
+Private mFieldChanges As Long
+Private mNameDays As Long
+Private mBadStore As Long
+
+'=============================================================================
+' ModVersion - version REELLEMENT chargee dans le VBE.
+'=============================================================================
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+'=============================================================================
+' ContactImportCsv  (epinglable au QAT)
+'=============================================================================
+Public Sub ContactImportCsv()
+    Dim errNo As Long, errDesc As String
+    On Error GoTo ErrH
+    LoadSettings
+    ResetState
+    Randomize
+
+    Set mStores = PickStores()
+    If mStores Is Nothing Then Exit Sub
+    Dim k As Variant, st As Outlook.Store, storeNames As String
+    Set mStoreByName = CreateObject("Scripting.Dictionary")
+    For Each k In mStores
+        Set st = k
+        Set mStoreByName.Item(LCase$(st.DisplayName)) = st
+        storeNames = storeNames & IIf(Len(storeNames) > 0, ", ", "") & st.DisplayName
+    Next k
+
+    Dim csvPath As String
+    csvPath = PickCsvPath()
+    If Len(csvPath) = 0 Then Exit Sub
+    mCsvDir = Left$(csvPath, InStrRev(csvPath, "\") - 1)
+
+    Dim rows As Collection
+    Set rows = ReadCsv(csvPath)
+    If rows Is Nothing Then Exit Sub
+    If rows.Count < 2 Then
+        MsgBox T("Le fichier ne contient aucune ligne de donn~ees.", "The file has no data row."), vbExclamation, UiTitle()
+        Exit Sub
+    End If
+    If Not BuildHeaderIndex(rows.Item(1)) Then Exit Sub
+
+    Dim choice As VbMsgBoxResult
+    choice = modMsgBoxCustom.Confirm3( _
+        T("Compte(s) : ", "Account(s): ") & storeNames & vbCrLf & _
+        T("Fichier : ", "File: ") & csvPath & vbCrLf & _
+        T("Lignes : ", "Rows: ") & (rows.Count - 1) & vbCrLf & vbCrLf & _
+        T("Simulation : rien n'est ~ecrit, le rapport liste champ par champ ce qui SERAIT chang~e." & vbCrLf & _
+          "Appliquer : met ~a jour les fiches (jamais de suppression)." & vbCrLf & _
+          "(Boutons natifs : Oui = Simulation, Non = Appliquer.)", _
+          "Dry run: nothing is written, the report lists field by field what WOULD change." & vbCrLf & _
+          "Apply: updates the cards (never deletes)." & vbCrLf & _
+          "(Native buttons: Yes = Dry run, No = Apply.)"), _
+        UiTitle(), T("&Simulation", "&Dry run"), T("&Appliquer", "&Apply"), T("A&nnuler", "&Cancel"))
+    If choice = vbCancel Then Exit Sub
+    Dim dryRun As Boolean
+    dryRun = (choice = vbYes)
+
+    modDebugLog.DInfo MOD_NAME, "Import start stores=" & storeNames & " file=" & csvPath & " dryRun=" & dryRun
+    ReportLine "modContactImport " & MOD_VERSION & " - " & Format$(Now, "yyyy-mm-dd hh:nn:ss")
+    ReportLine IIf(dryRun, "MODE : SIMULATION (aucune modification)", "MODE : APPLIQUE")
+    ReportLine "Compte(s) : " & storeNames
+    ReportLine "Fichier : " & csvPath & " (" & (rows.Count - 1) & " lignes)"
+    ReportLine "Deplacement par _Folder : " & mAllowMove & " | creation de dossiers : " & mCreateFolders
+    ReportLine String$(78, "-")
+
+    For Each k In mStores
+        Set st = k
+        IndexFolderTree st.GetRootFolder
+    Next k
+    ReportLine "Fiches indexees : " & mBySync.Count & " etiquettes, " & mByName.Count & " noms"
+    ReportLine String$(78, "-")
+
+    Dim ri As Long
+    For ri = 2 To rows.Count
+        ProcessRow rows.Item(ri), ri, dryRun
+        If (ri Mod 20) = 0 Then DoEvents
+    Next ri
+
+    WriteReport
+    modDebugLog.DInfo MOD_NAME, "Import end rows=" & mRows & " updated=" & mUpdated & " unchanged=" & mUnchanged & _
+        " created=" & mCreated & " moved=" & mMoved & " photos=" & mPhotos & " namedays=" & mNameDays & _
+        " skipped=" & mSkipped & " conflicts=" & mConflicts & " nomatch=" & mNoMatch & " ambiguous=" & mAmbiguous & _
+        " badstore=" & mBadStore & " errors=" & mErrors
+    ShowSummary dryRun
+    Exit Sub
+ErrH:
+    errNo = Err.Number
+    errDesc = Err.Description
+    On Error Resume Next
+    modDebugLog.DError MOD_NAME, "ContactImportCsv err " & errNo & " - " & errDesc
+    ReportLine "!! ERREUR " & errNo & " - " & errDesc
+    WriteReport
+    MsgBox T("Erreur : ", "Error: ") & errNo & " - " & errDesc, vbExclamation, UiTitle()
+End Sub
+
+'=============================================================================
+' Reglages / etat
+'=============================================================================
+Private Sub LoadSettings()
+    modConfig.EnsureLoaded
+    mExportDir = Trim$(modConfig.Cfg("ContactExportDir", ""))
+    If Len(mExportDir) = 0 Then mExportDir = modConfig.MacroVBADir()
+    If Right$(mExportDir, 1) = "\" Then mExportDir = Left$(mExportDir, Len(mExportDir) - 1)
+    mAllowMove = modConfig.CfgB("ContactImportAllowMove", True)
+    mCreateFolders = modConfig.CfgB("ContactImportCreateFolders", True)
+    mSkipFolders = modConfig.Cfg("ContactSkipFolders", DEFAULT_SKIP)
+End Sub
+
+Private Sub ResetState()
+    mReport = "": mReportPath = "": mCsvDir = ""
+    Set mColIdx = CreateObject("Scripting.Dictionary")
+    Set mBySync = CreateObject("Scripting.Dictionary")
+    Set mByName = CreateObject("Scripting.Dictionary")
+    Set mFolders = CreateObject("Scripting.Dictionary")
+    mExportStamp = 0
+    mRows = 0: mUpdated = 0: mUnchanged = 0: mCreated = 0: mMoved = 0: mPhotos = 0
+    mSkipped = 0: mConflicts = 0: mNoMatch = 0: mAmbiguous = 0: mErrors = 0: mFieldChanges = 0
+    mNameDays = 0: mBadStore = 0
+End Sub
+
+Private Function UiTitle() As String
+    UiTitle = T("R~eimport des contacts", "Contact re-import")
+End Function
+
+'=============================================================================
+' Choix des comptes (stores) : numeros separes par des virgules ("1,3").
+' Defaut = store du dossier courant.
+'=============================================================================
+Private Function PickStores() As Collection
+    On Error GoTo ErrH
+    Dim ns As Outlook.NameSpace
+    Set ns = Application.Session
+    Dim cur As Outlook.Store
+    On Error Resume Next
+    Set cur = Application.ActiveExplorer.CurrentFolder.Store
+    On Error GoTo ErrH
+    Dim listTxt As String, idx As Long, defIdx As Long
+    For idx = 1 To ns.Stores.Count
+        listTxt = listTxt & idx & " - " & ns.Stores(idx).DisplayName & vbCrLf
+        If Not cur Is Nothing Then
+            If ns.Stores(idx).StoreID = cur.StoreID Then defIdx = idx
+        End If
+    Next idx
+    If defIdx = 0 Then defIdx = 1
+    Dim ans As String
+    ans = Trim$(InputBox(T("Compte(s) dans le(s)quel(s) r~eimporter - num~eros s~epar~es par des virgules :", _
+                           "Account(s) to re-import into - comma-separated numbers:") & _
+                         vbCrLf & vbCrLf & listTxt, UiTitle(), CStr(defIdx)))
+    If Len(ans) = 0 Then Exit Function
+    Dim parts() As String, res As Collection, seen As String, num As Long
+    Set res = New Collection
+    parts = Split(Replace(ans, ";", ","), ",")
+    For idx = LBound(parts) To UBound(parts)
+        If Len(Trim$(parts(idx))) > 0 Then
+            If Not IsNumeric(Trim$(parts(idx))) Then GoTo BadChoice
+            num = CLng(Trim$(parts(idx)))
+            If num < 1 Or num > ns.Stores.Count Then GoTo BadChoice
+            If InStr(seen, "|" & num & "|") = 0 Then
+                res.Add ns.Stores(num)
+                seen = seen & "|" & num & "|"
+            End If
+        End If
+    Next idx
+    If res.Count = 0 Then GoTo BadChoice
+    Set PickStores = res
+    Exit Function
+BadChoice:
+    MsgBox T("Choix invalide.", "Invalid choice."), vbExclamation, UiTitle()
+    Exit Function
+ErrH:
+    modDebugLog.DError MOD_NAME, "PickStores err " & Err.Number & " - " & Err.Description
+End Function
+
+'=============================================================================
+' Chemin du CSV : InputBox pre-rempli avec le dernier dossier Contacts-*.
+'=============================================================================
+Private Function PickCsvPath() As String
+    On Error Resume Next
+    Dim latest As String, nm As String
+    Dim names As Collection
+    Set names = New Collection
+    ' 1) enumeration seule (Dir ne supporte pas d'appel imbrique)
+    nm = Dir(mExportDir & "\Contacts-*", vbDirectory)
+    Do While Len(nm) > 0
+        If nm <> "." And nm <> ".." Then names.Add nm
+        nm = Dir
+    Loop
+    ' 2) puis verification de chaque candidat
+    Dim k As Variant
+    For Each k In names
+        If (GetAttr(mExportDir & "\" & k) And vbDirectory) <> 0 Then
+            If Dir(mExportDir & "\" & k & "\contacts.csv") <> "" Then
+                If CStr(k) > latest Then latest = CStr(k)
+            End If
+        End If
+    Next k
+    Dim defPath As String
+    If Len(latest) > 0 Then defPath = mExportDir & "\" & latest & "\contacts.csv"
+    Dim ans As String
+    ans = Trim$(InputBox(T("Chemin complet du fichier contacts.csv ~a r~eimporter :", _
+                           "Full path of the contacts.csv to re-import:"), UiTitle(), defPath))
+    If Len(ans) = 0 Then Exit Function
+    If Left$(ans, 1) = """" And Right$(ans, 1) = """" Then ans = Mid$(ans, 2, Len(ans) - 2)
+    If Dir(ans) = "" Then
+        MsgBox T("Fichier introuvable : ", "File not found: ") & ans, vbExclamation, UiTitle()
+        Exit Function
+    End If
+    PickCsvPath = ans
+End Function
+
+'=============================================================================
+' Lecture + decodage du CSV. Renvoie une Collection de tableaux (Variant)
+' de chaines ; element 1 = en-tete.
+'=============================================================================
+Private Function ReadCsv(ByVal path As String) As Collection
+    On Error GoTo ErrH
+    Dim txt As String
+    txt = ReadTextAuto(path)
+    If Len(txt) = 0 Then
+        MsgBox T("Fichier vide ou illisible.", "Empty or unreadable file."), vbExclamation, UiTitle()
+        Exit Function
+    End If
+    ' Separateur : celui qui domine sur la premiere ligne
+    Dim firstLine As String, pLf As Long, sep As String
+    pLf = InStr(txt, vbLf)
+    If pLf = 0 Then pLf = Len(txt) + 1
+    firstLine = Left$(txt, pLf - 1)
+    If Len(firstLine) - Len(Replace(firstLine, ";", "")) >= Len(firstLine) - Len(Replace(firstLine, ",", "")) Then
+        sep = ";"
+    Else
+        sep = ","
+    End If
+    Set ReadCsv = ParseCsv(txt, sep)
+    modDebugLog.DDebug MOD_NAME, "CSV lu : " & ReadCsv.Count & " lignes, separateur '" & sep & "'"
+    Exit Function
+ErrH:
+    modDebugLog.DError MOD_NAME, "ReadCsv err " & Err.Number & " - " & Err.Description
+    MsgBox T("Lecture du CSV impossible : ", "Cannot read the CSV: ") & Err.Description, vbExclamation, UiTitle()
+End Function
+
+' UTF-8 (avec ou sans BOM) sinon Windows-1252 (Excel "CSV" classique).
+Private Function ReadTextAuto(ByVal path As String) As String
+    On Error Resume Next
+    Dim stm As Object, txt As String
+    Set stm = CreateObject("ADODB.Stream")
+    stm.Type = 2
+    stm.Charset = "utf-8"
+    stm.Open
+    stm.LoadFromFile path
+    txt = stm.ReadText(-1)
+    stm.Close
+    ' Caractere de remplacement U+FFFD = octets non UTF-8 -> relire en 1252
+    If InStr(txt, ChrW$(65533)) > 0 Then
+        Set stm = CreateObject("ADODB.Stream")
+        stm.Type = 2
+        stm.Charset = "windows-1252"
+        stm.Open
+        stm.LoadFromFile path
+        txt = stm.ReadText(-1)
+        stm.Close
+        modDebugLog.DDebug MOD_NAME, "CSV decode en windows-1252"
+    End If
+    If Left$(txt, 1) = ChrW$(65279) Then txt = Mid$(txt, 2)
+    ReadTextAuto = txt
+End Function
+
+' Analyseur RFC 4180 : guillemets doubles, separateur et retours a la ligne
+' autorises dans un champ entre guillemets.
+Private Function ParseCsv(ByVal txt As String, ByVal sep As String) As Collection
+    Dim rows As Collection
+    Set rows = New Collection
+    Dim cells() As String, nFields As Long
+    ReDim cells(0 To 255)
+    Dim pos As Long, n As Long, ch As String, field As String, inQ As Boolean
+    n = Len(txt)
+    pos = 1
+    Do While pos <= n
+        ch = Mid$(txt, pos, 1)
+        If inQ Then
+            If ch = """" Then
+                If pos < n Then
+                    If Mid$(txt, pos + 1, 1) = """" Then
+                        field = field & """"
+                        pos = pos + 1
+                    Else
+                        inQ = False
+                    End If
+                Else
+                    inQ = False
+                End If
+            Else
+                field = field & ch
+            End If
+        Else
+            If ch = """" Then
+                inQ = True
+            ElseIf ch = sep Then
+                If nFields > UBound(cells) Then ReDim Preserve cells(0 To UBound(cells) + 64)
+                cells(nFields) = field: nFields = nFields + 1: field = ""
+            ElseIf ch = vbCr Or ch = vbLf Then
+                If ch = vbCr And pos < n Then
+                    If Mid$(txt, pos + 1, 1) = vbLf Then pos = pos + 1
+                End If
+                If nFields > UBound(cells) Then ReDim Preserve cells(0 To UBound(cells) + 64)
+                cells(nFields) = field: nFields = nFields + 1: field = ""
+                AddRow rows, cells, nFields
+                nFields = 0
+            Else
+                field = field & ch
+            End If
+        End If
+        pos = pos + 1
+    Loop
+    If nFields > 0 Or Len(field) > 0 Then
+        If nFields > UBound(cells) Then ReDim Preserve cells(0 To UBound(cells) + 64)
+        cells(nFields) = field: nFields = nFields + 1
+        AddRow rows, cells, nFields
+    End If
+    Set ParseCsv = rows
+End Function
+
+Private Sub AddRow(ByVal rows As Collection, ByRef cells() As String, ByVal nFields As Long)
+    ' Ligne entierement vide ignoree
+    Dim idx As Long, allEmpty As Boolean
+    allEmpty = True
+    For idx = 0 To nFields - 1
+        If Len(cells(idx)) > 0 Then allEmpty = False: Exit For
+    Next idx
+    If allEmpty Then Exit Sub
+    Dim arr() As String
+    ReDim arr(0 To nFields - 1)
+    For idx = 0 To nFields - 1
+        arr(idx) = cells(idx)
+    Next idx
+    rows.Add arr
+End Sub
+
+Private Function BuildHeaderIndex(ByVal hdr As Variant) As Boolean
+    Dim idx As Long, nm As String, unknown As String
+    For idx = LBound(hdr) To UBound(hdr)
+        nm = Trim$(hdr(idx))
+        If Len(nm) > 0 Then
+            If Not mColIdx.Exists(nm) Then mColIdx.Add nm, idx
+            If InStr("|" & META_FIELDS & "|", "|" & nm & "|") = 0 And InStr("|" & FIELDS & "|", "|" & nm & "|") = 0 Then
+                unknown = unknown & nm & " "
+            End If
+        End If
+    Next idx
+    If Not mColIdx.Exists("_SyncID") And Not mColIdx.Exists("_EntryID") And Not mColIdx.Exists("FullName") _
+       And Not mColIdx.Exists("LastName") Then
+        MsgBox T("En-t~xte non reconnu : il faut au moins _SyncID, _EntryID, FullName ou LastName.", _
+                 "Header not recognised: at least _SyncID, _EntryID, FullName or LastName is required."), _
+               vbExclamation, UiTitle()
+        Exit Function
+    End If
+    If Len(unknown) > 0 Then ReportLine "Colonnes inconnues ignorees : " & unknown
+    BuildHeaderIndex = True
+End Function
+
+' Valeur d'une colonne pour une ligne ("" si colonne absente).
+Private Function Cell(ByVal row As Variant, ByVal colName As String) As String
+    If Not mColIdx.Exists(colName) Then Exit Function
+    Dim idx As Long
+    idx = mColIdx.Item(colName)
+    If idx > UBound(row) Then Exit Function
+    Cell = row(idx)
+End Function
+
+'=============================================================================
+' Index du compte : SyncID -> fiche, cle nom -> fiche, chemin -> dossier.
+'=============================================================================
+Private Sub IndexFolderTree(ByVal fld As Outlook.MAPIFolder)
+    On Error Resume Next
+    Dim isContacts As Boolean
+    isContacts = (fld.DefaultItemType = olContactItem)
+    If Err.Number <> 0 Then isContacts = False: Err.Clear
+    If isContacts Then
+        If Not IsSkippedFolder(fld) Then
+            Set mFolders.Item(FolderKey(fld.Store.DisplayName, ShortPath(fld))) = fld
+            IndexContacts fld
+        End If
+    End If
+    Dim child As Outlook.MAPIFolder
+    For Each child In fld.Folders
+        IndexFolderTree child
+    Next child
+End Sub
+
+Private Sub IndexContacts(ByVal fld As Outlook.MAPIFolder)
+    On Error Resume Next
+    Dim itm As Object, up As Outlook.UserProperty, sid As String, nk As String, cnt As Long
+    For Each itm In fld.Items
+        cnt = cnt + 1
+        If TypeName(itm) = "ContactItem" Then
+            Set up = Nothing
+            Set up = itm.UserProperties.Find(UP_SYNC)
+            If Not up Is Nothing Then
+                sid = Trim$(CStr(up.Value))
+                If Len(sid) > 0 Then
+                    If mBySync.Exists(sid) Then
+                        mBySync.Item(sid) = "DUP"
+                    Else
+                        mBySync.Add sid, itm
+                    End If
+                End If
+            End If
+            nk = NameKeyOf(itm)
+            If Len(nk) > 0 Then
+                If mByName.Exists(nk) Then
+                    mByName.Item(nk) = "DUP"
+                Else
+                    mByName.Add nk, itm
+                End If
+            End If
+        End If
+        If (cnt Mod 25) = 0 Then DoEvents
+    Next itm
+    Err.Clear
+End Sub
+
+Private Function NameKeyOf(ByVal ct As Object) As String
+    On Error Resume Next
+    Dim fn As String, ln As String, res As String
+    fn = Trim$(ct.FirstName)
+    ln = Trim$(ct.LastName)
+    If Len(fn) > 0 And Len(ln) > 0 Then
+        res = fn & " " & ln
+    Else
+        res = Trim$(ct.FullName)
+    End If
+    NameKeyOf = NormKey(res)
+End Function
+
+Private Function NameKeyOfRow(ByVal row As Variant) As String
+    Dim fn As String, ln As String, res As String
+    fn = Trim$(Cell(row, "FirstName"))
+    ln = Trim$(Cell(row, "LastName"))
+    If fn = CLEAR_TOKEN Then fn = ""
+    If ln = CLEAR_TOKEN Then ln = ""
+    If Len(fn) > 0 And Len(ln) > 0 Then
+        res = fn & " " & ln
+    Else
+        res = Trim$(Cell(row, "FullName"))
+        If res = CLEAR_TOKEN Then res = ""
+    End If
+    NameKeyOfRow = NormKey(res)
+End Function
+
+Private Function IsSkippedFolder(ByVal fld As Outlook.MAPIFolder) As Boolean
+    ' Pack v3 (C3) : delegation modContactCommon (helper partage).
+    IsSkippedFolder = modContactCommon.IsSkippedFolder(fld, mSkipFolders)
+End Function
+
+' Dossier situe sous les Elements supprimes de son compte (corbeille) ?
+Private Function IsInDeletedItems(ByVal fld As Outlook.MAPIFolder) As Boolean
+    ' Pack v3 (C3) : delegation modContactCommon (helper partage).
+    IsInDeletedItems = modContactCommon.IsInDeletedItems(fld)
+End Function
+
+
+Private Function ShortPath(ByVal fld As Outlook.MAPIFolder) As String
+    On Error Resume Next
+    ShortPath = Replace(fld.FolderPath, "\\" & fld.Store.DisplayName & "\", "")
+    If Len(ShortPath) = 0 Then ShortPath = fld.Name
+End Function
+
+Private Function FolderKey(ByVal storeName As String, ByVal relPath As String) As String
+    Dim k As String
+    k = LCase$(Trim$(relPath))
+    If Left$(k, 1) = "\" Then k = Mid$(k, 2)
+    If Right$(k, 1) = "\" Then k = Left$(k, Len(k) - 1)
+    FolderKey = LCase$(storeName) & "|" & k
+End Function
+
+' Compte de la ligne : colonne _Store, sinon l'unique compte choisi.
+Private Function RowStore(ByVal row As Variant, ByVal ct As Object) As Outlook.Store
+    On Error Resume Next
+    Dim nm As String
+    nm = LCase$(Trim$(Cell(row, "_Store")))
+    If Len(nm) > 0 Then
+        If mStoreByName.Exists(nm) Then Set RowStore = mStoreByName.Item(nm)
+        Exit Function
+    End If
+    If Not ct Is Nothing Then
+        Set RowStore = ct.Parent.Store
+        If Not RowStore Is Nothing Then Exit Function
+    End If
+    If mStores.Count = 1 Then Set RowStore = mStores.Item(1)
+End Function
+
+'=============================================================================
+' Traitement d'une ligne.
+'=============================================================================
+Private Sub ProcessRow(ByVal row As Variant, ByVal rowNo As Long, ByVal dryRun As Boolean)
+    Dim errNo As Long, errDesc As String
+    Dim who As String
+    On Error GoTo ErrH
+    mRows = mRows + 1
+
+    Dim action As String
+    action = LCase$(Trim$(Cell(row, "_Action")))
+    who = Trim$(Cell(row, "FullName"))
+    If Len(who) = 0 Or who = CLEAR_TOKEN Then who = Trim$(Cell(row, "FirstName") & " " & Cell(row, "LastName"))
+    If Len(who) = 0 Then who = "(ligne " & rowNo & ")"
+
+    If action = "skip" Or action = "ignorer" Then
+        mSkipped = mSkipped + 1
+        Exit Sub
+    End If
+
+    ' Horodatage de l'export (pour la detection de conflit)
+    Dim expTxt As String
+    expTxt = Trim$(Cell(row, "_Exported"))
+    If Len(expTxt) > 0 Then mExportStamp = ParseDateTime(expTxt)
+
+    ' --- Rapprochement ---
+    Dim ct As Outlook.ContactItem
+    Dim how As String
+    Set ct = FindCard(row, how)
+    If how = "AMBIGU" Then
+        mAmbiguous = mAmbiguous + 1
+        ReportLine "[AMBIGU ] " & who & " : plusieurs fiches portent la meme etiquette / le meme nom - ligne ignoree"
+        Exit Sub
+    End If
+
+    If ct Is Nothing Then
+        If action = "creer" Or action = "create" Then
+            CreateFromRow row, who, dryRun
+        Else
+            mNoMatch = mNoMatch + 1
+            ReportLine "[ABSENT ] " & who & " : aucune fiche correspondante (mettre _Action=creer pour la creer)"
+        End If
+        Exit Sub
+    End If
+
+    ' --- Conflit : fiche modifiee dans Outlook apres l'export ---
+    If mExportStamp > 0 And action <> "force" And action <> "forcer" Then
+        If ct.LastModificationTime > DateAdd("s", CONFLICT_TOLERANCE_SEC, mExportStamp) Then
+            mConflicts = mConflicts + 1
+            ReportLine "[CONFLIT] " & who & " : modifiee dans Outlook le " & _
+                       Format$(ct.LastModificationTime, "yyyy-mm-dd hh:nn") & " (export " & _
+                       Format$(mExportStamp, "yyyy-mm-dd hh:nn") & ") - ligne ignoree, _Action=force pour ecraser"
+            Exit Sub
+        End If
+    End If
+
+    ' --- Champs ---
+    Dim lines As String, changes As Long
+    changes = ApplyFields(ct, row, lines, dryRun)
+
+    ' --- Photo ---
+    changes = changes + ApplyPhoto(ct, row, lines, dryRun)
+
+    ' --- Fete du prenom ---
+    changes = changes + ApplyNameDay(ct, row, lines, dryRun)
+
+    ' --- Save ---
+    If changes > 0 Then
+        mUpdated = mUpdated + 1
+        mFieldChanges = mFieldChanges + changes
+        ReportLine "[" & IIf(dryRun, "SIMUL ", "MODIF ") & "] " & who & "  (" & how & ")"
+        mReport = mReport & lines
+        If Not dryRun Then
+            If Not SafeSave(ct) Then
+                mErrors = mErrors + 1
+                ReportLine "   !! Save en echec"
+                Exit Sub
+            End If
+        End If
+    Else
+        mUnchanged = mUnchanged + 1
+    End If
+
+    ' --- Deplacement ---
+    Dim wantFolder As String
+    wantFolder = Trim$(Cell(row, "_Folder"))
+    If mAllowMove And Len(wantFolder) > 0 And wantFolder <> CLEAR_TOKEN Then
+        Dim curPath As String
+        curPath = ShortPath(ct.Parent)
+        If StrComp(curPath, wantFolder, vbTextCompare) <> 0 Then
+            If changes = 0 Then ReportLine "[" & IIf(dryRun, "SIMUL ", "MODIF ") & "] " & who & "  (" & how & ")"
+            ReportLine "   dossier : " & curPath & "  ->  " & wantFolder
+            Dim rowSt As Outlook.Store
+            Set rowSt = RowStore(row, ct)
+            If rowSt Is Nothing Then
+                mBadStore = mBadStore + 1
+                ReportLine "   !! compte _Store inconnu ou non selectionne : deplacement refuse"
+            ElseIf rowSt.StoreID <> ct.Parent.Store.StoreID Then
+                mBadStore = mBadStore + 1
+                ReportLine "   !! deplacement d'un compte a l'autre refuse (" & ct.Parent.Store.DisplayName & " -> " & rowSt.DisplayName & ")"
+            ElseIf Not dryRun Then
+                Dim target As Outlook.MAPIFolder
+                Set target = ResolveFolder(rowSt, wantFolder)
+                If target Is Nothing Then
+                    mErrors = mErrors + 1
+                    ReportLine "   !! dossier cible introuvable / non cree : " & wantFolder
+                Else
+                    Dim moved As Object
+                    Set moved = ct.Move(target)
+                    mMoved = mMoved + 1
+                End If
+            Else
+                mMoved = mMoved + 1
+            End If
+        End If
+    End If
+    Exit Sub
+ErrH:
+    errNo = Err.Number
+    errDesc = Err.Description
+    mErrors = mErrors + 1
+    modDebugLog.DError MOD_NAME, "ProcessRow " & rowNo & " err " & errNo & " - " & errDesc
+    ReportLine "[ERREUR ] " & who & " : " & errNo & " - " & errDesc
+End Sub
+
+' _SyncID -> _EntryID -> nom normalise unique. how = SyncID / EntryID / Nom
+' / AMBIGU / "".
+' PIEGE VBA : VarType(objet) renvoie le type de la PROPRIETE PAR DEFAUT de
+' l'objet (ContactItem -> vbString) : on distingue le marqueur "DUP" avec
+' TypeName, jamais avec VarType.
+Private Function FindCard(ByVal row As Variant, ByRef how As String) As Outlook.ContactItem
+    On Error Resume Next
+    how = ""
+    Dim sid As String, eid As String, nk As String
+    sid = Trim$(Cell(row, "_SyncID"))
+    If Len(sid) > 0 Then
+        If mBySync.Exists(sid) Then
+            If TypeName(mBySync.Item(sid)) = "String" Then
+                how = "AMBIGU"
+                Exit Function
+            End If
+            Set FindCard = mBySync.Item(sid)
+            how = "SyncID"
+            Exit Function
+        End If
+    End If
+    eid = Trim$(Cell(row, "_EntryID"))
+    If Len(eid) > 0 Then
+        Dim itm As Object, k As Variant, st As Outlook.Store
+        For Each k In mStores
+            Set st = k
+            Set itm = Nothing
+            Err.Clear
+            Set itm = Application.Session.GetItemFromID(eid, st.StoreID)
+            If Err.Number = 0 And Not itm Is Nothing Then
+                If TypeName(itm) = "ContactItem" Then
+                    Set FindCard = itm
+                    how = "EntryID"
+                    Exit Function
+                End If
+            End If
+        Next k
+        Err.Clear
+    End If
+    nk = NameKeyOfRow(row)
+    If Len(nk) > 0 Then
+        If mByName.Exists(nk) Then
+            If TypeName(mByName.Item(nk)) = "String" Then
+                how = "AMBIGU"
+                Exit Function
+            End If
+            Set FindCard = mByName.Item(nk)
+            how = "Nom"
+        End If
+    End If
+End Function
+
+' Applique les colonnes reconnues. Cellule vide = intact ; "-" = vide.
+Private Function ApplyFields(ByVal ct As Outlook.ContactItem, ByVal row As Variant, _
+                             ByRef lines As String, ByVal dryRun As Boolean) As Long
+    On Error GoTo ErrH
+    Dim props() As String, idx As Long, nm As String, raw As String, newV As String, oldV As String
+    Dim cnt As Long
+    props = Split(FIELDS, "|")
+    For idx = LBound(props) To UBound(props)
+        nm = props(idx)
+        If mColIdx.Exists(nm) Then
+            raw = Cell(row, nm)
+            If Len(raw) > 0 Then
+                If raw = CLEAR_TOKEN Then newV = "" Else newV = raw
+                oldV = ReadField(ct, nm)
+                If InStr(DATE_FIELDS, "|" & nm & "|") > 0 Then
+                    Dim d As Date
+                    If Len(newV) > 0 Then
+                        d = ParseDateCell(newV)
+                        If d = 0 Then
+                            AddNote lines, "!! " & nm & " : date non reconnue, ignoree : " & newV
+                            GoTo NextField
+                        End If
+                        newV = Format$(d, "yyyy-mm-dd")
+                    End If
+                    If StrComp(oldV, newV, vbBinaryCompare) <> 0 Then
+                        cnt = cnt + 1
+                        AddLine lines, nm, oldV, newV
+                        If Not dryRun Then
+                            If Len(newV) = 0 Then
+                                CallByName ct, nm, VbLet, DateSerial(4501, 1, 1)
+                            Else
+                                CallByName ct, nm, VbLet, d
+                            End If
+                        End If
+                    End If
+                ElseIf InStr(LONG_FIELDS, "|" & nm & "|") > 0 Then
+                    If Len(newV) > 0 And Not IsNumeric(newV) Then
+                        AddNote lines, "!! " & nm & " : valeur non numerique, ignoree : " & newV
+                        GoTo NextField
+                    End If
+                    If Len(newV) = 0 Then newV = "0"
+                    If StrComp(oldV, CStr(CLng(newV)), vbBinaryCompare) <> 0 Then
+                        cnt = cnt + 1
+                        AddLine lines, nm, oldV, newV
+                        If Not dryRun Then CallByName ct, nm, VbLet, CLng(newV)
+                    End If
+                ElseIf nm = "Body" Then
+                    If StrComp(FlatText(oldV), FlatText(newV), vbBinaryCompare) <> 0 Then
+                        cnt = cnt + 1
+                        AddLine lines, nm, Left$(oldV, 60), Left$(newV, 60)
+                        If Not dryRun Then ct.Body = newV
+                    End If
+                Else
+                    If StrComp(oldV, newV, vbBinaryCompare) <> 0 Then
+                        cnt = cnt + 1
+                        AddLine lines, nm, oldV, newV
+                        If Not dryRun Then CallByName ct, nm, VbLet, newV
+                    End If
+                End If
+            End If
+        End If
+NextField:
+    Next idx
+    ApplyFields = cnt
+    Exit Function
+ErrH:
+    modDebugLog.DError MOD_NAME, "ApplyFields " & nm & " err " & Err.Number & " - " & Err.Description
+    AddNote lines, "!! " & nm & " : erreur " & Err.Number & " - " & Err.Description
+    ApplyFields = cnt
+End Function
+
+Private Function ApplyPhoto(ByVal ct As Outlook.ContactItem, ByVal row As Variant, _
+                            ByRef lines As String, ByVal dryRun As Boolean) As Long
+    On Error GoTo ErrH
+    Dim v As String
+    v = Trim$(Cell(row, "_Photo"))
+    If Len(v) = 0 Then Exit Function
+    If v = CLEAR_TOKEN Then
+        If ct.HasPicture Then
+            AddLine lines, "_Photo", "(photo)", "(retiree)"
+            If Not dryRun Then ct.RemovePicture
+            mPhotos = mPhotos + 1
+            ApplyPhoto = 1
+        End If
+        Exit Function
+    End If
+    Dim path As String
+    If InStr(v, ":\") > 0 Or Left$(v, 2) = "\\" Then
+        path = v
+    Else
+        path = mCsvDir & "\photos\" & v
+    End If
+    If Dir(path) = "" Then
+        AddNote lines, "!! _Photo : fichier introuvable : " & path
+        Exit Function
+    End If
+    Dim apply As Boolean
+    If Not ct.HasPicture Then
+        apply = True
+    ElseIf mExportStamp > 0 Then
+        apply = (FileDateTime(path) > DateAdd("s", CONFLICT_TOLERANCE_SEC, mExportStamp))
+    End If
+    If apply Then
+        AddLine lines, "_Photo", IIf(ct.HasPicture, "(photo)", "(aucune)"), v
+        If Not dryRun Then ct.AddPicture path
+        mPhotos = mPhotos + 1
+        ApplyPhoto = 1
+    End If
+    Exit Function
+ErrH:
+    modDebugLog.DError MOD_NAME, "ApplyPhoto err " & Err.Number & " - " & Err.Description
+    AddNote lines, "!! _Photo : erreur " & Err.Number & " - " & Err.Description
+End Function
+
+' _NameDay : "MM-JJ" = posee ; "-" = retiree ; vide = intacte.
+Private Function ApplyNameDay(ByVal ct As Outlook.ContactItem, ByVal row As Variant, _
+                              ByRef lines As String, ByVal dryRun As Boolean) As Long
+    On Error GoTo ErrH
+    Dim v As String, cur As String, up As Outlook.UserProperty
+    v = Trim$(Cell(row, "_NameDay"))
+    If Len(v) = 0 Then Exit Function
+    Set up = ct.UserProperties.Find(UP_NAMEDAY)
+    If Not up Is Nothing Then cur = Trim$(CStr(up.Value))
+    If v = CLEAR_TOKEN Then
+        If Len(cur) = 0 Then Exit Function
+        AddLine lines, "_NameDay", cur, ""
+        If Not dryRun Then up.Value = ""
+    Else
+        If Not v Like "##-##" Then
+            AddNote lines, "!! _NameDay : format attendu MM-JJ, ignoree : " & v
+            Exit Function
+        End If
+        If cur = v Then Exit Function
+        AddLine lines, "_NameDay", cur, v
+        If Not dryRun Then
+            If up Is Nothing Then Set up = ct.UserProperties.Add(UP_NAMEDAY, olText, False)
+            up.Value = v
+        End If
+    End If
+    mNameDays = mNameDays + 1
+    ApplyNameDay = 1
+    Exit Function
+ErrH:
+    modDebugLog.DError MOD_NAME, "ApplyNameDay err " & Err.Number & " - " & Err.Description
+    AddNote lines, "!! _NameDay : erreur " & Err.Number & " - " & Err.Description
+End Function
+
+' Creation d'une fiche (_Action=creer) dans _Folder (ou Contacts par defaut).
+Private Sub CreateFromRow(ByVal row As Variant, ByVal who As String, ByVal dryRun As Boolean)
+    On Error GoTo ErrH
+    Dim wantFolder As String, target As Outlook.MAPIFolder, rowSt As Outlook.Store
+    wantFolder = Trim$(Cell(row, "_Folder"))
+    Set rowSt = RowStore(row, Nothing)
+    If rowSt Is Nothing Then
+        mBadStore = mBadStore + 1
+        ReportLine "[ABSENT ] " & who & " : creation refusee, compte _Store inconnu ou non selectionne"
+        Exit Sub
+    End If
+    ReportLine "[" & IIf(dryRun, "SIMUL ", "CREE  ") & "] " & who & "  (nouvelle fiche dans " & rowSt.DisplayName & _
+               IIf(Len(wantFolder) > 0, " \ " & wantFolder, "") & ")"
+    If dryRun Then
+        mCreated = mCreated + 1
+        Exit Sub
+    End If
+    If Len(wantFolder) > 0 And wantFolder <> CLEAR_TOKEN Then Set target = ResolveFolder(rowSt, wantFolder)
+    If target Is Nothing Then Set target = rowSt.GetDefaultFolder(olFolderContacts)
+    Dim ct As Outlook.ContactItem
+    Set ct = target.Items.Add(olContactItem)
+    Dim lines As String, changes As Long
+    changes = ApplyFields(ct, row, lines, False)
+    changes = changes + ApplyPhoto(ct, row, lines, False)
+    changes = changes + ApplyNameDay(ct, row, lines, False)
+    Dim sid As String
+    sid = Trim$(Cell(row, "_SyncID"))
+    If Len(sid) = 0 Then sid = "CS" & Format$(Now, "yyyymmddhhnnss") & "-" & Format$(mRows, "000000") & "-" & Format$(Int(Rnd * 10000), "0000")
+    Dim up As Outlook.UserProperty
+    Set up = ct.UserProperties.Add(UP_SYNC, olText, False)
+    up.Value = sid
+    If SafeSave(ct) Then
+        mCreated = mCreated + 1
+        mFieldChanges = mFieldChanges + changes
+        mReport = mReport & lines
+        mBySync.Add sid, ct
+    Else
+        mErrors = mErrors + 1
+        ReportLine "   !! Save en echec (creation)"
+    End If
+    Exit Sub
+ErrH:
+    mErrors = mErrors + 1
+    modDebugLog.DError MOD_NAME, "CreateFromRow err " & Err.Number & " - " & Err.Description
+    ReportLine "   !! creation en echec : " & Err.Number & " - " & Err.Description
+End Sub
+
+' Chemin relatif ("Contacts\Famille") -> dossier du compte donne ; cree le
+' dernier segment sous son parent si autorise.
+Private Function ResolveFolder(ByVal st As Outlook.Store, ByVal relPath As String) As Outlook.MAPIFolder
+    On Error Resume Next
+    Dim keyPath As String
+    keyPath = FolderKey(st.DisplayName, relPath)
+    If mFolders.Exists(keyPath) Then
+        Set ResolveFolder = mFolders.Item(keyPath)
+        Exit Function
+    End If
+    If Not mCreateFolders Then Exit Function
+    Dim rel As String
+    rel = Trim$(relPath)
+    If Left$(rel, 1) = "\" Then rel = Mid$(rel, 2)
+    If Right$(rel, 1) = "\" Then rel = Left$(rel, Len(rel) - 1)
+    Dim segs() As String, leaf As String, parentRel As String, parentFld As Outlook.MAPIFolder
+    segs = Split(rel, "\")
+    leaf = segs(UBound(segs))
+    If UBound(segs) = 0 Then
+        Set parentFld = st.GetRootFolder
+    Else
+        parentRel = Left$(rel, Len(rel) - Len(leaf) - 1)
+        Set parentFld = ResolveFolder(st, parentRel)
+    End If
+    If parentFld Is Nothing Then Exit Function
+    Dim created As Outlook.MAPIFolder
+    Err.Clear
+    Set created = parentFld.Folders.Add(leaf, olFolderContacts)
+    If Err.Number <> 0 Or created Is Nothing Then
+        modDebugLog.DError MOD_NAME, "Creation dossier echouee : " & relPath & " err " & Err.Number
+        Err.Clear
+        Exit Function
+    End If
+    Set mFolders.Item(keyPath) = created
+    ReportLine "   dossier cree : " & st.DisplayName & " \ " & relPath
+    modDebugLog.DInfo MOD_NAME, "Dossier cree : " & st.DisplayName & " \ " & relPath
+    Set ResolveFolder = created
+End Function
+
+'=============================================================================
+' Helpers
+'=============================================================================
+Private Function ReadField(ByVal ct As Outlook.ContactItem, ByVal nm As String) As String
+    On Error Resume Next
+    Dim v As Variant
+    v = CallByName(ct, nm, VbGet)
+    If Err.Number <> 0 Then
+        Err.Clear
+        ReadField = ""
+        Exit Function
+    End If
+    If InStr(DATE_FIELDS, "|" & nm & "|") > 0 Then
+        If IsDate(v) Then
+            If Year(CDate(v)) < NO_DATE_YEAR And CDate(v) > DateSerial(1600, 1, 1) Then
+                ReadField = Format$(CDate(v), "yyyy-mm-dd")
+            End If
+        End If
+    ElseIf InStr(LONG_FIELDS, "|" & nm & "|") > 0 Then
+        ReadField = CStr(CLng(v))
+    Else
+        ReadField = CStr(v)
+    End If
+    Err.Clear
+End Function
+
+' AAAA-MM-JJ, JJ/MM/AAAA, sinon CDate ; 0 si non reconnue.
+Private Function ParseDateCell(ByVal s As String) As Date
+    On Error Resume Next
+    s = Trim$(s)
+    If s Like "####-##-##*" Then
+        ParseDateCell = DateSerial(CLng(Left$(s, 4)), CLng(Mid$(s, 6, 2)), CLng(Mid$(s, 9, 2)))
+    ElseIf s Like "##/##/####*" Then
+        ParseDateCell = DateSerial(CLng(Mid$(s, 7, 4)), CLng(Mid$(s, 4, 2)), CLng(Left$(s, 2)))
+    ElseIf IsDate(s) Then
+        ParseDateCell = CDate(s)
+    End If
+    If Err.Number <> 0 Then ParseDateCell = 0: Err.Clear
+End Function
+
+Private Function ParseDateTime(ByVal s As String) As Date
+    On Error Resume Next
+    s = Trim$(s)
+    If s Like "####-##-## ##:##:##" Then
+        ParseDateTime = DateSerial(CLng(Left$(s, 4)), CLng(Mid$(s, 6, 2)), CLng(Mid$(s, 9, 2))) + _
+                        TimeSerial(CLng(Mid$(s, 12, 2)), CLng(Mid$(s, 15, 2)), CLng(Mid$(s, 18, 2)))
+    ElseIf IsDate(s) Then
+        ParseDateTime = CDate(s)
+    End If
+    If Err.Number <> 0 Then ParseDateTime = 0: Err.Clear
+End Function
+
+Private Function NormKey(ByVal s As String) As String
+    ' Pack v3 (C3) : delegation modContactCommon (helper partage).
+    NormKey = modContactCommon.NormKey(s)
+End Function
+
+Private Function StripAccents(ByVal s As String) As String
+    ' Pack v3 (C3) : delegation modContactCommon (helper partage).
+    StripAccents = modContactCommon.StripAccents(s)
+End Function
+
+Private Function CollapseSpaces(ByVal s As String) As String
+    ' Pack v3 (C3) : delegation modContactCommon (helper partage).
+    CollapseSpaces = modContactCommon.CollapseSpaces(s)
+End Function
+
+Private Function FlatText(ByVal s As String) As String
+    ' Pack v3 (C3) : delegation modContactCommon (helper partage).
+    FlatText = modContactCommon.FlatText(s)
+End Function
+
+Private Sub AddLine(ByRef lines As String, ByVal lbl As String, ByVal oldV As String, ByVal newV As String)
+    lines = lines & "   " & lbl & " : " & Flat(oldV) & "  ->  " & Flat(newV) & vbCrLf
+End Sub
+
+Private Sub AddNote(ByRef lines As String, ByVal txt As String)
+    lines = lines & "   " & Flat(txt) & vbCrLf
+End Sub
+
+Private Function Flat(ByVal s As String) As String
+    Flat = Replace(Replace(s, vbCrLf, " / "), vbLf, " / ")
+End Function
+
+Private Function SafeSave(ByVal itm As Object) As Boolean
+    Dim tries As Long
+    On Error Resume Next
+    For tries = 1 To 3
+        Err.Clear
+        itm.Save
+        If Err.Number = 0 Then
+            SafeSave = True
+            Exit Function
+        End If
+        modDebugLog.DDebug MOD_NAME, "Save essai " & tries & " err " & Err.Number & " - " & Err.Description
+        Sleep 300 * tries
+    Next tries
+    SafeSave = False
+End Function
+
+'=============================================================================
+' Rapport
+'=============================================================================
+Private Sub ReportLine(ByVal s As String)
+    mReport = mReport & s & vbCrLf
+End Sub
+
+Private Sub WriteReport()
+    On Error Resume Next
+    Dim dirPath As String
+    dirPath = modConfig.MacroVBADir()
+    If Dir(dirPath, vbDirectory) = "" Then MkDir dirPath
+    mReportPath = dirPath & "\ContactImport-" & Format$(Now, "yyyymmdd-hhnnss") & ".txt"
+    Dim stm As Object
+    Set stm = CreateObject("ADODB.Stream")
+    stm.Type = 2
+    stm.Charset = "utf-8"
+    stm.Open
+    stm.WriteText mReport
+    stm.SaveToFile mReportPath, 2
+    stm.Close
+    If Err.Number <> 0 Then
+        modDebugLog.DError MOD_NAME, "WriteReport err " & Err.Number & " - " & Err.Description
+        Err.Clear
+    End If
+End Sub
+
+Private Sub ShowSummary(ByVal dryRun As Boolean)
+    Dim msg As String
+    msg = IIf(dryRun, T("SIMULATION - rien n'a ~et~e ~ecrit.", "DRY RUN - nothing was written."), _
+                      T("Termin~e.", "Done.")) & vbCrLf & vbCrLf & _
+          T("Lignes trait~ees : ", "Rows processed: ") & mRows & vbCrLf & _
+          T("Fiches ~a modifier / modifi~ees : ", "Cards to change / changed: ") & mUpdated & _
+          "  (" & mFieldChanges & T(" champs)", " fields)") & vbCrLf & _
+          T("Inchang~ees : ", "Unchanged: ") & mUnchanged & vbCrLf & _
+          T("Cr~e~ees : ", "Created: ") & mCreated & "   " & _
+          T("D~eplac~ees : ", "Moved: ") & mMoved & "   " & _
+          T("Photos : ", "Photos: ") & mPhotos & "   " & _
+          T("F~xtes : ", "Name days: ") & mNameDays & vbCrLf & _
+          T("Ignor~ees (_Action=skip) : ", "Skipped (_Action=skip): ") & mSkipped & "   " & _
+          T("Compte refus~e : ", "Account refused: ") & mBadStore & vbCrLf & _
+          T("Conflits (modifi~ees apr~fs l'export) : ", "Conflicts (modified after export): ") & mConflicts & vbCrLf & _
+          T("Sans correspondance : ", "No match: ") & mNoMatch & "   " & _
+          T("Ambigu~es : ", "Ambiguous: ") & mAmbiguous & vbCrLf & _
+          T("Erreurs : ", "Errors: ") & mErrors & vbCrLf & vbCrLf & _
+          T("Rapport : ", "Report: ") & mReportPath & vbCrLf & vbCrLf & _
+          T("Ouvrir le rapport ?", "Open the report?")
+    If MsgBox(msg, vbYesNo + vbInformation, UiTitle()) = vbYes Then
+        If Dir(mReportPath) <> "" Then Shell "notepad.exe """ & mReportPath & """", vbNormalFocus
+    End If
+End Sub

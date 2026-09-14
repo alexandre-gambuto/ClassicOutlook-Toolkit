@@ -1,0 +1,862 @@
+Option Explicit
+
+'=============================================================================
+' modQuickStart  (v1.0 - 2026-09-15)
+' Purpose (EN): first-run quick start guide. When no config.ini exists, offers
+'   (8 s after startup, through modDefer) to check the environment, ask five
+'   questions and write a minimal config.ini in the working folder. Can be run
+'   by hand at any time (Maintenance > Configuration); with an existing file
+'   it only performs the environment check. Never overwrites a file, never
+'   writes outside the working folder and the toolkit registry branch.
+'
+' Guide de demarrage rapide. Specification : QuickStart-deroule.md (sections
+' numerotees reprises dans les commentaires ci-dessous).
+'
+'   Declenchement AUTO (section 2) : ThisOutlookSession arme "QuickStart" +8 s
+'     si AutoWanted() ; modDefer appelle QuickStartAuto.
+'   Declenchement MANUEL : QuickStart (menu Maintenance > Configuration).
+'   QuickStartReset   : efface le marqueur registre (le guide se reproposera).
+'   QuickStartPreview : affiche le contenu du fichier qui serait ecrit, sans
+'                       rien ecrire ni toucher au registre.
+'
+' Etapes : 0 accueil (Confirm3) - 1 verification d'environnement (7 controles,
+' un seul bloquant) - 2 cinq questions (AskText, defaut pre-rempli) - 3 recap
+' et ecriture - 4 rechargement de la config et message final.
+'
+' REGLES : aucune boite depuis Application_Startup ; chaque etape protegee ;
+' un config.ini existant n'est JAMAIS modifie (test refait juste avant
+' l'ecriture) ; pas de Reinit, pas de redemarrage.
+' Marqueur registre : Toolkit \ QuickStart \ Status =
+'   "" (jamais) | later:AAAA-MM-JJ | never | done:AAAA-MM-JJ
+' DEPENDANCES : modConfig, modDebugLog, modDefer, modUi, modMsgBoxCustom,
+' modSmtp, modStoreContext.
+'=============================================================================
+
+Private Const MOD_NAME As String = "QuickStart"
+Private Const MOD_VERSION As String = "v1.0 - 2026-09-15"
+
+' Declenchement automatique (une ligne a passer a False pour le couper).
+Private Const AUTO_ENABLED As Boolean = True
+' Adresse du guide d'installation (vide = bouton remplace par "Fermer").
+Private Const DOC_URL As String = ""
+' Fermeture automatique de la boite d'accueil (= "Plus tard").
+Private Const WELCOME_AUTOCLOSE_MS As Long = 60000
+' Reponses invalides tolerees sur une question avant de retenir le defaut.
+Private Const MAX_INVALID As Long = 3
+
+Private Const REG_APP As String = "Toolkit"
+Private Const REG_SECTION As String = "QuickStart"
+Private Const REG_KEY As String = "Status"
+Private Const PROBE_FILE As String = "quickstart.tmp"
+
+' Garde de reentrance (auto + manuel, ou double clic).
+Private mRunning As Boolean
+
+' Reponses de la session (servent aussi a QuickStartPreview).
+Private mAnswered As Boolean
+Private mLang As String
+Private mPrefix As String
+Private mDomains As String
+Private mTimeFile As String
+Private mAlerts As Boolean
+Private mStoreName As String
+
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+'=============================================================================
+' Section 2 - conditions du declenchement automatique (aucune interface).
+'=============================================================================
+Public Function AutoWanted() As Boolean
+    On Error Resume Next
+    AutoWanted = False
+    If Not AUTO_ENABLED Then Exit Function
+    modConfig.EnsureLoaded
+    If modConfig.ConfigLoaded() Then Exit Function
+    If ConfigFileExists() Then Exit Function
+    Dim st As String
+    st = StatusGet()
+    If st = "never" Then Exit Function
+    If Left$(st, 5) = "done:" Then Exit Function
+    If st = "later:" & Today() Then Exit Function
+    AutoWanted = True
+End Function
+
+' Cible modDefer "QuickStart".
+Public Sub QuickStartAuto()
+    On Error Resume Next
+    If Not AutoWanted() Then
+        modDebugLog.DDebug MOD_NAME, "Auto : conditions non reunies, pas de guide"
+        Exit Sub
+    End If
+    Run False
+End Sub
+
+' Commande manuelle (Maintenance > Configuration).
+Public Sub QuickStart()
+    Run True
+End Sub
+
+' Efface le marqueur registre : le guide se reproposera au prochain demarrage
+' sans fichier de configuration.
+Public Sub QuickStartReset()
+    On Error Resume Next
+    DeleteSetting REG_APP, REG_SECTION, REG_KEY
+    modDebugLog.DInfo MOD_NAME, "Marqueur registre efface"
+    modUi.Inform T("Marqueur du guide effac~e. Il se reproposera au prochain d~emarrage " & _
+                   "si aucun fichier de configuration n'est trouv~e.", _
+                   "Guide marker cleared. It will be offered again at the next startup " & _
+                   "if no configuration file is found."), Title()
+End Sub
+
+' Apercu du fichier qui serait ecrit (reponses de la session si le guide a
+' tourne, sinon defauts + valeurs detectees). N'ecrit rien.
+Public Sub QuickStartPreview()
+    On Error GoTo ErrH
+    If Not mAnswered Then SetDefaultAnswers
+    Dim body As String
+    body = BuildIniText()
+    modUi.Inform T("Contenu qui serait ~ecrit dans :", "Content that would be written to:") & vbCrLf & _
+                  modConfig.ConfigPath() & vbCrLf & vbCrLf & body, _
+                  Title() & " - " & T("aper~cu", "preview")
+    Exit Sub
+ErrH:
+    modDebugLog.DError MOD_NAME, "Preview err " & Err.Number & " - " & Err.Description
+End Sub
+
+'=============================================================================
+' Deroule principal
+'=============================================================================
+Private Sub Run(ByVal manual As Boolean)
+    If mRunning Then
+        modDebugLog.DDebug MOD_NAME, "Deja en cours : appel ignore"
+        Exit Sub
+    End If
+    mRunning = True
+    On Error GoTo ErrH
+
+    Dim fileExists As Boolean
+    fileExists = ConfigFileExists()
+    modDebugLog.DInfo MOD_NAME, "Guide lance (" & IIf(manual, "manuel", "auto") & _
+        ", fichier " & IIf(fileExists, "present", "absent") & ")"
+
+    ' --- Etape 0 : accueil -------------------------------------------------
+    Dim welcome As VbMsgBoxResult
+    welcome = ShowWelcome(manual, fileExists)
+    Select Case welcome
+        Case vbYes
+            ' continuer
+        Case vbNo
+            ' Plus tard (ou fermeture automatique) - cas A1
+            StatusSet "later:" & Today()
+            modDebugLog.DInfo MOD_NAME, "Reporte (plus tard)"
+            GoTo Fin
+        Case Else
+            If manual Then
+                GoTo Fin                                   ' Quitter
+            End If
+            ' Ne plus proposer - cas N1
+            StatusSet "never"
+            modDebugLog.DInfo MOD_NAME, "Refuse definitivement (never)"
+            modUi.Inform T("Entendu. La commande QuickStart reste disponible dans " & _
+                           "Maintenance > Configuration.", _
+                           "Understood. The QuickStart command stays available under " & _
+                           "Maintenance > Configuration."), Title()
+            GoTo Fin
+    End Select
+
+    ' --- Etape 1 : verification d'environnement ----------------------------
+    Dim report As String, blocking As Boolean, warnings As Long
+    report = EnvironmentCheck(blocking, warnings)
+
+    If blocking Then
+        ' cas E1 : pas de marqueur, le probleme est a corriger
+        modUi.Inform report & vbCrLf & vbCrLf & _
+            T("Le dossier de travail n'est pas accessible en ~ecriture. Le fichier de " & _
+              "configuration ne peut pas ~xtre cr~e~e ici. Voir docs/TROUBLESHOOTING.md " & _
+              "(chemin du Bureau).", _
+              "The working folder is not writable. The configuration file cannot be " & _
+              "created there. See docs/TROUBLESHOOTING.md (desktop path)."), _
+            Title(), vbExclamation
+        modDebugLog.DError MOD_NAME, "Bloquant : dossier de travail non inscriptible"
+        GoTo Fin
+    End If
+
+    If fileExists Then
+        ' cas F1 : manuel avec fichier existant = verification seule
+        modUi.Inform report & vbCrLf & vbCrLf & _
+            T("Un fichier de configuration existe : il n'est pas modifi~e.", _
+              "A configuration file exists: it is not modified."), _
+            Title(), IIf(warnings > 0, vbExclamation, vbInformation)
+        GoTo Fin
+    End If
+
+    If modUi.Ask(report & vbCrLf & vbCrLf & _
+                 T("Continuer avec les questions ?", "Continue with the questions?"), _
+                 Title(), vbYesNo + IIf(warnings > 0, vbExclamation, vbQuestion)) <> vbYes Then
+        Stopped "verification"                             ' cas A2
+        GoTo Fin
+    End If
+
+    ' --- Etape 2 : questions ----------------------------------------------
+    If Not AskQuestions() Then
+        GoTo Fin                                           ' cas A3 (message deja affiche)
+    End If
+
+    ' --- Etape 3 : recapitulatif et ecriture --------------------------------
+    If modUi.Ask(RecapText(), Title(), vbYesNo + vbQuestion) <> vbYes Then
+        Stopped "recapitulatif"                            ' cas A4
+        GoTo Fin
+    End If
+
+    If ConfigFileExists() Then
+        ' cas F2 : apparu entre-temps
+        StatusSet "done:" & Today()
+        modDebugLog.DInfo MOD_NAME, "Fichier apparu pendant le guide : conserve tel quel"
+        modUi.Inform T("Un fichier config.ini existe maintenant : il est conserv~e tel quel.", _
+                       "A config.ini file now exists: it is kept as it is."), Title()
+        GoTo Fin
+    End If
+
+    Dim body As String
+    body = BuildIniText()
+    If Not WriteIni(body) Then
+        GoTo Fin                                           ' cas E2 (message deja affiche)
+    End If
+
+    ' --- Etape 4 : rechargement et fin --------------------------------------
+    On Error Resume Next
+    modConfig.ReloadConfig
+    On Error GoTo ErrH
+    StatusSet "done:" & Today()
+    modDebugLog.DInfo MOD_NAME, "config.ini cree (" & KeyCount() & " cles), langue=" & mLang & _
+        ", prefixe=" & mPrefix & ", domaines=" & mDomains & ", alertes=" & IIf(mAlerts, "oui", "non")
+    ShowFinal
+
+Fin:
+    mRunning = False
+    Exit Sub
+ErrH:
+    ' cas E3
+    modDebugLog.DError MOD_NAME, "Guide err " & Err.Number & " - " & Err.Description
+    On Error Resume Next
+    modUi.Inform T("Le guide s'est arr~xt~e (erreur ", "The guide stopped (error ") & Err.Number & _
+                  T("). Le toolkit fonctionne normalement.", "). The toolkit works normally."), _
+                  Title(), vbExclamation
+    mRunning = False
+End Sub
+
+' Fin propre apres un Non / abandon (cas A2, A3, A4).
+Private Sub Stopped(ByVal where As String)
+    On Error Resume Next
+    StatusSet "later:" & Today()
+    modDebugLog.DInfo MOD_NAME, "Interrompu (" & where & ")"
+    modUi.Inform T("Guide interrompu. Relance : Maintenance > Configuration.", _
+                   "Guide stopped. Run again: Maintenance > Configuration."), Title()
+End Sub
+
+'=============================================================================
+' Section 3 - accueil
+'=============================================================================
+Private Function ShowWelcome(ByVal manual As Boolean, ByVal fileExists As Boolean) As VbMsgBoxResult
+    Dim intro As String
+    If manual Then
+        intro = T("Guide de d~emarrage.", "Quick start guide.")
+        If fileExists Then
+            intro = intro & vbCrLf & vbCrLf & _
+                T("Un fichier de configuration existe d~ej~a : il ne sera pas modifi~e.", _
+                  "A configuration file already exists: it will not be modified.")
+        End If
+    Else
+        intro = T("Bienvenue.", "Welcome.") & vbCrLf & vbCrLf & _
+                T("Aucun fichier de configuration n'a ~et~e trouv~e :", _
+                  "No configuration file was found:") & vbCrLf & modConfig.ConfigPath()
+    End If
+
+    Dim body As String
+    body = intro & vbCrLf & vbCrLf & _
+        T("Le toolkit fonctionne avec des valeurs par d~efaut, mais sans vos codes " & _
+          "projet ni vos domaines. Ce guide v~erifie l'environnement, pose cinq " & _
+          "questions et ~ecrit le fichier pour vous (deux minutes).", _
+          "The toolkit runs with default values, but without your project codes or " & _
+          "domains. This guide checks the environment, asks five questions and " & _
+          "writes the file for you (two minutes).") & vbCrLf & vbCrLf & _
+        T("Vous pourrez le relancer plus tard : Maintenance > Configuration.", _
+          "You can run it again later: Maintenance > Configuration.")
+
+    If manual Then
+        ShowWelcome = modMsgBoxCustom.Confirm3(body, Title(), _
+            T("&Configurer", "&Set up"), T("&Plus tard", "&Later"), T("&Quitter", "&Quit"), _
+            vbInformation, 0, 1)
+    Else
+        ' Fermeture automatique = bouton 2 (Plus tard).
+        ShowWelcome = modMsgBoxCustom.Confirm3(body, Title(), _
+            T("&Configurer", "&Set up"), T("&Plus tard", "&Later"), _
+            T("&Ne plus proposer", "&Don't ask again"), _
+            vbInformation, WELCOME_AUTOCLOSE_MS, 2)
+    End If
+End Function
+
+'=============================================================================
+' Section 4 - verification d'environnement (7 controles, C3 seul bloquant)
+'=============================================================================
+Private Function EnvironmentCheck(ByRef blocking As Boolean, ByRef warnings As Long) As String
+    Dim lines As String
+    blocking = False
+    warnings = 0
+
+    ' C1 : version d'Outlook et bitness
+    Dim ver As String, bits As String
+    On Error Resume Next
+    ver = CStr(Application.Version)
+    On Error GoTo 0
+    If Len(ver) = 0 Then ver = "?"
+    #If Win64 Then
+        bits = "64"
+    #Else
+        bits = "32"
+    #End If
+    lines = lines & Prefix(0) & "Outlook " & ver & " (" & bits & " bits)" & vbCrLf
+
+    ' C2 : chemin du Bureau
+    Dim desk As String
+    On Error Resume Next
+    desk = modConfig.DesktopPath()
+    On Error GoTo 0
+    If Len(desk) > 0 And StrComp(desk, Environ("USERPROFILE"), vbTextCompare) <> 0 Then
+        lines = lines & Prefix(0) & T("Bureau : ", "Desktop: ") & desk & vbCrLf
+    Else
+        warnings = warnings + 1
+        lines = lines & Prefix(1) & T("Bureau non r~esolu (OneDrive ?) : repli sur ", _
+                                      "Desktop not resolved (OneDrive?): falling back to ") & desk & vbCrLf
+    End If
+
+    ' C3 : dossier de travail cree + test d'ecriture (BLOQUANT)
+    Dim work As String
+    work = modConfig.MacroVBADir()
+    If EnsureFolderRec(work) And ProbeWrite(work) Then
+        lines = lines & Prefix(0) & T("Dossier de travail : ", "Working folder: ") & work & _
+                T(" (accessible en ~ecriture)", " (writable)") & vbCrLf
+    Else
+        blocking = True
+        lines = lines & Prefix(2) & T("Dossier de travail inaccessible : ", "Working folder not accessible: ") & work & vbCrLf
+    End If
+
+    ' C4 : journal
+    Dim logPath As String
+    On Error Resume Next
+    modDebugLog.DInfo MOD_NAME, "Verification d'environnement (guide de demarrage)"
+    logPath = modDebugLog.LogFilePath()
+    Dim logOk As Boolean
+    logOk = (Len(logPath) > 0)
+    If logOk Then logOk = (Len(Dir(logPath)) > 0)
+    On Error GoTo 0
+    If logOk Then
+        lines = lines & Prefix(0) & T("Journal : ", "Log: ") & logPath & vbCrLf
+    Else
+        warnings = warnings + 1
+        lines = lines & Prefix(1) & T("Journal non ~ecrit (diagnostics limit~es)", _
+                                      "Log not written (limited diagnostics)") & vbCrLf
+    End If
+
+    ' C5 : Excel (instance jamais rendue visible, quittee aussitot)
+    If ExcelReachable() Then
+        lines = lines & Prefix(0) & T("Excel joignable", "Excel reachable") & vbCrLf
+    Else
+        warnings = warnings + 1
+        lines = lines & Prefix(1) & T("Excel injoignable : ~etiquetage projet, suivi des r~eponses " & _
+                                      "et campagnes resteront inactifs", _
+                                      "Excel not reachable: project tagging, response tracking " & _
+                                      "and campaigns will stay inactive") & vbCrLf
+    End If
+
+    ' C6 : notifications (mshta present)
+    Dim hta As String
+    On Error Resume Next
+    hta = Dir(Environ("WINDIR") & "\System32\mshta.exe")
+    On Error GoTo 0
+    If Len(hta) > 0 Then
+        lines = lines & Prefix(0) & T("Notifications disponibles", "Notifications available") & vbCrLf
+    Else
+        warnings = warnings + 1
+        lines = lines & Prefix(1) & T("Notifications indisponibles (mshta absent) : confirmations en boites de dialogue", _
+                                      "Notifications unavailable (mshta missing): confirmations as dialogs") & vbCrLf
+    End If
+
+    ' C7 : registre utilisateur
+    If RegistryWritable() Then
+        lines = lines & Prefix(0) & T("R~eglages persistants (registre utilisateur)", _
+                                      "Persistent settings (user registry)") & vbCrLf
+    Else
+        warnings = warnings + 1
+        lines = lines & Prefix(1) & T("Registre utilisateur non inscriptible : certains r~eglages ne seront pas m~emoris~es", _
+                                      "User registry not writable: some settings will not be remembered") & vbCrLf
+    End If
+
+    EnvironmentCheck = T("V~erification de l'environnement", "Environment check") & vbCrLf & vbCrLf & lines
+End Function
+
+' Prefixe de ligne : 0 = OK, 1 = ATTENTION, 2 = BLOQUANT
+Private Function Prefix(ByVal level As Long) As String
+    Select Case level
+        Case 0: Prefix = "OK   "
+        Case 1: Prefix = T("ATTENTION   ", "WARNING   ")
+        Case Else: Prefix = T("BLOQUANT   ", "BLOCKING   ")
+    End Select
+End Function
+
+' Cree un dossier segment par segment. True si le dossier existe a la fin.
+Private Function EnsureFolderRec(ByVal path As String) As Boolean
+    On Error Resume Next
+    EnsureFolderRec = False
+    If Len(path) = 0 Then Exit Function
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    If fso.FolderExists(path) Then
+        EnsureFolderRec = True
+        Exit Function
+    End If
+    Dim parts() As String, cur As String, i As Long
+    parts = Split(path, "\")
+    For i = LBound(parts) To UBound(parts)
+        If Len(parts(i)) = 0 Then
+            cur = cur & "\"                        ' racine UNC "\\serveur"
+        Else
+            If Len(cur) = 0 Then
+                cur = parts(i)                     ' "C:"
+            ElseIf Right$(cur, 1) = "\" Then
+                cur = cur & parts(i)
+            Else
+                cur = cur & "\" & parts(i)
+            End If
+            If Right$(cur, 1) <> ":" Then
+                If Not fso.FolderExists(cur) Then MkDir cur
+            End If
+        End If
+    Next i
+    EnsureFolderRec = fso.FolderExists(path)
+End Function
+
+' Ecrit puis supprime un petit fichier dans le dossier.
+Private Function ProbeWrite(ByVal folder As String) As Boolean
+    On Error Resume Next
+    ProbeWrite = False
+    Dim p As String, f As Long
+    p = folder & "\" & PROBE_FILE
+    f = FreeFile
+    Err.Clear
+    Open p For Output As #f
+    If Err.Number <> 0 Then Exit Function
+    Print #f, "probe"
+    Close #f
+    ProbeWrite = (Len(Dir(p)) > 0)
+    Kill p
+End Function
+
+Private Function ExcelReachable() As Boolean
+    On Error Resume Next
+    ExcelReachable = False
+    Dim xl As Object
+    Set xl = CreateObject("Excel.Application")
+    If xl Is Nothing Then Exit Function
+    xl.Visible = False
+    xl.DisplayAlerts = False
+    xl.Quit
+    Set xl = Nothing
+    ExcelReachable = True
+End Function
+
+Private Function RegistryWritable() As Boolean
+    On Error Resume Next
+    RegistryWritable = False
+    SaveSetting REG_APP, REG_SECTION, "Probe", "1"
+    RegistryWritable = (GetSetting(REG_APP, REG_SECTION, "Probe", "") = "1")
+    DeleteSetting REG_APP, REG_SECTION, "Probe"
+End Function
+
+'=============================================================================
+' Section 5 - les cinq questions. False = abandon (message deja affiche).
+'=============================================================================
+Private Function AskQuestions() As Boolean
+    AskQuestions = False
+    SetDefaultAnswers
+
+    ' --- Q1 : langue ---
+    Dim ans As String, tries As Long, ok As Boolean
+    tries = 0
+    Do
+        ans = modUi.AskText( _
+            T("1/5 - Langue de l'interface", "1/5 - Interface language") & vbCrLf & vbCrLf & _
+            T("FR = fran~cais, EN = anglais.", "FR = French, EN = English.") & vbCrLf & _
+            T("Toutes les fen~xtres du toolkit suivent ce choix.", "Every toolkit dialog follows this choice."), _
+            QTitle(1), mLang)
+        If Len(Trim$(ans)) = 0 Then
+            If ConfirmQuit(1) Then Exit Function
+            GoTo NextQ1
+        End If
+        ans = UCase$(Trim$(ans))
+        ok = (ans = "FR" Or ans = "EN")
+        If ok Then
+            mLang = ans
+            modConfig.g_Language = mLang           ' applique en memoire pour la suite
+        Else
+            tries = tries + 1
+            If tries >= MAX_INVALID Then
+                ok = True                          ' defaut retenu
+            Else
+                modUi.Inform T("R~eponse attendue : FR ou EN.", "Expected answer: FR or EN."), QTitle(1), vbExclamation
+            End If
+        End If
+NextQ1:
+    Loop Until ok
+
+    ' --- Q2 : prefixe des codes projet ---
+    tries = 0: ok = False
+    Do
+        ans = modUi.AskText( _
+            T("2/5 - Pr~efixe des codes projet", "2/5 - Project code prefix") & vbCrLf & vbCrLf & _
+            T("Le toolkit reconna~yt vos projets par un pr~efixe suivi de chiffres " & _
+              "(exemple : DV2485). Indiquez le pr~efixe seul, lettres uniquement.", _
+              "The toolkit recognises your projects by a prefix followed by digits " & _
+              "(example: DV2485). Enter the prefix only, letters only.") & vbCrLf & _
+            T("Laissez DV si vous n'en avez pas.", "Leave DV if you do not have one."), _
+            QTitle(2), mPrefix)
+        If Len(Trim$(ans)) = 0 Then
+            If ConfirmQuit(2) Then Exit Function
+            GoTo NextQ2
+        End If
+        ans = UCase$(Trim$(ans))
+        ok = IsLetters(ans) And Len(ans) >= 1 And Len(ans) <= 6
+        If ok Then
+            mPrefix = ans
+        Else
+            tries = tries + 1
+            If tries >= MAX_INVALID Then
+                ok = True
+            Else
+                modUi.Inform T("1 ~a 6 lettres, sans chiffre ni espace.", "1 to 6 letters, no digit, no space."), QTitle(2), vbExclamation
+            End If
+        End If
+NextQ2:
+    Loop Until ok
+
+    ' --- Q3 : domaines internes ---
+    tries = 0: ok = False
+    Do
+        ans = modUi.AskText( _
+            T("3/5 - Domaines de messagerie internes", "3/5 - Internal mail domains") & vbCrLf & vbCrLf & _
+            T("Les adresses de ces domaines sont consid~er~ees comme internes " & _
+              "(coloration des r~eunions, d~etection des mails en attente).", _
+              "Addresses on these domains count as internal (meeting colouring, " & _
+              "awaiting-reply detection).") & vbCrLf & _
+            T("Plusieurs domaines : s~eparez-les par | (exemple : societe.fr|filiale.com).", _
+              "Several domains: separate them with | (example: company.com|subsidiary.com)."), _
+            QTitle(3), mDomains)
+        If Len(Trim$(ans)) = 0 Then
+            If ConfirmQuit(3) Then Exit Function
+            GoTo NextQ3
+        End If
+        ans = LCase$(Trim$(ans))
+        ok = DomainsValid(ans)
+        If ok Then
+            mDomains = ans
+        Else
+            tries = tries + 1
+            If tries >= MAX_INVALID Then
+                ok = True
+            Else
+                modUi.Inform T("Chaque domaine doit contenir un point, sans espace ni @ (ex. societe.fr).", _
+                               "Each domain must contain a dot, no space, no @ (e.g. company.com)."), QTitle(3), vbExclamation
+            End If
+        End If
+NextQ3:
+    Loop Until ok
+
+    ' --- Q4 : classeur de suivi du temps (vide accepte, 0 = abandon) ---
+    tries = 0: ok = False
+    Do
+        ans = modUi.AskText( _
+            T("4/5 - Classeur de suivi du temps (optionnel)", "4/5 - Time-tracking workbook (optional)") & vbCrLf & vbCrLf & _
+            T("Nom du fichier Excel qui liste vos projets et contrats, ~a placer dans " & _
+              "le dossier de travail. Il alimente l'~etiquetage des rendez-vous.", _
+              "Name of the Excel file listing your projects and contracts, to be placed " & _
+              "in the working folder. It feeds appointment tagging.") & vbCrLf & _
+            T("Laissez vide si vous n'en avez pas encore : la fonction restera inactive. " & _
+              "Tapez 0 pour abandonner le guide.", _
+              "Leave empty if you do not have one yet: the feature stays inactive. " & _
+              "Type 0 to quit the guide."), _
+            QTitle(4), mTimeFile)
+        ans = Trim$(ans)
+        If ans = "0" Then
+            If ConfirmQuit(4) Then Exit Function
+            GoTo NextQ4
+        End If
+        If Len(ans) = 0 Then
+            mTimeFile = ""
+            ok = True
+        Else
+            ok = FileNameValid(ans)
+            If ok Then
+                If LCase$(Right$(ans, 5)) <> ".xlsm" And LCase$(Right$(ans, 5)) <> ".xlsx" Then ans = ans & ".xlsm"
+                mTimeFile = ans
+            Else
+                tries = tries + 1
+                If tries >= MAX_INVALID Then
+                    ok = True
+                Else
+                    modUi.Inform T("Nom de fichier seul (sans chemin), sans les caract~fres \ / : * ? "" < > |", _
+                                   "File name only (no path), without the characters \ / : * ? "" < > |"), _
+                                   QTitle(4), vbExclamation
+                End If
+            End If
+        End If
+NextQ4:
+    Loop Until ok
+
+    ' --- Q5 : alertes nouveaux mails (oui / non ; Annuler = non) ---
+    mAlerts = (modUi.Ask( _
+        T("5/5 - Alertes de nouveaux mails", "5/5 - New-mail alerts") & vbCrLf & vbCrLf & _
+        T("Afficher une petite notification ~a chaque mail re~cu dans la bo~ite principale ? " & _
+          "(silencieuse si Outlook est d~ej~a au premier plan ; r~eglable ensuite dans config.ini)", _
+          "Show a small notification for each mail received in the main mailbox? " & _
+          "(silent when Outlook is already in front; adjustable later in config.ini)"), _
+        QTitle(5), vbYesNo + vbQuestion) = vbYes)
+
+    mAnswered = True
+    AskQuestions = True
+End Function
+
+' Boite "Abandonner le guide ?" ; True = abandon confirme (cas A3).
+Private Function ConfirmQuit(ByVal q As Long) As Boolean
+    ConfirmQuit = (modUi.Ask(T("Abandonner le guide ?", "Quit the guide?"), Title(), vbYesNo + vbQuestion) = vbYes)
+    If ConfirmQuit Then Stopped "question " & q
+End Function
+
+Private Function QTitle(ByVal n As Long) As String
+    QTitle = T("Guide de d~emarrage ", "Quick start ") & n & "/5"
+End Function
+
+Private Function Title() As String
+    Title = T("Guide de d~emarrage", "Quick start guide")
+End Function
+
+'=============================================================================
+' Defauts et valeurs detectees (session)
+'=============================================================================
+Private Sub SetDefaultAnswers()
+    On Error Resume Next
+    mLang = "FR"
+    If UCase$(modConfig.Language()) = "EN" Then mLang = "EN"
+    mPrefix = "DV"
+    mDomains = modSmtp.ExtractDomain(modSmtp.MySmtp())
+    mTimeFile = "Suivi de temps.xlsm"
+    mAlerts = False
+    mStoreName = ""
+    mStoreName = CStr(modStoreContext.DefaultStore().DisplayName)
+End Sub
+
+Private Function IsLetters(ByVal s As String) As Boolean
+    Dim i As Long, ch As String
+    IsLetters = (Len(s) > 0)
+    For i = 1 To Len(s)
+        ch = Mid$(s, i, 1)
+        If ch < "A" Or ch > "Z" Then
+            IsLetters = False
+            Exit Function
+        End If
+    Next i
+End Function
+
+Private Function DomainsValid(ByVal s As String) As Boolean
+    Dim parts() As String, i As Long, d As String
+    DomainsValid = False
+    parts = Split(s, "|")
+    For i = LBound(parts) To UBound(parts)
+        d = Trim$(parts(i))
+        If Len(d) = 0 Then Exit Function
+        If InStr(d, ".") = 0 Or InStr(d, " ") > 0 Or InStr(d, "@") > 0 Then Exit Function
+    Next i
+    DomainsValid = True
+End Function
+
+Private Function FileNameValid(ByVal s As String) As Boolean
+    Dim bad As String, i As Long
+    bad = "\/:*?""<>|"
+    FileNameValid = False
+    If Len(s) = 0 Then Exit Function
+    For i = 1 To Len(bad)
+        If InStr(s, Mid$(bad, i, 1)) > 0 Then Exit Function
+    Next i
+    FileNameValid = True
+End Function
+
+'=============================================================================
+' Section 6 - recapitulatif, contenu du fichier, ecriture
+'=============================================================================
+Private Function RecapText() As String
+    Dim alerts As String
+    If mAlerts Then
+        alerts = T("oui", "yes")
+        If Len(mStoreName) > 0 Then alerts = alerts & " (" & mStoreName & ")"
+    Else
+        alerts = T("non", "no")
+    End If
+    RecapText = T("R~ecapitulatif", "Summary") & vbCrLf & vbCrLf & _
+        T("  Langue            : ", "  Language          : ") & mLang & vbCrLf & _
+        T("  Pr~efixe projet    : ", "  Project prefix    : ") & mPrefix & vbCrLf & _
+        T("  Domaines internes : ", "  Internal domains  : ") & mDomains & vbCrLf & _
+        T("  Suivi du temps    : ", "  Time tracking     : ") & IIf(Len(mTimeFile) > 0, mTimeFile, T("(aucun)", "(none)")) & vbCrLf & _
+        T("  Alertes mails     : ", "  Mail alerts       : ") & alerts & vbCrLf & vbCrLf & _
+        T("Fichier ~a cr~eer :", "File to create:") & vbCrLf & "  " & modConfig.ConfigPath() & vbCrLf & vbCrLf & _
+        T("~Ecrire ce fichier ?", "Write this file?")
+End Function
+
+' Contenu du fichier (fonction pure : aucune ecriture). Commentaires en
+' anglais (ASCII) ; les valeurs sont ecrites telles quelles.
+Private Function BuildIniText() As String
+    Dim s As String
+    s = s & "; config.ini - ClassicOutlook-Toolkit, created by the quick start guide on " & _
+            Format$(Now, "yyyy-mm-dd hh:nn") & "." & vbCrLf
+    s = s & "; Other keys keep the defaults coded in modConfig; full list: config.ini.example" & vbCrLf
+    s = s & "; (docs/CONFIGURATION.md). After editing: Maintenance > Configuration > Reload." & vbCrLf
+    s = s & vbCrLf
+    s = s & "[ClassicOutlookToolkit]" & vbCrLf
+    s = s & "; Language of every dialog: FR or EN" & vbCrLf
+    s = s & "Language=" & mLang & vbCrLf
+    s = s & "; Project codes = prefix + digits (e.g. DV2485); digits: ProjectCodeLength (4)" & vbCrLf
+    s = s & "ProjectPrefix=" & mPrefix & vbCrLf
+    s = s & "; Internal mail domains, pipe-separated" & vbCrLf
+    s = s & "InternalDomains=" & mDomains & vbCrLf
+    s = s & "; Referential workbook in the working folder; empty = tagging inactive" & vbCrLf
+    s = s & "TimeTrackingFilename=" & mTimeFile & vbCrLf
+    s = s & "; New-mail alerts (per mailbox: InboxAlertStore1, InboxAlertStore2...)" & vbCrLf
+    If mAlerts Then
+        s = s & "InboxAlertEnabled=1" & vbCrLf
+        s = s & "InboxAlertStore1=" & mStoreName & vbCrLf
+    Else
+        s = s & "InboxAlertEnabled=0" & vbCrLf
+    End If
+    s = s & "; Birthday calendar view at startup (0 = off)" & vbCrLf
+    s = s & "BirthdayCalendarAutoShow=0" & vbCrLf
+    BuildIniText = s
+End Function
+
+Private Function KeyCount() As Long
+    KeyCount = 6
+    If mAlerts Then KeyCount = 7
+End Function
+
+' Ecriture ANSI, CRLF, sans jamais ecraser (test fait par l'appelant).
+' False = echec (cas E2 : message affiche, contenu envoye dans le journal).
+Private Function WriteIni(ByVal body As String) As Boolean
+    Dim p As String, f As Long, e As Long
+    p = modConfig.ConfigPath()
+    WriteIni = False
+    On Error Resume Next
+    f = FreeFile
+    Err.Clear
+    Open p For Output As #f
+    e = Err.Number
+    If e = 0 Then
+        Print #f, body;                              ' body porte deja ses CRLF
+        e = Err.Number
+        Close #f
+    End If
+    On Error GoTo 0
+    If e <> 0 Or Len(Dir(p)) = 0 Then
+        modDebugLog.DError MOD_NAME, "Ecriture config.ini echouee (err " & e & ") : " & p
+        LogBody body
+        modUi.Inform T("Le fichier n'a pas pu ~xtre ~ecrit (erreur ", "The file could not be written (error ") & e & _
+                      T("). Le contenu pr~evu est dans le journal.", "). The intended content is in the log."), _
+                      Title(), vbExclamation
+        Exit Function
+    End If
+    modDebugLog.DInfo MOD_NAME, "config.ini ecrit : " & p
+    WriteIni = True
+End Function
+
+Private Sub LogBody(ByVal body As String)
+    On Error Resume Next
+    Dim lines() As String, i As Long
+    lines = Split(body, vbCrLf)
+    For i = LBound(lines) To UBound(lines)
+        modDebugLog.DInfo MOD_NAME, "  | " & lines(i)
+    Next i
+End Sub
+
+'=============================================================================
+' Section 7 - message final
+'=============================================================================
+Private Sub ShowFinal()
+    Dim body As String
+    body = T("Configuration ~ecrite.", "Configuration written.") & vbCrLf & vbCrLf & _
+        T("Actif d~fs maintenant : classement QuickMove, rangement des r~eponses, " & _
+          "coloration des r~eunions, formule de politesse, confidentialit~e, alertes.", _
+          "Active now: QuickMove filing, reply filing, meeting colouring, greeting " & _
+          "line, confidentiality banners, alerts.") & vbCrLf & vbCrLf & _
+        T("En attente d'un classeur dans le dossier de travail : ~etiquetage des " & _
+          "rendez-vous (Suivi de temps), suivi des r~eponses (cr~e~e ~a la premi~fre " & _
+          "utilisation), campagnes.", _
+          "Waiting for a workbook in the working folder: appointment tagging (time " & _
+          "tracking), response tracking (created at first use), campaigns.") & vbCrLf & vbCrLf & _
+        T("Les modules charg~es au d~emarrage (alertes, fen~xtres ~a r~ole) prennent " & _
+          "la nouvelle configuration au prochain red~emarrage d'Outlook.", _
+          "Modules bound at startup (alerts, role windows) pick up the new " & _
+          "configuration at the next Outlook restart.")
+
+    Dim r As VbMsgBoxResult
+    If Len(DOC_URL) > 0 Then
+        r = modMsgBoxCustom.Confirm3(body, Title(), _
+                T("&Ouvrir le dossier", "&Open folder"), T("&Guide d'installation", "Install &guide"), _
+                T("&Fermer", "&Close"), vbInformation, 0, 3)
+        If r = vbNo Then OpenUrl DOC_URL
+    Else
+        r = modMsgBoxCustom.MsgBoxC(body, vbYesNo + vbInformation, Title(), _
+                T("&Ouvrir le dossier", "&Open folder"), T("&Fermer", "&Close"), "", 0, 2, False)
+    End If
+    If r = vbYes Then OpenWorkingFolder
+End Sub
+
+Private Sub OpenWorkingFolder()
+    On Error Resume Next
+    Dim p As String
+    p = modConfig.MacroVBADir()
+    Shell "explorer.exe """ & p & """", vbNormalFocus
+    If Err.Number <> 0 Then modDebugLog.DError MOD_NAME, "Ouverture dossier err " & Err.Number
+End Sub
+
+Private Sub OpenUrl(ByVal url As String)
+    On Error Resume Next
+    Dim sa As Object
+    Set sa = CreateObject("Shell.Application")
+    sa.ShellExecute url
+    If Err.Number <> 0 Then modDebugLog.DError MOD_NAME, "Ouverture URL err " & Err.Number
+End Sub
+
+'=============================================================================
+' Utilitaires
+'=============================================================================
+Private Function ConfigFileExists() As Boolean
+    On Error Resume Next
+    ConfigFileExists = False
+    Dim p As String
+    p = modConfig.ConfigPath()
+    If Len(p) = 0 Then Exit Function
+    ConfigFileExists = (Len(Dir(p)) > 0)
+End Function
+
+Private Function StatusGet() As String
+    On Error Resume Next
+    StatusGet = ""
+    StatusGet = GetSetting(REG_APP, REG_SECTION, REG_KEY, "")
+End Function
+
+Private Sub StatusSet(ByVal v As String)
+    On Error Resume Next
+    SaveSetting REG_APP, REG_SECTION, REG_KEY, v
+End Sub
+
+Private Function Today() As String
+    Today = Format$(Date, "yyyy-mm-dd")
+End Function

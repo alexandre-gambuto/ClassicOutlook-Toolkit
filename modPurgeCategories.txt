@@ -1,0 +1,283 @@
+Option Explicit
+
+' =====================================================================
+' modPurgeCategories v8  (2026-08-22)
+' Purpose (EN): removes all categories from non-recurring appointments
+'   between Jan 1st and today (exclusive), EXCEPT "Personnel". Calendar
+'   events are suspended during the loop so auto-coloring does not re-apply
+'   the categories being removed (each Save would otherwise fire ItemChange
+'   -> modMeetingColor.ApplyCategory). The flag is restored even on error.
+'
+' Retire toutes les categories sur les RDV entre le 1er janvier et
+' aujourd'hui (exclu), SAUF "Personnel". Les events calendar sont
+' suspendus pendant la boucle (cf. ThisOutlookSession) pour empecher la
+' re-coloration auto de reposer les categories qu'on vient de retirer.
+'
+' v8 (2026-08-22) : revue UX pop-ups + un piege projet corrige.
+'   (a) Le RECAPITULATIF de fin passe en toast (modUi.Toast). La decision a
+'       deja ete prise avant : la confirmation d'entree, elle, est CONSERVEE
+'       en modale et c'est justifie (action de masse sur les RDV de l'annee
+'       en cours, non annulable). Elle passe par modUi.Ask - garantie de
+'       premier plan - et son bouton par defaut devient "Non"
+'       (vbDefaultButton2) : rien dans ce module ne justifie que la touche
+'       Entree declenche la purge.
+'   (b) PIEGE PROJET CORRIGE : la boucle declarait "Dim a As
+'       Outlook.AppointmentItem". VBA etant insensible a la casse, le nom
+'       "a" occupe la meme portee que le wrapper global A() de modConfig.
+'       Aucun appel a A() n'existait dans cette procedure, donc rien ne
+'       cassait aujourd'hui - mais toute ligne ajoutee ensuite avec un
+'       marqueur d'accent aurait leve "Declaration existante dans la
+'       portee", avec un message d'erreur qui ne designe pas la cause.
+'       Renomme en "appt". Meme motif pour les compteurs.
+'   (c) Instrumentation de version ajoutee (le module n'avait ni
+'       MOD_VERSION ni ModVersion). Erreurs via modUi.Fail.
+'   Dependance ajoutee : modUi.
+'
+' v7.1 (2026-07-05) : filtre DASL - date via modCommon.FormatDaslDate ;
+' les jetons / et : de Format() suivent les reglages regionaux Windows
+' (meme correctif que modMeetingColor v13.1).
+' v7 (2026-06-10) : fix B5 - SetStatus route vers modCommon.SetStatus (log
+' DEBUG) ; Explorer.StatusBar n'existe pas dans le modele objet Outlook
+' (l'appel etait un no-op silencieux). Dependance ajoutee : modCommon.
+' (Historique des versions -> CHANGELOG.)
+' =====================================================================
+
+Private Const MOD_NAME As String = "PurgeCat"
+Private Const MOD_VERSION As String = "v8 - 2026-08-22"
+
+'=============================================================================
+' ModVersion - version REELLEMENT chargee dans le VBE.
+'=============================================================================
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+'=============================================================================
+' UiTitle - titre de fenetre localise (etait repete 3 fois en clair).
+'=============================================================================
+Private Function UiTitle() As String
+    UiTitle = T("Purger cat~egories RDV passes", "Purge past appointment categories")
+End Function
+
+' SetStatus (v7 - fix B5) : progression -> log DEBUG via modCommon.SetStatus.
+' Outlook n'a aucune API de barre de statut (cf. doc modCommon.SetStatus).
+Private Sub SetStatus(ByVal msg As String)
+    modCommon.SetStatus MOD_NAME, msg
+End Sub
+
+Public Sub PurgePastCategories()
+    On Error GoTo ErrH
+
+    Dim startDate As Date, endDate As Date
+    startDate = DateSerial(Year(Now), 1, 1)
+    endDate = DateSerial(Year(Now), Month(Now), Day(Now))
+
+    ' v8 : confirmation CONSERVEE (action de masse, non annulable), mais
+    ' via modUi.Ask et avec le bouton par defaut sur "Non".
+    Dim confirmation As VbMsgBoxResult
+    confirmation = modUi.Ask( _
+        T("Retirer toutes les cat~egories sur les RDV entre le ", _
+          "Remove all categories from appointments between ") & _
+        Format(startDate, "dd/mm/yyyy") & T(" et le ", " and ") & _
+        Format(endDate, "dd/mm/yyyy") & T(" (exclu) ?", " (exclusive)?") & vbCrLf & vbCrLf & _
+        T("La cat~egorie 'Personnel' est pr~eserv~ee.", _
+          "The 'Personnel' category is preserved.") & vbCrLf & _
+        T("Les RDV r~ecurrents ne sont pas modifi~es.", _
+          "Recurring appointments are not modified.") & vbCrLf & vbCrLf & _
+        T("Note : la coloration auto sera RE-APPLIQUEE au prochain", _
+          "Note: auto-coloring will be RE-APPLIED on the next") & vbCrLf & _
+        T("ItemChange sur chaque RDV. Pour purger durablement,", _
+          "ItemChange on each appointment. To purge permanently,") & vbCrLf & _
+        T("desactive d'abord la coloration auto.", _
+          "disable auto-coloring first."), _
+        UiTitle(), _
+        vbYesNo + vbQuestion + vbDefaultButton2)
+    If confirmation <> vbYes Then
+        modDebugLog.DInfo MOD_NAME, "Purge annulee par l'utilisateur"
+        Exit Sub
+    End If
+
+    modDebugLog.DInfo MOD_NAME, "Batch PurgePastCategories " & _
+        Format(startDate, "dd/mm/yyyy") & " -> " & Format(endDate, "dd/mm/yyyy")
+
+    ' Fix v6 : suspendre les events calendar pendant la boucle pour
+    ' empecher modMeetingColor.ApplyCategory de retomber sur
+    ' chaque appt.Save et reposer les categories auto qu'on vient de retirer.
+    ' Cf. modMeetingColor v11.
+    ThisOutlookSession.SuspendCalendarEvents = True
+
+    Dim calFolder As Outlook.folder
+    Set calFolder = Application.Session.GetDefaultFolder(olFolderCalendar)
+
+    Dim items As Outlook.items
+    Set items = calFolder.items
+    items.Sort "[Start]"
+    items.IncludeRecurrences = False
+
+    Dim dasl As String
+    dasl = "[Start] >= '" & modCommon.FormatDaslDate(startDate) & _
+           "' AND [Start] < '" & modCommon.FormatDaslDate(endDate) & "'"
+
+    Dim filtered As Outlook.items
+    Set filtered = items.Restrict(dasl)
+
+    Dim total As Long
+    total = filtered.count
+
+    SetStatus T("Purge cat~egories en cours : ", "Purging categories: ") & total & _
+              T(" RDV a examiner...", " appointments to examine...")
+
+    Dim modifiedCount As Long, errs As Long
+    Dim i As Long
+    Dim itm As Object
+    ' v8 : "appt" et non "a" - cf. note (b) de l'en-tete.
+    Dim appt As Outlook.AppointmentItem
+    Dim currentCats As String, newCats As String
+
+    For i = 1 To total
+        DoEvents
+        On Error Resume Next
+        Set itm = filtered.Item(i)
+        On Error GoTo ErrH
+
+        If itm Is Nothing Then GoTo Continue
+        If Not (TypeOf itm Is Outlook.AppointmentItem) Then GoTo Continue
+
+        Set appt = itm
+
+        If appt.IsRecurring Then GoTo Continue
+        If IsTechnical(appt) Then GoTo Continue
+
+        currentCats = appt.Categories
+        If Len(currentCats) = 0 Then GoTo Continue
+
+        newCats = KeepOnlyPersonal(currentCats)
+
+        If StrComp(currentCats, newCats, vbTextCompare) <> 0 Then
+            On Error Resume Next
+            appt.Categories = newCats
+            appt.Save
+            If Err.Number = 0 Then
+                modifiedCount = modifiedCount + 1
+                modDebugLog.DDebug MOD_NAME, Format(appt.Start, "yyyy-mm-dd") & _
+                    " '" & appt.subject & "' : " & Len(currentCats) & _
+                    " chars -> '" & newCats & "'"
+            Else
+                errs = errs + 1
+                Err.Clear
+            End If
+            On Error GoTo ErrH
+        End If
+
+        If i Mod 50 = 0 Then
+            SetStatus T("Purge : ", "Purge: ") & i & "/" & total & _
+                      " (" & modifiedCount & T(" modifi~es)", " modified)")
+        End If
+Continue:
+    Next i
+
+    ' Restaurer le flag - critique meme en cas d'erreur (gere par ErrH)
+    ThisOutlookSession.SuspendCalendarEvents = False
+    SetStatus ""
+
+    modDebugLog.DInfo MOD_NAME, "Batch termine : " & modifiedCount & _
+        " modifiedCount, " & errs & " erreurs, " & total & " examines"
+
+    ' v8 : recapitulatif en toast. Le detail chiffre est dans debug.log.
+    Dim msg As String
+    msg = T("Purge des cat~egories termin~ee.", "Category purge complete.") & vbLf & _
+          modifiedCount & T(" RDV modifi~es sur ", " appointments modified out of ") & total
+    If errs > 0 Then msg = msg & T(" - erreurs : ", " - errors: ") & errs
+    modUi.Toast msg, uiInfo, True
+    Exit Sub
+
+ErrH:
+    ' Restauration imperative meme en erreur, sinon les events restent
+    ' suspendus pour le reste de la session Outlook (plus aucun tag auto,
+    ' plus aucune coloration auto jusqu'au prochain redemarrage).
+    Dim errNo As Long, errDesc As String
+    errNo = Err.Number: errDesc = Err.Description
+    On Error Resume Next
+    ThisOutlookSession.SuspendCalendarEvents = False
+    SetStatus ""
+    modDebugLog.DError MOD_NAME, "error " & errNo & " - " & errDesc
+    modUi.Fail T("Erreur : ", "Error: ") & errNo & " - " & errDesc, UiTitle()
+End Sub
+
+' Parser tolerant : accepte ',' et ';' comme separateur.
+Private Function SplitCategories(ByVal cats As String) As Variant
+    If Len(cats) = 0 Then
+        SplitCategories = Array()
+        Exit Function
+    End If
+
+    Dim normalized As String
+    normalized = Replace(cats, ";", ",")
+
+    Dim raw() As String
+    raw = Split(normalized, ",")
+
+    Dim clean() As String
+    ReDim clean(0 To UBound(raw) - LBound(raw))
+
+    Dim n As Long, i As Long, c As String
+    n = 0
+    For i = LBound(raw) To UBound(raw)
+        c = Trim(raw(i))
+        If Len(c) > 0 Then
+            clean(n) = c
+            n = n + 1
+        End If
+    Next i
+
+    If n = 0 Then
+        SplitCategories = Array()
+    Else
+        ReDim Preserve clean(0 To n - 1)
+        SplitCategories = clean
+    End If
+End Function
+
+' NOTE : "Personnel" et "Perso" sont des CATEGORIES OUTLOOK comparees, donc
+' des chaines fonctionnelles - jamais traduites, jamais wrappees dans T().
+Private Function KeepOnlyPersonal(ByVal cats As String) As String
+    KeepOnlyPersonal = ""
+    If Len(cats) = 0 Then Exit Function
+
+    Dim arr As Variant
+    arr = SplitCategories(cats)
+
+    Dim result As String
+    Dim seen As Object
+    Set seen = CreateObject("Scripting.Dictionary")
+    seen.CompareMode = 1  ' vbTextCompare
+
+    Dim i As Long, c As String
+    result = ""
+    For i = LBound(arr) To UBound(arr)
+        c = CStr(arr(i))
+        If Len(c) > 0 Then
+            If StrComp(c, "Personnel", vbTextCompare) = 0 Or _
+               StrComp(c, "Perso", vbTextCompare) = 0 Then
+                ' Deduplication : une seule occurrence meme en cas de pollution
+                If Not seen.Exists(c) Then
+                    seen.Add c, True
+                    If Len(result) > 0 Then result = result & ", "
+                    result = result & c
+                End If
+            End If
+        End If
+    Next i
+    KeepOnlyPersonal = result
+End Function
+
+Private Function IsTechnical(ByVal appt As Outlook.AppointmentItem) As Boolean
+    IsTechnical = False
+    If InStr(1, appt.subject, "QuickMove_", vbTextCompare) > 0 Then
+        IsTechnical = True
+        Exit Function
+    End If
+    If InStr(1, appt.Categories, "QuickMove", vbTextCompare) > 0 Then
+        IsTechnical = True
+    End If
+End Function

@@ -1,0 +1,228 @@
+Option Explicit
+
+'=============================================================================
+' modCommon v1.2
+' Purpose (EN): shared, STATELESS helper functions used by several modules
+'   (file-name sanitizing, HTML escaping, folder resolution by full path,
+'   protected item-property accessors). No module-level state, no UI, no
+'   event handler.
+'
+' Helpers communs SANS ETAT, partages entre modules. Premiere extraction
+' (revue 2026-06-10) :
+'   SanitizeFileName  (ex modMailExport.SanitizeName)
+'   EscapeHTML        (union modMailExport.EscapeHTML + modNotify.EscapeHtml)
+'   GetFolderByPath   (ex modSnooze.GetFolderByPath)
+'   SafeReceivedTime  (ex modMailExport.SafeReceivedTime, + modFolderScan)
+'   SafeSubject       (ex modMailExport.SafeSubject)
+'   SetStatus         (v1.1 - fix B5 : progression -> log DEBUG)
+'   ExcelAlive        (v1.2 - instance Excel VRAIMENT vivante, anti-fantome)
+'   FormatDaslDate    (v1.2 - date filtre DASL m/d/yyyy h:mm AM/PM, locale-proof)
+'
+' PERIMETRE VOLONTAIREMENT LIMITE : les helpers SMTP / categories /
+' IsTechnical restent pour l'instant dans leurs modules consommateurs
+' (modMeetingColor, modMailResponseTracker, modPurgeCategories). Ils seront
+' centralises ici a la prochaine revision de fond de ces modules : un swap
+' de helper seul sur des modules evenementiels hot-path ne justifie pas le
+' risque de regression.
+'
+' REGLES :
+'   - Fonctions pures uniquement, aucune variable module-level.
+'   - Seule dependance applicative : modDebugLog (v1.1, pour SetStatus).
+'     Un helper qui echoue renvoie une valeur neutre ("", Nothing, 0).
+'   - Toute lecture COM est protegee (certains items levent sur certaines
+'     proprietes, ex. ReportItem sur ReceivedTime).
+' (Historique des versions -> CHANGELOG.)
+'=============================================================================
+
+Private Const MOD_NAME As String = "Common"
+Private Const MOD_VERSION As String = "v1.2 - 2026-07-05"
+
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+'-----------------------------------------------------------------------------
+' SanitizeFileName
+' Retire les caracteres interdits dans un nom de fichier Windows (remplaces
+' par des espaces), compacte les espaces multiples, Trim final.
+'-----------------------------------------------------------------------------
+Public Function SanitizeFileName(ByVal s As String) As String
+    Dim forbidden As String, i As Long, ch As String, out As String
+    forbidden = "\/:*?""<>|" & vbCr & vbLf & vbTab
+    For i = 1 To Len(s)
+        ch = Mid$(s, i, 1)
+        If InStr(forbidden, ch) > 0 Then
+            out = out & " "
+        Else
+            out = out & ch
+        End If
+    Next i
+    ' Compacter les espaces multiples
+    Do While InStr(out, "  ") > 0
+        out = Replace(out, "  ", " ")
+    Loop
+    SanitizeFileName = Trim$(out)
+End Function
+
+'-----------------------------------------------------------------------------
+' EscapeHTML
+' Echappe & < > " pour injecter du texte brut dans du HTML.
+' Union des deux variantes historiques (modMailExport n'echappait pas le
+' guillemet, modNotify si) : le &quot; supplementaire est inoffensif partout.
+'-----------------------------------------------------------------------------
+Public Function EscapeHTML(ByVal s As String) As String
+    s = Replace(s, "&", "&amp;")
+    s = Replace(s, "<", "&lt;")
+    s = Replace(s, ">", "&gt;")
+    s = Replace(s, """", "&quot;")
+    EscapeHTML = s
+End Function
+
+'-----------------------------------------------------------------------------
+' GetFolderByPath
+' Resout un dossier Outlook depuis son FolderPath complet
+' ("\\Compte\Dossier\Sous-dossier"). Renvoie Nothing si introuvable.
+' (Comportement identique a l'ex-modSnooze.GetFolderByPath.)
+'-----------------------------------------------------------------------------
+Public Function GetFolderByPath(ByVal folderPath As String) As Object
+    Dim ns As Object
+    Dim parts() As String
+    Dim folder As Object
+    Dim i As Long
+
+    Set ns = Application.GetNamespace("MAPI")
+
+    ' Le FolderPath commence par \\NomCompte\Dossier\Sous-dossier :
+    ' supprimer les \\ du debut.
+    Dim cleanPath As String
+    cleanPath = folderPath
+    If Left(cleanPath, 2) = "\\" Then
+        cleanPath = Mid(cleanPath, 3)
+    End If
+
+    parts = Split(cleanPath, "\")
+
+    If UBound(parts) < 0 Then
+        Set GetFolderByPath = Nothing
+        Exit Function
+    End If
+
+    ' Trouver le store racine
+    On Error Resume Next
+    Set folder = ns.Folders(parts(0))
+    If folder Is Nothing Then
+        Set GetFolderByPath = Nothing
+        Exit Function
+    End If
+
+    ' Descendre dans l'arborescence.
+    ' v1.2 - FIX : sous On Error Resume Next, un Set qui echoue CONSERVE
+    ' l'objet precedent -> la fonction renvoyait un ANCETRE au lieu de
+    ' Nothing des qu'un segment intermediaire manquait (risque : consommateur
+    ' type modSnooze deplacant vers le mauvais dossier). On repart de Nothing
+    ' a chaque etape et on teste Err apres chaque descente.
+    Dim parentFld As Object
+    For i = 1 To UBound(parts)
+        Set parentFld = folder
+        Set folder = Nothing
+        Err.Clear
+        Set folder = parentFld.Folders(parts(i))
+        If Err.Number <> 0 Or folder Is Nothing Then
+            Set GetFolderByPath = Nothing
+            Exit Function
+        End If
+    Next i
+    On Error GoTo 0
+
+    Set GetFolderByPath = folder
+End Function
+
+'-----------------------------------------------------------------------------
+' SafeReceivedTime
+' Date d'un item, lecture protegee : ReceivedTime, sinon SentOn, sinon 0.
+' Un ReportItem (ou un non-mail) peut lever sur l'une ou l'autre propriete.
+'-----------------------------------------------------------------------------
+Public Function SafeReceivedTime(ByVal itm As Object) As Date
+    On Error Resume Next
+    Dim d As Date
+    d = itm.ReceivedTime
+    If d <= 0 Then d = itm.SentOn
+    SafeReceivedTime = d
+End Function
+
+'-----------------------------------------------------------------------------
+' SafeSubject : Subject d'un item, lecture protegee ("" si illisible).
+'-----------------------------------------------------------------------------
+Public Function SafeSubject(ByVal itm As Object) As String
+    On Error Resume Next
+    SafeSubject = itm.Subject
+End Function
+
+'-----------------------------------------------------------------------------
+' SetStatus (v1.1 - fix B5)
+' Trace de progression "barre de statut". REALITE OUTLOOK : contrairement a
+' Excel, le modele objet Outlook n'expose AUCUNE API de barre de statut.
+' Explorer.StatusBar et Explorer.SetStatusBarMessage N'EXISTENT PAS : les
+' anciens appels (modMailExport, modPurgeCategories, modSnooze) etaient des
+' no-op silencieux sous On Error Resume Next.
+' Pas d'injection Win32 non plus : la barre Outlook moderne n'est pas un
+' controle msctls_statusbar32 classique (et toute nouvelle mecanique Win32
+' devrait d'abord passer par une sonde EDR). Un toast mshta par tick de
+' progression serait du spam visuel + des spawns de process repetes.
+' => Canal fiable retenu : le LOG (niveau DEBUG, visible via Maintenance >
+' Logs quand on veut suivre un lot). Le feedback utilisateur visible reste
+' la MsgBox de synthese de fin de lot cote appelant.
+'-----------------------------------------------------------------------------
+Public Sub SetStatus(ByVal modName As String, ByVal msg As String)
+    On Error Resume Next
+    If Len(Trim$(msg)) = 0 Then Exit Sub
+    modDebugLog.DDebug modName, "Statut : " & msg
+End Sub
+
+'-----------------------------------------------------------------------------
+' ExcelAlive (v1.2)
+' L'instance Excel repond-elle VRAIMENT ? Workbooks.Count impose un
+' aller-retour complet vers le processus, contrairement a .Version que le
+' proxy COM peut servir de memoire APRES la mort du processus (EXCEL.EXE
+' fantome : incident erreur 462 du 2026-07-03 cote tracker).
+' Centralisation du helper prive de modMailResponseTracker v5.2, pour
+' proteger TOUS les consommateurs de GetObject (ProjectTag, MailCampaign...).
+'-----------------------------------------------------------------------------
+Public Function ExcelAlive(ByVal xl As Object) As Boolean
+    On Error Resume Next
+    ExcelAlive = False
+    If xl Is Nothing Then Exit Function
+    Dim n As Long
+    n = -1
+    n = xl.Workbooks.count
+    ExcelAlive = (Err.Number = 0 And n >= 0)
+    Err.Clear
+End Function
+
+'-----------------------------------------------------------------------------
+' FormatDaslDate (v1.2)
+' Date au format DASL m/d/yyyy h:mm AM/PM construite A LA MAIN : les jetons
+' "/" et ":" de Format() suivent les reglages regionaux Windows (separateur
+' personnalise = filtre casse en silence). Reprise du helper prive de
+' modAntiOverlap (FormatOutlookDate), centralisee pour modMeetingColor et
+' modPurgeCategories. modAntiOverlap garde sa copie privee (hot-path, cf.
+' regle "pas de swap de helper seul sur un module evenementiel").
+'-----------------------------------------------------------------------------
+Public Function FormatDaslDate(ByVal d As Date) As String
+    Dim ampm As String
+    Dim h As Long
+    h = Hour(d)
+    If h = 0 Then
+        ampm = "AM"
+        h = 12
+    ElseIf h < 12 Then
+        ampm = "AM"
+    ElseIf h = 12 Then
+        ampm = "PM"
+    Else
+        ampm = "PM"
+        h = h - 12
+    End If
+    FormatDaslDate = Month(d) & "/" & Day(d) & "/" & Year(d) & " " & _
+                     h & ":" & Format$(Minute(d), "00") & " " & ampm
+End Function

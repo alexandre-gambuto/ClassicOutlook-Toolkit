@@ -1,0 +1,350 @@
+Option Explicit
+
+' =====================================================================
+' modShiftAppointment v3.1
+' Purpose (EN): shifts the selected calendar appointment by +/-15 min
+'   (duration unchanged). Refuses recurring masters; warns before turning
+'   a recurring occurrence into an exception. v3 adds SetActualDuration:
+'   adjusts the duration of a (typically past) appointment or meeting to
+'   the actually elapsed time, via a silent MAPI Save - NO update is ever
+'   sent to attendees (Save never sends; only Send does).
+'
+' Decale un rendez-vous selectionne dans le Calendrier Outlook
+' de +15 ou -15 minutes. La duree reste inchangee.
+'
+' Utilisation :
+'   - Selectionner un rendez-vous dans le calendrier (ou l'ouvrir)
+'   - Cliquer sur le bouton + (ShiftAppointmentPlus15)
+'     ou sur le bouton - (ShiftAppointmentMinus15)
+'   - SetActualDuration : ajuster la duree au temps reellement passe
+'     (InputBox minutes, debut inchange, fin recalculee, Save silencieux)
+'
+' Fix v2 (2026-05-27) : GESTION RECURRENTS
+'   La v1 modifiait directement appt.Start sur une occurrence d'une serie
+'   recurrente. Outlook cree alors une EXCEPTION dans la serie : cette
+'   occurrence devient un item desolidarise du master, ce qui :
+'     - pollue la serie de maniere irreversible
+'     - genere des conflits de sync iOS (deux representations de
+'       l'occurrence : master + exception locale)
+'     - viole la convention projet "ecrire sur le master via
+'       GetRecurrencePattern.Parent, jamais sur l'occurrence"
+'
+'   Comportement v2 :
+'     - RDV non recurrent       -> decalage applique (comportement v1)
+'     - Occurrence de recurrence -> MsgBox de confirmation explicite,
+'                                   le decalage cree une exception mais
+'                                   on previent l'utilisateur
+'     - Master de recurrence     -> refus, demander a l'utilisateur
+'                                   d'ouvrir la serie pour decaler toutes
+'                                   les occurrences via le mecanisme natif
+'
+' v3 (2026-06-11) : SetActualDuration
+'   Ajuste la duree d'une reunion/RDV (typiquement passe) au temps
+'   reellement vecu, pour coller le calendrier au reel (pointage TEMPO).
+'   - Save MAPI uniquement, JAMAIS de Send : aucune mise a jour n'est
+'     envoyee aux participants. Le prompt "Envoyer la mise a jour" est
+'     un comportement purement UI ; il n'existe pas via l'OOM.
+'     Consequence assumee : le calendrier de l'organisateur diverge de
+'     celui des participants (c'est le but). Si une mise a jour est
+'     envoyee plus tard pour une autre raison, le nouvel horaire part avec.
+'   - Evenements calendrier SUSPENDUS pendant le Save
+'     (ThisOutlookSession.SuspendCalendarEvents) : un ajustement de duree
+'     ne doit pas etre retraite par le pipeline ItemChange. Risque reel
+'     sinon : duree ramenee a la duree par defaut (modConfig.MeetingDuration)
+'     + chevauchement existant = re-decalage silencieux par
+'     modAntiOverlap.TryShift (verifie : TryShift n'a aucun garde
+'     passe/futur), plus re-prompt tag potentiel via CheckReTag.
+'   - Meme politique recurrence que ShiftSelectedAppointment :
+'     master refuse, occurrence/exception confirmee explicitement.
+'   - Journee entiere : refus (pas de duree a ajuster).
+'
+' v3.1 (2026-06-11) : fix B5 - appel mort Explorer.StatusBar (propriete
+'   inexistante dans l'OOM Outlook, no-op silencieux sous OERN) remplace
+'   par modCommon.SetStatus (log DEBUG). Dependance ajoutee : modCommon.
+'
+' Contraintes respectees :
+'   - Chaines ASCII uniquement dans les MsgBox (accents via T()/A())
+'   - Aucune confirmation hors recurrence + erreur
+'   - Nom de module : modShiftAppointment
+' =====================================================================
+
+Private Const MOD_NAME As String = "ShiftAppt"
+Private Const MOD_VERSION As String = "v3.1 - 2026-06-11"
+
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+Public Sub ShiftAppointmentPlus15()
+    ShiftSelectedAppointment 15
+End Sub
+
+Public Sub ShiftAppointmentMinus15()
+    ShiftSelectedAppointment -15
+End Sub
+
+' ---------------------------------------------------------------------
+' Coeur du traitement
+' ---------------------------------------------------------------------
+Private Sub ShiftSelectedAppointment(ByVal minutesToShift As Long)
+    Dim objItem As Object
+    Dim appt As Outlook.AppointmentItem
+    Dim origStart As Date
+    Dim origEnd As Date
+    Dim newStart As Date
+
+    On Error GoTo ErrHandler
+
+    Set objItem = GetSelectedAppointment()
+    If objItem Is Nothing Then
+        MsgBox T("S~electionnez d'abord un rendez-vous unique dans le Calendrier.", _
+                 "Please select a single appointment in the Calendar first."), _
+               vbExclamation, T("D~ecaler le rendez-vous", "Shift appointment")
+        Exit Sub
+    End If
+
+    If TypeOf objItem Is Outlook.AppointmentItem Then
+        Set appt = objItem
+    Else
+        MsgBox T("L'~el~ement s~electionn~e n'est pas un rendez-vous.", _
+                 "The selected item is not an appointment."), _
+               vbExclamation, T("D~ecaler le rendez-vous", "Shift appointment")
+        Exit Sub
+    End If
+
+    ' --- Gestion recurrence (Fix v2) ---
+    ' RecurrenceState :
+    '   olApptNotRecurring     (0) : RDV simple, OK
+    '   olApptMaster           (1) : master d'une serie -> refus
+    '   olApptOccurrence       (2) : occurrence "normale" d'une serie
+    '   olApptException        (3) : occurrence deja modifiee (exception)
+    Dim recState As Long
+    recState = olApptNotRecurring
+    On Error Resume Next
+    recState = appt.RecurrenceState
+    On Error GoTo ErrHandler
+
+    If recState = olApptMaster Then
+        MsgBox T("Ceci est le ma~itre d'une s~erie r~ecurrente." & vbCrLf & _
+                 "Pour d~ecaler toute la s~erie, ouvrez-la dans Outlook et modifiez" & vbCrLf & _
+                 "l'heure de d~ebut directement (Outlook propagera ~a toutes les" & vbCrLf & _
+                 "occurrences). Cette macro ne d~ecale que les RDV non r~ecurrents.", _
+                 "This is the master of a recurring series." & vbCrLf & _
+                 "To shift the whole series, open it in Outlook and edit" & vbCrLf & _
+                 "the start time directly (Outlook will propagate to all" & vbCrLf & _
+                 "occurrences). This macro only shifts non-recurring items."), _
+               vbExclamation, T("D~ecaler le rendez-vous - S~erie r~ecurrente", _
+                                "Shift appointment - Recurring series")
+        Exit Sub
+    End If
+
+    If recState = olApptOccurrence Or recState = olApptException Then
+        Dim rep As VbMsgBoxResult
+        rep = MsgBox(T("Cette occurrence appartient ~a une s~erie r~ecurrente." & vbCrLf & vbCrLf & _
+                       "La d~ecaler cr~eera une EXCEPTION dans la s~erie" & vbCrLf & _
+                       "(cette occurrence se d~esynchronise du ma~itre et ne" & vbCrLf & _
+                       "suivra plus les modifications futures de la s~erie)." & vbCrLf & vbCrLf & _
+                       "Continuer quand meme ?", _
+                       "This occurrence belongs to a recurring series." & vbCrLf & vbCrLf & _
+                       "Shifting it will create an EXCEPTION in the series" & vbCrLf & _
+                       "(this single occurrence becomes desynced from the" & vbCrLf & _
+                       "master and won't follow future series edits)." & vbCrLf & vbCrLf & _
+                       "Proceed anyway ?"), _
+                     vbYesNo + vbExclamation + vbDefaultButton2, _
+                     T("D~ecaler le rendez-vous - Confirmer l'exception", _
+                       "Shift appointment - Confirm exception"))
+        If rep <> vbYes Then Exit Sub
+    End If
+
+    origStart = appt.Start
+    origEnd = appt.End
+    newStart = DateAdd("n", minutesToShift, origStart)
+
+    ' On decale Start ; Outlook conserve la duree si on ne touche pas a End,
+    ' mais par securite on recalcule End explicitement.
+    appt.Start = newStart
+    appt.End = DateAdd("n", minutesToShift, origEnd)
+
+    appt.Save
+
+    Set appt = Nothing
+    Set objItem = Nothing
+    Exit Sub
+
+ErrHandler:
+    MsgBox T("Erreur lors du d~ecalage du rendez-vous :", _
+             "Error while shifting the appointment:") & vbCrLf & _
+           T("Num~ero : ", "Number: ") & Err.Number & vbCrLf & _
+           "Source : " & Err.Source & vbCrLf & _
+           T("Descr. : ", "Descr.: ") & Err.Description, _
+           vbCritical, T("D~ecaler le rendez-vous", "Shift appointment")
+End Sub
+
+' ---------------------------------------------------------------------
+' DUREE REELLE (v3) - ajuste la duree du RDV/reunion cible au temps
+' reellement passe. Debut inchange, fin recalculee, Save MAPI silencieux :
+' AUCUNE mise a jour envoyee aux participants. Pipeline calendrier
+' (TryShift / CheckReTag / ApplyCategory / DemoteIfEmptyMeeting) suspendu
+' pendant le Save via ThisOutlookSession.SuspendCalendarEvents.
+' Ruban : onAction="Projet.SetActualDuration".
+' ---------------------------------------------------------------------
+Public Sub SetActualDuration()
+    Dim objItem As Object
+    Dim appt As Outlook.AppointmentItem
+    Dim curMin As Long
+    Dim answer As String
+    Dim newMin As Long
+
+    On Error GoTo ErrHandler
+
+    Set objItem = GetSelectedAppointment()
+    If objItem Is Nothing Then
+        MsgBox T("S~electionnez d'abord un rendez-vous unique dans le Calendrier.", _
+                 "Please select a single appointment in the Calendar first."), _
+               vbExclamation, T("Dur~ee r~eelle", "Actual duration")
+        Exit Sub
+    End If
+
+    If TypeOf objItem Is Outlook.AppointmentItem Then
+        Set appt = objItem
+    Else
+        MsgBox T("L'~el~ement s~electionn~e n'est pas un rendez-vous.", _
+                 "The selected item is not an appointment."), _
+               vbExclamation, T("Dur~ee r~eelle", "Actual duration")
+        Exit Sub
+    End If
+
+    If appt.AllDayEvent Then
+        MsgBox T("~Ev~enement sur journ~ee enti~fre : pas de dur~ee ~a ajuster.", _
+                 "All-day event: no duration to adjust."), _
+               vbExclamation, T("Dur~ee r~eelle", "Actual duration")
+        Exit Sub
+    End If
+
+    ' --- Recurrence : meme politique que ShiftSelectedAppointment ---
+    Dim recState As Long
+    recState = olApptNotRecurring
+    On Error Resume Next
+    recState = appt.RecurrenceState
+    On Error GoTo ErrHandler
+
+    If recState = olApptMaster Then
+        MsgBox T("Ceci est le ma~itre d'une s~erie r~ecurrente." & vbCrLf & _
+                 "S~electionnez l'occurrence concern~ee (pas la s~erie)" & vbCrLf & _
+                 "pour ajuster sa dur~ee.", _
+                 "This is the master of a recurring series." & vbCrLf & _
+                 "Select the affected occurrence (not the series)" & vbCrLf & _
+                 "to adjust its duration."), _
+               vbExclamation, T("Dur~ee r~eelle - S~erie r~ecurrente", _
+                                "Actual duration - Recurring series")
+        Exit Sub
+    End If
+
+    If recState = olApptOccurrence Or recState = olApptException Then
+        Dim rep As VbMsgBoxResult
+        rep = MsgBox(T("Cette occurrence appartient ~a une s~erie r~ecurrente." & vbCrLf & vbCrLf & _
+                       "La modifier cr~eera une EXCEPTION dans la s~erie" & vbCrLf & _
+                       "(cette occurrence se d~esynchronise du ma~itre et ne" & vbCrLf & _
+                       "suivra plus les modifications futures de la s~erie)." & vbCrLf & vbCrLf & _
+                       "Continuer quand meme ?", _
+                       "This occurrence belongs to a recurring series." & vbCrLf & vbCrLf & _
+                       "Changing it will create an EXCEPTION in the series" & vbCrLf & _
+                       "(this single occurrence becomes desynced from the" & vbCrLf & _
+                       "master and won't follow future series edits)." & vbCrLf & vbCrLf & _
+                       "Proceed anyway ?"), _
+                     vbYesNo + vbExclamation + vbDefaultButton2, _
+                     T("Dur~ee r~eelle - Confirmer l'exception", _
+                       "Actual duration - Confirm exception"))
+        If rep <> vbYes Then Exit Sub
+    End If
+
+    curMin = appt.Duration
+
+    answer = InputBox(T("Dur~ee r~eelle de la r~eunion, en minutes." & vbCrLf & _
+                        "Le d~ebut reste inchang~e ; la fin est recalcul~ee." & vbCrLf & _
+                        "Aucune mise ~a jour n'est envoy~ee aux participants.", _
+                        "Actual meeting duration, in minutes." & vbCrLf & _
+                        "Start is unchanged; end is recomputed." & vbCrLf & _
+                        "No update is sent to attendees."), _
+                      T("Dur~ee r~eelle", "Actual duration"), CStr(curMin))
+    If Len(Trim$(answer)) = 0 Then Exit Sub        ' Annuler ou vide
+
+    If Not IsNumeric(answer) Then
+        MsgBox T("Valeur invalide : entrez un nombre de minutes.", _
+                 "Invalid value: enter a number of minutes."), _
+               vbExclamation, T("Dur~ee r~eelle", "Actual duration")
+        Exit Sub
+    End If
+    newMin = CLng(Val(answer))                     ' Val : locale-safe, tronque
+    If newMin < 1 Or newMin > 1440 Then
+        MsgBox T("Dur~ee hors limites (1 ~a 1440 minutes).", _
+                 "Duration out of range (1 to 1440 minutes)."), _
+               vbExclamation, T("Dur~ee r~eelle", "Actual duration")
+        Exit Sub
+    End If
+    If newMin = curMin Then Exit Sub               ' rien a changer
+
+    ' --- Save silencieux : suspendre le pipeline calendrier ---
+    ThisOutlookSession.SuspendCalendarEvents = True
+    appt.End = DateAdd("n", newMin, appt.Start)
+    appt.Save
+    ThisOutlookSession.SuspendCalendarEvents = False
+
+    modDebugLog.DInfo MOD_NAME, "Duree ajustee '" & appt.subject & "' " & _
+        curMin & " -> " & newMin & " min (Save sans update participants)"
+
+    ' v3.1 (fix B5) : Explorer.StatusBar n'existe pas dans l'OOM
+    ' (no-op silencieux sous OERN) -> trace DEBUG via modCommon.SetStatus.
+    modCommon.SetStatus MOD_NAME, "Duree ajustee : " & newMin & " min"
+
+    Set appt = Nothing
+    Set objItem = Nothing
+    Exit Sub
+
+ErrHandler:
+    ThisOutlookSession.SuspendCalendarEvents = False
+    modDebugLog.DError MOD_NAME, "SetActualDuration err " & Err.Number & _
+        " - " & Err.Description
+    MsgBox T("Erreur lors de l'ajustement de la dur~ee :", _
+             "Error while adjusting the duration:") & vbCrLf & _
+           T("Num~ero : ", "Number: ") & Err.Number & vbCrLf & _
+           T("Descr. : ", "Descr.: ") & Err.Description, _
+           vbCritical, T("Dur~ee r~eelle", "Actual duration")
+End Sub
+
+' ---------------------------------------------------------------------
+' Recupere le rendez-vous actuellement cible :
+'   - soit l'item ouvert dans l'inspecteur actif
+'   - soit l'item unique selectionne dans l'explorateur actif
+' Retourne Nothing si rien d'exploitable.
+' ---------------------------------------------------------------------
+Private Function GetSelectedAppointment() As Object
+    Dim insp As Outlook.Inspector
+    Dim expl As Outlook.Explorer
+    Dim sel As Outlook.Selection
+
+    Set GetSelectedAppointment = Nothing
+
+    ' 1) Inspecteur actif (RDV ouvert dans sa propre fenetre)
+    Set insp = Application.ActiveInspector
+    If Not insp Is Nothing Then
+        If Not insp.CurrentItem Is Nothing Then
+            If TypeOf insp.CurrentItem Is Outlook.AppointmentItem Then
+                Set GetSelectedAppointment = insp.CurrentItem
+                Exit Function
+            End If
+        End If
+    End If
+
+    ' 2) Explorateur actif (vue Calendrier)
+    Set expl = Application.ActiveExplorer
+    If expl Is Nothing Then Exit Function
+
+    Set sel = expl.Selection
+    If sel Is Nothing Then Exit Function
+    If sel.count <> 1 Then Exit Function
+
+    If TypeOf sel.Item(1) Is Outlook.AppointmentItem Then
+        Set GetSelectedAppointment = sel.Item(1)
+    End If
+End Function

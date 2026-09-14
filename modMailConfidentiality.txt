@@ -1,0 +1,962 @@
+Option Explicit
+
+' modMailConfidentiality v11
+' v11 (2026-08-17) : la detection et le retrait des bandeaux ne regardent plus
+'   que la ZONE PROPRE du message (ce que l'on redige), jamais l'historique
+'   cite (Reply / Forward). Avant : un bandeau Urgent present dans le mail
+'   d'origine cite etait vu par HasUrgentBanner a l'envoi -> le transfert
+'   recevait un bandeau Urgent neuf, un prefixe [URGENT], une importance
+'   haute ET ecrasait la ligne de suivi de la conversation. La frontiere
+'   zone propre / historique est le premier separateur de citation Outlook
+'   (_MailOriginal, divRplyFwdMsg, "De :"/"From:", <blockquote>) : ces
+'   ancres sont celles de l'injection du bandeau bas, qui insere toujours
+'   AVANT elles ; les bandeaux poses restent donc en zone propre. Les bandeaux
+'   cites (Urgent ou C2) sont desormais laisses intacts dans l'historique.
+'   Instrumentation de version (MOD_VERSION / ModVersion).
+' v10 (2026-07-13) : ajout du niveau URGENT dans le cycle de bandeau.
+'   Cycle : neant -> CONFIDENTIEL -> URGENT -> PERSONNEL -> neant.
+'   URGENT pose une banniere datee ("Urgent - Avant le JJ/MM/AAAA" en FR,
+'   "Urgent - Before AAAA-MM-JJ" en EN), SANS prefixe "C2". Le jour (XX) est
+'   a completer directement dans le corps du message. URGENT active aussi
+'   l'importance HAUTE et pose un prefixe objet "[URGENT] " ; les deux sont
+'   retires des qu'on quitte URGENT. Reset de l'importance UNIQUEMENT quand on
+'   quitte URGENT (une importance haute posee a la main sur un autre niveau
+'   n'est pas ecrasee). Helpers publics pour le flux d'envoi
+'   (ThisOutlookSession -> suivi automatique) :
+'     HasUrgentBanner(oMail)     -> True si le bandeau Urgent est present
+'     UrgentBannerDate(oMail)    -> date saisie (0 si XX non rempli / invalide)
+'     FinalizeUrgentBanner(oMail)-> re-ecrit les DEUX bandeaux sur la date
+'                                   concrete (synchronise haut et bas)
+'   Detection/retrait des bandeaux : marqueurs "C2 - " (confidentialite) et
+'   "Urgent - Avant le" / "Urgent - Before" (urgence).
+' v9 (2026-07-05) : couleurs lues via getters modConfig (EnsureLoaded-safe)
+'   au lieu des globales g_Confid* en direct (bandeaux noirs / texte invisible
+'   si config non chargee apres un Ctrl+S VBE).
+' v8 : PRIVE retire du cycle (Prive et Personnel etaient redondants).
+' Purpose (EN): cyclic confidentiality/urgency banner on the mail being
+'   composed. ToggleSensitivityCycle cycles none -> CONFIDENTIEL -> URGENT ->
+'   PERSONNEL -> none, setting Outlook Sensitivity (URGENT keeps it Normal),
+'   Importance (high for URGENT), a subject prefix ([PERSONNEL] / [URGENT]) and
+'   injecting/removing top+bottom HTML banners. The current level is detected
+'   by scanning the HTML body (PresentLevel), so those labels are functional
+'   markers. Banner colors are configurable (modConfig). No UserForm.
+' (Historique des versions -> CHANGELOG.)
+
+Private Const MOD_NAME As String = "MailConfid"
+Private Const MOD_VERSION As String = "v11 - 2026-08-17"
+
+' Prefixes poses dans l'objet du mail. Chaines FONCTIONNELLES (comparees pour
+' idempotence) -> hors T()/A(). L'espace final fait partie du prefixe.
+Private Const SUBJECT_PREFIX_PERSONAL As String = "[PERSONNEL] "
+Private Const SUBJECT_PREFIX_URGENT As String = "[URGENT] "
+
+' Marqueurs de la banniere URGENT (visibles ET fonctionnels : servent a la
+' detection et au parsing de la date). Source unique -> hors T()/A().
+' Espace final volontaire (colle a la date).
+Private Const URG_MARK_FR As String = "Urgent - Avant le "
+Private Const URG_MARK_EN As String = "Urgent - Before "
+
+Private Declare PtrSafe Function PlaySound Lib "winmm.dll" Alias "PlaySoundA" _
+    (ByVal lpszName As String, ByVal hModule As LongPtr, ByVal dwFlags As Long) As Long
+Private Const SND_ALIAS = &H10000
+Private Const SND_ASYNC = &H1
+
+'=============================================================================
+' PALETTE COULEURS externalisee dans config.ini (modConfig.g_*) :
+'   ConfidTextColorPersonal / ConfidBandColorPersonal   (Personnel,   bleu)
+'   ConfidTextColorPrivate  / ConfidBandColorPrivate    (Prive,       bronze)
+'   ConfidTextColorConf     / ConfidBandColorConf       (Confidentiel, rouge)
+'   ConfidTextColorUrgent   / ConfidBandColorUrgent     (Urgent,       rouge vif)
+'=============================================================================
+
+'=============================================================================
+' Version reellement chargee (lue par modMaintenance.MaintModuleVersions).
+'=============================================================================
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+'=============================================================================
+' DumpHTML : outil de diagnostic ponctuel (ecrit le HTMLBody sur le Bureau).
+'=============================================================================
+Public Sub DumpHTML()
+    On Error GoTo ErrH
+    Dim oMail As MailItem
+    Set oMail = GetCurrentMail()
+    If oMail Is Nothing Then
+        MsgBox T("Aucun mail en cours de redaction (Inspector ni InlineResponse).", "No mail being composed (neither Inspector nor InlineResponse)."), _
+               vbExclamation, T("Export du HTML du message", "Message HTML dump")
+        Exit Sub
+    End If
+
+    Dim outPath As String
+    outPath = modConfig.DesktopPath() & "\Macro VBA\Outlook\confid_html.html"
+
+    Dim f As Integer
+    f = FreeFile
+    Open outPath For Output As #f
+    Print #f, oMail.HTMLBody
+    Close #f
+
+    modDebugLog.DInfo MOD_NAME, "DumpHTML ecrit " & Len(oMail.HTMLBody) & " chars dans " & outPath
+
+    If MsgBox(T("HTMLBody sauvegarde dans :", "HTMLBody saved to:") & vbCrLf & outPath & vbCrLf & vbCrLf & _
+              T("Ouvrir maintenant ?", "Open it now?"), vbYesNo + vbQuestion, "Dump HTML OK") = vbYes Then
+        Shell "notepad.exe """ & outPath & """", vbNormalFocus
+    End If
+    Exit Sub
+ErrH:
+    modDebugLog.DError MOD_NAME, "DumpHTML err " & Err.Number & " - " & Err.Description
+    MsgBox T("Erreur : ", "Error: ") & Err.Number & " - " & Err.Description, vbExclamation
+End Sub
+
+'=============================================================================
+' GetCurrentMail : mail en cours de redaction (Inspector ouvert ou volet de
+' reponse rapide ActiveInlineResponse).
+'=============================================================================
+Private Function GetCurrentMail() As MailItem
+    On Error Resume Next
+    Set GetCurrentMail = Nothing
+
+    If Not Application.ActiveInspector Is Nothing Then
+        Dim itm As Object
+        Set itm = Application.ActiveInspector.CurrentItem
+        If Not itm Is Nothing Then
+            If TypeOf itm Is MailItem Then
+                Set GetCurrentMail = itm
+                modDebugLog.DTrace MOD_NAME, "GetCurrentMail : Inspector"
+                Exit Function
+            End If
+        End If
+    End If
+
+    If Not Application.ActiveExplorer Is Nothing Then
+        Dim ilr As Object
+        Set ilr = Application.ActiveExplorer.ActiveInlineResponse
+        If Not ilr Is Nothing Then
+            If TypeOf ilr Is MailItem Then
+                Set GetCurrentMail = ilr
+                modDebugLog.DTrace MOD_NAME, "GetCurrentMail : InlineResponse"
+                Exit Function
+            End If
+        End If
+    End If
+
+    modDebugLog.DTrace MOD_NAME, "GetCurrentMail : aucun mail en redaction"
+End Function
+
+'=============================================================================
+' Point d'entree public (compatibilite) : niveau natif OlSensitivity.
+' URGENT n'a pas d'equivalent OlSensitivity et n'est atteint que par le cycle.
+'=============================================================================
+Public Sub SetSensitivity(level As OlSensitivity)
+    modDebugLog.DTrace MOD_NAME, "SetSensitivity ENTREE level=" & level
+    On Error GoTo ErrH
+
+    Dim oMail As MailItem
+    Set oMail = GetCurrentMail()
+    If oMail Is Nothing Then Exit Sub
+
+    Dim tok As String
+    Select Case level
+        Case olConfidential: tok = "CONFIDENTIEL"
+        Case olPersonal:     tok = "PERSONNEL"
+        Case olPrivate:      tok = "PRIVE"
+        Case Else:           tok = ""
+    End Select
+
+    RenderLevelToken oMail, tok, 0
+    Exit Sub
+ErrH:
+    modDebugLog.DError MOD_NAME, "SetSensitivity error " & Err.Number & " - " & Err.Description
+End Sub
+
+'=============================================================================
+' RenderLevelToken : coeur de pose/retrait pour un niveau donne.
+'   tok : "" (neant) / "CONFIDENTIEL" / "URGENT" / "PERSONNEL" / "PRIVE"
+'   urgentDate : utilisee seulement si tok="URGENT" ; > 0 -> banniere datee
+'     concrete (finalisation a l'envoi) ; 0 -> gabarit avec XX a completer.
+'=============================================================================
+Private Sub RenderLevelToken(oMail As MailItem, ByVal tok As String, ByVal urgentDate As Date)
+    On Error GoTo ErrH
+
+    ' Etat present AVANT retrait (pour ne toucher l'importance qu'en quittant URGENT).
+    Dim wasUrgent As Boolean
+    wasUrgent = (PresentLevel(oMail.HTMLBody) = "URGENT")
+
+    ' 1) Sensibilite (URGENT ne modifie pas la confidentialite).
+    Select Case tok
+        Case "CONFIDENTIEL": oMail.Sensitivity = olConfidential
+        Case "PERSONNEL":    oMail.Sensitivity = olPersonal
+        Case "PRIVE":        oMail.Sensitivity = olPrivate
+        Case Else:           oMail.Sensitivity = olNormal   ' "" et "URGENT"
+    End Select
+
+    ' 2) Prefixes objet : on retire toujours les deux, puis on pose celui du
+    '    niveau courant (jamais de cumul "[PERSONNEL] [URGENT] ...").
+    SetSubjectPrefix oMail, SUBJECT_PREFIX_PERSONAL, (tok = "PERSONNEL")
+    SetSubjectPrefix oMail, SUBJECT_PREFIX_URGENT, (tok = "URGENT")
+
+    ' 3) Importance : haute pour URGENT ; retour a Normal SEULEMENT si on quitte
+    '    URGENT (sinon on n'ecrase pas une importance posee a la main).
+    If tok = "URGENT" Then
+        oMail.Importance = olImportanceHigh
+    ElseIf wasUrgent Then
+        oMail.Importance = olImportanceNormal
+    End If
+
+    ' 4) Retrait des bandeaux existants.
+    Dim removed As Boolean
+    removed = RemoveBannersIfPresent(oMail)
+
+    ' 5) Niveau neant : rien a poser.
+    If tok = "" Then
+        If removed Then
+            PlaySound "SystemAsterisk", 0, SND_ALIAS Or SND_ASYNC
+            modDebugLog.DInfo MOD_NAME, "Bandeaux retires"
+        End If
+        Exit Sub
+    End If
+
+    ' 6) Libelle complet + couleurs.
+    Dim fullLabel As String, textColor As String, bandColor As String
+    Select Case tok
+        Case "CONFIDENTIEL"
+            fullLabel = "C2 - CONFIDENTIEL"
+            textColor = modConfig.ConfidTextColorConf()
+            bandColor = modConfig.ConfidBandColorConf()
+        Case "PERSONNEL"
+            fullLabel = "C2 - PERSONNEL"
+            textColor = modConfig.ConfidTextColorPersonal()
+            bandColor = modConfig.ConfidBandColorPersonal()
+        Case "PRIVE"
+            fullLabel = "C2 - PRIVE"
+            textColor = modConfig.ConfidTextColorPrivate()
+            bandColor = modConfig.ConfidBandColorPrivate()
+        Case "URGENT"
+            If urgentDate > 0 Then
+                fullLabel = UrgentLabelForDate(urgentDate)
+            Else
+                fullLabel = BuildUrgentLabelPlaceholder()
+            End If
+            textColor = modConfig.ConfidTextColorUrgent()
+            bandColor = modConfig.ConfidBandColorUrgent()
+    End Select
+
+    modDebugLog.DInfo MOD_NAME, "=== Pose " & fullLabel & " ==="
+
+    ' 7) Construction + injection des bandeaux.
+    Dim topBanner As String, bottomBanner As String
+    topBanner = "<div style='margin-bottom:6.0pt'>" & _
+                  "<p class=MsoNormal align=center style='text-align:center'>" & _
+                  "<b><span style='font-size:10.0pt;font-family:""Calibri"",sans-serif;" & _
+                  "color:" & textColor & "'>" & _
+                  fullLabel & _
+                  "</span></b></p></div>"
+
+    bottomBanner = "<div style='margin-top:9.0pt;margin-bottom:9.0pt;border-radius:3px'>" & _
+                 "<p class=MsoNormal align=center style='text-align:center;background:" & bandColor & "'>" & _
+                 "<b><span style='font-size:10.0pt;font-family:""Calibri"",sans-serif;color:white'>" & _
+                 fullLabel & _
+                 "</span></b></p></div>"
+
+    Dim bodyText As String
+    bodyText = oMail.HTMLBody
+    bodyText = InjectTopBanner(bodyText, topBanner)
+    bodyText = InjectBottomBanner(bodyText, bottomBanner)
+    oMail.HTMLBody = bodyText
+
+    PlaySound "SystemAsterisk", 0, SND_ALIAS Or SND_ASYNC
+    modDebugLog.DInfo MOD_NAME, "Bandeaux poses (" & fullLabel & ")"
+    Exit Sub
+
+ErrH:
+    modDebugLog.DError MOD_NAME, "RenderLevelToken error " & Err.Number & " - " & Err.Description
+End Sub
+
+'=============================================================================
+' Prefixe objet generique.
+' want=True  : garantit que l'objet commence par thePrefix (idempotent).
+' want=False : retire thePrefix s'il est present.
+'=============================================================================
+Private Sub SetSubjectPrefix(oMail As MailItem, ByVal thePrefix As String, ByVal want As Boolean)
+    On Error GoTo ErrH
+    Dim subj As String
+    subj = oMail.Subject
+
+    Dim hasP As Boolean
+    hasP = (Left$(subj, Len(thePrefix)) = thePrefix)
+
+    If want Then
+        If Not hasP Then oMail.Subject = thePrefix & subj
+    Else
+        If hasP Then oMail.Subject = Mid$(subj, Len(thePrefix) + 1)
+    End If
+    Exit Sub
+ErrH:
+    modDebugLog.DTrace MOD_NAME, "SetSubjectPrefix err " & Err.Number & " : " & Err.Description
+End Sub
+
+'=============================================================================
+' Toggle simple (compatibilite ascendante) : niveau natif X <-> neant.
+'=============================================================================
+Public Sub ToggleSensitivity(level As OlSensitivity)
+    modDebugLog.DTrace MOD_NAME, "ToggleSensitivity ENTREE level=" & level
+    On Error GoTo ErrH
+
+    Dim oMail As MailItem
+    Set oMail = GetCurrentMail()
+    If oMail Is Nothing Then Exit Sub
+
+    Dim currentLevel As String, requestedLevel As String
+    currentLevel = PresentLevel(oMail.HTMLBody)
+    requestedLevel = LevelText(level)
+
+    If currentLevel <> "" And currentLevel = requestedLevel Then
+        SetSensitivity olNormal
+    Else
+        SetSensitivity level
+    End If
+    Exit Sub
+
+ErrH:
+    modDebugLog.DError MOD_NAME, "ToggleSensitivity error " & Err.Number & " - " & Err.Description
+End Sub
+
+'=============================================================================
+' Toggle cyclique
+' Cycle : neant -> CONFIDENTIEL -> URGENT -> PERSONNEL -> neant -> ...
+'=============================================================================
+Public Sub ToggleSensitivityCycle()
+    modDebugLog.DTrace MOD_NAME, "ToggleSensitivityCycle ENTREE"
+    On Error GoTo ErrH
+
+    Dim oMail As MailItem
+    Set oMail = GetCurrentMail()
+    If oMail Is Nothing Then Exit Sub
+
+    Dim currentLevel As String
+    currentLevel = PresentLevel(oMail.HTMLBody)
+    modDebugLog.DTrace MOD_NAME, "Cycle : actuel=[" & currentLevel & "]"
+
+    Select Case currentLevel
+        Case ""
+            RenderLevelToken oMail, "CONFIDENTIEL", 0
+        Case "CONFIDENTIEL"
+            RenderLevelToken oMail, "URGENT", 0
+        Case "URGENT"
+            RenderLevelToken oMail, "PERSONNEL", 0
+        Case "PERSONNEL"
+            RenderLevelToken oMail, "", 0
+        Case Else
+            modDebugLog.DTrace MOD_NAME, "Cycle : etat inconnu [" & currentLevel & "] -> retrait"
+            RenderLevelToken oMail, "", 0
+    End Select
+    Exit Sub
+
+ErrH:
+    modDebugLog.DError MOD_NAME, "ToggleSensitivityCycle error " & Err.Number & " - " & Err.Description
+End Sub
+
+'=============================================================================
+' PresentLevel : detection par CONTENU TEXTUEL, limitee a la ZONE PROPRE
+' (v11 : l'historique cite d'un Reply/Forward est ignore).
+'=============================================================================
+Private Function PresentLevel(bodyText As String) As String
+    Dim zone As String
+    zone = OwnZone(bodyText)
+    PresentLevel = ""
+    If InStr(1, zone, "C2 - CONFIDENTIEL") > 0 Then
+        PresentLevel = "CONFIDENTIEL"
+    ElseIf InStr(1, zone, URG_MARK_FR) > 0 Or InStr(1, zone, URG_MARK_EN) > 0 Then
+        PresentLevel = "URGENT"
+    ElseIf InStr(1, zone, "C2 - PERSONNEL") > 0 Then
+        PresentLevel = "PERSONNEL"
+    ElseIf InStr(1, zone, "C2 - PRIVE") > 0 Then
+        PresentLevel = "PRIVE"
+    End If
+End Function
+
+'=============================================================================
+' v11 - ZONE PROPRE vs HISTORIQUE CITE
+' OwnZoneEnd : position (1-based) du premier separateur de citation Outlook
+' dans le HTML ; 0 si aucun (tout le corps est la zone propre). Les ancres
+' sont celles de InjectBottomBanner (le style border-top #E1E1E1 est exclu :
+' il pourrait exister plus haut dans une signature). Le bandeau bas est
+' toujours insere AVANT l'ancre retenue, donc les deux bandeaux poses par ce
+' module vivent dans la zone propre. Tout ce qui est apres appartient au mail
+' cite et ne doit ni etre detecte, ni etre retire.
+' OwnZone : le HTML tronque a cette frontiere.
+'=============================================================================
+Private Function OwnZoneEnd(ByVal bodyText As String) As Long
+    Dim bodyLC As String
+    bodyLC = LCase(bodyText)
+
+    Dim best As Long
+    best = 0
+
+    Dim anchors As Variant
+    anchors = Array( _
+        "<a name=""_mailoriginal""", "<a name='_mailoriginal'", "<a name=_mailoriginal", _
+        "id=""divrplyfwdmsg""", "id='divrplyfwdmsg'", _
+        "<blockquote")
+
+    Dim i As Long, pos As Long
+    For i = LBound(anchors) To UBound(anchors)
+        pos = InStr(1, bodyLC, CStr(anchors(i)))
+        If pos > 0 Then
+            If best = 0 Or pos < best Then best = pos
+        End If
+    Next i
+
+    pos = FindFrenchSeparator(bodyLC)
+    If pos > 0 Then
+        If best = 0 Or pos < best Then best = pos
+    End If
+
+    OwnZoneEnd = best
+End Function
+
+Private Function OwnZone(ByVal bodyText As String) As String
+    Dim boundary As Long
+    boundary = OwnZoneEnd(bodyText)
+    If boundary > 1 Then
+        OwnZone = Left$(bodyText, boundary - 1)
+    ElseIf boundary = 1 Then
+        OwnZone = ""
+    Else
+        OwnZone = bodyText
+    End If
+End Function
+
+Private Function LevelText(level As OlSensitivity) As String
+    Select Case level
+        Case olPersonal:     LevelText = "PERSONNEL"
+        Case olPrivate:      LevelText = "PRIVE"
+        Case olConfidential: LevelText = "CONFIDENTIEL"
+        Case Else:           LevelText = ""
+    End Select
+End Function
+
+'=============================================================================
+' Injection BANDEAU HAUT
+'=============================================================================
+Private Function InjectTopBanner(bodyText As String, banner As String) As String
+    Dim posBody As Long, posClose As Long
+    posBody = InStr(1, LCase(bodyText), "<body")
+    If posBody > 0 Then
+        posClose = InStr(posBody, bodyText, ">")
+        If posClose > 0 Then
+            Dim posWS As Long
+            posWS = InStr(posClose, LCase(bodyText), "<div class=wordsection1")
+            If posWS > 0 And posWS < posClose + 100 Then
+                Dim posCloseWS As Long
+                posCloseWS = InStr(posWS, bodyText, ">")
+                If posCloseWS > 0 Then
+                    InjectTopBanner = Left(bodyText, posCloseWS) & banner & Mid(bodyText, posCloseWS + 1)
+                    modDebugLog.DTrace MOD_NAME, "Haut insere apres <div class=WordSection1> pos " & posCloseWS
+                    Exit Function
+                End If
+            End If
+            InjectTopBanner = Left(bodyText, posClose) & banner & Mid(bodyText, posClose + 1)
+            modDebugLog.DTrace MOD_NAME, "Haut insere apres <body> pos " & posClose
+            Exit Function
+        End If
+    End If
+    InjectTopBanner = banner & bodyText
+    modDebugLog.DTrace MOD_NAME, "Haut insere en tete"
+End Function
+
+'=============================================================================
+' Injection BANDEAU BAS - chaine de fallback
+'=============================================================================
+Private Function InjectBottomBanner(bodyText As String, banner As String) As String
+    Dim bodyLC As String
+    bodyLC = LCase(bodyText)
+    Dim pos As Long
+
+    ' --- 1) <a name="_MailOriginal"> (Outlook Classic FR principal) ---
+    pos = InStr(1, bodyLC, "<a name=""_mailoriginal""")
+    If pos = 0 Then pos = InStr(1, bodyLC, "<a name='_mailoriginal'")
+    If pos = 0 Then pos = InStr(1, bodyLC, "<a name=_mailoriginal")
+    If pos > 0 Then
+        Dim posAnchor As Long
+        posAnchor = FindParentDivWithBorderTop(bodyText, bodyLC, pos)
+        If posAnchor > 0 Then
+            InjectBottomBanner = Left(bodyText, posAnchor - 1) & banner & Mid(bodyText, posAnchor)
+            modDebugLog.DTrace MOD_NAME, "Bas : _MailOriginal -> div parent border-top pos " & posAnchor
+            Exit Function
+        End If
+        Dim posOpen As Long
+        posOpen = GoUpToOpeningBracket(bodyText, pos)
+        If posOpen > 0 Then
+            InjectBottomBanner = Left(bodyText, posOpen - 1) & banner & Mid(bodyText, posOpen)
+            modDebugLog.DTrace MOD_NAME, "Bas : _MailOriginal avant <a> pos " & posOpen
+            Exit Function
+        End If
+    End If
+
+    ' --- 2) border-top:solid #E1E1E1 ---
+    pos = InStr(1, bodyLC, "border-top:solid #e1e1e1")
+    If pos > 0 Then
+        Dim posOpen2 As Long
+        posOpen2 = GoUpToOpeningDiv(bodyText, bodyLC, pos)
+        If posOpen2 > 0 Then
+            Dim posOpenExt As Long
+            posOpenExt = GoUpToOpeningDiv(bodyText, bodyLC, posOpen2 - 1)
+            If posOpenExt > 0 And (posOpen2 - posOpenExt) < 30 Then
+                Dim segment As String
+                segment = Mid(bodyText, posOpenExt, posOpen2 - posOpenExt + 5)
+                If InStr(1, LCase(segment), "<div>") > 0 Then
+                    InjectBottomBanner = Left(bodyText, posOpenExt - 1) & banner & Mid(bodyText, posOpenExt)
+                    modDebugLog.DTrace MOD_NAME, "Bas : border-top E1E1E1 div externe pos " & posOpenExt
+                    Exit Function
+                End If
+            End If
+            InjectBottomBanner = Left(bodyText, posOpen2 - 1) & banner & Mid(bodyText, posOpen2)
+            modDebugLog.DTrace MOD_NAME, "Bas : border-top E1E1E1 div interne pos " & posOpen2
+            Exit Function
+        End If
+    End If
+
+    ' --- 3) <a name="_MailAutoSig"> (fallback : apres signature) ---
+    pos = InStr(1, bodyLC, "<a name=""_mailautosig""")
+    If pos = 0 Then pos = InStr(1, bodyLC, "<a name='_mailautosig'")
+    If pos > 0 Then
+        Dim posTable As Long
+        posTable = FindEndOfContainingTable(bodyText, bodyLC, pos)
+        If posTable > 0 Then
+            InjectBottomBanner = Left(bodyText, posTable) & banner & Mid(bodyText, posTable + 1)
+            modDebugLog.DTrace MOD_NAME, "Bas : apres _MailAutoSig table pos " & (posTable + 1)
+            Exit Function
+        End If
+    End If
+
+    ' --- 4) divRplyFwdMsg ---
+    pos = InStr(1, bodyLC, "id=""divrplyfwdmsg""")
+    If pos = 0 Then pos = InStr(1, bodyLC, "id='divrplyfwdmsg'")
+    If pos > 0 Then
+        Dim posOpen4 As Long
+        posOpen4 = GoUpToOpeningBracket(bodyText, pos)
+        If posOpen4 > 0 Then
+            InjectBottomBanner = Left(bodyText, posOpen4 - 1) & banner & Mid(bodyText, posOpen4)
+            modDebugLog.DTrace MOD_NAME, "Bas : divRplyFwdMsg pos " & posOpen4
+            Exit Function
+        End If
+    End If
+
+    ' --- 5) <b>De :</b> / <b>From:</b> ---
+    pos = FindFrenchSeparator(bodyLC)
+    If pos > 0 Then
+        Dim posOpen5 As Long
+        posOpen5 = GoUpToParagraphStart(bodyText, pos)
+        If posOpen5 > 0 Then
+            InjectBottomBanner = Left(bodyText, posOpen5 - 1) & banner & Mid(bodyText, posOpen5)
+            modDebugLog.DTrace MOD_NAME, "Bas : <b>De :</b> pos " & posOpen5
+            Exit Function
+        End If
+    End If
+
+    ' --- 6) <blockquote> ---
+    pos = InStr(1, bodyLC, "<blockquote")
+    If pos > 0 Then
+        InjectBottomBanner = Left(bodyText, pos - 1) & banner & Mid(bodyText, pos)
+        modDebugLog.DTrace MOD_NAME, "Bas : <blockquote> pos " & pos
+        Exit Function
+    End If
+
+    ' --- 7) </body> ---
+    pos = InStr(1, bodyLC, "</body>")
+    If pos > 0 Then
+        InjectBottomBanner = Left(bodyText, pos - 1) & banner & Mid(bodyText, pos)
+        modDebugLog.DTrace MOD_NAME, "Bas : </body> pos " & pos
+        Exit Function
+    End If
+
+    InjectBottomBanner = bodyText & banner
+    modDebugLog.DTrace MOD_NAME, "Bas : queue absolue"
+End Function
+
+'=============================================================================
+' Helpers structure HTML
+'=============================================================================
+Private Function FindParentDivWithBorderTop(bodyText As String, bodyLC As String, _
+                                                posAnchor As Long) As Long
+    Dim minBound As Long
+    minBound = posAnchor - 2000
+    If minBound < 1 Then minBound = 1
+
+    Dim posBorder As Long
+    posBorder = InStrRev(bodyLC, "border-top:solid #e1e1e1", posAnchor)
+    If posBorder = 0 Or posBorder < minBound Then
+        FindParentDivWithBorderTop = 0
+        Exit Function
+    End If
+
+    Dim posDiv As Long
+    posDiv = GoUpToOpeningDiv(bodyText, bodyLC, posBorder)
+    If posDiv = 0 Then FindParentDivWithBorderTop = 0: Exit Function
+
+    Dim posExt As Long
+    posExt = GoUpToOpeningDiv(bodyText, bodyLC, posDiv - 1)
+    If posExt > 0 And (posDiv - posExt) < 30 Then
+        Dim segment As String
+        segment = LCase(Mid(bodyText, posExt, posDiv - posExt + 5))
+        If InStr(1, segment, "<div>") > 0 Then
+            FindParentDivWithBorderTop = posExt
+            Exit Function
+        End If
+    End If
+
+    FindParentDivWithBorderTop = posDiv
+End Function
+
+Private Function FindEndOfContainingTable(bodyText As String, bodyLC As String, _
+                                            innerPos As Long) As Long
+    Dim posTab As Long
+    posTab = InStrRev(bodyLC, "<table", innerPos)
+    If posTab = 0 Then FindEndOfContainingTable = 0: Exit Function
+
+    Dim posScan As Long, depth As Long, openCount As Long, closeCount As Long
+    posScan = posTab
+    depth = 0
+
+    Do
+        openCount = InStr(posScan + 1, bodyLC, "<table")
+        closeCount = InStr(posScan + 1, bodyLC, "</table>")
+        If closeCount = 0 Then FindEndOfContainingTable = 0: Exit Function
+        If openCount > 0 And openCount < closeCount Then
+            depth = depth + 1
+            posScan = openCount
+        Else
+            If depth = 0 Then
+                FindEndOfContainingTable = closeCount + Len("</table>") - 1
+                Exit Function
+            Else
+                depth = depth - 1
+                posScan = closeCount
+            End If
+        End If
+    Loop
+End Function
+
+Private Function GoUpToOpeningDiv(bodyText As String, bodyLC As String, _
+                                       innerPos As Long) As Long
+    GoUpToOpeningDiv = InStrRev(bodyLC, "<div", innerPos)
+End Function
+
+Private Function FindFrenchSeparator(bodyLC As String) As Long
+    Dim candidats As Variant
+    candidats = Array( _
+        "<b>de :</b>", "<b>de&nbsp;:</b>", "<b>de&#160;:</b>", _
+        "<b>de :", "<b>de&nbsp;:", _
+        "<b>from:</b>", "<b>from:", _
+        "________________________________")
+
+    Dim i As Long, pos As Long, best As Long
+    For i = LBound(candidats) To UBound(candidats)
+        pos = InStr(1, bodyLC, CStr(candidats(i)))
+        If pos > 0 Then
+            If best = 0 Or pos < best Then best = pos
+        End If
+    Next i
+    FindFrenchSeparator = best
+End Function
+
+Private Function GoUpToParagraphStart(bodyText As String, innerPos As Long) As Long
+    Dim bodyLC As String
+    bodyLC = LCase(bodyText)
+    Dim minBound As Long
+    minBound = innerPos - 500
+    If minBound < 1 Then minBound = 1
+
+    Dim i As Long, posPara As Long, posDiv As Long
+    For i = innerPos - 1 To minBound Step -1
+        If posPara = 0 And Mid(bodyLC, i, 2) = "<p" Then posPara = i
+        If posDiv = 0 And Mid(bodyLC, i, 4) = "<div" Then posDiv = i
+        If posPara > 0 And posDiv > 0 Then Exit For
+    Next i
+
+    Dim best As Long
+    best = posPara
+    If posDiv > best Then best = posDiv
+
+    If best > 0 Then GoUpToParagraphStart = best: Exit Function
+
+    For i = innerPos To 1 Step -1
+        If Mid(bodyText, i, 1) = "<" Then
+            GoUpToParagraphStart = i
+            Exit Function
+        End If
+    Next i
+    GoUpToParagraphStart = 0
+End Function
+
+Private Function FindEndOfContainingDiv(bodyText As String, startPos As Long) As Long
+    Dim posScan As Long, depth As Long, openCount As Long, closeCount As Long
+    Dim bodyLC As String
+    bodyLC = LCase(bodyText)
+    posScan = startPos: depth = 0
+
+    Do
+        openCount = InStr(posScan + 1, bodyLC, "<div")
+        closeCount = InStr(posScan + 1, bodyLC, "</div>")
+        If closeCount = 0 Then FindEndOfContainingDiv = 0: Exit Function
+        If openCount > 0 And openCount < closeCount Then
+            depth = depth + 1
+            posScan = openCount
+        Else
+            If depth = 0 Then
+                FindEndOfContainingDiv = InStr(closeCount, bodyText, ">")
+                Exit Function
+            Else
+                depth = depth - 1
+                posScan = closeCount
+            End If
+        End If
+    Loop
+End Function
+
+Private Function GoUpToOpeningBracket(bodyText As String, innerPos As Long) As Long
+    Dim i As Long
+    For i = innerPos To 1 Step -1
+        If Mid(bodyText, i, 1) = "<" Then
+            GoUpToOpeningBracket = i
+            Exit Function
+        End If
+    Next i
+    GoUpToOpeningBracket = 0
+End Function
+
+'=============================================================================
+' RemoveBannersIfPresent : retrait de tout bandeau (marqueurs "C2 - " et
+' "Urgent - Avant le" / "Urgent - Before"). Retire le <div> parent de chaque
+' occurrence trouvee. v11 : uniquement dans la ZONE PROPRE ; les bandeaux
+' presents dans l'historique cite sont conserves tels quels.
+'=============================================================================
+Private Function RemoveBannersIfPresent(oMail As MailItem) As Boolean
+    Dim fullBody As String
+    fullBody = oMail.HTMLBody
+
+    ' Decoupe zone propre / historique cite. On ne travaille que sur la
+    ' premiere ; la seconde est recollee intacte a la fin.
+    Dim bodyText As String, quotedTail As String
+    bodyText = OwnZone(fullBody)
+    quotedTail = Mid$(fullBody, Len(bodyText) + 1)
+
+    Dim markers As Variant
+    markers = Array("C2 - ", URG_MARK_FR, URG_MARK_EN)
+
+    Dim before As String
+    before = bodyText
+
+    Dim mi As Long, mk As String
+    Dim loopCount As Long
+    Dim pos As Long, posOpening As Long, posEnd As Long
+
+    For mi = LBound(markers) To UBound(markers)
+        mk = CStr(markers(mi))
+        loopCount = 0
+        Do
+            pos = InStr(1, bodyText, mk)
+            If pos = 0 Then Exit Do
+
+            posOpening = InStrRev(LCase(bodyText), "<div", pos)
+            If posOpening = 0 Then
+                modDebugLog.DTrace MOD_NAME, "Marqueur sans <div> parent a pos " & pos
+                Exit Do
+            End If
+
+            posEnd = FindEndOfContainingDiv(bodyText, posOpening)
+            If posEnd = 0 Then Exit Do
+
+            modDebugLog.DTrace MOD_NAME, "Retrait bandeau div pos " & posOpening & " a " & posEnd
+            bodyText = Left(bodyText, posOpening - 1) & Mid(bodyText, posEnd + 1)
+
+            loopCount = loopCount + 1
+            If loopCount > 10 Then Exit Do
+        Loop
+    Next mi
+
+    If bodyText <> before Then
+        oMail.HTMLBody = bodyText & quotedTail
+        RemoveBannersIfPresent = True
+    Else
+        RemoveBannersIfPresent = False
+    End If
+End Function
+
+'=============================================================================
+' HELPERS PUBLICS pour le flux d'envoi (ThisOutlookSession) -> suivi auto.
+'=============================================================================
+
+' True si la banniere Urgent est presente dans la ZONE PROPRE du mail
+' (v11 : un bandeau Urgent dans l'historique cite ne compte pas).
+Public Function HasUrgentBanner(oMail As MailItem) As Boolean
+    On Error Resume Next
+    ' Pack v3 (B9) : PRE-FILTRE sans lecture du corps. Le niveau URGENT pose
+    ' TOUJOURS le prefixe objet "[URGENT] " ET l'importance haute (v10) : si
+    ' aucun des deux n'est present, il n'y a pas de bandeau Urgent a nous et
+    ' on evite de lire HTMLBody (plusieurs centaines de Ko sur un long fil)
+    ' a CHAQUE envoi, sur le chemin critique d'Application_ItemSend.
+    Dim subj As String
+    subj = CStr(oMail.subject)
+    If Left$(subj, Len(SUBJECT_PREFIX_URGENT)) <> SUBJECT_PREFIX_URGENT Then
+        If oMail.Importance <> olImportanceHigh Then
+            HasUrgentBanner = False
+            Exit Function
+        End If
+    End If
+    HasUrgentBanner = (PresentLevel(oMail.HTMLBody) = "URGENT")
+End Function
+
+' Date saisie dans la banniere Urgent. Renvoie 0 si pas de banniere Urgent,
+' si le jour (XX) n'a pas ete remplace, ou si la date est invalide.
+Public Function UrgentBannerDate(oMail As MailItem) As Date
+    On Error GoTo Fail
+    Dim body As String
+    body = oMail.HTMLBody
+    If PresentLevel(body) <> "URGENT" Then UrgentBannerDate = 0: Exit Function
+
+    ' v11 : la date est lue dans la ZONE PROPRE seulement (un "Avant le"
+    ' present dans le mail cite ne doit pas etre pris pour la notre).
+    Dim txt As String
+    txt = StripTags(OwnZone(body))
+
+    Dim p As Long
+    ' FR : "Avant le JJ/MM/AAAA"
+    p = InStr(1, txt, "Avant le ")
+    If p > 0 Then
+        UrgentBannerDate = ParseFrDate(Mid$(txt, p + Len("Avant le ")))
+        Exit Function
+    End If
+    ' EN : "Before AAAA-MM-JJ"
+    p = InStr(1, txt, "Before ")
+    If p > 0 Then
+        UrgentBannerDate = ParseEnDate(Mid$(txt, p + Len("Before ")))
+        Exit Function
+    End If
+
+    UrgentBannerDate = 0
+    Exit Function
+Fail:
+    UrgentBannerDate = 0
+End Function
+
+' Re-ecrit les DEUX bandeaux Urgent avec la date concrete saisie (synchronise
+' le bas sur le haut). Renvoie False si la date n'est pas renseignee/valide :
+' l'appelant (ItemSend) affiche alors le garde-fou.
+Public Function FinalizeUrgentBanner(oMail As MailItem) As Boolean
+    On Error GoTo Fail
+    Dim d As Date
+    d = UrgentBannerDate(oMail)
+    If d = 0 Then FinalizeUrgentBanner = False: Exit Function
+
+    RenderLevelToken oMail, "URGENT", d
+    FinalizeUrgentBanner = True
+    Exit Function
+Fail:
+    FinalizeUrgentBanner = False
+End Function
+
+'=============================================================================
+' Construction du libelle Urgent
+'=============================================================================
+Private Function BuildUrgentLabelPlaceholder() As String
+    Dim mm As String, yyyy As String
+    mm = Format$(Month(Date), "00")
+    yyyy = CStr(Year(Date))
+    If modConfig.LangIsEN() Then
+        BuildUrgentLabelPlaceholder = URG_MARK_EN & yyyy & "-" & mm & "-XX"
+    Else
+        BuildUrgentLabelPlaceholder = URG_MARK_FR & "XX/" & mm & "/" & yyyy
+    End If
+End Function
+
+Private Function UrgentLabelForDate(ByVal d As Date) As String
+    If modConfig.LangIsEN() Then
+        UrgentLabelForDate = URG_MARK_EN & Format$(d, "yyyy-mm-dd")
+    Else
+        UrgentLabelForDate = URG_MARK_FR & Format$(d, "dd/mm/yyyy")
+    End If
+End Function
+
+'=============================================================================
+' Parsing date (sur texte de-balise)
+'=============================================================================
+Private Function ParseFrDate(ByVal s As String) As Date
+    On Error GoTo Fail
+    Dim frag As String
+    frag = LeadingRun(LTrim$(s), "0123456789/")
+    Dim parts() As String
+    parts = Split(frag, "/")
+    If UBound(parts) < 2 Then GoTo Fail
+    If Not IsNumeric(parts(0)) Then GoTo Fail
+    If Not IsNumeric(parts(1)) Then GoTo Fail
+    If Not IsNumeric(parts(2)) Then GoTo Fail
+
+    Dim dd As Long, mm As Long, yy As Long
+    dd = CLng(parts(0)): mm = CLng(parts(1)): yy = CLng(parts(2))
+    If dd < 1 Or dd > 31 Or mm < 1 Or mm > 12 Or yy < 2000 Or yy > 2100 Then GoTo Fail
+
+    ParseFrDate = DateSerial(yy, mm, dd)
+    Exit Function
+Fail:
+    ParseFrDate = 0
+End Function
+
+Private Function ParseEnDate(ByVal s As String) As Date
+    On Error GoTo Fail
+    Dim frag As String
+    frag = LeadingRun(LTrim$(s), "0123456789-")
+    Dim parts() As String
+    parts = Split(frag, "-")
+    If UBound(parts) < 2 Then GoTo Fail
+    If Not IsNumeric(parts(0)) Then GoTo Fail
+    If Not IsNumeric(parts(1)) Then GoTo Fail
+    If Not IsNumeric(parts(2)) Then GoTo Fail
+
+    Dim yy As Long, mm As Long, dd As Long
+    yy = CLng(parts(0)): mm = CLng(parts(1)): dd = CLng(parts(2))
+    If dd < 1 Or dd > 31 Or mm < 1 Or mm > 12 Or yy < 2000 Or yy > 2100 Then GoTo Fail
+
+    ParseEnDate = DateSerial(yy, mm, dd)
+    Exit Function
+Fail:
+    ParseEnDate = 0
+End Function
+
+' Chaine de tete composee uniquement des caracteres autorises.
+Private Function LeadingRun(ByVal s As String, ByVal allowed As String) As String
+    Dim i As Long, ch As String, outp As String
+    For i = 1 To Len(s)
+        ch = Mid$(s, i, 1)
+        If InStr(1, allowed, ch) > 0 Then
+            outp = outp & ch
+        Else
+            Exit For
+        End If
+    Next i
+    LeadingRun = outp
+End Function
+
+' Supprime les balises HTML et decode &nbsp; -> espace (pour parser la date
+' meme si Word a insere des <span> au milieu des chiffres saisis).
+Private Function StripTags(ByVal html As String) As String
+    Dim i As Long, ch As String, inTag As Boolean, outp As String
+    inTag = False
+    For i = 1 To Len(html)
+        ch = Mid$(html, i, 1)
+        If ch = "<" Then
+            inTag = True
+        ElseIf ch = ">" Then
+            inTag = False
+            outp = outp & " "
+        ElseIf Not inTag Then
+            outp = outp & ch
+        End If
+    Next i
+    outp = Replace(outp, "&nbsp;", " ")
+    outp = Replace(outp, "&#160;", " ")
+    StripTags = outp
+End Function

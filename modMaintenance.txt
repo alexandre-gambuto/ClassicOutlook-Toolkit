@@ -1,0 +1,987 @@
+Option Explicit
+
+'=============================================================================
+' modMaintenance v4.1  (2026-08-22)
+'
+' v4.1 (2026-08-22) : MODULES_DEFAULT aligne sur les MOD_NAME REELS.
+'   Trois modules y figuraient sous un nom different de leur MOD_NAME :
+'   OneNoteProbe/ONProbe, ReplyGreeting/ReplyGreet, StoreContext/StoreCtx.
+'   Le filtre de log par module ne les atteignait donc pas. C'est la LISTE
+'   qui est corrigee, pas les MOD_NAME : ceux-ci sont deja ecrits dans
+'   debug.log depuis des mois, les changer rendrait tout l'historique non
+'   filtrable. Case "StoreContext" de ModuleVersionOf renomme en accord.
+'   Detecte par validate.py (controle MODNAME).
+'
+' v4  (2026-08-22)
+'
+' v4 (2026-08-22) : revue traduction + UX pop-ups.
+'   (a) TRADUCTION. Les en-tetes de menus ("=== LOGS ===",
+'       "=== CONFIGURATION ===", "=== DIAGNOSTIC ===",
+'       "=== BINDINGS & CACHE ==="), plusieurs entrees numerotees et TOUT
+'       MaintDiagnosePaths - libelles de chemins, en-tetes de tests et
+'       verdicts "OK (existe)" / "KO (absent)" / "KO (ecriture echouee)" -
+'       etaient en dur, hors T(). Language=EN laissait donc le diagnostic
+'       "a lancer en premier quand plus rien ne marche" integralement en
+'       francais. Idem pour les libelles des 5 bindings du health-check.
+'       Les CHEMINS eux-memes restent hors T() : ce sont des donnees, et
+'       T() applique A() a ses branches (un chemin contenant "~e" ou "~a"
+'       serait altere).
+'   (b) UX. Les 7 InputBox de navigation dans les menus passent par
+'       modUi.AskText (remontee au premier plan : InputBox n'accepte aucun
+'       drapeau) et MaintDiagnosePaths par modUi.Inform.
+'   (c) ENREGISTREMENT DES NOUVEAUX MODULES : Ui ajoute a MODULES_DEFAULT,
+'       et ModuleVersionOf complete pour Ui, MigrateTags, ProjectTag,
+'       PurgeCat, ReplySusp, DevTools et Campaign - tous instrumentes le
+'       2026-08-22 mais qui seraient restes affiches "non instrumente".
+'   Dependance ajoutee : modUi.
+'
+' v3.2  (2026-08-21)
+' Purpose (EN): single entry point for maintenance actions, exposed via the
+'   public Maintenance() sub (pin it to the QAT). A master MsgBox/InputBox menu
+'   routes to numbered sections: logs (open/clear/level/module filter), backups,
+'   configuration (reload/open config, open VBA folder), diagnostics (resolved
+'   paths + write test, module versions) and bindings/cache (Reinit, QuickMove
+'   reindex). All native dialogs (no UserForm in this environment).
+'
+' Point d'entree unique des actions de maintenance, expose via la Sub
+' publique Maintenance(). A epingler manuellement au QAT (clic droit sur
+' la macro > Ajouter a la barre d'outils Acces rapide), faute de pouvoir
+' personnaliser le ruban sans le Project Object Model (bloque par l'IT).
+'
+' Navigation : menu maitre -> sections numerotees -> actions. Tout en
+' MsgBox / InputBox natifs (pas de UserForm dans cet environnement).
+'
+'   1 - Logs            : ouvrir, vider, niveau (cycle), filtre modules
+'   2 - Sauvegardes     : backup VBA, forcer backup mensuel, ouvrir dossier
+'   3 - Configuration   : recharger config, ouvrir config, ouvrir dossier VBA
+'   4 - Diagnostic      : chemins resolus + test ecriture, versions modules
+'   5 - Bindings & cache: Reinit (WithEvents), regenerer cache QuickMove,
+'                         health-check des bindings (v2)
+'
+' v2 (2026-06-10) :
+'   - AssertBindings : health-check des 5 bindings WithEvents critiques
+'     (appele silencieusement en fin d'Application_Startup, en fin de
+'     modDevTools.Reinit, et depuis le menu Bindings & cache). Les
+'     bindings morts apres un Ctrl+S VBE etaient la 1re cause des
+'     regressions "la fonction ne marche plus" - desormais detectes.
+'   - MaintenanceQuick : acces direct aux 3 actions frequentes via une
+'     MsgBox Win32 a boutons renommes (modMsgBoxCustom.Confirm3),
+'     auto-fermee a 10 s (timeout = aucune action).
+'   - KnownModules par defaut complete (modules ajoutes depuis v1).
+'
+' v3 (2026-07-25) :
+'   - MaintModuleVersions REECRIT. Il lisait des cles "Version.modXxx" dans
+'     config.ini : il n'y en avait AUCUNE, le rapport affichait donc
+'     "(non renseigne)" pour les 36 modules depuis sa creation. Pire, une
+'     valeur declaree dans un fichier de config ne prouve rien sur le code
+'     REELLEMENT charge dans le VBE - c'est precisement le risque du mode
+'     de migration par copier-coller module par module. La version est
+'     desormais lue dans une constante PORTEE PAR LE MODULE LUI-MEME
+'     (modXxx.ModVersion), donc non falsifiable.
+'   - Instrumentation progressive : les modules non encore equipes sont
+'     affiches "(non instrumente)". Aucun risque de compilation : seuls
+'     les modules reellement equipes figurent dans ModuleVersionOf.
+'   - MODULES_DEFAULT complete : 6 modules existants y manquaient
+'     (AppEvents, Defer, ExplorerWatch, MarkRead, OneNoteProbe,
+'     ReplyGreeting) - ils etaient donc absents du filtre de log ET du
+'     rapport de versions.
+'   - MOD_VERSION / ModVersion sur ce module.
+'
+' v3.1 (2026-07-25) : inventaire - "MailTracker" corrige en "MailTrack".
+'   L'inventaire declarait un nom que le logger n'ecrivait jamais (il ecrit
+'   "MailTrack" depuis toujours) : filtrer le log sur ce module ne remontait
+'   rien. Case "MailTrack" ajoutee a ModuleVersionOf.
+'
+' v3.2 (2026-08-21) : inventaire complete.
+'   - MODULES_DEFAULT : 13 entrees ajoutees (ContBday, ContExp, ContImp,
+'     ContMail, ContNorm, ContNote, ContRel, FolderRen, FolderSort, HideBcc,
+'     InboxAlert, InboxWatch, StoreContext) - modules livres depuis v3 mais
+'     jamais inscrits : absents du filtre de log ET du rapport de versions.
+'   - "ExplorerWatch" corrige en "ExplWatch" : meme bug que MailTracker/v3.1
+'     (la classe logge "ExplWatch" ; filtrer sur "ExplorerWatch" ne remontait
+'     rien).
+'   - ModuleVersionOf : 16 Case ajoutees pour les modules deja instrumentes
+'     (ContBday, ContExp, ContImp, ContMail, ContNorm, ContNote, ContRel,
+'     FolderRen, FolderSort, HideBcc, InboxAlert, MailConfid, QuickMove,
+'     Snooze, StoreContext) - ils affichaient "(non instrumente)" a tort.
+'     PREREQUIS COMPILATION : modStoreContext et modSnooze v4 colles avant
+'     ce module (les Case referencent leurs ModVersion).
+'
+' Dependances : modConfig v2, modDebugLog v2, modDevTools, modBackupVBA,
+' modBackupAuto, modQuickMove, modMsgBoxCustom (v2), modNewMeetingDefault,
+' ThisOutlookSession (accesseurs de bindings).
+'
+' SUBS PUBLIQUES EPINGLABLES AU QAT (un bouton chacune) :
+'   Maintenance              menu maitre (toutes les actions)
+'   MaintenanceQuick      Reinit / Health-check / Voir le log (auto-ferme)
+'   AssertBindings        health-check des bindings WithEvents
+'   MaintCycleLogLevel      cycle OFF/INFO/DEBUG/TRACE
+'   MaintFilterModules       filtre log par module (pseudo-UI)
+'   MaintOpenConfig        ouvrir config.ini (cree un modele si absent)
+'   MaintOpenVBAFolder    ouvrir <Bureau>\Macro VBA\Outlook\VBA
+'   MaintDiagnosePaths   chemins resolus + test ecriture
+'   MaintModuleVersions     versions REELLEMENT chargees dans le VBE
+' Deja publiques ailleurs (epinglables directement) :
+'   modDebugLog.OpenLog / ClearLog
+'   modBackupVBA.BackupVBA
+'   modBackupAuto.RunBackupNow / OpenBackupsFolder
+'   modConfig.ReloadConfig
+'   modDevTools.Reinit
+'   modQuickMove.QuickMoveReload
+'=============================================================================
+
+Private Const MOD_NAME As String = "Maint"
+Private Const MOD_VERSION As String = "v4.1 - 2026-08-22"
+Private Const TITLE As String = "Maintenance VBA"
+
+' Copie locale du filtre de log courant. modDebugLog n'expose pas son
+' filtre (champ prive) : on garde donc une copie synchronisee a chaque
+' SetEnabledModules emis par ce module. Fiable tant que le filtre n'est
+' touche que via MaintFilterModules.
+Private mFilterLocal As String
+
+' Liste des modules connus pour le filtre de log et les versions.
+' Surchargeable via config.ini : cle "KnownModules=modA|modB|..."
+' (sinon la valeur par defaut ci-dessous est utilisee).
+Private Const MODULES_DEFAULT As String = _
+    "Config|DebugLog|QuickMove|Snooze|Search|ProjectTag|MeetingColor|" & _
+    "AntiOverlap|NewMeeting|ShiftAppt|FlashAppt|ReplyInPlace|PurgeCat|" & _
+    "DevTools|FolderScan|BackupVBA|BackupAuto|Maint|OneNote|MailConfid|" & _
+    "ApptPrivacy|MaxWindow|MailTrack|Analytics|ApptWatch|Campaign|" & _
+    "Common|FolderMerge|MailExport|MigrateTags|MsgBoxC|Mtg2Appt|Notify|" & _
+    "ReplySusp|SendLLM|ThisOutlook|" & _
+    "AppEvents|Defer|ExplWatch|MarkRead|ONProbe|ReplyGreet|" & _
+    "ContBday|ContExp|ContImp|ContMail|ContNorm|ContNote|ContRel|" & _
+    "FolderRen|FolderSort|HideBcc|InboxAlert|InboxWatch|StoreCtx|Ui|" & _
+    "Smtp|ExcelBridge|ContCommon|InspQueue|QuickStart"
+
+'=============================================================================
+' Maintenance  (POINT D'ENTREE - a epingler au QAT)
+'=============================================================================
+Public Sub Maintenance()
+    On Error GoTo ErrH
+    Dim choice As String
+    Do
+        choice = modUi.AskText( _
+            "=== " & UCase$(TITLE) & " ===" & vbCrLf & vbCrLf & _
+            T("1 - Logs", "1 - Logs") & vbCrLf & _
+            T("2 - Sauvegardes", "2 - Backups") & vbCrLf & _
+            T("3 - Configuration", "3 - Configuration") & vbCrLf & _
+            T("4 - Diagnostic", "4 - Diagnostics") & vbCrLf & _
+            T("5 - Bindings & cache", "5 - Bindings & cache") & vbCrLf & vbCrLf & _
+            T("0 - Quitter", "0 - Quit") & vbCrLf & vbCrLf & _
+            T("Num~ero :", "Number:"), TITLE)
+
+        If Len(choice) = 0 Then Exit Sub          ' Annuler ou vide -> sortie
+        Select Case Trim$(choice)
+            Case "0": Exit Sub
+            Case "1": MenuLogs
+            Case "2": MenuBackups
+            Case "3": MenuConfiguration
+            Case "4": MenuDiagnostic
+            Case "5": MenuBindingsCache
+            Case Else: MsgBox T("Choix invalide.", "Invalid choice."), vbExclamation, TITLE
+        End Select
+    Loop
+    Exit Sub
+ErrH:
+    modDebugLog.DError MOD_NAME, "Maintenance err " & Err.Number & " - " & Err.Description
+    MsgBox T("Erreur : ", "Error: ") & Err.Number & " - " & Err.Description, vbExclamation, TITLE
+End Sub
+
+' =====================================================================
+' 1 - LOGS
+' =====================================================================
+Private Sub MenuLogs()
+    Dim choice As String
+    Do
+        choice = modUi.AskText( _
+            T("=== LOGS ===", "=== LOGS ===") & vbCrLf & vbCrLf & _
+            T("Niveau actuel : ", "Current level: ") & LogLevelText() & vbCrLf & _
+            T("Filtre        : ", "Filter        : ") & LogFilterText() & vbCrLf & vbCrLf & _
+            T("1 - Ouvrir le log", "1 - Open the log") & vbCrLf & _
+            T("2 - Vider le log", "2 - Clear the log") & vbCrLf & _
+            T("3 - Niveau log (cycle OFF/INFO/DEBUG/TRACE)", "3 - Log level (cycle OFF/INFO/DEBUG/TRACE)") & vbCrLf & _
+            T("4 - Filtre modules", "4 - Module filter") & vbCrLf & vbCrLf & _
+            T("0 - Retour", "0 - Back") & vbCrLf & vbCrLf & _
+            T("Num~ero :", "Number:"), TITLE)
+
+        Select Case Trim$(choice)
+            Case "", "0": Exit Sub
+            Case "1": modDebugLog.OpenLog
+            Case "2": modDebugLog.ClearLog
+            Case "3": MaintCycleLogLevel
+            Case "4": MaintFilterModules
+            Case Else: MsgBox T("Choix invalide.", "Invalid choice."), vbExclamation, TITLE
+        End Select
+    Loop
+End Sub
+
+'=============================================================================
+' MaintCycleLogLevel  (epinglable au QAT)
+' Fait tourner le niveau de log : OFF -> INFO -> DEBUG -> TRACE -> OFF.
+'=============================================================================
+Public Sub MaintCycleLogLevel()
+    Dim n As Long
+    n = modDebugLog.GlobalLevel
+    n = n + 1
+    If n > modDebugLog.LOG_TRACE Then n = modDebugLog.LOG_ERROR
+    modDebugLog.SetGlobalLevel n
+    ' MsgBox utile quand l'action est lancee en bouton direct (hors menu) :
+    MsgBox T("Niveau log -> ", "Log level -> ") & LogLevelText() & vbCrLf & vbCrLf & _
+           LogLevelHelp(), vbInformation, TITLE
+End Sub
+
+' Aide affichee a chaque changement de niveau : rappelle ce que chaque
+' niveau ecrit dans debug.log (du moins au plus verbeux). Marque le niveau
+' courant d'une fleche.
+Private Function LogLevelHelp() As String
+    Dim cur As Long
+    cur = modDebugLog.GlobalLevel
+    LogLevelHelp = _
+        Marker(cur, modDebugLog.LOG_ERROR) & T("OFF   : erreurs uniquement (defaut)", "OFF   : errors only (default)") & vbCrLf & _
+        Marker(cur, modDebugLog.LOG_INFO) & T("INFO  : + actions reussies (RDV decale, mail range...)", "INFO  : + successful actions (appt shifted, mail filed...)") & vbCrLf & _
+        Marker(cur, modDebugLog.LOG_DEBUG) & T("DEBUG : + decisions et valeurs intermediaires", "DEBUG : + decisions and intermediate values") & vbCrLf & _
+        Marker(cur, modDebugLog.LOG_TRACE) & T("TRACE : + entree/sortie de fonctions (tout, verbeux)", "TRACE : + function entry/exit (everything, verbose)")
+End Function
+
+Private Function Marker(ByVal cur As Long, ByVal lvl As Long) As String
+    If cur = lvl Then
+        Marker = ">> "
+    Else
+        Marker = "   "
+    End If
+End Function
+
+Private Function LogLevelText() As String
+    Select Case modDebugLog.GlobalLevel
+        Case modDebugLog.LOG_ERROR: LogLevelText = T("OFF (erreurs seules)", "OFF (errors only)")
+        Case modDebugLog.LOG_INFO:  LogLevelText = "INFO"
+        Case modDebugLog.LOG_DEBUG: LogLevelText = "DEBUG"
+        Case modDebugLog.LOG_TRACE: LogLevelText = "TRACE"
+        Case Else: LogLevelText = "LVL " & modDebugLog.GlobalLevel
+    End Select
+End Function
+
+'=============================================================================
+' MaintFilterModules  (epinglable au QAT)
+' Pseudo-UI rechargee : liste numerotee de tous les modules connus avec
+' statut ACTIF/off. Taper un numero -> toggle. 0 / vide -> quitter en
+' gardant la config courante.
+'=============================================================================
+Public Sub MaintFilterModules()
+    Dim mods() As String, n As Long
+    n = SplitModules(mods)
+    If n = 0 Then
+        MsgBox T("Aucun module connu (v~erifier KnownModules dans config.ini).", "No known module (check KnownModules in config.ini)."), _
+               vbExclamation, TITLE
+        Exit Sub
+    End If
+
+    Dim choice As String, idx As Long
+    Do
+        ' Construire l'affichage avec statut
+        Dim disp As String, i As Long
+        Dim filterStr As String
+        filterStr = CurrentFilter()
+        disp = T("=== FILTRE MODULES ===", "=== MODULE FILTER ===") & vbCrLf & _
+               T("(ACTIF = trace dans le log)", "(ACTIF = traced in the log)") & vbCrLf & vbCrLf
+        If Len(filterStr) = 0 Then
+            disp = disp & T("Filtre courant : (tous actifs)", "Current filter: (all active)") & vbCrLf & vbCrLf
+        Else
+            disp = disp & T("Filtre courant : ", "Current filter: ") & filterStr & vbCrLf & vbCrLf
+        End If
+        For i = 0 To n - 1
+            disp = disp & Format$(i + 1, "00") & " - " & _
+                   Left$(mods(i) & String(14, " "), 14) & " [" & _
+                   IIf(IsActive(mods(i), filterStr), T("ACTIF", "ON   "), "  off") & "]" & vbCrLf
+        Next i
+        disp = disp & vbCrLf & T("Numero pour basculer, 0 = quitter (garde la config) :", "Number to toggle, 0 = quit (keep config):")
+
+        choice = modUi.AskText(disp, TITLE)
+        Select Case Trim$(choice)
+            Case "", "0": Exit Sub
+            Case Else
+                If IsNumeric(choice) Then
+                    idx = CLng(choice)
+                    If idx >= 1 And idx <= n Then
+                        ToggleModule mods, n, mods(idx - 1)
+                    Else
+                        MsgBox T("Num~ero hors plage.", "Number out of range."), vbExclamation, TITLE
+                    End If
+                Else
+                    MsgBox T("Entree invalide.", "Invalid entry."), vbExclamation, TITLE
+                End If
+        End Select
+    Loop
+End Sub
+
+Private Function LogFilterText() As String
+    Dim f As String
+    f = CurrentFilter()
+    If Len(f) = 0 Then
+        LogFilterText = T("(tous actifs)", "(all active)")
+    Else
+        LogFilterText = f
+    End If
+End Function
+
+' Le filtre courant n'est pas lisible directement depuis modDebugLog
+' (champ prive). On en garde une copie locale synchronisee a chaque
+' SetEnabledModules emis ici. Comme la seule UI qui touche au filtre est
+' ce module, la copie reste fiable au sein d'une session.
+' (Declaration de mFilterLocal en tete de module.)
+
+Private Function CurrentFilter() As String
+    CurrentFilter = mFilterLocal
+End Function
+
+Private Function IsActive(ByVal moduleName As String, ByVal filterStr As String) As Boolean
+    If Len(filterStr) = 0 Then
+        IsActive = True            ' filtre vide -> tous actifs
+    Else
+        IsActive = (InStr(1, "|" & filterStr & "|", "|" & moduleName & "|", vbTextCompare) > 0)
+    End If
+End Function
+
+' Bascule un module. Logique :
+'   - filtre vide (tous actifs) + toggle X  -> filtre = tous SAUF X
+'   - filtre non vide + X present           -> retirer X
+'   - filtre non vide + X absent            -> ajouter X
+'   - si apres ajout le filtre contient TOUS les modules -> revenir a vide
+'     (etat "tous actifs" canonique, plus propre dans le log)
+Private Sub ToggleModule(ByRef mods() As String, ByVal n As Long, ByVal target As String)
+    Dim filterStr As String
+    filterStr = CurrentFilter()
+
+    If Len(filterStr) = 0 Then
+        ' Tous actifs -> on desactive target : filtre = tous les autres
+        Dim s As String, i As Long
+        For i = 0 To n - 1
+            If StrComp(mods(i), target, vbTextCompare) <> 0 Then
+                s = s & IIf(Len(s) > 0, "|", "") & mods(i)
+            End If
+        Next i
+        ApplyFilter s
+        Exit Sub
+    End If
+
+    If InStr(1, "|" & filterStr & "|", "|" & target & "|", vbTextCompare) > 0 Then
+        ' Present -> retirer
+        ApplyFilter RemoveFromPipe(filterStr, target)
+    Else
+        ' Absent -> ajouter
+        Dim nf As String
+        nf = filterStr & "|" & target
+        ' Si on vient de tout reactiver, revenir a "vide" (canonique)
+        If CountPipe(nf) >= n Then
+            ApplyFilter ""
+        Else
+            ApplyFilter nf
+        End If
+    End If
+End Sub
+
+Private Sub ApplyFilter(ByVal filterStr As String)
+    mFilterLocal = filterStr
+    modDebugLog.SetEnabledModules filterStr
+End Sub
+
+Private Function RemoveFromPipe(ByVal pipe As String, ByVal item As String) As String
+    Dim parts() As String, i As Long, s As String
+    parts = Split(pipe, "|")
+    For i = LBound(parts) To UBound(parts)
+        If Len(parts(i)) > 0 And StrComp(parts(i), item, vbTextCompare) <> 0 Then
+            s = s & IIf(Len(s) > 0, "|", "") & parts(i)
+        End If
+    Next i
+    RemoveFromPipe = s
+End Function
+
+Private Function CountPipe(ByVal pipe As String) As Long
+    If Len(pipe) = 0 Then
+        CountPipe = 0
+    Else
+        CountPipe = UBound(Split(pipe, "|")) + 1
+    End If
+End Function
+
+Private Function SplitModules(ByRef mods() As String) As Long
+    Dim raw As String
+    raw = modConfig.Cfg("KnownModules", MODULES_DEFAULT)
+    If Len(Trim$(raw)) = 0 Then raw = MODULES_DEFAULT
+    mods = Split(raw, "|")
+    SplitModules = UBound(mods) - LBound(mods) + 1
+End Function
+
+' =====================================================================
+' 2 - SAUVEGARDES
+' =====================================================================
+Private Sub MenuBackups()
+    Dim choice As String
+    Do
+        choice = modUi.AskText( _
+            T("=== SAUVEGARDES ===", "=== BACKUPS ===") & vbCrLf & vbCrLf & _
+            T("1 - Backup VBA maintenant", "1 - Backup VBA now") & vbCrLf & _
+            T("2 - Forcer backup mensuel", "2 - Force monthly backup") & vbCrLf & _
+            T("3 - Ouvrir dossier Sauvegardes", "3 - Open Backups folder") & vbCrLf & vbCrLf & _
+            T("0 - Retour", "0 - Back") & vbCrLf & vbCrLf & _
+            T("Num~ero :", "Number:"), TITLE)
+
+        Select Case Trim$(choice)
+            Case "", "0": Exit Sub
+            Case "1": modBackupVBA.BackupVBA
+            Case "2": modBackupAuto.RunBackupNow
+            Case "3": modBackupAuto.OpenBackupsFolder
+            Case Else: MsgBox T("Choix invalide.", "Invalid choice."), vbExclamation, TITLE
+        End Select
+    Loop
+End Sub
+
+' =====================================================================
+' 3 - CONFIGURATION
+' =====================================================================
+Private Sub MenuConfiguration()
+    Dim choice As String
+    Do
+        choice = modUi.AskText( _
+            T("=== CONFIGURATION ===", "=== CONFIGURATION ===") & vbCrLf & vbCrLf & _
+            T("Fichier : ", "File: ") & modConfig.ConfigPath() & vbCrLf & _
+            T("Charge  : ", "Loaded  : ") & IIf(modConfig.ConfigLoaded(), T("oui", "yes"), T("non (defauts)", "no (defaults)")) & vbCrLf & vbCrLf & _
+            T("1 - Recharger config", "1 - Reload config") & vbCrLf & _
+            T("2 - Ouvrir config (Notepad)", "2 - Open config (Notepad)") & vbCrLf & _
+            T("3 - Ouvrir le dossier VBA", "3 - Open the VBA folder") & vbCrLf & _
+            T("5 - Guide de d~emarrage (v~erification + config minimale)", "5 - Quick start guide (check + minimal config)") & vbCrLf & _
+            T("6 - Aper~cu du fichier que le guide ~ecrirait", "6 - Preview of the file the guide would write") & vbCrLf & _
+            T("7 - R~einitialiser le marqueur du guide", "7 - Reset the guide marker") & vbCrLf & vbCrLf & _
+            T("0 - Retour", "0 - Back") & vbCrLf & vbCrLf & _
+            T("Num~ero :", "Number:"), TITLE)
+
+        Select Case Trim$(choice)
+            Case "", "0": Exit Sub
+            Case "1": ReloadConfig
+            Case "2": MaintOpenConfig
+            Case "3": MaintOpenVBAFolder
+            Case "5": modQuickStart.QuickStart
+            Case "6": modQuickStart.QuickStartPreview
+            Case "7": modQuickStart.QuickStartReset
+            Case Else: MsgBox T("Choix invalide.", "Invalid choice."), vbExclamation, TITLE
+        End Select
+    Loop
+End Sub
+
+Private Sub ReloadConfig()
+    On Error GoTo ErrH
+    modConfig.ReloadConfig
+    Dim n As Long
+    n = modConfig.AllConfigKeys().count
+    MsgBox T("Config recharg~ee : ", "Config reloaded: ") & n & T(" cle(s).", " key(s).") & vbCrLf & _
+           T("Fichier : ", "File: ") & IIf(modConfig.ConfigLoaded(), T("pr~esent", "present"), T("absent (defauts)", "absent (defaults)")), _
+           vbInformation, TITLE
+    Exit Sub
+ErrH:
+    MsgBox T("Erreur rechargement : ", "Reload error: ") & Err.Number & " - " & Err.Description, _
+           vbExclamation, TITLE
+End Sub
+
+'=============================================================================
+' MaintOpenConfig  (epinglable au QAT)
+' Ouvre config.ini dans Notepad. Propose de creer un modele si absent.
+'=============================================================================
+Public Sub MaintOpenConfig()
+    On Error GoTo ErrH
+    Dim p As String
+    p = modConfig.ConfigPath()
+    If Dir(p) = "" Then
+        ' Creer un fichier modele si absent, pour edition immediate.
+        If MsgBox(T("Aucun config.ini.", "No config.ini.") & vbCrLf & _
+                  T("Cr~eer un mod~fle commente maintenant ?", "Create a commented template now?"), _
+                  vbQuestion + vbYesNo, TITLE) = vbYes Then
+            CreateConfigTemplate p
+        Else
+            Exit Sub
+        End If
+    End If
+    Shell "notepad.exe """ & p & """", vbNormalFocus
+    Exit Sub
+ErrH:
+    MsgBox T("Erreur ouverture config : ", "Config open error: ") & Err.Number & " - " & Err.Description, _
+           vbExclamation, TITLE
+End Sub
+
+'=============================================================================
+' MaintOpenVBAFolder  (epinglable au QAT)
+' Ouvre <Bureau>\Macro VBA\Outlook\VBA dans l'Explorateur. Propose de
+' creer le dossier s'il n'existe pas.
+'=============================================================================
+Public Sub MaintOpenVBAFolder()
+    On Error GoTo ErrH
+    Dim p As String
+    p = modConfig.VBADir()
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    If Not fso.FolderExists(p) Then
+        If MsgBox(T("Le dossier VBA n'existe pas :", "The VBA folder does not exist:") & vbCrLf & p & vbCrLf & vbCrLf & _
+                  T("Le cr~eer ?", "Create it?"), vbQuestion + vbYesNo, TITLE) = vbYes Then
+            CreateFolderRec p
+        Else
+            Exit Sub
+        End If
+    End If
+    Shell "explorer.exe """ & p & """", vbNormalFocus
+    Exit Sub
+ErrH:
+    MsgBox T("Erreur ouverture dossier VBA : ", "VBA folder open error: ") & Err.Number & " - " & Err.Description, _
+           vbExclamation, TITLE
+End Sub
+
+' =====================================================================
+' 4 - DIAGNOSTIC
+' =====================================================================
+Private Sub MenuDiagnostic()
+    Dim choice As String
+    Do
+        choice = modUi.AskText( _
+            T("=== DIAGNOSTIC ===", "=== DIAGNOSTICS ===") & vbCrLf & vbCrLf & _
+            T("1 - Chemins resolus + test ~ecriture", "1 - Resolved paths + write test") & vbCrLf & _
+            T("2 - Versions des modules (+ date)", "2 - Module versions (+ date)") & vbCrLf & vbCrLf & _
+            T("0 - Retour", "0 - Back") & vbCrLf & vbCrLf & _
+            T("Num~ero :", "Number:"), TITLE)
+
+        Select Case Trim$(choice)
+            Case "", "0": Exit Sub
+            Case "1": MaintDiagnosePaths
+            Case "2": MaintModuleVersions
+            Case Else: MsgBox T("Choix invalide.", "Invalid choice."), vbExclamation, TITLE
+        End Select
+    Loop
+End Sub
+
+' Affiche les chemins resolus a l'execution + un test lecture/ecriture
+' par cible. Le diagnostic a lancer en premier quand "plus rien ne marche".
+' Epinglable au QAT.
+Public Sub MaintDiagnosePaths()
+    On Error Resume Next
+    Dim r As String
+    ' v4 : entierement localise. Les CHEMINS restent hors T() (donnees :
+    ' A() alterait un chemin contenant "~e" ou "~a").
+    r = T("=== CHEMINS RESOLUS ===", "=== RESOLVED PATHS ===") & vbCrLf & vbCrLf
+    r = r & T("Bureau        : ", "Desktop       : ") & modConfig.DesktopPath() & vbCrLf
+    r = r & T("Macro VBA     : ", "Macro VBA     : ") & modConfig.MacroVBADir() & vbCrLf
+    r = r & T("Dossier VBA   : ", "VBA folder    : ") & modConfig.VBADir() & vbCrLf
+    r = r & T("config.ini    : ", "config.ini    : ") & modConfig.ConfigPath() & vbCrLf
+    r = r & T("debug.log     : ", "debug.log     : ") & modDebugLog.LogFilePath() & vbCrLf
+    r = r & T("Suivi temps   : ", "Time tracking : ") & modConfig.TimeTrackingPath() & vbCrLf
+    r = r & T("Suivi mails   : ", "Mail tracking : ") & modConfig.MailTrackingPath() & vbCrLf
+    r = r & T("AppData OL    : ", "AppData OL    : ") & modConfig.AppDataOutlookPath() & vbCrLf
+    r = r & vbCrLf & T("=== TESTS ===", "=== TESTS ===") & vbCrLf & vbCrLf
+    r = r & T("Bureau (lecture)      : ", "Desktop (read)        : ") & TestDir(modConfig.DesktopPath()) & vbCrLf
+    r = r & T("Macro VBA (ecriture)  : ", "Macro VBA (write)     : ") & TestWrite(modConfig.MacroVBADir()) & vbCrLf
+    r = r & T("Dossier VBA (lecture) : ", "VBA folder (read)     : ") & TestDir(modConfig.VBADir()) & vbCrLf
+    r = r & T("AppData OL (ecriture) : ", "AppData OL (write)    : ") & TestWrite(modConfig.AppDataOutlookPath()) & vbCrLf
+    r = r & T("Suivi temps (lecture) : ", "Time tracking (read)  : ") & TestFile(modConfig.TimeTrackingPath()) & vbCrLf
+    r = r & T("Suivi mails (lecture) : ", "Mail tracking (read)  : ") & TestFile(modConfig.MailTrackingPath()) & vbCrLf
+
+    modUi.Inform r, TITLE
+End Sub
+
+Private Function TestDir(ByVal p As String) As String
+    On Error Resume Next
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    If fso.FolderExists(p) Then
+        TestDir = T("OK (existe)", "OK (exists)")
+    Else
+        TestDir = T("KO (absent)", "KO (missing)")
+    End If
+End Function
+
+Private Function TestFile(ByVal p As String) As String
+    On Error Resume Next
+    If Dir(p) <> "" Then
+        TestFile = T("OK (existe)", "OK (exists)")
+    Else
+        TestFile = T("KO (absent)", "KO (missing)")
+    End If
+End Function
+
+' Teste l'ecriture reelle : cree puis supprime un fichier sonde.
+Private Function TestWrite(ByVal dirPath As String) As String
+    On Error GoTo ErrH
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    If Not fso.FolderExists(dirPath) Then
+        TestWrite = T("KO (dossier absent)", "KO (folder missing)")
+        Exit Function
+    End If
+    Dim probe As String
+    probe = dirPath & "\__maint_probe_" & Format$(Now, "hhnnss") & ".tmp"
+    Dim f As Integer
+    f = FreeFile
+    Open probe For Output As #f
+    Print #f, "probe"
+    Close #f
+    If Dir(probe) <> "" Then
+        Kill probe
+        TestWrite = T("OK (ecriture/suppression)", "OK (write/delete)")
+    Else
+        TestWrite = T("KO (ecriture echouee)", "KO (write failed)")
+    End If
+    Exit Function
+ErrH:
+    TestWrite = "KO (" & Err.Number & ")"
+End Function
+
+'=============================================================================
+' ModVersion - version REELLEMENT chargee dans le VBE.
+'=============================================================================
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+'=============================================================================
+' ModuleVersionOf - interroge la constante de version PORTEE PAR LE MODULE.
+'
+' Table d'aiguillage en dur, comme modDefer.Dispatch : sans le Project
+' Object Model (bloque par l'IT), VBA ne sait pas resoudre un nom de
+' procedure a partir d'une chaine. Une ligne par module instrumente.
+'
+' AJOUTER UN MODULE : (1) coller dans le module les 6 lignes MOD_VERSION +
+' ModVersion, (2) ajouter sa Case ici, (3) verifier qu'il figure dans
+' MODULES_DEFAULT. Rien d'autre.
+'
+' Non interrogeables : les classes (clsAppEvents, clsApptWatcher,
+' clsExplorerWatcher) n'ont pas d'instance publique atteignable depuis ici,
+' et ThisOutlookSession n'expose pas de ModVersion. Elles portent quand
+' meme leur constante MOD_VERSION, lisible dans le source.
+'=============================================================================
+Private Function ModuleVersionOf(ByVal shortName As String) As String
+    ' Pack v3 (A9) : liste GENEREE par validate.py --gen-versions a partir des
+    ' modules qui exposent ModVersion() (avant : 4 modules instrumentes
+    ' oublies - MeetingColor, Mtg2Appt, BackupAuto, BackupVBA - et 20 non
+    ' instrumentes). Les classes (clsXxx) n'ont pas d'acces statique et
+    ' restent hors liste ; modSendToLLM est volontairement intact (C15).
+    On Error Resume Next
+    Select Case shortName
+        Case "AntiOverlap":  ModuleVersionOf = modAntiOverlap.ModVersion()
+        Case "ApptPrivacy":  ModuleVersionOf = modAppointmentPrivacy.ModVersion()
+        Case "BackupAuto":   ModuleVersionOf = modBackupAuto.ModVersion()
+        Case "BackupVBA":    ModuleVersionOf = modBackupVBA.ModVersion()
+        Case "Campaign":     ModuleVersionOf = modMailCampaign.ModVersion()
+        Case "Common":       ModuleVersionOf = modCommon.ModVersion()
+        Case "Config":       ModuleVersionOf = modConfig.ModVersion()
+        Case "ContBday":     ModuleVersionOf = modContactBirthday.ModVersion()
+        Case "ContCommon":   ModuleVersionOf = modContactCommon.ModVersion()
+        Case "ContExp":      ModuleVersionOf = modContactExport.ModVersion()
+        Case "ContImp":      ModuleVersionOf = modContactImport.ModVersion()
+        Case "ContMail":     ModuleVersionOf = modContactFromMail.ModVersion()
+        Case "ContNorm":     ModuleVersionOf = modContactNormalize.ModVersion()
+        Case "ContNote":     ModuleVersionOf = modContactNote.ModVersion()
+        Case "ContRel":      ModuleVersionOf = modContactRelation.ModVersion()
+        Case "DebugLog":     ModuleVersionOf = modDebugLog.ModVersion()
+        Case "Defer":        ModuleVersionOf = modDefer.ModVersion()
+        Case "DevTools":     ModuleVersionOf = modDevTools.ModVersion()
+        Case "ExcelBridge":  ModuleVersionOf = modExcelBridge.ModVersion()
+        Case "FlashAppt":    ModuleVersionOf = modFlashAppointment.ModVersion()
+        Case "FolderMerge":  ModuleVersionOf = modFolderMerge.ModVersion()
+        Case "FolderRen":    ModuleVersionOf = modFolderRename.ModVersion()
+        Case "FolderScan":   ModuleVersionOf = modFolderScan.ModVersion()
+        Case "FolderSort":   ModuleVersionOf = modFolderSort.ModVersion()
+        Case "HideBcc":      ModuleVersionOf = modHideBcc.ModVersion()
+        Case "InboxAlert":   ModuleVersionOf = modInboxAlert.ModVersion()
+        Case "InspQueue":    ModuleVersionOf = modInspectorQueue.ModVersion()
+        Case "MailConfid":   ModuleVersionOf = modMailConfidentiality.ModVersion()
+        Case "MailExport":   ModuleVersionOf = modMailExport.ModVersion()
+        Case "MailTrack":    ModuleVersionOf = modMailResponseTracker.ModVersion()
+        Case "Maint":        ModuleVersionOf = ModVersion()
+        Case "MarkRead":     ModuleVersionOf = modMarkAllRead.ModVersion()
+        Case "MaxWindow":    ModuleVersionOf = modMaximizeWindow.ModVersion()
+        Case "MeetingColor": ModuleVersionOf = modMeetingColor.ModVersion()
+        Case "MigrateTags":  ModuleVersionOf = modMigrateTags.ModVersion()
+        Case "MsgBoxC":      ModuleVersionOf = modMsgBoxCustom.ModVersion()
+        Case "Mtg2Appt":     ModuleVersionOf = modMeetingToAppointment.ModVersion()
+        Case "NewMeeting":   ModuleVersionOf = modNewMeetingDefault.ModVersion()
+        Case "Notify":       ModuleVersionOf = modNotify.ModVersion()
+        Case "ONProbe":      ModuleVersionOf = modOneNoteProbe.ModVersion()
+        Case "OneNote":      ModuleVersionOf = modOneNote.ModVersion()
+        Case "ProjectTag":   ModuleVersionOf = modProjectTag.ModVersion()
+        Case "PurgeCat":     ModuleVersionOf = modPurgeCategories.ModVersion()
+        Case "QuickMove":    ModuleVersionOf = modQuickMove.ModVersion()
+        Case "QuickStart":   ModuleVersionOf = modQuickStart.ModVersion()
+        Case "ReplyGreet":   ModuleVersionOf = modReplyGreeting.ModVersion()
+        Case "ReplyInPlace": ModuleVersionOf = modReplyInPlace.ModVersion()
+        Case "ReplySusp":    ModuleVersionOf = modReplySuspicion.ModVersion()
+        Case "Search":       ModuleVersionOf = modSearch.ModVersion()
+        Case "ShiftAppt":    ModuleVersionOf = modShiftAppointment.ModVersion()
+        Case "Smtp":         ModuleVersionOf = modSmtp.ModVersion()
+        Case "Snooze":       ModuleVersionOf = modSnooze.ModVersion()
+        Case "StoreCtx":     ModuleVersionOf = modStoreContext.ModVersion()
+        Case "ThisOutlook":  ModuleVersionOf = ThisOutlookSession.ModVersion()
+        Case "Ui":           ModuleVersionOf = modUi.ModVersion()
+        Case Else:        ModuleVersionOf = ""
+    End Select
+    If Err.Number <> 0 Then
+        ModuleVersionOf = T("(erreur de lecture)", "(read error)")
+        Err.Clear
+    End If
+End Function
+
+'=============================================================================
+' MaintModuleVersions (v3) - versions REELLEMENT chargees dans le VBE.
+' Lues dans la constante de chaque module, pas dans config.ini : un module
+' non recolle apres une livraison affiche donc son ANCIENNE version, ce qui
+' est exactement le signal recherche.
+'=============================================================================
+Public Sub MaintModuleVersions()
+    On Error GoTo ErrH
+
+    Dim mods() As String, n As Long, i As Long
+    n = SplitModules(mods)
+
+    Dim v As String
+    Dim known As String, unknown As String
+    Dim nbKnown As Long, nbUnknown As Long
+
+    For i = 0 To n - 1
+        v = ModuleVersionOf(mods(i))
+        If Len(v) > 0 Then
+            known = known & "  " & Left$(mods(i) & String(16, " "), 16) & _
+                    " " & v & vbCrLf
+            nbKnown = nbKnown + 1
+        Else
+            If Len(unknown) > 0 Then unknown = unknown & ", "
+            unknown = unknown & mods(i)
+            nbUnknown = nbUnknown + 1
+        End If
+    Next i
+
+    Dim r As String
+    r = "=== " & T("VERSIONS CHARG~EES DANS LE VBE", "VERSIONS LOADED IN THE VBE") & " ===" & vbCrLf & _
+        T("(lues dans le code lui-m~xme, pas dans config.ini)", _
+          "(read from the code itself, not from config.ini)") & vbCrLf & vbCrLf & _
+        known & vbCrLf & _
+        T("Non instrument~es (", "Not instrumented (") & nbUnknown & _
+        T(") :", "):") & vbCrLf & _
+        "  " & unknown & vbCrLf & vbCrLf & _
+        nbKnown & "/" & n & " " & T("module(s) instrument~e(s).", "module(s) instrumented.")
+
+    modDebugLog.DInfo MOD_NAME, "MaintModuleVersions : " & nbKnown & "/" & n & " instrumentes"
+    modUi.Inform r, TITLE
+    Exit Sub
+ErrH:
+    modDebugLog.DError MOD_NAME, "MaintModuleVersions err " & Err.Number & " - " & Err.Description
+    MsgBox T("Erreur : ", "Error: ") & Err.Number & " - " & Err.Description, _
+           vbExclamation, TITLE
+End Sub
+
+' =====================================================================
+' 5 - BINDINGS & CACHE
+' =====================================================================
+Private Sub MenuBindingsCache()
+    Dim choice As String
+    Do
+        choice = modUi.AskText( _
+            T("=== BINDINGS & CACHE ===", "=== BINDINGS & CACHE ===") & vbCrLf & vbCrLf & _
+            T("1 - Reinit (rebind WithEvents)", "1 - Reinit (rebind WithEvents)") & vbCrLf & _
+            T("2 - Regenerer cache QuickMove", "2 - Rebuild QuickMove cache") & vbCrLf & _
+            T("3 - Health-check bindings", "3 - Bindings health-check") & vbCrLf & vbCrLf & _
+            T("0 - Retour", "0 - Back") & vbCrLf & vbCrLf & _
+            T("Num~ero :", "Number:"), TITLE)
+
+        Select Case Trim$(choice)
+            Case "", "0": Exit Sub
+            Case "1": ReinitBindings
+            Case "2": modQuickMove.QuickMoveReload
+            Case "3": AssertBindings False
+            Case Else: MsgBox T("Choix invalide.", "Invalid choice."), vbExclamation, TITLE
+        End Select
+    Loop
+End Sub
+
+Private Sub ReinitBindings()
+    On Error GoTo ErrH
+    ' v2 : le rapport est produit par modDevTools.Reinit lui-meme
+    ' (AssertBindings en fin de Reinit) ; plus de MsgBox statique ici.
+    modDevTools.Reinit
+    Exit Sub
+ErrH:
+    MsgBox T("Erreur Reinit : ", "Reinit error: ") & Err.Number & " - " & Err.Description, _
+           vbExclamation, TITLE
+End Sub
+
+'=============================================================================
+' AssertBindings  (health-check des WithEvents - v2, 2026-06-10)
+' Verifie que les bindings evenementiels critiques sont vivants :
+'   1. SentItems ItemAdd        (ThisOutlookSession.mSentItems)
+'   2. CalendarItems Add/Change (ThisOutlookSession.CalendarItems)
+'   3. Explorer FolderSwitch    (ThisOutlookSession.olMainExplorer)
+'   4. Inspectors NewInspector  (modNewMeetingDefault.g_AppEvents ->
+'                                clsAppEvents.m_Inspectors)
+'   5. Explorer InlineResponse  (clsAppEvents.m_Explorer)
+' Un WithEvents remis a Nothing par un Ctrl+S VBE = plus AUCUN evenement,
+' silencieusement : c'est la 1re cause historique des regressions.
+'
+' silentIfOk:=True  : log seul si tout est OK ; MsgBox d'alerte sinon
+'                     (mode demarrage / fin de Reinit).
+' silentIfOk:=False : rapport systematique ; OK -> MsgBoxC auto-fermee 5 s,
+'                     KO -> MsgBox persistante + rappel Reinit (mode menu).
+' Retour : True si les 5 bindings sont vivants.
+'
+' NB : les libelles de bindings sont des chaines FONCTIONNELLES de
+' diagnostic (noms d'evenements Outlook), volontairement hors T().
+' NB : le binding 5 (InlineResponse) peut etre legitimement KO si aucune
+' fenetre Outlook n'existait a l'initialisation de clsAppEvents
+' (ActiveExplorer = Nothing) ; un Reinit le repare.
+' Epinglable au QAT.
+'=============================================================================
+Public Function AssertBindings(Optional ByVal silentIfOk As Boolean = False) As Boolean
+    On Error Resume Next
+
+    ' Pack v3 : 6e binding = watchers InboxAlert (compte comme vivant si la
+    ' fonction est desactivee par config, pour ne pas alerter a tort).
+    Const NB_BINDINGS As Long = 6
+    Dim names(1 To NB_BINDINGS) As String
+    Dim alive(1 To NB_BINDINGS) As Boolean
+    Dim i As Long
+
+    names(1) = T("SentItems ItemAdd (QuickMove / ReplyInPlace)", "SentItems ItemAdd (QuickMove / ReplyInPlace)")
+    alive(1) = ThisOutlookSession.SentItemsEventsBound
+
+    names(2) = T("CalendarItems ItemAdd/ItemChange (tag / couleur / anti-chev.)", "CalendarItems ItemAdd/ItemChange (tag / colour / anti-overlap)")
+    alive(2) = ThisOutlookSession.CalendarEventsBound
+
+    names(3) = T("Explorer FolderSwitch (calendrier fenetre separee)", "Explorer FolderSwitch (calendar in separate window)")
+    alive(3) = ThisOutlookSession.MainExplorerEventsBound
+
+    names(4) = T("Inspectors NewInspector (duree defaut / ReplyInPlace / Maximize)", "Inspectors NewInspector (default duration / ReplyInPlace / Maximize)")
+    alive(4) = modNewMeetingDefault.InspectorEventsBound
+
+    names(5) = T("Explorer InlineResponse (ReplyInPlace volet de lecture)", "Explorer InlineResponse (ReplyInPlace reading pane)")
+    alive(5) = modNewMeetingDefault.InlineExplorerBound
+
+    names(6) = T("Inbox ItemAdd (alertes nouveaux mails)", "Inbox ItemAdd (new mail alerts)")
+    If modConfig.InboxAlertEnabled() Then
+        alive(6) = modInboxAlert.InboxAlertBound()
+    Else
+        alive(6) = True
+    End If
+
+    Dim allOk As Boolean, okCount As Long, deadList As String
+    allOk = True
+    For i = 1 To NB_BINDINGS
+        If alive(i) Then
+            okCount = okCount + 1
+            modDebugLog.DDebug MOD_NAME, "Binding OK   : " & names(i)
+        Else
+            allOk = False
+            deadList = deadList & "  - " & names(i) & vbCrLf
+            modDebugLog.DError MOD_NAME, "Binding MORT : " & names(i)
+        End If
+    Next i
+
+    AssertBindings = allOk
+    modDebugLog.DInfo MOD_NAME, "AssertBindings : " & okCount & "/" & NB_BINDINGS & " OK"
+
+    If allOk Then
+        If Not silentIfOk Then
+            ' Rapport positif auto-ferme (n'exige aucun clic).
+            modMsgBoxCustom.MsgBoxC _
+                T("Bindings WithEvents : 6/6 actifs.", "WithEvents bindings: 6/6 alive."), _
+                vbInformation + vbOKOnly, TITLE, "", "", "", 5000, 1
+        End If
+    Else
+        MsgBox T("BINDINGS EVENEMENTIELS MORTS :", "DEAD EVENT BINDINGS:") & vbCrLf & vbCrLf & _
+               deadList & vbCrLf & _
+               T("Les automatismes associ~es ne tournent plus.", "The related automations are no longer running.") & vbCrLf & _
+               T("Correctif : Maintenance > Bindings & cache > Reinit.", "Fix: Maintenance > Bindings & cache > Reinit."), _
+               vbExclamation, TITLE
+    End If
+End Function
+
+'=============================================================================
+' MaintenanceQuick  (v2 - a epingler au QAT)
+' Acces direct aux 3 actions de maintenance les plus frequentes, via une
+' MsgBox Win32 a boutons renommes (modMsgBoxCustom), auto-fermee a 10 s.
+'   Oui (Reinit)        -> rebind des WithEvents (apres Ctrl+S VBE)
+'   Non (Health-check)  -> etat des 5 bindings
+'   Annuler (Voir log)  -> ouvre debug.log (Echap / croix : idem, inoffensif)
+' Timeout 10 s -> AUCUNE action : le defaut est en position 3 (log) et
+' LastResultWasTimeout() court-circuite le Select. Menu complet : Maintenance().
+'=============================================================================
+Public Sub MaintenanceQuick()
+    On Error GoTo ErrH
+    Dim r As VbMsgBoxResult
+    r = modMsgBoxCustom.Confirm3( _
+            T("Maintenance rapide :", "Quick maintenance:") & vbCrLf & vbCrLf & _
+            T("  Reinit       = rebind des WithEvents (apr~fs Ctrl+S VBE)", "  Reinit       = rebind WithEvents (after VBE Ctrl+S)") & vbCrLf & _
+            T("  Health-check = ~etat des 5 bindings", "  Health-check = state of the 5 bindings") & vbCrLf & _
+            T("  Voir le log  = ouvrir debug.log", "  Show log     = open debug.log") & vbCrLf & vbCrLf & _
+            T("(fermeture auto dans 10 s = aucune action)", "(auto-close in 10 s = no action)"), _
+            TITLE, _
+            "&Reinit", "&Health-check", T("Voir le &log", "Show &log"), _
+            vbQuestion, 10000, 3)
+
+    If modMsgBoxCustom.LastResultWasTimeout() Then Exit Sub
+
+    Select Case r
+        Case vbYes:    ReinitBindings
+        Case vbNo:     AssertBindings False
+        Case vbCancel: modDebugLog.OpenLog
+    End Select
+    Exit Sub
+ErrH:
+    modDebugLog.DError MOD_NAME, "MaintenanceQuick err " & Err.Number & " - " & Err.Description
+End Sub
+
+' =====================================================================
+' Utilitaires fichiers
+' =====================================================================
+Private Sub CreateFolderRec(ByVal path As String)
+    On Error Resume Next
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    If fso.FolderExists(path) Then Exit Sub
+    Dim parent As String
+    parent = fso.GetParentFolderName(path)
+    If Len(parent) > 0 And Not fso.FolderExists(parent) Then CreateFolderRec parent
+    If Not fso.FolderExists(path) Then fso.CreateFolder path
+End Sub
+
+' Cree un config.ini modele commente (utilise si l'utilisateur ouvre la
+' config alors qu'aucun fichier n'existe).
+Private Sub CreateConfigTemplate(ByVal path As String)
+    On Error GoTo ErrH
+    Dim f As Integer
+    f = FreeFile
+    Open path For Output As #f
+    Print #f, "; ============================================================"
+    Print #f, T("; config.ini - configuration externe du projet VBA Outlook", "; config.ini - external configuration for the Outlook VBA project")
+    Print #f, T("; Format : cle=valeur (une par ligne). ; ou # = commentaire.", "; Format: key=value (one per line). ; or # starts a comment.")
+    Print #f, T("; Apres edition : Maintenance > Configuration > Recharger.", "; After editing: Maintenance > Configuration > Reload.")
+    Print #f, T("; Toute cle absente retombe sur la valeur par defaut du code.", "; Any missing key falls back to the code default.")
+    Print #f, "; ============================================================"
+    Print #f, ""
+    Print #f, T("; --- Chemins (laisser vide = calcul auto depuis le Bureau) ---", "; --- Paths (leave empty = auto-computed from the Desktop) ---")
+    Print #f, "; VBADir="
+    Print #f, "; TimeTrackingPath="
+    Print #f, "; MailTrackingPath="
+    Print #f, ""
+    Print #f, T("; --- Liste des modules connus (filtre log + versions) ---", "; --- Known modules (log filter + versions) ---")
+    Print #f, "; KnownModules=Config|DebugLog|QuickMove|ProjectTag|..."
+    Print #f, ""
+    Print #f, T("; --- Versions (diagnostic, saisie manuelle) ---", "; --- Versions (diagnostic, manual entry) ---")
+    Print #f, "; Version.ProjectTag=v8.4 / 2026-05-01"
+    Print #f, "; Version.MeetingColor=v9 / 2026-05-01"
+    Print #f, ""
+    Print #f, T("; --- Parametres metier (exemples a activer selon besoin) ---", "; --- Business parameters (examples, enable as needed) ---")
+    Print #f, "; InternalDomains=domaine1.fr|domaine2.fr"
+    Print #f, "; DefaultAppointmentDuration=15"
+    Print #f, "; ShiftMinutes=15"
+    Print #f, "; DefaultLogLevel=0"
+    Print #f, "; BackupRetentionMonths=12"
+    Close #f
+    Exit Sub
+ErrH:
+    MsgBox T("Impossible de cr~eer le mod~fle : ", "Cannot create the template: ") & Err.Number & " - " & _
+           Err.Description, vbExclamation, TITLE
+End Sub

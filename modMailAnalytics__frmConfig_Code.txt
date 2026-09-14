@@ -1,0 +1,944 @@
+Option Explicit
+
+' ============================================================================
+' frmConfig - CODE V23.7
+'
+' V23.7 (2026-08-22) : revue traduction. Les deux seules MsgBox du
+'         formulaire etaient en dur : "frmConfig initialization error" en
+'         anglais SANS titre, et "Please select at least one mailbox." en
+'         anglais avec le titre "Attention" en francais - deux langues dans
+'         la meme boite. Les deux passent par T() et recoivent
+'         vbMsgBoxSetForeground (le formulaire est modal, mais l'erreur
+'         d'initialisation peut survenir avant son affichage).
+'         NOTE : les motifs "*inbox*", "*reception*", "*boite de reception*"
+'         de GetInboxOrFirst ne sont PAS traduits - ce sont des motifs de
+'         reconnaissance de noms de dossiers Outlook localises, donc des
+'         chaines fonctionnelles. Idem pour les noms de la palette
+'         (Blue, Green...) qui servent de cles.
+'
+' V23.5 : pre-remplissage depuis config.ini
+' Configuration de l'analyse des emails
+' V23.5 : pre-remplissage depuis config.ini (cles StatMailboxN lues par
+'         modMailAnalytics.GetStatMailboxPreset) : mot-cle, couleur exacte,
+'         email utilisateur (4e champ optionnel), domaine derive.
+'         Couleur de repli StatMailboxDefault pour les boites non listees.
+'         La couleur exacte n'est plus ecrasee par la palette tant que
+'         l'utilisateur ne change pas la selection de couleur.
+' Avec option : Analyse longueur des messages
+' ============================================================================
+
+' --- Variables de module ---
+Private m_MailboxConfigs As Object    ' Dictionary: storeName -> config (Dictionary)
+Private m_Cancelled As Boolean
+Private m_LastSelectedStore As String
+
+' ============================================================================
+' INITIALISATION
+' ============================================================================
+Private Sub UserForm_Initialize()
+    On Error GoTo ErrInit
+    
+    Debug.Print "[frmConfig] Initialize debut..."
+    
+    Set m_MailboxConfigs = CreateObject("Scripting.Dictionary")
+    m_Cancelled = True
+    m_LastSelectedStore = ""
+    
+    Debug.Print "[frmConfig] Remplissage cboCouleur..."
+    ' Remplir la liste des couleurs
+    With cboCouleur
+        .Clear
+        .AddItem "Blue"
+        .AddItem "Green"
+        .AddItem "Orange"
+        .AddItem "Red"
+        .AddItem "Purple"
+        .AddItem "Cyan"
+        .AddItem "Pink"
+        .AddItem "Yellow"
+        .AddItem "Navy"
+        .AddItem "Forest green"
+        .AddItem "Brown"
+        .AddItem "Gray"
+        .AddItem "Turquoise"
+        .AddItem "Coral"
+        .AddItem "Plum"
+        .ListIndex = 0
+    End With
+    
+    Debug.Print "[frmConfig] Lecture config.ini (StatMailboxN)..."
+    ' V23.5 : relire config.ini a chaque ouverture du formulaire pour
+    ' prendre en compte les modifications sans redemarrer l'hote.
+    Call ReloadStatMailboxConfig
+    
+    Debug.Print "[frmConfig] LoadMailboxes..."
+    ' Charger les boites aux lettres
+    Call LoadMailboxes
+    
+    Debug.Print "[frmConfig] Initialisation periode..."
+    ' Initialiser periode
+    optTout.Value = True
+    cboDepuis.Enabled = False
+    txtDateDebut.Enabled = False
+    txtDateFin.Enabled = False
+    Call LoadYearsCombo
+    
+    Debug.Print "[frmConfig] Initialisation options..."
+    ' Initialiser options ; V23.9 : analyse COMPLETE par defaut (pas Test)
+    optTest.Value = False
+    chkResolutionExchange.Value = True
+    chkAnalyseDistincte.Value = False
+    chkAnalyseLongueur.Value = False
+    
+    m_Cancelled = True
+    
+    ' V25 : si l'analyse a ete lancee en mode delta, la fenetre est
+    ' pre-remplie et la periode verrouillee.
+    Call ApplyDeltaMode
+
+    Debug.Print "[frmConfig] Initialize termine OK"
+    Exit Sub
+    
+ErrInit:
+    Debug.Print "[frmConfig] !!! ERREUR Initialize: " & Err.Number & " - " & Err.Description
+    MsgBox T("Erreur d'initialisation de frmConfig : ", _
+             "frmConfig initialization error: ") & Err.Description, _
+           vbCritical + vbMsgBoxSetForeground, _
+           T("Statistiques", "Analytics")
+End Sub
+
+' ============================================================================
+' CHARGEMENT DES BOITES
+' ============================================================================
+'============================================================================
+' V25 - MODE DELTA
+'
+' La case "Analyse incrementale" est COCHEE et GRISEE : elle informe, elle ne
+' pilote rien. La periode est imposee par modMailAnalytics apres la fermeture
+' de cette fenetre (g_PeriodStart / g_PeriodEnd sont ecrases). Une case
+' decochable aurait fait dependre la justesse des chiffres d'un clic.
+'
+' La case est creee A L'EXECUTION : la maquette du formulaire vit dans le
+' .frx binaire, on ne peut pas y ajouter un controle par edition de texte.
+' Controls.Add a l'execution ne demande PAS l'acces au modele d'objet VBA
+' (bloque par l'IT) - il ne modifie pas le projet, seulement l'instance.
+'
+' Position calculee a partir de optDepuis plutot qu'en coordonnees fixes :
+' la maquette peut bouger, le reperage relatif tient.
+'============================================================================
+Private Sub ApplyDeltaMode()
+    On Error Resume Next
+
+    If Not modMailAnalytics.g_DeltaMode Then Exit Sub
+
+    Dim chk As Object
+    Set chk = Me.Controls.Add("Forms.CheckBox.1", "chkIncremental", True)
+    If chk Is Nothing Then
+        ' Repli : si l'ajout de controle echoue, on ne laisse PAS l'utilisateur
+        ' sans information - le titre de la fenetre porte le message.
+        Me.Caption = Me.Caption & "  -  " & modMailAnalytics.DeltaBannerText()
+        GoTo LockPeriod
+    End If
+
+    With chk
+        .Caption = modMailAnalytics.DeltaBannerText()
+        .Value = True
+        .Enabled = False           ' cochee et non decochable
+        .Left = optDepuis.Left
+        .Top = optDepuis.Top + optDepuis.Height + 6
+        .Width = 320
+        .Height = 18
+    End With
+
+LockPeriod:
+    ' La periode ne se choisit plus : elle decoule de l'etat lu.
+    optTout.Enabled = False
+    optDepuis.Enabled = False
+    optPerso.Enabled = False
+    txtDateDebut.Enabled = False
+    txtDateFin.Enabled = False
+    optTest.Enabled = False
+    optTout.Value = True
+
+    Debug.Print "[frmConfig] Mode delta : " & modMailAnalytics.DeltaBannerText()
+End Sub
+
+'----------------------------------------------------------------------------
+' DeltaPresetFor - email / mot-cle relus dans _ETAT pour une boite donnee.
+' Renvoie "" si la boite n'etait pas dans l'analyse d'origine.
+'----------------------------------------------------------------------------
+Private Function DeltaPresetEmail(ByVal storeName As String) As String
+    On Error Resume Next
+    If Not modMailAnalytics.g_DeltaMode Then Exit Function
+    DeltaPresetEmail = modMailAnalytics.DeltaStoreEmail(storeName)
+End Function
+
+Private Function DeltaPresetKeyword(ByVal storeName As String) As String
+    On Error Resume Next
+    If Not modMailAnalytics.g_DeltaMode Then Exit Function
+    DeltaPresetKeyword = modMailAnalytics.DeltaStoreKeyword(storeName)
+End Function
+
+Private Sub LoadMailboxes()
+    Dim olNS As Object
+    Dim store As Object
+    Dim colorIndex As Long
+    Dim storeName As String
+    Dim emailUser As String
+    Dim cfg As Object
+    
+    On Error Resume Next
+    Set olNS = Application.GetNamespace("MAPI")
+    
+    lstBoites.Clear
+    colorIndex = 0
+    
+    For Each store In olNS.Stores
+        storeName = store.DisplayName
+        
+        If Len(storeName) > 0 Then
+            lstBoites.AddItem storeName
+            
+            Set cfg = CreateObject("Scripting.Dictionary")
+            
+            ' Appliquer pre-configuration si disponible, sinon extraction auto
+            Call ApplyPresetConfig(storeName, cfg, colorIndex)
+            
+            m_MailboxConfigs.Add storeName, cfg
+            colorIndex = colorIndex + 1
+        End If
+    Next store
+    
+    On Error GoTo 0
+End Sub
+
+' ============================================================================
+' PRESET CONFIGURATIONS (per-mailbox shortcuts)
+' ============================================================================
+Private Sub ApplyPresetConfig(storeName As String, ByRef cfg As Object, colorIndex As Long)
+    Dim lowerStore As String
+    lowerStore = LCase(Trim(storeName))
+    
+    ' ------------------------------------------------------------------
+    ' V25 : en mode delta, l'etat lu dans _ETAT est PRIORITAIRE sur
+    ' config.ini. Motif de correction : email et mot-cle decident de
+    ' IsSentByUser et de RecipientRole (A / Cc / Indirect). Rejouer les
+    ' mois manquants avec des reperes differents de l'analyse d'origine
+    ' produirait un fichier dont les premiers mois et les derniers ne
+    ' seraient pas comptes de la meme facon - une incoherence invisible
+    ' a la lecture du rapport.
+    If modMailAnalytics.g_DeltaMode Then
+        Dim dEmail As String, dKey As String
+        dEmail = DeltaPresetEmail(storeName)
+        dKey = DeltaPresetKeyword(storeName)
+        If Len(dEmail) > 0 Or Len(dKey) > 0 Then
+            If Len(dEmail) > 0 Then
+                cfg("EmailUser") = dEmail
+                cfg("Domain") = ExtractDomainFromEmail(dEmail)
+            End If
+            If Len(dKey) > 0 Then cfg("Keyword") = dKey
+            cfg("AddressMode") = False
+            cfg("ColorIndex") = colorIndex Mod 15
+            cfg("ColorRGB") = GetColorByIndex(colorIndex Mod 15)
+            Debug.Print "[frmConfig] delta preset " & storeName & " -> " & dEmail & " / " & dKey
+            Exit Sub
+        End If
+    End If
+
+    ' V23.5 : presets lus dans config.ini (StatMailboxN) - PRIORITAIRES.
+    ' Format : fragment_nom ; mot-cle ; #RRGGBB [; email_utilisateur]
+    ' ------------------------------------------------------------------
+    Dim preset As Object
+    Set preset = GetStatMailboxPreset(storeName)
+    If Not preset Is Nothing Then
+        Dim pEmail As String
+        pEmail = CStr(preset("EmailUser"))
+        If Len(pEmail) = 0 Then pEmail = ExtractEmailFromStore(storeName)
+        cfg("EmailUser") = pEmail
+        
+        If Len(CStr(preset("Domain"))) > 0 Then
+            cfg("Domain") = CStr(preset("Domain"))
+        Else
+            cfg("Domain") = ExtractDomainFromEmail(pEmail)
+        End If
+        
+        If Len(CStr(preset("Keyword"))) > 0 Then
+            cfg("Keyword") = CStr(preset("Keyword"))
+        Else
+            cfg("Keyword") = ExtractKeywordFromEmail(pEmail)
+        End If
+        
+        cfg("AddressMode") = False
+        
+        If preset("ColorSet") Then
+            cfg("ColorRGB") = CLng(preset("ColorRGB"))
+            cfg("ColorIndex") = NearestPaletteIndex(CLng(preset("ColorRGB")))
+        Else
+            cfg("ColorIndex") = colorIndex Mod 15
+            cfg("ColorRGB") = GetColorByIndex(colorIndex Mod 15)
+        End If
+
+        ' V23.9 : date seuil (ne pas remonter avant) lue dans config.ini
+        If preset.Exists("DateMinSet") Then
+            If preset("DateMinSet") Then
+                cfg("DateMinEnabled") = True
+                cfg("DateMin") = preset("DateMin")
+            End If
+        End If
+        Exit Sub
+    End If
+    
+    ' Hard-coded shortcuts (match on the mailbox store name).
+    Select Case True
+        ' --- Example preset (optional shortcut for a known mailbox) ----------
+        ' Add one Case per mailbox you want pre-configured: match on the store
+        ' name as shown in Outlook, and set the user email / domain / keyword.
+        ' Anything not matched here falls through to Case Else (auto-extraction).
+        Case InStr(1, lowerStore, "example", vbTextCompare) > 0
+            cfg("EmailUser") = "first.last@example.com"
+            cfg("Domain") = "example.com"
+            cfg("Keyword") = "last"
+            cfg("AddressMode") = False
+            cfg("ColorIndex") = 0
+            cfg("ColorRGB") = GetColorByIndex(0)
+            
+        Case Else
+            ' Configuration par defaut (extraction automatique)
+            Dim emailUser As String
+            emailUser = ExtractEmailFromStore(storeName)
+            cfg("EmailUser") = emailUser
+            cfg("Domain") = ExtractDomainFromEmail(emailUser)
+            cfg("Keyword") = ExtractKeywordFromEmail(emailUser)
+            cfg("AddressMode") = False
+            cfg("ColorIndex") = colorIndex Mod 15
+            cfg("ColorRGB") = GetColorByIndex(colorIndex Mod 15)
+            
+            ' V23.5 : couleur de repli config.ini pour une boite non
+            ' listee (active seulement si >= 1 ligne StatMailboxN existe)
+            Dim defColor As Long
+            If GetStatDefaultColor(defColor) Then
+                cfg("ColorRGB") = defColor
+                cfg("ColorIndex") = NearestPaletteIndex(defColor)
+            End If
+    End Select
+End Sub
+
+Private Function ExtractEmailFromStore(storeName As String) As String
+    ' Si le nom de la boite contient @, c'est l'adresse email
+    If InStr(storeName, "@") > 0 Then
+        ExtractEmailFromStore = storeName
+    Else
+        ExtractEmailFromStore = ""
+    End If
+End Function
+
+Private Function ExtractDomainFromEmail(email As String) As String
+    Dim atPos As Long
+    atPos = InStr(email, "@")
+    If atPos > 0 Then
+        ExtractDomainFromEmail = Mid(email, atPos + 1)
+    Else
+        ExtractDomainFromEmail = ""
+    End If
+End Function
+
+Private Function ExtractKeywordFromEmail(email As String) As String
+    Dim atPos As Long
+    Dim localPart As String
+    Dim dotPos As Long
+    
+    atPos = InStr(email, "@")
+    If atPos > 1 Then
+        localPart = LCase(Left(email, atPos - 1))
+        ' Prendre le dernier segment apres le point (generalement le prenom ou nom)
+        dotPos = InStrRev(localPart, ".")
+        If dotPos > 0 Then
+            ExtractKeywordFromEmail = Mid(localPart, dotPos + 1)
+        Else
+            ExtractKeywordFromEmail = localPart
+        End If
+    Else
+        ExtractKeywordFromEmail = ""
+    End If
+End Function
+
+Private Sub LoadYearsCombo()
+    Dim y As Long
+    cboDepuis.Clear
+    For y = Year(Now) To 2000 Step -1
+        cboDepuis.AddItem y
+    Next y
+    If cboDepuis.ListCount > 0 Then cboDepuis.ListIndex = 0
+End Sub
+
+' ============================================================================
+' GESTION DES COULEURS
+' ============================================================================
+Private Function GetColorByIndex(idx As Long) As Long
+    Select Case idx
+        Case 0: GetColorByIndex = RGB(68, 114, 196)   ' Bleu
+        Case 1: GetColorByIndex = RGB(112, 173, 71)   ' Vert
+        Case 2: GetColorByIndex = RGB(255, 152, 0)    ' Orange
+        Case 3: GetColorByIndex = RGB(255, 0, 0)      ' Rouge
+        Case 4: GetColorByIndex = RGB(128, 0, 128)    ' Violet
+        Case 5: GetColorByIndex = RGB(0, 176, 183)    ' Cyan
+        Case 6: GetColorByIndex = RGB(215, 45, 124)   ' Rose
+        Case 7: GetColorByIndex = RGB(255, 192, 0)    ' Jaune
+        Case 8: GetColorByIndex = RGB(0, 43, 89)      ' Bleu marine
+        Case 9: GetColorByIndex = RGB(34, 139, 34)    ' Vert foret
+        Case 10: GetColorByIndex = RGB(139, 69, 19)   ' Marron
+        Case 11: GetColorByIndex = RGB(128, 128, 128) ' Gris
+        Case 12: GetColorByIndex = RGB(64, 224, 208)  ' Turquoise
+        Case 13: GetColorByIndex = RGB(255, 127, 80)  ' Corail
+        Case 14: GetColorByIndex = RGB(142, 69, 133)  ' Prune
+        Case Else: GetColorByIndex = RGB(128, 128, 128)
+    End Select
+End Function
+
+' V23.5 : index de palette le plus proche d'une couleur exacte (config.ini),
+' pour que la ComboBox affiche quelque chose de coherent. La couleur EXACTE
+' reste dans cfg("ColorRGB") tant que l'utilisateur ne change pas la combo.
+Private Function NearestPaletteIndex(colorVal As Long) As Long
+    Dim r As Long, g As Long, b As Long
+    r = colorVal Mod 256
+    g = (colorVal \ 256) Mod 256
+    b = (colorVal \ 65536) Mod 256
+    
+    Dim best As Long, bestDist As Double
+    best = 0
+    bestDist = 1E+15
+    
+    Dim i As Long, c As Long, dist As Double
+    Dim cr As Long, cg As Long, cb As Long
+    For i = 0 To 14
+        c = GetColorByIndex(i)
+        cr = c Mod 256
+        cg = (c \ 256) Mod 256
+        cb = (c \ 65536) Mod 256
+        dist = CDbl(r - cr) * (r - cr) + CDbl(g - cg) * (g - cg) + CDbl(b - cb) * (b - cb)
+        If dist < bestDist Then
+            bestDist = dist
+            best = i
+        End If
+    Next i
+    
+    NearestPaletteIndex = best
+End Function
+
+' ============================================================================
+' EVENEMENTS LISTE DES BOITES
+' ============================================================================
+Private Sub lstBoites_Change()
+    Dim selectedCount As Long
+    Dim lastSelectedIndex As Long
+    Dim storeName As String
+    Dim cfg As Object
+    Dim i As Long
+    
+    ' Compter les selections et trouver le dernier index selectionne
+    selectedCount = 0
+    lastSelectedIndex = -1
+    
+    For i = 0 To lstBoites.ListCount - 1
+        If lstBoites.Selected(i) Then
+            selectedCount = selectedCount + 1
+            lastSelectedIndex = i
+        End If
+    Next i
+    
+    ' Aucune selection : desactiver le panneau config
+    If selectedCount = 0 Then
+        fraConfigBoite.Enabled = False
+        fraConfigBoite.Caption = "Selected mailbox configuration"
+        Call ClearConfigFields
+        m_LastSelectedStore = ""
+        Exit Sub
+    End If
+    
+    ' Si l'element actuellement clique est selectionne, l'utiliser
+    If lstBoites.ListIndex >= 0 And lstBoites.Selected(lstBoites.ListIndex) Then
+        lastSelectedIndex = lstBoites.ListIndex
+    End If
+    
+    storeName = lstBoites.List(lastSelectedIndex)
+    
+    ' Sauvegarder la config precedente si on change de boite
+    If storeName <> m_LastSelectedStore Then
+        If Len(m_LastSelectedStore) > 0 And m_MailboxConfigs.Exists(m_LastSelectedStore) Then
+            Call SaveCurrentConfig(m_LastSelectedStore)
+        End If
+    Else
+        ' Meme boite, pas besoin de recharger
+        Exit Sub
+    End If
+    
+    m_LastSelectedStore = storeName
+    
+    If Not m_MailboxConfigs.Exists(storeName) Then Exit Sub
+    
+    ' Activer le panneau et mettre a jour le titre
+    fraConfigBoite.Enabled = True
+    If Len(storeName) > 30 Then
+        fraConfigBoite.Caption = "Config: " & Left(storeName, 27) & "..."
+    Else
+        fraConfigBoite.Caption = "Config: " & storeName
+    End If
+    
+    ' Charger la config de la boite selectionnee
+    Set cfg = m_MailboxConfigs(storeName)
+    
+    txtEmailUser.Text = cfg("EmailUser")
+    txtDomaine.Text = cfg("Domain")
+    txtMotCle.Text = cfg("Keyword")
+    
+    If cfg("AddressMode") Then
+        optModeAdresse.Value = True
+    Else
+        optModeMotCle.Value = True
+    End If
+    
+    cboCouleur.ListIndex = cfg("ColorIndex")
+    lblCouleurApercu.BackColor = cfg("ColorRGB")
+    lblResultatTest.Caption = ""
+    
+    ' V23.9 : DateMin en mode gabarit. Champ toujours editable.
+    ' Une date valide => seuil actif ; le gabarit JJ/MM/AAAA (ou toute
+    ' valeur non-date) => pas de seuil.
+    On Error Resume Next
+    Dim hasDate As Boolean: hasDate = False
+    Dim dmVal As Date
+    If cfg.Exists("DateMinEnabled") And cfg.Exists("DateMin") Then
+        If cfg("DateMinEnabled") Then
+            If IsDate(cfg("DateMin")) Then
+                hasDate = True
+                dmVal = cfg("DateMin")
+            End If
+        End If
+    End If
+    Me.Controls("txtDateMin").Enabled = True
+    Me.Controls("txtDateMin").BackColor = &H80000005  ' Blanc
+    If hasDate Then
+        Me.Controls("chkDateMin").Value = True
+        Me.Controls("txtDateMin").Text = Format(dmVal, DateFmtPattern())
+    Else
+        Me.Controls("chkDateMin").Value = False
+        Me.Controls("txtDateMin").Text = DateMinPlaceholder()
+    End If
+    On Error GoTo 0
+End Sub
+
+Private Sub ClearConfigFields()
+    txtEmailUser.Text = ""
+    txtDomaine.Text = ""
+    txtMotCle.Text = ""
+    optModeMotCle.Value = True
+    cboCouleur.ListIndex = 0
+    lblCouleurApercu.BackColor = GetColorByIndex(0)
+    lblResultatTest.Caption = ""
+End Sub
+
+Private Sub SaveCurrentConfig(storeName As String)
+    If Not m_MailboxConfigs.Exists(storeName) Then Exit Sub
+    
+    Dim cfg As Object
+    Set cfg = m_MailboxConfigs(storeName)
+    
+    cfg("EmailUser") = txtEmailUser.Text
+    cfg("Domain") = txtDomaine.Text
+    cfg("Keyword") = txtMotCle.Text
+    cfg("AddressMode") = optModeAdresse.Value
+    
+    ' V23.5 : la couleur exacte issue de config.ini n'est remplacee par la
+    ' couleur de palette QUE si l'utilisateur a change la selection.
+    If CLng(cfg("ColorIndex")) <> cboCouleur.ListIndex Then
+        cfg("ColorIndex") = cboCouleur.ListIndex
+        cfg("ColorRGB") = GetColorByIndex(cboCouleur.ListIndex)
+    End If
+    
+    ' V23.9 : seuil pilote par le CONTENU du champ (date valide ou non),
+    ' pas par la case. Gabarit JJ/MM/AAAA => pas de seuil.
+    On Error Resume Next
+    Dim dmTxt As String
+    dmTxt = Me.Controls("txtDateMin").Text
+    If IsDate(dmTxt) Then
+        cfg("DateMinEnabled") = True
+        cfg("DateMin") = CDate(dmTxt)
+    Else
+        cfg("DateMinEnabled") = False
+    End If
+    On Error GoTo 0
+End Sub
+
+' ============================================================================
+' EVENEMENTS CONFIGURATION BOITE
+' ============================================================================
+Private Sub txtEmailUser_Change()
+    ' Auto-remplir domaine et mot-cle
+    Dim email As String
+    email = txtEmailUser.Text
+    
+    If InStr(email, "@") > 0 Then
+        txtDomaine.Text = Mid(email, InStr(email, "@") + 1)
+        Dim localPart As String
+        localPart = Left(email, InStr(email, "@") - 1)
+        If InStr(localPart, ".") > 0 Then
+            txtMotCle.Text = Left(localPart, InStr(localPart, ".") - 1)
+        Else
+            txtMotCle.Text = localPart
+        End If
+    End If
+End Sub
+
+Private Sub cboCouleur_Change()
+    lblCouleurApercu.BackColor = GetColorByIndex(cboCouleur.ListIndex)
+End Sub
+
+Private Sub btnAppliquerConfig_Click()
+    If Len(m_LastSelectedStore) > 0 Then
+        Call SaveCurrentConfig(m_LastSelectedStore)
+        lblResultatTest.Caption = "Configuration applied."
+        lblResultatTest.ForeColor = RGB(0, 128, 0)
+    End If
+End Sub
+
+Private Sub btnTesterResolution_Click()
+    If Len(m_LastSelectedStore) = 0 Then Exit Sub
+    
+    lblResultatTest.Caption = "Testing..."
+    lblResultatTest.ForeColor = RGB(0, 0, 0)
+    DoEvents
+    
+    Dim olNS As Outlook.NameSpace
+    Dim store As Outlook.store
+    Dim rootFolder As Outlook.folder
+    Dim testFolder As Outlook.folder
+    Dim item As Object
+    Dim testCount As Long, resolvedCount As Long
+    
+    Set olNS = Application.GetNamespace("MAPI")
+    
+    On Error Resume Next
+    For Each store In olNS.Stores
+        If store.DisplayName = m_LastSelectedStore Then
+            Set rootFolder = store.GetRootFolder
+            Set testFolder = GetInboxOrFirst(rootFolder)
+            If Not testFolder Is Nothing Then
+                testCount = 0
+                resolvedCount = 0
+                For Each item In testFolder.Items
+                    If TypeName(item) = "MailItem" Then
+                        Dim mail As Outlook.MailItem
+                        Set mail = item
+                        If Not mail.Sender Is Nothing Then
+                            testCount = testCount + 1
+                            Dim resolved As String
+                            resolved = TryResolveAddress(mail.Sender)
+                            If InStr(resolved, "@") > 0 Then resolvedCount = resolvedCount + 1
+                        End If
+                        If testCount >= 20 Then Exit For
+                    End If
+                Next item
+            End If
+            Exit For
+        End If
+    Next store
+    On Error GoTo 0
+    
+    If testCount > 0 Then
+        Dim pct As Long
+        pct = (resolvedCount * 100) \ testCount
+        lblResultatTest.Caption = "Resolution: " & resolvedCount & "/" & testCount & " (" & pct & "%)" & vbCrLf & _
+                                  IIf(pct >= 80, "Address mode recommended", "Keyword mode recommended")
+        If pct >= 80 Then
+            lblResultatTest.ForeColor = RGB(0, 128, 0)
+        Else
+            lblResultatTest.ForeColor = RGB(255, 128, 0)
+        End If
+    Else
+        lblResultatTest.Caption = "No email found for the test"
+        lblResultatTest.ForeColor = RGB(255, 0, 0)
+    End If
+End Sub
+
+Private Function GetInboxOrFirst(rootFolder As Outlook.folder) As Outlook.folder
+    Dim subFolder As Outlook.folder
+    On Error Resume Next
+    For Each subFolder In rootFolder.Folders
+        If LCase(subFolder.Name) Like "*inbox*" Or LCase(subFolder.Name) Like "*reception*" Or _
+           LCase(subFolder.Name) Like "*boite de reception*" Then
+            Set GetInboxOrFirst = subFolder
+            Exit Function
+        End If
+    Next subFolder
+    If rootFolder.Folders.count > 0 Then
+        Set GetInboxOrFirst = rootFolder.Folders(1)
+    End If
+    On Error GoTo 0
+End Function
+
+Private Function TryResolveAddress(Sender As Object) As String
+    On Error Resume Next
+    TryResolveAddress = ""
+    
+    If Sender.AddressEntry.Type = "SMTP" Then
+        TryResolveAddress = Sender.AddressEntry.Address
+        Exit Function
+    End If
+    
+    If Sender.AddressEntry.Type = "EX" Then
+        Dim exUser As Object
+        Set exUser = Sender.AddressEntry.GetExchangeUser
+        If Not exUser Is Nothing Then
+            If Len(exUser.PrimarySmtpAddress) > 0 Then
+                TryResolveAddress = exUser.PrimarySmtpAddress
+                Exit Function
+            End If
+        End If
+    End If
+    
+    TryResolveAddress = Sender.AddressEntry.Address
+    On Error GoTo 0
+End Function
+
+' ============================================================================
+' BOUTONS SELECTION
+' ============================================================================
+Private Sub btnToutSel_Click()
+    Dim i As Long
+    For i = 0 To lstBoites.ListCount - 1
+        lstBoites.Selected(i) = True
+    Next i
+End Sub
+
+Private Sub btnToutDesel_Click()
+    Dim i As Long
+    For i = 0 To lstBoites.ListCount - 1
+        lstBoites.Selected(i) = False
+    Next i
+End Sub
+
+' ============================================================================
+' EVENEMENTS PERIODE
+' ============================================================================
+Private Sub optTout_Click()
+    cboDepuis.Enabled = False
+    txtDateDebut.Enabled = False
+    txtDateFin.Enabled = False
+End Sub
+
+Private Sub optDepuis_Click()
+    cboDepuis.Enabled = True
+    txtDateDebut.Enabled = False
+    txtDateFin.Enabled = False
+End Sub
+
+Private Sub optPerso_Click()
+    cboDepuis.Enabled = False
+    txtDateDebut.Enabled = True
+    txtDateFin.Enabled = True
+End Sub
+
+' ============================================================================
+' BOUTONS PRINCIPAUX
+' ============================================================================
+Private Sub btnLancer_Click()
+    Debug.Print "[frmConfig] btnLancer_Click debut..."
+    
+    ' Verifier qu'au moins une boite est selectionnee
+    Dim i As Long, hasSelection As Boolean
+    hasSelection = False
+    For i = 0 To lstBoites.ListCount - 1
+        If lstBoites.Selected(i) Then hasSelection = True: Exit For
+    Next i
+    
+    Debug.Print "[frmConfig] hasSelection = " & hasSelection
+    
+    If Not hasSelection Then
+        MsgBox T("S~electionnez au moins une bo~ite aux lettres.", _
+                 "Please select at least one mailbox."), _
+               vbExclamation + vbMsgBoxSetForeground, _
+               T("Attention", "Warning")
+        Exit Sub
+    End If
+    
+    ' Sauvegarder la derniere config
+    If Len(m_LastSelectedStore) > 0 Then
+        Debug.Print "[frmConfig] Sauvegarde config: " & m_LastSelectedStore
+        Call SaveCurrentConfig(m_LastSelectedStore)
+    End If
+    
+    Debug.Print "[frmConfig] m_Cancelled = False"
+    m_Cancelled = False
+    
+    Debug.Print "[frmConfig] Appel Hide..."
+    On Error Resume Next
+    Me.Hide
+    Debug.Print "[frmConfig] Hide termine, err=" & Err.Number
+    On Error GoTo 0
+End Sub
+
+Private Sub btnAnnuler_Click()
+    m_Cancelled = True
+    Me.Hide
+End Sub
+
+Private Sub UserForm_QueryClose(Cancel As Integer, CloseMode As Integer)
+    If CloseMode = 0 Then ' Clic sur X
+        Cancel = True  ' Empecher la fermeture automatique qui detruit l'objet
+        m_Cancelled = True
+        Me.Hide  ' Cacher le formulaire au lieu de le detruire
+    End If
+End Sub
+
+' ============================================================================
+' PROPRIETES PUBLIQUES
+' ============================================================================
+Public Property Get Cancelled() As Boolean
+    Cancelled = m_Cancelled
+End Property
+
+Public Property Get SelectedStores() As Collection
+    Dim col As New Collection
+    Dim i As Long
+    For i = 0 To lstBoites.ListCount - 1
+        If lstBoites.Selected(i) Then
+            col.Add lstBoites.List(i)
+        End If
+    Next i
+    Set SelectedStores = col
+End Property
+
+Public Property Get IsTestMode() As Boolean
+    IsTestMode = optTest.Value
+End Property
+
+Public Property Get UseExchangeResolution() As Boolean
+    UseExchangeResolution = chkResolutionExchange.Value
+End Property
+
+Public Property Get AnalyzeLength() As Boolean
+    AnalyzeLength = chkAnalyseLongueur.Value
+End Property
+
+' V22 : Mode debug (optionnel - si chkDebugMode n'existe pas, retourne False)
+Public Property Get DebugMode() As Boolean
+    On Error Resume Next
+    DebugMode = False
+    DebugMode = Me.Controls("chkDebugMode").Value
+    On Error GoTo 0
+End Property
+
+Public Property Get PeriodStart() As Date
+    If optTout.Value Then
+        PeriodStart = DateSerial(2000, 1, 1)
+    ElseIf optDepuis.Value Then
+        PeriodStart = DateSerial(CLng(cboDepuis.Value), 1, 1)
+    Else
+        On Error Resume Next
+        PeriodStart = CDate(txtDateDebut.Text)
+        If Err.Number <> 0 Then PeriodStart = DateSerial(2000, 1, 1)
+        On Error GoTo 0
+    End If
+End Property
+
+Public Property Get PeriodEnd() As Date
+    If optTout.Value Or optDepuis.Value Then
+        PeriodEnd = Now
+    Else
+        On Error Resume Next
+        PeriodEnd = CDate(txtDateFin.Text)
+        If Err.Number <> 0 Then PeriodEnd = Now
+        On Error GoTo 0
+    End If
+End Property
+
+Public Function GetStoreColor(storeName As String) As Long
+    If m_MailboxConfigs.Exists(storeName) Then
+        GetStoreColor = m_MailboxConfigs(storeName)("ColorRGB")
+    Else
+        GetStoreColor = RGB(128, 128, 128)
+    End If
+End Function
+
+Public Function GetStoreDomain(storeName As String) As String
+    If m_MailboxConfigs.Exists(storeName) Then
+        GetStoreDomain = m_MailboxConfigs(storeName)("Domain")
+    Else
+        GetStoreDomain = ""
+    End If
+End Function
+
+Public Function GetStoreEmailUser(storeName As String) As String
+    If m_MailboxConfigs.Exists(storeName) Then
+        GetStoreEmailUser = m_MailboxConfigs(storeName)("EmailUser")
+    Else
+        GetStoreEmailUser = ""
+    End If
+End Function
+
+Public Function GetStoreKeyword(storeName As String) As String
+    If m_MailboxConfigs.Exists(storeName) Then
+        GetStoreKeyword = m_MailboxConfigs(storeName)("Keyword")
+    Else
+        GetStoreKeyword = ""
+    End If
+End Function
+
+Public Function GetStoreAddressMode(storeName As String) As Boolean
+    If m_MailboxConfigs.Exists(storeName) Then
+        GetStoreAddressMode = m_MailboxConfigs(storeName)("AddressMode")
+    Else
+        GetStoreAddressMode = False
+    End If
+End Function
+
+Public Function GetStoreDateMin(storeName As String) As Date
+    ' Retourne la date minimum pour cette boite (ou 1/1/1900 si pas active)
+    On Error Resume Next
+    If m_MailboxConfigs.Exists(storeName) Then
+        If m_MailboxConfigs(storeName)("DateMinEnabled") Then
+            GetStoreDateMin = m_MailboxConfigs(storeName)("DateMin")
+            If GetStoreDateMin < DateSerial(1990, 1, 1) Then
+                GetStoreDateMin = DateSerial(1900, 1, 1)
+            End If
+        Else
+            GetStoreDateMin = DateSerial(1900, 1, 1)
+        End If
+    Else
+        GetStoreDateMin = DateSerial(1900, 1, 1)
+    End If
+    On Error GoTo 0
+End Function
+
+' Evenement pour le checkbox DateMin
+Private Sub chkDateMin_Click()
+    On Error Resume Next
+    Me.Controls("txtDateMin").Enabled = True
+    Me.Controls("txtDateMin").BackColor = &H80000005  ' Blanc
+    If Me.Controls("chkDateMin").Value Then
+        ' Cocher : preparer la saisie si le champ est encore le gabarit
+        If Not IsDate(Me.Controls("txtDateMin").Text) Then
+            Me.Controls("txtDateMin").Text = ""
+            Me.Controls("txtDateMin").SetFocus
+        End If
+    Else
+        ' Decocher : remettre le gabarit => pas de seuil
+        Me.Controls("txtDateMin").Text = DateMinPlaceholder()
+    End If
+    On Error GoTo 0
+End Sub
+
+' ============================================================================
+' V23.9 : gabarit et format d'affichage de la date DateMin (selon Language)
+' ============================================================================
+Private Function DateMinPlaceholder() As String
+    On Error Resume Next
+    DateMinPlaceholder = T("JJ/MM/AAAA", "MM/DD/YYYY")
+    If Len(DateMinPlaceholder) = 0 Then DateMinPlaceholder = "JJ/MM/AAAA"
+End Function
+
+Private Function DateFmtPattern() As String
+    On Error Resume Next
+    DateFmtPattern = T("DD/MM/YYYY", "MM/DD/YYYY")
+    If Len(DateFmtPattern) = 0 Then DateFmtPattern = "DD/MM/YYYY"
+End Function

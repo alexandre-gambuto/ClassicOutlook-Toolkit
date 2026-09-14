@@ -1,0 +1,143 @@
+Option Explicit
+
+'=============================================================================
+' clsApptWatcher  (v2.2 - 2026-09-01)
+' Purpose (EN): watches one AppointmentItem open in an inspector (WithEvents) to
+'   clean the Teams block at Save time (Write event), while the window is still
+'   open and WordEditor is available. Lifetime managed by modMeetingToAppointment.
+'
+' Surveille UN AppointmentItem ouvert dans un inspecteur, via WithEvents, pour
+' declencher le nettoyage du bloc Teams AU MOMENT DU SAVE (evenement Write),
+' c'est-a-dire pendant que la fenetre est encore ouverte et que WordEditor
+' est disponible.
+'
+' Contexte / pourquoi cette classe :
+'   L'auto-nettoyage depuis CalendarItems_ItemChange echoue sur le CORPS
+'   parce qu'au moment de l'ItemChange (apres conversion reunion->RDV), la
+'   fenetre est deja fermee -> pas de WordEditor -> abstention.
+'   L'evenement Write de l'item, lui, se declenche AVANT la fermeture, fenetre
+'   encore ouverte. C'est le bon moment pour nettoyer le corps.
+'
+' INSTRUMENTATION : on logge la disponibilite du WordEditor au Write, pour
+'   verifier sur le poste reel que l'approche fonctionne (cf. echanges).
+'
+' Cycle de vie : instanciee par modMeetingToAppointment.OnNewInspector sur un
+'   inspecteur de reunion, stockee dans une collection cote module (sinon le
+'   GC VBA detruit l'instance et le WithEvents meurt). Liberee quand
+'   l'inspecteur se ferme (m_Inspector_Close).
+'
+' Reentrance : garde m_DejaTraite pour ne nettoyer qu'une fois par fenetre.
+'
+' v2 (2026-06-28) : GARDE-FOU. On ne nettoie le bloc Teams QUE si l'item
+'   n'est pas une vraie reunion destinee a des invites tiers
+'   (modMeetingToAppointment.IsRealThirdPartyMeeting). Avant, le bloc etait
+'   retire des qu'il y avait un lien teams.microsoft.com, y compris sur une
+'   invitation envoyee a l'externe -> les invites recevaient un message sans
+'   le lien de connexion.
+' v2.1 (2026-09-01) : toast apres retrait du bloc Teams au Write ;
+'   instrumentation MOD_VERSION / ModVersion.
+' v2.2 (2026-09-01) : le pre-test "teams.microsoft.com dans le TEXTE visible"
+'   est retire : les blocs Teams 2026 portent l'URL en hyperlien, pas en
+'   texte -> le watcher sortait sans rien faire. La detection (texte OU
+'   hyperlien) est faite par modMeetingToAppointment.CleanBodyViaWord,
+'   passe au moteur v6. Toast via NotifyPersonalSlot (lien retire).
+'=============================================================================
+
+Private Const MOD_NAME As String = "ApptWatch"
+Private Const MOD_VERSION As String = "v2.2 - 2026-09-01"
+
+Private WithEvents m_Item As Outlook.AppointmentItem
+Private WithEvents m_Inspector As Outlook.Inspector
+Private m_AlreadyDone As Boolean
+Private m_Key As String           ' cle d'enregistrement dans la collection du module
+
+'-----------------------------------------------------------------------------
+' ModVersion - version reellement chargee dans le VBE.
+'-----------------------------------------------------------------------------
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+'-----------------------------------------------------------------------------
+' Initialisation depuis le module : on lui passe l'inspecteur et la cle.
+'-----------------------------------------------------------------------------
+Public Sub Init(ByVal insp As Outlook.Inspector, ByVal key As String)
+    On Error Resume Next
+    m_Key = key
+    m_AlreadyDone = False
+    Set m_Inspector = insp
+    If TypeOf insp.CurrentItem Is Outlook.AppointmentItem Then
+        Set m_Item = insp.CurrentItem
+        modDebugLog.DTrace MOD_NAME, "Watcher arme sur '" & m_Item.subject & "'"
+    End If
+    On Error GoTo 0
+End Sub
+
+'-----------------------------------------------------------------------------
+' Write : declenche au Save de l'item, fenetre encore ouverte.
+'-----------------------------------------------------------------------------
+Private Sub m_Item_Write(Cancel As Boolean)
+    On Error Resume Next
+
+    If m_AlreadyDone Then Exit Sub
+    If m_Item Is Nothing Then Exit Sub
+
+    ' v2 - GARDE-FOU : ne JAMAIS nettoyer le corps d'une vraie reunion a
+    ' envoyer a des invites tiers (sinon le lien Teams disparait du message
+    ' qu'ils recoivent). On laisse alors l'item totalement intact.
+    If modMeetingToAppointment.IsRealThirdPartyMeeting(m_Item) Then
+        modDebugLog.DInfo MOD_NAME, "Vraie reunion (invites tiers) : corps PRESERVE, lien Teams conserve sur '" & m_Item.subject & "'"
+        Exit Sub
+    End If
+
+    ' On ne traite que les ex-reunions devenues rendez-vous (olNonMeeting)
+    ' OU encore olMeeting mais sans invite tiers : dans les deux cas, si le
+    ' corps contient un bloc Teams, il est devenu inutile.
+    ' (La conversion MeetingStatus est geree par modMeetingToAppointment cote
+    '  ItemChange ; ici on s'occupe UNIQUEMENT du corps.)
+
+    ' Test diagnostic : WordEditor dispo au Write ?
+    Dim weAvail As Boolean
+    weAvail = False
+    Dim doc As Object
+    Set doc = m_Inspector.WordEditor
+    If Not doc Is Nothing Then weAvail = True
+
+    modDebugLog.DInfo MOD_NAME, "Write sur '" & m_Item.subject & "' : WordEditor dispo = " & weAvail
+
+    If Not weAvail Then Exit Sub
+
+    ' Nettoyage via la fonction publique de modMeetingToAppointment (moteur
+    ' v6 : detecte le lien en texte OU en hyperlien, retire tous les blocs
+    ' bornes ; sort sans rien faire s'il n'y a pas de lien).
+    Dim okClean As Boolean
+    okClean = modMeetingToAppointment.CleanBodyViaWord(m_Inspector)
+
+    If okClean Then
+        m_AlreadyDone = True
+        modDebugLog.DInfo MOD_NAME, "Bloc Teams retire au Write sur '" & m_Item.subject & "'"
+        ' v2.2 : toast (un seul par RDV, anti-doublon cote module).
+        modMeetingToAppointment.NotifyPersonalSlot m_Item, True, False
+        ' On ne fait PAS de m_Item.Save ici : on est DANS le Write, la modif
+        ' sera persistee par le Save en cours. Un Save explicite ici
+        ' relancerait Write (reentrance).
+    Else
+        modDebugLog.DInfo MOD_NAME, "Nettoyage corps non effectue (pas de lien teams, ou bornes non trouvees)"
+    End If
+
+    On Error GoTo 0
+End Sub
+
+'-----------------------------------------------------------------------------
+' Close : la fenetre se ferme -> on demande au module de liberer ce watcher.
+'-----------------------------------------------------------------------------
+Private Sub m_Inspector_Close()
+    On Error Resume Next
+    modMeetingToAppointment.ReleaseWatcher m_Key
+    On Error GoTo 0
+End Sub
+
+Private Sub Class_Terminate()
+    Set m_Item = Nothing
+    Set m_Inspector = Nothing
+End Sub

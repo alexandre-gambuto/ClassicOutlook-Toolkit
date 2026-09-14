@@ -1,0 +1,2311 @@
+Option Explicit
+
+'=============================================================================
+' modContactFromMail v1.5  (2026-09-01)
+' Purpose (EN): create a contact card from the signature of the selected or
+'   open e-mail (or from the highlighted text of an open e-mail): sender
+'   SMTP address, name, job title, company, phones (E.164), postal address,
+'   web site are pre-filled, then the NATIVE Outlook contact form is opened
+'   for review - you save or discard. Duplicate check by e-mail / name in the
+'   target account first. No UserForm.
+'
+' Cree une fiche contact a partir de la signature du mail selectionne (volet
+' de lecture) ou ouvert - ou de la ZONE SURLIGNEE d'un mail ouvert. Une seule
+' boite de saisie (compte \ dossier cible), puis la fiche PREREMPLIE s'ouvre
+' dans le formulaire natif d'Outlook : tu corriges ce qui est mal lu, tu
+' enregistres - ou tu fermes sans enregistrer. Rien n'est ecrit avant ton
+' Enregistrer.
+'
+' SOURCE DES DONNEES
+'   - Adresse et nom : voir "PERSONNE VISEE" (v1.5) ci-dessous - zone
+'     surlignee, expediteur externe, auteur du message cite, destinataire,
+'     puis correction par la signature. Formes "DUPONT Jean", "Jean Dupont",
+'     "Dupont, Jean" et "prenom.nom@" reconnues.
+'   - Signature : zone surlignee si un mail est ouvert avec une selection ;
+'     sinon detection automatique = lignes qui suivent la formule de
+'     politesse (Cordialement, Bien a vous, Regards...) et precedent tout
+'     historique cite (De :, From:, -----Message d'origine-----, "a ecrit :",
+'     separateur Outlook). A defaut, les 10 dernieres lignes.
+'   - Dans la signature : telephones (normalises E.164, mobile / fixe
+'     distingues), site web, adresse postale (ligne code postal + ville,
+'     precedee de la ligne "rue"), fonction et societe (les deux premieres
+'     lignes de texte libre apres le nom ; "Fonction | Societe" ou "Fonction
+'     - Societe" reconnus). La signature brute est copiee dans les Notes avec
+'     la date du mail : tracabilite, et matiere pour un futur "completer".
+'
+' CHOIX DU DOSSIER : liste groupee par compte, sans repeter l'adresse ; le
+' dossier de contacts par defaut apparait comme [Racine] / [Root] et le
+' prefixe "Contacts\" est retire des sous-dossiers. On valide par le NUMERO
+' ou en TAPANT UN MORCEAU du nom ("artisans", "ami") : recherche sans
+' accents ni casse, d'abord egalite exacte, puis "commence par", puis
+' "contient" ; plusieurs correspondances ou aucune -> la boite se reaffiche
+' avec la liste des candidats. "compte\dossier" permet de lever une
+' ambiguite entre deux comptes ("live\amis").
+'
+' ANTI-DOUBLON : avant creation, recherche dans les dossiers de contacts du
+' compte cible par adresse e-mail puis par nom. Si trouve : Oui = ouvrir la
+' fiche existante, Non = creer quand meme, Annuler.
+'
+' NOUVEAU v1.4 :
+'   - COMPLETER UNE FICHE EXISTANTE : si l'anti-doublon trouve la personne,
+'     les informations NOUVELLES de la signature (champs vides de la fiche)
+'     sont listees et "Completer" les pose dans la fiche, qui s'ouvre pour
+'     validation - rien n'est ecrit avant ton Enregistrer. La signature
+'     datee est ajoutee EN TETE des notes, l'existant est conserve.
+'   - EXTRACTION DURCIE : libelles de ligne lus (Mob/Port/GSM -> mobile,
+'     Tel/Fixe/Standard/Office -> bureau, Fax ecarte) ; "+33(6) 03..."
+'     reconnu ; adresse "72000, Le Mans" (virgule) et "F-75008" (prefixe
+'     pays) reconnues ; rue sur 2 lignes (complement Bureau/Bat/Zone...) ;
+'     pays detecte (", France" ou ligne seule) ; lignes reseaux sociaux /
+'     avertissements / marketing ignorees ; "Fonction FR | Titre EN" ne
+'     pollue plus la societe ; lignes "Direction / Service / Pole..." ->
+'     champ Service (Department) ; societe et site web deduits du domaine
+'     de l'adresse e-mail en dernier recours (fournisseurs grand public
+'     exclus).
+'   - CONVENTION TELEPHONE : les numeros poses suivent la convention du
+'     toolkit via modContactNormalize.PhoneFormatCanonical (E.164 +
+'     PhoneOutputSpaced) - plus de divergence avec l'harmonisation.
+'   - ContactFromMailProbeFolders : diagnostic des dossiers de contacts
+'     (tous comptes, nombre de fiches, motifs d'exclusion).
+'
+' NOUVEAU v1.5 :
+'   - PERSONNE VISEE, ordre de resolution :
+'       1. zone surlignee (mail ouvert + selection) = seule source : 1er
+'          e-mail de la zone (jamais le tien) et 1re ligne "Prenom NOM" ;
+'          l'en-tete du mail ne sert que si la zone ne donne rien ;
+'       2. expediteur externe : SMTP reel + nom d'affichage (comme avant) ;
+'       3. expediteur interne (collegue) ou toi-meme : auteur du message
+'          CITE (ligne "De : Nom <e-mail>", "From:", "... a ecrit :",
+'          "... wrote:" du premier bloc d'historique) s'il est externe ;
+'          sinon 1er destinataire qui n'est pas toi (externe prefere) quand
+'          tu es l'expediteur ; sinon le collegue lui-meme (sa signature) ;
+'       4. correction par la signature : si l'adresse retenue est vide ou
+'          interne, l'e-mail lu dans la signature la remplace et le nom
+'          vient de la ligne "Prenom NOM" de la signature (fini "IC" en
+'          nom et "Dylan DIARD" en fonction). Un nom d'affichage faible
+'          (initiales, un seul mot, adresse) est remplace de meme.
+'   - SIGNATURE D'UN MAIL TRANSFERE / REPONDU par un interne : lue dans le
+'     message cite (bloc qui suit l'en-tete De / Envoye / A / Objet, avant
+'     l'historique plus ancien ; prefixes ">" retires), plus dans le haut
+'     du mail qui ne contient que la note du collegue. Les notes de la
+'     fiche portent la mention "(message cite)".
+'   - TOI EXCLU : tes adresses (comptes du profil + utilisateur courant) et
+'     tes noms d'affichage (ordre des mots indifferent) ne sont jamais
+'     retenus ; ta propre signature (mail envoye par toi) est ignoree.
+'   - Telephone "06.76. 52.67.33" (double separateur) reconnu ; tiret
+'     typographique en fin de rue retire ; lignes "ORIAS : 25006085",
+'     "SIRET ...", "TVA ..." ecartees de la fonction / societe ; mots de
+'     fonction ajoutes (courtier, conseiller, agent, doctorant...) ;
+'     "Nom | Fonction" et "Nom (Societe)" : le reste de la ligne nom
+'     alimente fonction / societe ; civilites (Dr, Pr, Me, M., Mme)
+'     retirees du nom.
+'   - ContactFromMailDiagnose (QAT) : resultat complet de l'analyse du
+'     mail selectionne ou ouvert (personne, source, signature, champs
+'     lus), sans creer de fiche - a utiliser avant de signaler un cas.
+'   - Reintegre les comportements livres le 19/08 (zone surlignee = seule
+'     source, toi exclu) perdus dans la livraison v1.4 du 20/08.
+'
+' SUBS PUBLIQUES (epinglables au QAT / ruban) :
+'   ContactCreateFromMail        creation / completion depuis un e-mail
+'   ContactFromMailDiagnose      diagnostic de l'analyse (aucune ecriture)
+'   ContactFromMailProbeFolders  diagnostic des dossiers de contacts
+'
+' Dependances : modConfig (Cfg, T, A, MacroVBADir), modDebugLog,
+'   modMsgBoxCustom (Confirm3), modContactNormalize (PhoneFormatCanonical
+'   - installer modContactNormalize v1.5+ AVANT ce module). VBScript.RegExp
+'   en late binding pour l'extraction.
+' Cles config.ini : ContactFromMailDefaultFolder (ex. "Contacts\Reseau",
+'   ou "compte\Reseau"), ContactFromMailCategory, PhoneDefaultCountryCode
+'   (partagee), InternalDomains (existante), ContactSkipFolders (partagee).
+'=============================================================================
+
+Private Const MOD_NAME As String = "ContMail"
+Private Const MOD_VERSION As String = "v1.5 - 2026-09-01"
+
+Private Const PROPTAG_HIDDEN As String = "http://schemas.microsoft.com/mapi/proptag/0x10F4000B"
+Private Const PROPTAG_SENDER_SMTP As String = "http://schemas.microsoft.com/mapi/proptag/0x5D02001F"
+Private Const PROPTAG_RECIP_SMTP As String = "http://schemas.microsoft.com/mapi/proptag/0x39FE001F"
+Private Const DEFAULT_SKIP As String = "{*|Recipient Cache|*sugg*|GAL Contacts|Organizational Contacts|Companies|PeopleCentricConversation Buddies|*Lync*|*Skype*|ExternalContacts"
+' Formules de politesse (minuscules, sans accent) qui precedent une signature.
+Private Const CLOSINGS As String = "cordialement|bien cordialement|tres cordialement|sinceres salutations|salutations|salutations distinguees|bien a vous|bien a toi|amicalement|a bientot|belle journee|bonne journee|bonne reception|merci d'avance|merci par avance|cdlt|cdt|best regards|kind regards|warm regards|regards|best|thanks|thank you|many thanks|sincerely|cheers"
+' Marqueurs d'historique cite (debut de ligne, minuscules, sans accent).
+Private Const HISTORY_MARKS As String = "de :|de:|from:|from :|envoye :|envoye:|sent:|sent :|-----message d'origine|-----original message|________________________________|le * a ecrit|on * wrote:|-*message transfere|-*forwarded message|debut du message reexpedie|begin forwarded message|>"
+' Libelles du bloc d'en-tete cite (De / Envoye / A / Cc / Objet...), sautes
+' avant de chercher la signature du message cite.
+Private Const QUOTED_HEADER_LABELS As String = "de :|de:|from:|from :|envoye :|envoye:|sent:|sent :|a :|a:|to:|to :|cc :|cc:|cci :|cci:|bcc:|bcc :|objet :|objet:|subject:|subject :|date :|date:|importance|priorite|priority|pieces jointes|attachments|repondre a|reply-to|reply to|________________________________"
+' Adresse e-mail (VBScript.RegExp, IgnoreCase).
+Private Const MAIL_PATTERN As String = "[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}"
+' Libelles de telephone (minuscules, sans accent) - fax teste en premier.
+Private Const FAX_LABELS As String = "fax|telecopie"
+Private Const MOBILE_LABELS As String = "mob|portable|port|gsm|cell"
+Private Const FIXED_LABELS As String = "tel|fixe|standard|office|bureau|direct|phone|work|ligne"
+' Mots de fonction (jetons entiers) : classe une ligne comme FONCTION.
+Private Const TITLE_HINTS1 As String = "directeur|directrice|director|dg|ceo|cto|coo|cfo|cio|president|presidente|vp|responsable|manager|charge|chargee|chef|head|ingenieur|ingenieure|engineer|consultant|consultante|associe|associee|partner|fondateur|fondatrice|founder|cofondateur|gerant|gerante|adjoint|adjointe|deputy|officer|assistant|assistante|juriste|avocat|avocate|notaire|docteur|dr|professeur|chercheur|chercheuse|researcher|analyste|analyst|account|developer|commercial|commerciale|sales|marketing|achats|buyer|expert|experte|architecte|technicien|technicienne|coordinateur|coordinatrice|referent|referente|leader|lead|owner"
+Private Const TITLE_HINTS2 As String = "courtier|broker|conseiller|conseillere|advisor|adviser|agent|attache|attachee|delegue|deleguee|gestionnaire|secretaire|secretary|stagiaire|intern|alternant|alternante|apprenti|apprentie|doctorant|doctorante|postdoc|post-doc|phd|enseignant|enseignante|maitre|lecturer|scientist|scientifique|specialist|specialiste|comptable|accountant|controleur|controller|auditeur|auditrice|auditor|formateur|formatrice|trainer|coach|designer|developpeur|developpeuse|administrateur|administratrice|administrator|recruteur|recruteuse|recruiter|redacteur|redactrice|editor|journaliste|journalist"
+Private Const TITLE_HINTS3 As String = "pharmacien|pharmacienne|medecin|physician|veterinaire|economiste|economist|biologiste|biologist|chimiste|chemist|physicien|physicienne|physicist|informaticien|informaticienne|dirigeant|dirigeante|executive|principal|tresorier|tresoriere|treasurer|maire|depute|deputee|senateur|senatrice|elu|elue|membre|member|inspecteur|inspectrice|inspector|operateur|operatrice|operator|superviseur|supervisor|planner|strategist|animateur|animatrice|mediateur|mediatrice|traducteur|traductrice|translator|interprete|interpreter"
+Private Const TITLE_HINTS As String = TITLE_HINTS1 & "|" & TITLE_HINTS2 & "|" & TITLE_HINTS3
+' Debuts de ligne "service / departement" -> champ Service (Department).
+Private Const DEPT_HINTS As String = "direction |departement|department|service |pole |division|unite |cellule |laboratoire|equipe |team "
+' Lignes reseaux sociaux / marketing / mentions legales : ignorees.
+Private Const SOCIAL_HINTS As String = "linkedin|twitter|facebook|instagram|youtube|tiktok|suivre|suivez|follow us|rejoignez|abonnez|inscrivez|newsletter|avertissement|disclaimer|confidentialite|think before printing|pensez a l'environnement|n'imprimez|imprimer ce|consider the environment"
+' Pays reconnus (fin d'adresse ou ligne seule, minuscules sans accent).
+Private Const COUNTRY_NAMES As String = "france|belgique|belgium|suisse|switzerland|luxembourg|allemagne|germany|deutschland|espagne|spain|italie|italy|italia|royaume-uni|united kingdom|uk|pays-bas|netherlands|portugal|canada|usa|united states|etats-unis|monaco|maroc|tunisie|algerie"
+' Domaines de fournisseurs grand public : jamais utilises comme societe.
+Private Const GENERIC_DOMAINS As String = "gmail|googlemail|outlook|hotmail|live|msn|yahoo|orange|wanadoo|free|sfr|laposte|icloud|me|mac|protonmail|proton|gmx|aol|numericable|bbox|neuf|club-internet|noos"
+' Mots de voie (rue...) et complements (bureau, batiment, zone...).
+Private Const STREET_HINTS As String = "rue|avenue|av.|boulevard|bd |bld|chemin|allee|impasse|place|route|quai|cours|passage|square|voie|hameau|lieu-dit|za |zi |zac|zone|parc|campus|technopole|espace|street|road|drive|lane|way "
+Private Const COMPLEMENT_HINTS As String = "bureau|bat|batiment|bt |etage|esc|escalier|porte|appt|apt|appartement|bp |cs |tsa|cedex|immeuble|tour|hall|niveau|suite|floor|office|room|zone|za |zi |zac|campus|local"
+' Mots de societe (minuscules, sans accent) pour departager fonction / societe.
+' Mots de voie (jetons entiers, sans point) : une ligne nom n'en contient pas.
+Private Const STREET_TOKENS As String = "rue|avenue|av|boulevard|bd|bld|chemin|allee|impasse|place|route|quai|cours|passage|square|voie|hameau|lieu-dit|za|zi|zac|zone|parc|campus|technopole|street|road|drive|lane|way"
+' Lignes "numero d'immatriculation" (ORIAS, SIRET, TVA...) : ni fonction ni societe.
+Private Const REG_HINTS As String = "siret|siren|rcs|tva|vat|orias|naf|ape|iban|bic|numero|num|no|ref|reference|id|agrement|licence|license|immatriculation|matricule|rpps|adeli|finess|cnil|duns|eori"
+' Civilites retirees en tete d'une ligne nom (minuscules, sans accent ni point).
+Private Const HONORIFICS As String = "m|mr|mrs|ms|mme|mlle|mme.|monsieur|madame|mademoiselle|dr|pr|prof|me|maitre|docteur|professeur|ing|dipl|sir|herr|frau|sr|sra|mtre"
+' Particules tolerees en minuscules dans un nom de personne.
+Private Const PARTICLES As String = "de|du|des|d'|la|le|les|l'|van|von|der|den|di|da|del|della|dos|das|do|el|al|ben|bin|mac|mc|y|st|ste|saint|sainte|ter|te|af|av|zu|vom|op|'t"
+' Premiers mots d'une formule d'appel : jamais une ligne nom.
+Private Const GREETINGS As String = "bonjour|bonsoir|hello|hi|hey|dear|cher|chere|chers|cheres|salut|madame|monsieur|mesdames|messieurs|coucou|good"
+' Suffixes de nom ("Jean Dupont, PhD") : ni fonction ni societe.
+Private Const NAME_SUFFIXES As String = "phd|ph d|mba|msc|bsc|eng|esq|md|jr|sr|cfa|cpa|llm|hdr|dea|dess|ing"
+Private Const COMPANY_HINTS As String = "sarl|sas|sa |eurl|snc|scop|gie|groupe|group|inc|ltd|llc|gmbh|ag |spa|srl|universite|university|institut|institute|ecole|school|laboratoire|laboratory|cnrs|inserm|inria|cea|satt|agence|cabinet|societe|company|corp|holding|technologies|technology|solutions|consulting|conseil|partners"
+
+' --- Reglages ---
+Private mDefaultFolder As String
+Private mCategory As String
+Private mCountryCode As String
+Private mInternal As String
+Private mSkipFolders As String
+
+' --- Resultat de l'extraction ---
+Private mSig As String
+Private mSmtp As String
+Private mDisplay As String
+Private mFirst As String
+Private mLast As String
+Private mTitle As String
+Private mCompany As String
+Private mMobile As String
+Private mPhone As String
+Private mPhone2 As String
+Private mWeb As String
+Private mStreet As String
+Private mPostal As String
+Private mCity As String
+Private mDept As String
+Private mCountry As String
+Private mPhoneLines As String     ' "|2|5|" : index des lignes ou un numero a ete lu
+Private mMailDate As Date
+Private mMailSubject As String
+Private mOwnAddr As String        ' "|adresse|..." : tes adresses (comptes du profil + utilisateur courant)
+Private mOwnNames As String       ' "|mots tries|..." : tes noms d'affichage (NormKey, mots tries)
+Private mHeaderSmtp As String     ' adresse issue de l'en-tete, avant correction par la signature
+Private mSigMail As String        ' 1er e-mail lu dans la signature (jamais le tien)
+Private mQuoteStart As Long       ' index de la ligne d'historique dont l'auteur est retenu (-1 = aucune)
+Private mSigSource As Long        ' 0 = haut du mail, 1 = zone surlignee, 2 = message cite
+Private mNameLine As Long         ' index de la ligne "Prenom NOM" dans la signature (-1 = aucune)
+Private mNameRest As String       ' reste de la ligne nom ("Directeur" dans "Jean Dupont | Directeur")
+
+'=============================================================================
+' ModVersion - version REELLEMENT chargee dans le VBE.
+'=============================================================================
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+'=============================================================================
+' ContactCreateFromMail  (epinglable au QAT / ruban)
+'=============================================================================
+Public Sub ContactCreateFromMail()
+    Dim errNo As Long, errDesc As String
+    On Error GoTo ErrH
+    LoadSettings
+    ResetResult
+
+    ' 1) Mail source + texte de signature (selection Word si mail ouvert)
+    Dim mail As Outlook.MailItem, selText As String
+    Set mail = SourceMail(selText)
+    If mail Is Nothing Then
+        MsgBox T("S~electionne ou ouvre d'abord un e-mail.", "Select or open an e-mail first."), vbInformation, UiTitle()
+        Exit Sub
+    End If
+    mMailDate = mail.ReceivedTime
+    If mMailDate < DateSerial(1990, 1, 1) Then mMailDate = mail.SentOn
+    mMailSubject = mail.Subject
+
+    ' 2) + 3) Personne visee et signature (cf. en-tete, "PERSONNE VISEE")
+    AnalyzeMail mail, selText
+
+    ' 4) Compte \ dossier cible
+    Dim target As Outlook.MAPIFolder
+    Set target = PickTargetFolder()
+    If target Is Nothing Then Exit Sub
+
+    ' 5) Anti-doublon : fiche existante -> completer (champs vides), ouvrir,
+    '    creer quand meme, ou annuler. Rien n'est ecrit avant Enregistrer.
+    Dim existing As Outlook.ContactItem
+    Set existing = FindExisting(target.Store)
+    If Not existing Is Nothing Then
+        Dim news As String, ans As VbMsgBoxResult
+        news = NewFieldsSummary(existing)
+        If Len(news) > 0 Then
+            ans = modMsgBoxCustom.Confirm3( _
+                T("Une fiche existe d~ej~a : ", "A card already exists: ") & SafeStr(existing.FullName) & vbCrLf & _
+                T("Dossier : ", "Folder: ") & SafeStr(existing.Parent.FolderPath) & vbCrLf & vbCrLf & _
+                T("Informations nouvelles dans la signature :", "New information in the signature:") & vbCrLf & _
+                news & vbCrLf & _
+                T("Compl~eter = poser ces valeurs dans les champs vides de la fiche, qui s'ouvre pour validation (rien n'est ~ecrit avant ton Enregistrer).", _
+                  "Complete = put these values in the empty fields of the card, which opens for review (nothing is written before you Save)."), _
+                UiTitle(), T("Compl~eter", "Complete"), T("Nouvelle fiche", "New card"), T("Annuler", "Cancel"))
+            If ans = vbCancel Then Exit Sub
+            If ans = vbYes Then
+                ApplyToExisting existing
+                existing.Display
+                modDebugLog.DInfo MOD_NAME, "Fiche existante completee (a valider) : " & SafeStr(existing.FullName) & " <" & mSmtp & ">"
+                Exit Sub
+            End If
+        Else
+            ans = modMsgBoxCustom.Confirm3( _
+                T("Une fiche existe d~ej~a : ", "A card already exists: ") & SafeStr(existing.FullName) & vbCrLf & _
+                T("Dossier : ", "Folder: ") & SafeStr(existing.Parent.FolderPath) & vbCrLf & vbCrLf & _
+                T("Aucune information nouvelle dans cette signature.", "No new information in this signature."), _
+                UiTitle(), T("Ouvrir", "Open"), T("Nouvelle fiche", "New card"), T("Annuler", "Cancel"))
+            If ans = vbCancel Then Exit Sub
+            If ans = vbYes Then
+                existing.Display
+                Exit Sub
+            End If
+        End If
+    End If
+
+    ' 6) Fiche preremplie, ouverte dans le formulaire natif (pas de Save ici)
+    Dim ct As Outlook.ContactItem
+    Set ct = target.Items.Add(olContactItem)
+    FillContact ct
+    ct.Display
+    modDebugLog.DInfo MOD_NAME, "Fiche preremplie ouverte : " & mFirst & " " & mLast & " <" & mSmtp & "> -> " & target.FolderPath
+    Exit Sub
+ErrH:
+    errNo = Err.Number
+    errDesc = Err.Description
+    On Error Resume Next
+    modDebugLog.DError MOD_NAME, "ContactCreateFromMail err " & errNo & " - " & errDesc
+    MsgBox T("Erreur : ", "Error: ") & errNo & " - " & errDesc, vbExclamation, UiTitle()
+End Sub
+
+'=============================================================================
+' Analyse commune (creation et diagnostic) : personne visee via l'en-tete,
+' puis signature (zone surlignee / message cite / haut du mail), puis
+' correction de la personne par la signature. Aucune ecriture.
+'=============================================================================
+Private Sub AnalyzeMail(ByVal mail As Outlook.MailItem, ByVal selText As String)
+    Dim lines() As String
+    lines = Split(NormalizeLines(SafeStr(mail.Body)), vbLf)
+    ResolvePerson mail, lines
+    If Len(Trim$(selText)) > 0 Then
+        mSig = NormalizeLines(selText)
+        mSigSource = 1
+    Else
+        mSig = ExtractSignature(lines, mQuoteStart)
+        mSigSource = IIf(mQuoteStart >= 0, 2, 0)
+        If IsOwnSignature(mSig) Then mSig = ""       ' ta propre signature (mail envoye par toi)
+    End If
+    ParseSignature
+    modDebugLog.DDebug MOD_NAME, "Personne : " & mFirst & " " & mLast & " <" & mSmtp & "> en-tete=<" & mHeaderSmtp & _
+        "> sigSource=" & mSigSource & " quote=" & mQuoteStart & " nameLine=" & mNameLine & " sigMail=<" & mSigMail & ">"
+End Sub
+
+'=============================================================================
+' ContactFromMailDiagnose (epinglable au QAT) : montre le resultat de
+' l'analyse du mail selectionne ou ouvert - personne retenue, source de la
+' signature, champs lus - sans rien creer. A utiliser pour signaler un cas
+' mal lu (copier le texte de la boite).
+'=============================================================================
+Public Sub ContactFromMailDiagnose()
+    Dim errNo As Long, errDesc As String
+    On Error GoTo ErrH
+    LoadSettings
+    ResetResult
+    Dim mail As Outlook.MailItem, selText As String
+    Set mail = SourceMail(selText)
+    If mail Is Nothing Then
+        MsgBox T("S~electionne ou ouvre d'abord un e-mail.", "Select or open an e-mail first."), vbInformation, UiTitle()
+        Exit Sub
+    End If
+    mMailDate = mail.ReceivedTime
+    If mMailDate < DateSerial(1990, 1, 1) Then mMailDate = mail.SentOn
+    mMailSubject = mail.Subject
+    AnalyzeMail mail, selText
+    Dim srcTxt As String, hdrSmtp As String, hdrName As String
+    Select Case mSigSource
+        Case 1: srcTxt = T("zone surlign~ee", "highlighted text")
+        Case 2: srcTxt = T("message cit~e (ligne ", "quoted message (line ") & (mQuoteStart + 1) & ")"
+        Case Else: srcTxt = T("haut du mail", "top of the e-mail")
+    End Select
+    hdrSmtp = SenderSmtp(mail)
+    hdrName = Trim$(SafeStr(mail.SenderName))
+    Dim msg As String
+    msg = T("Exp~editeur : ", "Sender: ") & hdrName & " <" & hdrSmtp & ">" & _
+          IIf(IsSelf(hdrSmtp), T(" [toi]", " [you]"), IIf(IsInternal(hdrSmtp), T(" [interne]", " [internal]"), "")) & vbCrLf & _
+          T("Personne retenue : ", "Person kept: ") & mFirst & " " & mLast & " <" & mSmtp & ">" & vbCrLf & _
+          T("  via en-t~xte : ", "  from header: ") & "<" & mHeaderSmtp & ">" & _
+          T("  via signature : ", "  from signature: ") & "<" & mSigMail & ">" & vbCrLf & _
+          T("Source de la signature : ", "Signature source: ") & srcTxt & vbCrLf & _
+          T("Ligne nom : ", "Name line: ") & IIf(mNameLine >= 0, CStr(mNameLine + 1), "-") & _
+          IIf(Len(mNameRest) > 0, " (" & T("reste : ", "rest: ") & mNameRest & ")", "") & vbCrLf & vbCrLf & _
+          T("Fonction : ", "Job title: ") & mTitle & vbCrLf & _
+          T("Soci~et~e : ", "Company: ") & mCompany & vbCrLf & _
+          T("Service : ", "Department: ") & mDept & vbCrLf & _
+          T("Mobile / bureau / bureau 2 : ", "Mobile / business / business 2: ") & mMobile & " / " & mPhone & " / " & mPhone2 & vbCrLf & _
+          T("Adresse : ", "Address: ") & Replace(mStreet, vbCrLf, " / ") & " - " & mPostal & " " & mCity & " " & mCountry & vbCrLf & _
+          T("Site web : ", "Web page: ") & mWeb & vbCrLf & vbCrLf & _
+          T("Signature lue :", "Signature read:") & vbCrLf & Left$(Replace(mSig, vbLf, vbCrLf), 500)
+    modDebugLog.DInfo MOD_NAME, "Diagnose : " & Replace(Replace(msg, vbCrLf, " | "), vbLf, " ")
+    MsgBox msg, vbInformation, UiTitle()
+    Exit Sub
+ErrH:
+    errNo = Err.Number
+    errDesc = Err.Description
+    On Error Resume Next
+    modDebugLog.DError MOD_NAME, "ContactFromMailDiagnose err " & errNo & " - " & errDesc
+    MsgBox T("Erreur : ", "Error: ") & errNo & " - " & errDesc, vbExclamation, UiTitle()
+End Sub
+
+'=============================================================================
+' Reglages / etat
+'=============================================================================
+Private Sub LoadSettings()
+    modConfig.EnsureLoaded
+    mDefaultFolder = Trim$(modConfig.Cfg("ContactFromMailDefaultFolder", ""))
+    mCategory = Trim$(modConfig.Cfg("ContactFromMailCategory", ""))
+    mCountryCode = DigitsOnly(modConfig.Cfg("PhoneDefaultCountryCode", "33"))
+    If Len(mCountryCode) = 0 Then mCountryCode = "33"
+    mInternal = "|" & LCase$(Replace(modConfig.Cfg("InternalDomains", ""), " ", "")) & "|"
+    mSkipFolders = modConfig.Cfg("ContactSkipFolders", DEFAULT_SKIP)
+    BuildOwnIdentity
+End Sub
+
+' Tes adresses (tous les comptes du profil + utilisateur Exchange courant)
+' et tes noms d'affichage : jamais retenus comme personne visee.
+Private Sub BuildOwnIdentity()
+    On Error Resume Next
+    Dim ns As Outlook.NameSpace, idx As Long, s As String, nm As String, ex As Object
+    mOwnAddr = "|"
+    mOwnNames = "|"
+    Set ns = Application.Session
+    For idx = 1 To ns.Accounts.Count
+        s = LCase$(Trim$(SafeStr(ns.Accounts.Item(idx).SmtpAddress)))
+        If InStr(s, "@") > 0 Then mOwnAddr = mOwnAddr & s & "|"
+        nm = NormKey(SafeStr(ns.Accounts.Item(idx).UserName))
+        If Len(nm) >= 3 And InStr(nm, " ") > 0 Then mOwnNames = mOwnNames & WordsSorted(nm) & "|"
+    Next idx
+    Set ex = ns.CurrentUser.AddressEntry.GetExchangeUser
+    If Not ex Is Nothing Then
+        s = LCase$(Trim$(SafeStr(ex.PrimarySmtpAddress)))
+        If InStr(s, "@") > 0 And InStr(mOwnAddr, "|" & s & "|") = 0 Then mOwnAddr = mOwnAddr & s & "|"
+    End If
+    nm = NormKey(SafeStr(ns.CurrentUser.Name))
+    If Len(nm) >= 3 And InStr(nm, " ") > 0 Then mOwnNames = mOwnNames & WordsSorted(nm) & "|"
+    Err.Clear
+End Sub
+
+Private Function IsSelf(ByVal smtp As String) As Boolean
+    If InStr(smtp, "@") = 0 Then Exit Function
+    IsSelf = (InStr(mOwnAddr, "|" & LCase$(Trim$(smtp)) & "|") > 0)
+End Function
+
+' "GAMBUTO Alexandre" = "Alexandre Gambuto" (ordre des mots indifferent).
+Private Function IsOwnName(ByVal s As String) As Boolean
+    Dim k As String
+    k = NormKey(s)
+    If Len(k) < 3 Then Exit Function
+    IsOwnName = (InStr(mOwnNames, "|" & WordsSorted(k) & "|") > 0)
+End Function
+
+' Mots tries (A-Z) et rejoints.
+Private Function WordsSorted(ByVal s As String) As String
+    Dim parts() As String, ia As Long, ib As Long, tmp As String
+    parts = Split(CollapseSpaces(Trim$(s)), " ")
+    For ia = LBound(parts) To UBound(parts) - 1
+        For ib = ia + 1 To UBound(parts)
+            If parts(ib) < parts(ia) Then
+                tmp = parts(ia)
+                parts(ia) = parts(ib)
+                parts(ib) = tmp
+            End If
+        Next ib
+    Next ia
+    WordsSorted = Join(parts, " ")
+End Function
+
+Private Sub ResetResult()
+    mSig = "": mSmtp = "": mDisplay = "": mFirst = "": mLast = "": mTitle = "": mCompany = ""
+    mMobile = "": mPhone = "": mPhone2 = "": mWeb = "": mStreet = "": mPostal = "": mCity = ""
+    mDept = "": mCountry = "": mPhoneLines = "|"
+    mMailDate = 0: mMailSubject = ""
+    mHeaderSmtp = "": mSigMail = "": mQuoteStart = -1: mSigSource = 0
+    mNameLine = -1: mNameRest = ""
+End Sub
+
+Private Function UiTitle() As String
+    UiTitle = T("Contact depuis un e-mail", "Contact from e-mail")
+End Function
+
+'=============================================================================
+' Mail source : inspecteur ouvert (avec selection Word eventuelle) sinon
+' selection de l'explorateur.
+'=============================================================================
+Private Function SourceMail(ByRef selText As String) As Outlook.MailItem
+    On Error Resume Next
+    selText = ""
+    Dim insp As Outlook.Inspector
+    Set insp = Application.ActiveInspector
+    If Not insp Is Nothing Then
+        If TypeName(insp.CurrentItem) = "MailItem" Then
+            Set SourceMail = insp.CurrentItem
+            Dim wd As Object
+            Set wd = insp.WordEditor
+            If Not wd Is Nothing Then
+                selText = wd.Application.Selection.Text
+                If Err.Number <> 0 Then selText = "": Err.Clear
+                If Len(Trim$(selText)) < 8 Then selText = ""     ' curseur seul / selection vide
+            End If
+            Exit Function
+        End If
+    End If
+    Dim sel As Outlook.Selection
+    Set sel = Application.ActiveExplorer.Selection
+    If Not sel Is Nothing Then
+        If sel.Count >= 1 Then
+            If TypeName(sel.Item(1)) = "MailItem" Then Set SourceMail = sel.Item(1)
+        End If
+    End If
+    Err.Clear
+End Function
+
+'=============================================================================
+' Personne visee d'apres l'EN-TETE (avant correction par la signature) :
+'   - expediteur externe : lui ;
+'   - expediteur interne (collegue) ou toi : auteur externe du premier
+'     message cite ("De : Nom <e-mail>") ; sinon, si tu es l'expediteur,
+'     1er destinataire qui n'est pas toi (externe prefere) ; sinon le
+'     collegue lui-meme (c'est sa signature qui est dans le mail).
+' Toi-meme : jamais (adresse et nom effaces).
+'=============================================================================
+Private Sub ResolvePerson(ByVal mail As Outlook.MailItem, ByRef lines() As String)
+    On Error Resume Next
+    Dim sSmtp As String, sName As String, qIdx As Long, qName As String, qSmtp As String
+    sSmtp = SenderSmtp(mail)
+    sName = Trim$(SafeStr(mail.SenderName))
+    mSmtp = sSmtp
+    mDisplay = sName
+    mQuoteStart = -1
+    If Len(sSmtp) = 0 Or IsSelf(sSmtp) Or IsInternal(sSmtp) Then
+        ' 1) auteur du message cite (mail transfere / reponse d'un interne)
+        If QuotedAuthor(lines, qIdx, qName, qSmtp) Then
+            If Len(qSmtp) > 0 Then
+                If Not IsSelf(qSmtp) And Not IsInternal(qSmtp) Then
+                    mSmtp = qSmtp
+                    mDisplay = qName
+                    mQuoteStart = qIdx
+                End If
+            ElseIf Len(qName) > 0 And Not IsOwnName(qName) Then
+                mSmtp = ""
+                mDisplay = qName
+                mQuoteStart = qIdx
+            End If
+        End If
+        ' 2) sinon, si tu es l'expediteur : 1er destinataire qui n'est pas toi
+        '    (un collegue expediteur reste la personne visee : sa signature)
+        If mQuoteStart < 0 And (Len(sSmtp) = 0 Or IsSelf(sSmtp)) Then
+            FirstOtherRecipient mail
+        End If
+    End If
+    If IsSelf(mSmtp) Then
+        mSmtp = ""
+        mDisplay = ""
+    End If
+    If IsOwnName(mDisplay) Then mDisplay = ""
+    If Len(mDisplay) = 0 And Len(mSmtp) > 0 Then mDisplay = mSmtp
+    mHeaderSmtp = mSmtp
+    SplitDisplayName mDisplay, mFirst, mLast
+    Err.Clear
+End Sub
+
+' 1er destinataire qui n'est pas toi : externe d'abord, sinon interne.
+' Aucun : mSmtp / mDisplay inchanges.
+Private Sub FirstOtherRecipient(ByVal mail As Outlook.MailItem)
+    On Error Resume Next
+    Dim idx As Long, rcp As Outlook.Recipient, addr As String, intAddr As String, intName As String
+    For idx = 1 To mail.Recipients.Count
+        Set rcp = mail.Recipients.Item(idx)
+        addr = RecipientSmtp(rcp)
+        If Len(addr) > 0 And Not IsSelf(addr) Then
+            If Not IsInternal(addr) Then
+                mSmtp = addr
+                mDisplay = Trim$(SafeStr(rcp.Name))
+                Exit Sub
+            ElseIf Len(intAddr) = 0 Then
+                intAddr = addr
+                intName = Trim$(SafeStr(rcp.Name))
+            End If
+        End If
+    Next idx
+    If Len(intAddr) > 0 Then
+        mSmtp = intAddr
+        mDisplay = intName
+    End If
+    Err.Clear
+End Sub
+
+' SMTP reel de l'expediteur : PR_SENT_REPRESENTING_SMTP_ADDRESS, sinon
+' SenderEmailAddress (si SMTP), sinon utilisateur Exchange.
+Private Function SenderSmtp(ByVal mail As Outlook.MailItem) As String
+    On Error Resume Next
+    Dim s As String, ae As Object, ex As Object
+    s = LCase$(Trim$(SafeStr(mail.PropertyAccessor.GetProperty(PROPTAG_SENDER_SMTP))))
+    Err.Clear
+    If InStr(s, "@") = 0 Then
+        s = LCase$(Trim$(SafeStr(mail.SenderEmailAddress)))
+        If InStr(s, "@") = 0 Then
+            s = ""
+            Set ae = mail.Sender
+            If Not ae Is Nothing Then
+                Set ex = ae.GetExchangeUser
+                If Not ex Is Nothing Then s = LCase$(Trim$(SafeStr(ex.PrimarySmtpAddress)))
+            End If
+            If InStr(s, "@") = 0 Then s = ""
+        End If
+    End If
+    SenderSmtp = s
+    Err.Clear
+End Function
+
+' SMTP d'un destinataire : PR_SMTP_ADDRESS, sinon AddressEntry (utilisateur
+' ou liste Exchange -> PrimarySmtpAddress ; SMTP -> Address).
+Private Function RecipientSmtp(ByVal rcp As Outlook.Recipient) As String
+    On Error Resume Next
+    Dim s As String, ae As Object, ex As Object, typ As Long
+    s = LCase$(Trim$(SafeStr(rcp.PropertyAccessor.GetProperty(PROPTAG_RECIP_SMTP))))
+    Err.Clear
+    If InStr(s, "@") = 0 Then
+        s = ""
+        Set ae = rcp.AddressEntry
+        If Not ae Is Nothing Then
+            typ = -1
+            typ = ae.AddressEntryUserType
+            If typ = 0 Or typ = 5 Then                 ' olExchangeUserAddressEntry / olExchangeRemoteUserAddressEntry
+                Set ex = ae.GetExchangeUser
+                If Not ex Is Nothing Then s = LCase$(Trim$(SafeStr(ex.PrimarySmtpAddress)))
+            ElseIf typ = 1 Then                        ' olExchangeDistributionListAddressEntry
+                Set ex = ae.GetExchangeDistributionList
+                If Not ex Is Nothing Then s = LCase$(Trim$(SafeStr(ex.PrimarySmtpAddress)))
+            Else
+                s = LCase$(Trim$(SafeStr(ae.Address)))
+            End If
+        End If
+        If InStr(s, "@") = 0 Then s = LCase$(Trim$(SafeStr(rcp.Address)))
+        If InStr(s, "@") = 0 Then s = ""
+    End If
+    RecipientSmtp = s
+    Err.Clear
+End Function
+
+'=============================================================================
+' Auteur du premier message cite : ligne "De : Nom <e-mail>" / "From:" du
+' bloc d'en-tete qui suit le premier marqueur d'historique, ou ligne
+' "Le ... Nom <e-mail> a ecrit :" / "On ... Nom <e-mail> wrote:". Renvoie
+' True si un nom ou un e-mail a ete lu ; qIdx = index du marqueur.
+'=============================================================================
+Private Function QuotedAuthor(ByRef lines() As String, ByRef qIdx As Long, ByRef qName As String, ByRef qSmtp As String) As Boolean
+    Dim idx As Long, markAt As Long, ln As String, low As String, payload As String, isWrote As Boolean
+    qIdx = -1: qName = "": qSmtp = ""
+    If UBound(lines) < LBound(lines) Then Exit Function
+    markAt = -1
+    For idx = LBound(lines) To UBound(lines)
+        If IsHistoryMark(lines(idx)) Then
+            markAt = idx
+            Exit For
+        End If
+    Next idx
+    If markAt < 0 Then Exit Function
+    For idx = markAt To UBound(lines)
+        If idx > markAt + 8 Then Exit For
+        ln = Dequote(lines(idx))
+        low = StripAccents(LCase$(ln))
+        payload = ""
+        isWrote = False
+        If Left$(low, 4) = "de :" Or Left$(low, 5) = "from:" Or Left$(low, 6) = "from :" Then
+            payload = Trim$(Mid$(ln, InStr(ln, ":") + 1))
+        ElseIf Left$(low, 3) = "de:" Then
+            payload = Trim$(Mid$(ln, 4))
+        ElseIf low Like "le * a ecrit*" Or low Like "on * wrote*" Then
+            payload = ln
+            isWrote = True
+        End If
+        If Len(payload) > 0 Then
+            qSmtp = FirstMailIn(payload, False)
+            qName = NameFromHeaderPayload(payload, qSmtp, isWrote)
+            qIdx = markAt
+            QuotedAuthor = (Len(qName) > 0 Or Len(qSmtp) > 0)
+            Exit Function
+        End If
+    Next idx
+End Function
+
+' Nom dans "Nom <e-mail>", "Nom [mailto:e-mail]", "Nom e-mail" ; forme
+' "Le ... , Nom <e-mail> a ecrit :" -> derniers mots capitalises avant "<".
+Private Function NameFromHeaderPayload(ByVal payload As String, ByVal eml As String, ByVal isWrote As Boolean) As String
+    Dim s As String, p As Long, low As String
+    s = Replace(payload, Chr$(34), "")
+    s = Replace(Replace(s, ChrW$(8220), ""), ChrW$(8221), "")
+    p = InStr(s, "<")
+    If p = 0 Then p = InStr(LCase$(s), "[mailto:")
+    If p = 0 And Len(eml) > 0 Then p = InStr(LCase$(s), eml)
+    If p > 0 Then s = Left$(s, p - 1)
+    If isWrote Then
+        low = StripAccents(LCase$(s))
+        p = InStr(low, " a ecrit")
+        If p = 0 Then p = InStr(low, " wrote")
+        If p > 0 Then s = Left$(s, p - 1)
+    End If
+    s = Trim$(s)
+    Do While Len(s) > 0
+        If InStr(",;:-(", Right$(s, 1)) > 0 Then
+            s = Trim$(Left$(s, Len(s) - 1))
+        Else
+            Exit Do
+        End If
+    Loop
+    If isWrote Then s = TrailingCapWords(s)
+    If Len(s) > 60 Or InStr(s, "@") > 0 Then s = ""
+    NameFromHeaderPayload = CollapseSpaces(s)
+End Function
+
+' Derniers mots capitalises (ou particules) d'une chaine, 4 maximum ;
+' arret sur chiffre, virgule, deux-points, AM / PM.
+Private Function TrailingCapWords(ByVal s As String) As String
+    Dim parts() As String, idx As Long, w As String, wl As String, out As String, cnt As Long
+    s = CollapseSpaces(Trim$(s))
+    If Len(s) = 0 Then Exit Function
+    parts = Split(s, " ")
+    For idx = UBound(parts) To LBound(parts) Step -1
+        w = parts(idx)
+        wl = StripAccents(LCase$(w))
+        If HasDigit(w) Or wl = "am" Or wl = "pm" Then Exit For
+        If InStr(w, ",") > 0 Or InStr(w, ":") > 0 Then Exit For
+        If Not (Left$(StripAccents(w), 1) Like "[A-Z]" Or InStr("|" & PARTICLES & "|", "|" & wl & "|") > 0) Then Exit For
+        out = w & IIf(Len(out) > 0, " ", "") & out
+        cnt = cnt + 1
+        If cnt >= 4 Then Exit For
+    Next idx
+    TrailingCapWords = out
+End Function
+
+' Retire les prefixes ">" (citation) en tete de ligne.
+Private Function Dequote(ByVal s As String) As String
+    Dim r As String
+    r = Trim$(s)
+    Do While Left$(r, 1) = ">"
+        r = Trim$(Mid$(r, 2))
+    Loop
+    Dequote = r
+End Function
+
+' Ligne du bloc d'en-tete cite (De / Envoye / A / Cc / Objet...) ou vide.
+Private Function IsQuotedHeaderLine(ByVal ln As String) As Boolean
+    Dim low As String, labels() As String, idx As Long
+    low = StripAccents(LCase$(Trim$(ln)))
+    If Len(low) = 0 Then
+        IsQuotedHeaderLine = True
+        Exit Function
+    End If
+    labels = Split(QUOTED_HEADER_LABELS, "|")
+    For idx = LBound(labels) To UBound(labels)
+        If Left$(low, Len(labels(idx))) = labels(idx) Then
+            IsQuotedHeaderLine = True
+            Exit Function
+        End If
+    Next idx
+End Function
+
+' 1er e-mail d'un texte (skipSelf : jamais le tien).
+Private Function FirstMailIn(ByVal txt As String, ByVal skipSelf As Boolean) As String
+    On Error Resume Next
+    Dim re As Object, mt As Object, k As Long, s As String
+    If Len(txt) = 0 Then Exit Function
+    Set re = CreateObject("VBScript.RegExp")
+    re.Global = True
+    re.IgnoreCase = True
+    re.Pattern = MAIL_PATTERN
+    Set mt = re.Execute(txt)
+    For k = 0 To mt.Count - 1
+        s = LCase$(mt.Item(k).Value)
+        If Not (skipSelf And IsSelf(s)) Then
+            FirstMailIn = s
+            Exit Function
+        End If
+    Next k
+    Err.Clear
+End Function
+
+' Signature de TOI (mail envoye par toi) : un de tes e-mails, ou 1re ligne
+' "Prenom NOM" qui est un de tes noms.
+Private Function IsOwnSignature(ByVal sig As String) As Boolean
+    On Error Resume Next
+    Dim re As Object, mt As Object, k As Long, ls() As String, idx As Long, seen As Long, nm As String, rest As String
+    If Len(Trim$(sig)) = 0 Then Exit Function
+    Set re = CreateObject("VBScript.RegExp")
+    re.Global = True
+    re.IgnoreCase = True
+    re.Pattern = MAIL_PATTERN
+    Set mt = re.Execute(sig)
+    For k = 0 To mt.Count - 1
+        If IsSelf(LCase$(mt.Item(k).Value)) Then
+            IsOwnSignature = True
+            Exit Function
+        End If
+    Next k
+    ls = Split(sig, vbLf)
+    For idx = LBound(ls) To UBound(ls)
+        If Len(Trim$(ls(idx))) > 0 Then
+            seen = seen + 1
+            If seen > 6 Then Exit For
+            nm = PersonNameFrom(ls(idx), rest)
+            If Len(nm) > 0 Then
+                IsOwnSignature = IsOwnName(nm)
+                Exit Function
+            End If
+        End If
+    Next idx
+    Err.Clear
+End Function
+
+Private Function IsInternal(ByVal smtp As String) As Boolean
+    If InStr(smtp, "@") = 0 Then Exit Function
+    Dim dom As String
+    dom = LCase$(Mid$(smtp, InStr(smtp, "@") + 1))
+    If Len(mInternal) > 2 Then IsInternal = (InStr(mInternal, "|" & dom & "|") > 0)
+End Function
+
+' "DUPONT Jean" / "Jean Dupont" / "Dupont, Jean" / "jean.dupont" -> prenom, nom.
+Private Sub SplitDisplayName(ByVal dn As String, ByRef firstOut As String, ByRef lastOut As String)
+    Dim s As String, parts() As String, idx As Long, caps As String, lows As String
+    s = Trim$(dn)
+    If InStr(s, "<") > 0 Then s = Trim$(Left$(s, InStr(s, "<") - 1))
+    s = Replace(s, """", "")
+    If Len(s) = 0 Then Exit Sub
+    If InStr(s, "@") > 0 Then
+        ' Pas de nom d'affichage : "prenom.nom@..." -> Prenom Nom
+        s = Left$(s, InStr(s, "@") - 1)
+        s = Replace(Replace(s, ".", " "), "_", " ")
+        s = Replace(s, "-", " ")
+    End If
+    If InStr(s, ",") > 0 Then
+        lastOut = Trim$(Left$(s, InStr(s, ",") - 1))
+        firstOut = Trim$(Mid$(s, InStr(s, ",") + 1))
+        Exit Sub
+    End If
+    parts = Split(CollapseSpaces(s), " ")
+    If UBound(parts) = 0 Then
+        firstOut = parts(0)
+        Exit Sub
+    End If
+    For idx = LBound(parts) To UBound(parts)
+        If Len(parts(idx)) > 1 And UCase$(parts(idx)) = parts(idx) And parts(idx) <> LCase$(parts(idx)) Then
+            caps = caps & IIf(Len(caps) > 0, " ", "") & parts(idx)
+        Else
+            lows = lows & IIf(Len(lows) > 0, " ", "") & parts(idx)
+        End If
+    Next idx
+    If Len(caps) > 0 And Len(lows) > 0 Then
+        lastOut = caps
+        firstOut = lows
+    Else
+        firstOut = parts(0)
+        lastOut = Trim$(Mid$(s, Len(parts(0)) + 1))
+    End If
+    firstOut = CapWords(firstOut)
+    lastOut = UCase$(lastOut)
+End Sub
+
+'=============================================================================
+' Signature :
+'   - quoteStart < 0 : haut du mail = lignes AVANT le premier marqueur
+'     d'historique ; ce qui suit la derniere formule de politesse (sinon
+'     les 10 dernieres lignes non vides) ;
+'   - quoteStart >= 0 : message cite = lignes APRES le bloc d'en-tete
+'     (De / Envoye / A / Objet...) qui suit le marqueur, jusqu'au marqueur
+'     suivant ; prefixes ">" retires ; meme regle de politesse.
+'=============================================================================
+Private Function ExtractSignature(ByRef lines() As String, ByVal quoteStart As Long) As String
+    Dim segFrom As Long, segTo As Long, idx As Long
+    If UBound(lines) < LBound(lines) Then Exit Function
+    If quoteStart < 0 Then
+        segFrom = LBound(lines)
+        segTo = UBound(lines)
+        For idx = LBound(lines) To UBound(lines)
+            If IsHistoryMark(lines(idx)) Then
+                segTo = idx - 1
+                Exit For
+            End If
+        Next idx
+        ExtractSignature = SignatureInRange(lines, segFrom, segTo, False)
+    Else
+        segFrom = quoteStart + 1
+        Do While segFrom <= UBound(lines)
+            If Not IsQuotedHeaderLine(Dequote(lines(segFrom))) Then Exit Do
+            segFrom = segFrom + 1
+        Loop
+        segTo = UBound(lines)
+        For idx = segFrom To UBound(lines)
+            If IsHistoryMark(Dequote(lines(idx))) Then
+                segTo = idx - 1
+                Exit For
+            End If
+        Next idx
+        ExtractSignature = SignatureInRange(lines, segFrom, segTo, True)
+    End If
+End Function
+
+' Lignes qui suivent la derniere formule de politesse de la plage (15 max),
+' sinon les 10 dernieres lignes non vides. dq : retire les prefixes ">".
+Private Function SignatureInRange(ByRef lines() As String, ByVal segFrom As Long, ByVal segTo As Long, ByVal dq As Boolean) As String
+    Dim li As Long, startAt As Long, res As String, cnt As Long, ln As String
+    If segTo < segFrom Then Exit Function
+    startAt = -1
+    For li = segTo To segFrom Step -1
+        ln = lines(li)
+        If dq Then ln = Dequote(ln)
+        If IsClosing(ln) Then
+            startAt = li + 1
+            Exit For
+        End If
+    Next li
+    If startAt >= 0 Then
+        For li = startAt To segTo
+            ln = Trim$(lines(li))
+            If dq Then ln = Dequote(ln)
+            If Len(ln) > 0 Then
+                res = res & ln & vbLf
+                cnt = cnt + 1
+                If cnt >= 15 Then Exit For
+            End If
+        Next li
+    End If
+    If cnt = 0 Then
+        For li = segTo To segFrom Step -1
+            ln = Trim$(lines(li))
+            If dq Then ln = Dequote(ln)
+            If Len(ln) > 0 Then
+                res = ln & vbLf & res
+                cnt = cnt + 1
+                If cnt >= 10 Then Exit For
+            End If
+        Next li
+    End If
+    SignatureInRange = res
+End Function
+
+Private Function IsHistoryMark(ByVal ln As String) As Boolean
+    Dim s As String, marks() As String, idx As Long
+    s = StripAccents(LCase$(Trim$(ln)))
+    If Len(s) = 0 Then Exit Function
+    marks = Split(HISTORY_MARKS, "|")
+    For idx = LBound(marks) To UBound(marks)
+        If InStr(marks(idx), "*") > 0 Then
+            If s Like marks(idx) & "*" Then IsHistoryMark = True: Exit Function
+        ElseIf Left$(s, Len(marks(idx))) = marks(idx) Then
+            IsHistoryMark = True
+            Exit Function
+        End If
+    Next idx
+End Function
+
+Private Function IsClosing(ByVal ln As String) As Boolean
+    Dim s As String, cl() As String, idx As Long
+    s = StripAccents(LCase$(Trim$(ln)))
+    s = Replace(Replace(s, ",", ""), ".", "")
+    If Len(s) = 0 Or Len(s) > 40 Then Exit Function
+    cl = Split(CLOSINGS, "|")
+    For idx = LBound(cl) To UBound(cl)
+        If s = cl(idx) Or s Like cl(idx) & " *" Or s Like cl(idx) & "*" Then
+            IsClosing = True
+            Exit Function
+        End If
+    Next idx
+End Function
+
+'=============================================================================
+' Analyse de la signature : telephones, web, adresse, fonction / societe.
+'=============================================================================
+Private Sub ParseSignature()
+    On Error Resume Next
+    Dim re As Object, mt As Object
+    Set re = CreateObject("VBScript.RegExp")
+    re.Global = True
+    re.IgnoreCase = True
+
+    ' Site web explicite (http / www.)
+    re.Pattern = "(https?://[^\s|]+|www\.[^\s|]+)"
+    Set mt = re.Execute(mSig)
+    If mt.Count > 0 Then mWeb = mt.Item(0).Value
+
+    ' Telephones : par ligne et par segment, libelles lus, fax ecarte
+    ExtractPhones
+
+    Dim lines() As String, idx As Long, s As String, low As String
+    lines = Split(mSig, vbLf)
+
+    ' Adresse : "CP Ville" - virgule ("72000, Le Mans") et prefixe pays
+    ' ("F-75008") toleres. Les lignes ou un telephone a ete lu sont ignorees
+    ' (les chiffres d'une adresse ne sont plus pris pour un numero).
+    re.Global = False
+    re.Pattern = "(^|[\s,;:])(F-|FR-)?(\d{5})[\s,]+([A-Z" & ChrW$(192) & "-" & ChrW$(383) & "][A-Za-z" & ChrW$(192) & "-" & ChrW$(383) & "' \-]{1,40})"
+    For idx = LBound(lines) To UBound(lines)
+        s = Trim$(lines(idx))
+        If Len(s) > 0 And Not IsPhoneLine(idx) Then
+            Set mt = re.Execute(s)
+            If mt.Count > 0 Then
+                mPostal = mt.Item(0).SubMatches(2)
+                mCity = Trim$(mt.Item(0).SubMatches(3))
+                CollectStreet lines, idx, s, mt.Item(0).FirstIndex
+                ' Pays : fin de la ligne apres la ville, sinon ligne suivante
+                mCountry = CountryFromText(Mid$(s, mt.Item(0).FirstIndex + Len(mt.Item(0).Value) + 1))
+                If Len(mCountry) = 0 Then
+                    Dim nxt As Long
+                    For nxt = idx + 1 To UBound(lines)
+                        If Len(Trim$(lines(nxt))) > 0 Then
+                            mCountry = CountryFromText(lines(nxt))
+                            Exit For
+                        End If
+                    Next nxt
+                End If
+                Exit For
+            End If
+        End If
+    Next idx
+
+    ' Personne corrigee par la signature : e-mail et ligne "Prenom NOM".
+    ResolveFromSignature lines
+
+    ' Lignes de texte libre -> service, fonction, societe. Sont ecartees :
+    ' lignes telephone / e-mail / web, adresse, pays, reseaux sociaux et
+    ' mentions, formules de politesse, ligne du nom, numeros d'immatri-
+    ' culation (ORIAS, SIRET...), domaines nus (-> site).
+    Dim free As Collection, seenName As Boolean, dom As String
+    Set free = New Collection
+    For idx = LBound(lines) To UBound(lines)
+        s = Trim$(lines(idx))
+        If Len(s) = 0 Then GoTo NextLine
+        low = StripAccents(LCase$(s))
+        If IsPhoneLine(idx) Then GoTo NextLine
+        If InStr(s, "@") > 0 Or InStr(low, "http") > 0 Or InStr(low, "www.") > 0 Then GoTo NextLine
+        If HasHint(low, SOCIAL_HINTS) Then GoTo NextLine
+        If Len(mPostal) > 0 And InStr(s, mPostal) > 0 Then GoTo NextLine
+        If Len(mStreet) > 0 And InStr(mStreet, s) > 0 Then GoTo NextLine
+        If Len(CountryFromText(s)) > 0 Then GoTo NextLine
+        If IsClosing(s) Then GoTo NextLine
+        If idx = mNameLine Then
+            If Len(mNameRest) > 2 And Not IsNameSuffix(mNameRest) Then free.Add mNameRest
+            GoTo NextLine
+        End If
+        If Not seenName And LooksLikeName(s) Then
+            seenName = True
+            GoTo NextLine
+        End If
+        If IsCodeLine(s, low) Then GoTo NextLine
+        dom = BareDomainOf(low)
+        If Len(dom) > 0 Then
+            If Len(mWeb) = 0 Then mWeb = dom
+            GoTo NextLine
+        End If
+        If Len(s) <= 2 Or Len(s) > 90 Then GoTo NextLine
+        If Len(mDept) = 0 And HasHint(low, DEPT_HINTS) And Not AnyTokenIn(low, TITLE_HINTS) Then
+            mDept = s
+            GoTo NextLine
+        End If
+        free.Add s
+NextLine:
+    Next idx
+
+    ' Fonction = 1re ligne portant un mot de fonction (sinon 1re ligne libre) ;
+    ' societe = 1re ligne "societe" (sigle, mot de societe), sinon la suivante.
+    Dim lineA As String, lineB As String, fi As Long
+    For fi = 1 To free.Count
+        If AnyTokenIn(StripAccents(LCase$(CStr(free(fi)))), TITLE_HINTS) Then
+            lineA = CStr(free(fi))
+            Exit For
+        End If
+    Next fi
+    If Len(lineA) = 0 And free.Count >= 1 Then lineA = CStr(free(1))
+    For fi = 1 To free.Count
+        If CStr(free(fi)) <> lineA Then
+            If LooksLikeCompanyEx(CStr(free(fi))) Then
+                lineB = CStr(free(fi))
+                Exit For
+            End If
+        End If
+    Next fi
+    If Len(lineB) = 0 Then
+        For fi = 1 To free.Count
+            If CStr(free(fi)) <> lineA Then
+                lineB = CStr(free(fi))
+                Exit For
+            End If
+        Next fi
+    End If
+    ' "Fonction | Societe" - mais "Fonction FR | Titre EN" reste une fonction.
+    Dim rightPart As String
+    If InStr(lineA, " | ") > 0 Then
+        rightPart = Trim$(Mid$(lineA, InStr(lineA, " | ") + 3))
+        lineA = Trim$(Left$(lineA, InStr(lineA, " | ") - 1))
+        If Len(lineB) = 0 And Not AnyTokenIn(StripAccents(LCase$(rightPart)), TITLE_HINTS) Then lineB = rightPart
+    ElseIf InStr(lineA, " - ") > 0 And Len(lineB) = 0 Then
+        rightPart = Trim$(Mid$(lineA, InStr(lineA, " - ") + 3))
+        If LooksLikeCompanyEx(rightPart) Then
+            lineB = rightPart
+            lineA = Trim$(Left$(lineA, InStr(lineA, " - ") - 1))
+        End If
+    End If
+    ' Inversion si A ressemble a une societe (et pas a une fonction) et pas B.
+    If LooksLikeCompanyEx(lineA) And Not LooksLikeCompanyEx(lineB) And _
+       Not AnyTokenIn(StripAccents(LCase$(lineA)), TITLE_HINTS) Then
+        mCompany = lineA
+        mTitle = lineB
+    Else
+        mTitle = lineA
+        mCompany = lineB
+    End If
+    If Len(mTitle) > 80 Then mTitle = ""
+    If Len(mCompany) > 60 Then mCompany = ""
+    If Len(mDept) > 80 Then mDept = ""
+
+    ' Derniers recours : societe et site web deduits du domaine e-mail.
+    If Len(mCompany) = 0 Then mCompany = CompanyFromDomain()
+    If Len(mWeb) = 0 Then mWeb = WebFromDomain()
+
+    ' Convention du toolkit (E.164 + PhoneOutputSpaced) - source de verite
+    ' partagee avec l'harmonisation (modContactNormalize v1.5+).
+    mMobile = PhoneCanon(mMobile)
+    mPhone = PhoneCanon(mPhone)
+    mPhone2 = PhoneCanon(mPhone2)
+    Err.Clear
+End Sub
+
+'=============================================================================
+' Personne corrigee par la signature (v1.5) :
+'   - l'e-mail de la signature (jamais le tien) REMPLACE l'adresse de
+'     l'en-tete si celle-ci est vide ou interne, ou si la zone est
+'     surlignee (zone = seule source) ;
+'   - la ligne "Prenom NOM" REMPLACE le nom de l'en-tete quand l'adresse
+'     vient de la signature, quand le nom d'affichage est faible ("IC", un
+'     seul mot, adresse) ou quand l'adresse retenue est interne et ne porte
+'     pas ce nom (message cite / zone surlignee : l'adresse interne, qui est
+'     celle de quelqu'un d'autre, est alors ecartee) ;
+'   - sinon (expediteur externe, nom coherent) l'en-tete reste la reference.
+'=============================================================================
+Private Sub ResolveFromSignature(ByRef lines() As String)
+    Dim cand As String, takeMail As Boolean, headerWeak As Boolean
+    Dim useCand As Boolean, dropAddr As Boolean
+    mSigMail = FirstMailIn(mSig, True)
+    takeMail = (Len(mSigMail) > 0) And (mSigSource = 1 Or Len(mSmtp) = 0 Or (IsInternal(mSmtp) And Not IsInternal(mSigMail)))
+    headerWeak = WeakName(mDisplay)
+    mNameLine = FindNameLine(lines, cand)
+    If Len(cand) > 0 Then
+        If LooksLikeName(cand) Then
+            useCand = False
+        ElseIf takeMail Then
+            useCand = True
+        ElseIf headerWeak Then
+            useCand = True
+            dropAddr = (mSigSource <> 0 And Len(mSmtp) > 0 And IsInternal(mSmtp))
+        ElseIf Len(mSmtp) > 0 And IsInternal(mSmtp) And mSigSource <> 0 Then
+            useCand = True
+            dropAddr = True
+        End If
+    End If
+    If takeMail Then mSmtp = mSigMail
+    If useCand Then
+        mDisplay = cand
+        SplitDisplayName cand, mFirst, mLast
+        If dropAddr Then mSmtp = ""
+    ElseIf takeMail And Len(cand) = 0 Then
+        If headerWeak Or (Len(mHeaderSmtp) > 0 And StrComp(mSigMail, mHeaderSmtp, vbTextCompare) <> 0) Then
+            mDisplay = mSigMail
+            SplitDisplayName mSigMail, mFirst, mLast
+        End If
+    End If
+    If IsSelf(mSmtp) Then mSmtp = ""
+End Sub
+
+' Nom d'affichage faible : vide, adresse e-mail, un seul mot, initiales.
+Private Function WeakName(ByVal dn As String) As Boolean
+    Dim s As String, k As String
+    s = CollapseSpaces(Trim$(dn))
+    If Len(s) = 0 Or InStr(s, "@") > 0 Then
+        WeakName = True
+        Exit Function
+    End If
+    k = NormKey(s)
+    If InStr(k, " ") = 0 Then
+        WeakName = True
+    ElseIf Len(Replace(k, " ", "")) <= 3 Then
+        WeakName = True
+    End If
+End Function
+
+' Ligne "nom" de la signature parmi les 6 premieres lignes exploitables,
+' 3 passes : 1) ligne portant le nom deja connu (en-tete) ; 2) ligne
+' "Prenom NOM" (un mot tout en majuscules) ; 3) 1re ligne "Prenom Nom".
+' cand = nom nettoye (sans civilite ni reste "| Fonction"), mNameRest =
+' reste de la ligne. -1 si rien.
+Private Function FindNameLine(ByRef lines() As String, ByRef cand As String) As Long
+    Dim idx As Long, s As String, low As String, seen As Long, k As Long
+    Dim nm As String, rest As String
+    Dim lnIdx(1 To 6) As Long, lnCand(1 To 6) As String, lnRest(1 To 6) As String, lnKnown(1 To 6) As Boolean
+    FindNameLine = -1
+    cand = ""
+    mNameRest = ""
+    If UBound(lines) < LBound(lines) Then Exit Function
+    For idx = LBound(lines) To UBound(lines)
+        s = Trim$(lines(idx))
+        If Len(s) = 0 Then GoTo NextL
+        If IsPhoneLine(idx) Then GoTo NextL
+        low = StripAccents(LCase$(s))
+        If InStr(s, "@") > 0 Or InStr(low, "http") > 0 Or InStr(low, "www.") > 0 Then GoTo NextL
+        If HasHint(low, SOCIAL_HINTS) Then GoTo NextL
+        If Len(mPostal) > 0 And InStr(s, mPostal) > 0 Then GoTo NextL
+        If Len(mStreet) > 0 And InStr(mStreet, s) > 0 Then GoTo NextL
+        If Len(CountryFromText(s)) > 0 Then GoTo NextL
+        If IsClosing(s) Then GoTo NextL
+        seen = seen + 1
+        If seen > 6 Then Exit For
+        nm = PersonNameFrom(s, rest)
+        lnIdx(seen) = idx
+        lnKnown(seen) = LooksLikeName(s)
+        If lnKnown(seen) And Len(nm) = 0 Then
+            nm = s
+            rest = ""
+        End If
+        If Len(nm) > 0 Then
+            If IsOwnName(nm) Then nm = ""
+        End If
+        lnCand(seen) = nm
+        lnRest(seen) = rest
+NextL:
+    Next idx
+    If seen > 6 Then seen = 6
+    ' 1) nom deja connu
+    For k = 1 To seen
+        If lnKnown(k) Then
+            FindNameLine = lnIdx(k)
+            cand = lnCand(k)
+            mNameRest = lnRest(k)
+            Exit Function
+        End If
+    Next k
+    ' 2) "Prenom NOM"
+    For k = 1 To seen
+        If Len(lnCand(k)) > 0 Then
+            If HasCapsWord(lnCand(k)) Then
+                FindNameLine = lnIdx(k)
+                cand = lnCand(k)
+                mNameRest = lnRest(k)
+                Exit Function
+            End If
+        End If
+    Next k
+    ' 3) "Prenom Nom"
+    For k = 1 To seen
+        If Len(lnCand(k)) > 0 Then
+            FindNameLine = lnIdx(k)
+            cand = lnCand(k)
+            mNameRest = lnRest(k)
+            Exit Function
+        End If
+    Next k
+End Function
+
+' Un mot (hors particule) tout en majuscules, 2 lettres ou plus : "Dylan DIARD".
+Private Function HasCapsWord(ByVal nm As String) As Boolean
+    Dim parts() As String, idx As Long, w As String
+    parts = Split(CollapseSpaces(Trim$(nm)), " ")
+    For idx = LBound(parts) To UBound(parts)
+        w = parts(idx)
+        If Len(w) >= 2 And UCase$(w) = w And w <> LCase$(w) Then
+            If InStr("|" & PARTICLES & "|", "|" & LCase$(w) & "|") = 0 Then
+                HasCapsWord = True
+                Exit Function
+            End If
+        End If
+    Next idx
+End Function
+
+' "Dr Jean DUPONT | Directeur" -> "Jean DUPONT", rest = "Directeur".
+' Nom de personne = 2 a 5 mots de lettres (particules tolerees), au moins
+' 2 mots hors particule commencant par une majuscule, au moins un mot en
+' casse mixte ; ni chiffre, ni fonction / societe / service / voie / pays,
+' ni formule d'appel, ni le nom deduit du domaine e-mail.
+Private Function PersonNameFrom(ByVal s As String, ByRef rest As String) As String
+    Dim work As String, cutPos As Long, p As Long, seps As Variant, si As Long, sepStr As String
+    Dim parts() As String, idx As Long, w As String, wl As String, startIdx As Long
+    Dim nonPart As Long, hasLower As Boolean, cnt As Long, out As String, low As String
+    rest = ""
+    work = CollapseSpaces(Trim$(Replace(s, ChrW$(8217), "'")))
+    If Len(work) < 3 Or Len(work) > 70 Then Exit Function
+    If HasDigit(work) Or InStr(work, "@") > 0 Then Exit Function
+    ' "Contact : Jean Dupont" -> le nom est a droite du deux-points
+    If InStr(work, ":") > 0 Then work = Trim$(Mid$(work, InStr(work, ":") + 1))
+    seps = Array(" | ", " - ", " " & ChrW$(8211) & " ", " " & ChrW$(8212) & " ", ", ", " (", " / ", " " & ChrW$(8226) & " ", ";")
+    cutPos = 0
+    For si = LBound(seps) To UBound(seps)
+        p = InStr(work, CStr(seps(si)))
+        If p > 1 Then
+            If cutPos = 0 Or p < cutPos Then
+                cutPos = p
+                sepStr = CStr(seps(si))
+            End If
+        End If
+    Next si
+    If cutPos > 0 Then
+        rest = Trim$(Mid$(work, cutPos + Len(sepStr)))
+        work = Trim$(Left$(work, cutPos - 1))
+        If Right$(rest, 1) = ")" And InStr(rest, "(") = 0 Then rest = Trim$(Left$(rest, Len(rest) - 1))
+    End If
+    Do While Len(work) > 0
+        If InStr(",.;:-|", Right$(work, 1)) > 0 Then
+            work = Trim$(Left$(work, Len(work) - 1))
+        Else
+            Exit Do
+        End If
+    Loop
+    If Len(work) < 3 Then Exit Function
+    parts = Split(work, " ")
+    ' formule d'appel ("Bonjour Alexandre") : jamais un nom
+    wl = Replace(StripAccents(LCase$(parts(LBound(parts)))), ".", "")
+    If InStr("|" & GREETINGS & "|", "|" & wl & "|") > 0 Then Exit Function
+    ' civilites en tete (Dr, Pr, Me, M., Mme...)
+    startIdx = LBound(parts)
+    Do While startIdx <= UBound(parts)
+        wl = Replace(StripAccents(LCase$(parts(startIdx))), ".", "")
+        If InStr("|" & HONORIFICS & "|", "|" & wl & "|") > 0 Then
+            startIdx = startIdx + 1
+        Else
+            Exit Do
+        End If
+    Loop
+    For idx = startIdx To UBound(parts)
+        w = parts(idx)
+        If Len(w) = 0 Then GoTo NextW
+        wl = StripAccents(LCase$(w))
+        If Not LettersOnly(wl) Then Exit Function
+        cnt = cnt + 1
+        If InStr("|" & PARTICLES & "|", "|" & wl & "|") = 0 Then
+            If Not (Left$(StripAccents(w), 1) Like "[A-Z]") Then Exit Function
+            nonPart = nonPart + 1
+            If LCase$(w) <> w And UCase$(w) <> w Then hasLower = True
+        End If
+        out = out & IIf(Len(out) > 0, " ", "") & w
+NextW:
+    Next idx
+    If cnt < 2 Or cnt > 5 Or nonPart < 2 Or Not hasLower Then Exit Function
+    low = StripAccents(LCase$(out))
+    If AnyTokenIn(low, TITLE_HINTS) Then Exit Function
+    If HasCompanyHint(out) Then Exit Function
+    If HasHint(low & " ", DEPT_HINTS) Then Exit Function
+    If AnyTokenIn(low, STREET_TOKENS) Then Exit Function
+    If Len(CountryFromText(out)) > 0 Then Exit Function
+    If DomainKeyMatches(out) Then Exit Function
+    PersonNameFrom = out
+End Function
+
+' Lettres, tiret, apostrophe, point uniquement (mot deja en minuscules sans accent).
+Private Function LettersOnly(ByVal wl As String) As Boolean
+    Dim idx As Long, ch As String
+    If Len(wl) = 0 Then Exit Function
+    For idx = 1 To Len(wl)
+        ch = Mid$(wl, idx, 1)
+        Select Case ch
+            Case "a" To "z", "-", "'", "."
+            Case Else
+                Exit Function
+        End Select
+    Next idx
+    LettersOnly = True
+End Function
+
+' "Ouest Courtage" = domaine ouestcourtage.fr : c'est la societe, pas la personne.
+Private Function DomainKeyMatches(ByVal s As String) As Boolean
+    Dim k As String
+    k = Replace(NormKey(s), " ", "")
+    If Len(k) < 4 Then Exit Function
+    If k = DomainKeyOf(mSmtp) Or k = DomainKeyOf(mSigMail) Then DomainKeyMatches = True
+End Function
+
+Private Function DomainKeyOf(ByVal smtp As String) As String
+    Dim dom As String, base As String
+    If InStr(smtp, "@") = 0 Then Exit Function
+    dom = LCase$(Mid$(smtp, InStr(smtp, "@") + 1))
+    If InStr(dom, ".") = 0 Then Exit Function
+    base = Left$(dom, InStr(dom, ".") - 1)
+    DomainKeyOf = Replace(NormKey(base), " ", "")
+End Function
+
+' "PhD", "MBA"... reste de ligne nom sans valeur pour fonction / societe.
+Private Function IsNameSuffix(ByVal rest As String) As Boolean
+    Dim k As String
+    k = LCase$(NormKey(rest))
+    If Len(k) = 0 Then
+        IsNameSuffix = True
+    Else
+        IsNameSuffix = (InStr("|" & NAME_SUFFIXES & "|", "|" & k & "|") > 0)
+    End If
+End Function
+
+' Ligne "numero d'immatriculation" : "ORIAS : 25006085", "SIRET 830 123 456
+' 00017", "TVA : FR12..." - beaucoup de chiffres et peu de lettres, ou
+' libelle connu + chiffres.
+Private Function IsCodeLine(ByVal s As String, ByVal low As String) As Boolean
+    Dim idx As Long, ch As String, nDig As Long, nLet As Long
+    For idx = 1 To Len(s)
+        ch = Mid$(s, idx, 1)
+        If ch Like "#" Then
+            nDig = nDig + 1
+        ElseIf UCase$(ch) <> LCase$(ch) Then
+            nLet = nLet + 1
+        End If
+    Next idx
+    If nDig = 0 Then Exit Function
+    If AnyTokenIn(low, REG_HINTS) Then
+        IsCodeLine = True
+    Else
+        IsCodeLine = (nDig >= 5 And nLet <= 12)
+    End If
+End Function
+
+'=============================================================================
+' Telephones : segment par segment (/, ;, |), libelle lu avant le numero.
+' Fax ecarte. Mobile = libelle Mob/Port/GSM, sinon prefixe +336/+337.
+'=============================================================================
+Private Sub ExtractPhones()
+    On Error Resume Next
+    Dim re As Object, mt As Object, lines() As String, li As Long
+    Dim segs() As String, si As Long, seg As String, segLow As String
+    Dim kind As Long, k As Long, e164 As String, isMob As Boolean
+    Set re = CreateObject("VBScript.RegExp")
+    re.Global = True
+    re.Pattern = "(\+\d{1,3}[\s.\-]?(\(\d{1,2}\))?|\(?0\d\)?)([\s.\-]{0,2}\d){6,13}"
+    lines = Split(mSig, vbLf)
+    For li = LBound(lines) To UBound(lines)
+        seg = Replace(Replace(Replace(lines(li), "/", Chr$(1)), ";", Chr$(1)), "|", Chr$(1))
+        segs = Split(seg, Chr$(1))
+        For si = LBound(segs) To UBound(segs)
+            seg = segs(si)
+            Set mt = re.Execute(seg)
+            If mt.Count > 0 Then
+                segLow = StripAccents(LCase$(Left$(seg, mt.Item(0).FirstIndex)))
+                kind = 0                                   ' 0=auto 1=mobile 2=fixe 3=fax
+                If HasHint(segLow, FAX_LABELS) Then
+                    kind = 3
+                ElseIf HasHint(segLow, MOBILE_LABELS) Then
+                    kind = 1
+                ElseIf HasHint(segLow, FIXED_LABELS) Then
+                    kind = 2
+                End If
+                mPhoneLines = mPhoneLines & li & "|"
+                If kind <> 3 Then
+                    For k = 0 To mt.Count - 1
+                        e164 = ToE164(mt.Item(k).Value)
+                        If Len(e164) > 0 And e164 <> mMobile And e164 <> mPhone And e164 <> mPhone2 Then
+                            isMob = (kind = 1) Or (kind = 0 And (Left$(e164, 4) = "+336" Or Left$(e164, 4) = "+337"))
+                            If isMob And Len(mMobile) = 0 Then
+                                mMobile = e164
+                            ElseIf Len(mPhone) = 0 Then
+                                mPhone = e164
+                            ElseIf Len(mPhone2) = 0 Then
+                                mPhone2 = e164
+                            End If
+                        End If
+                    Next k
+                End If
+            End If
+        Next si
+    Next li
+    Err.Clear
+End Sub
+
+Private Function IsPhoneLine(ByVal li As Long) As Boolean
+    IsPhoneLine = (InStr(mPhoneLines, "|" & li & "|") > 0)
+End Function
+
+' Convention du toolkit ; garde la valeur E.164 si la fonction partagee
+' est indisponible ou ne reconnait pas le numero.
+Private Function PhoneCanon(ByVal e164 As String) As String
+    PhoneCanon = e164
+    If Len(e164) = 0 Then Exit Function
+    On Error Resume Next
+    Dim res As String
+    res = modContactNormalize.PhoneFormatCanonical(e164)
+    If Err.Number = 0 And Len(res) > 0 Then PhoneCanon = res
+    Err.Clear
+End Function
+
+' hints "contient" (liste a|b|c) sur texte minuscule sans accent.
+Private Function HasHint(ByVal low As String, ByVal hintList As String) As Boolean
+    Dim hints() As String, idx As Long
+    If Len(low) = 0 Then Exit Function
+    hints = Split(hintList, "|")
+    For idx = LBound(hints) To UBound(hints)
+        If InStr(low, hints(idx)) > 0 Then
+            HasHint = True
+            Exit Function
+        End If
+    Next idx
+End Function
+
+' Un des MOTS ENTIERS de la ligne figure-t-il dans la liste ?
+Private Function AnyTokenIn(ByVal low As String, ByVal tokenList As String) As Boolean
+    Dim s As String, words() As String, idx As Long, bag As String
+    s = low
+    s = Replace(s, ",", " "): s = Replace(s, ".", " "): s = Replace(s, "|", " ")
+    s = Replace(s, "/", " "): s = Replace(s, "(", " "): s = Replace(s, ")", " ")
+    s = Replace(s, "&", " "): s = Replace(s, "'", " ")
+    words = Split(CollapseSpaces(Trim$(s)), " ")
+    bag = "|" & tokenList & "|"
+    For idx = LBound(words) To UBound(words)
+        If Len(words(idx)) > 0 Then
+            If InStr(bag, "|" & words(idx) & "|") > 0 Then
+                AnyTokenIn = True
+                Exit Function
+            End If
+        End If
+    Next idx
+End Function
+
+' LooksLikeCompany + "contient un SIGLE" (mot tout en majuscules >= 3 lettres).
+Private Function LooksLikeCompanyEx(ByVal s As String) As Boolean
+    If Len(s) = 0 Then Exit Function
+    If LooksLikeCompany(s) Then
+        LooksLikeCompanyEx = True
+        Exit Function
+    End If
+    Dim words() As String, idx As Long, w As String
+    words = Split(CollapseSpaces(Trim$(s)), " ")
+    For idx = LBound(words) To UBound(words)
+        w = words(idx)
+        If Len(w) >= 3 And UCase$(w) = w And w <> LCase$(w) And Not HasDigit(w) Then
+            LooksLikeCompanyEx = True
+            Exit Function
+        End If
+    Next idx
+End Function
+
+'=============================================================================
+' Rue : partie avant le CP (labels "Adresse :" retires), complement
+' (Bureau, Bat., Zone...) rattache, sinon remontee de 2 lignes maximum
+' ("10 rue X" + "Zone Y" au-dessus de "72000, Le Mans").
+'=============================================================================
+Private Sub CollectStreet(ByRef lines() As String, ByVal idx As Long, ByVal s As String, ByVal matchPos As Long)
+    Dim beforePart As String, mainStreet As String, complement As String
+    beforePart = Trim$(Left$(s, matchPos))
+    beforePart = StripAddrLabel(beforePart)
+    Do While Len(beforePart) > 0
+        If InStr(",-;:|" & ChrW$(8211) & ChrW$(8212) & ChrW$(8226), Right$(beforePart, 1)) > 0 Or Right$(beforePart, 1) = " " Then
+            beforePart = Trim$(Left$(beforePart, Len(beforePart) - 1))
+        Else
+            Exit Do
+        End If
+    Loop
+    beforePart = CollapseSpaces(beforePart)
+    If Len(beforePart) > 2 Then
+        If IsComplement(beforePart) Then
+            complement = beforePart
+        Else
+            mainStreet = beforePart
+        End If
+    End If
+    If Len(mainStreet) = 0 Then
+        Dim li As Long, got As Long, l1 As String, l2 As String, cand As String
+        For li = idx - 1 To LBound(lines) Step -1
+            cand = Trim$(lines(li))
+            If Len(cand) = 0 Then Exit For
+            If Not EligibleStreetLine(cand, li) Then Exit For
+            If got = 0 Then
+                l1 = cand
+            Else
+                l2 = cand
+            End If
+            got = got + 1
+            If got >= 2 Then Exit For
+            If HasDigit(l1) And Not IsComplement(l1) Then Exit For
+        Next li
+        If got = 1 Then
+            mainStreet = l1
+        ElseIf got = 2 Then
+            mainStreet = l2 & vbCrLf & l1
+        End If
+    End If
+    If Len(complement) > 0 Then
+        If Len(mainStreet) > 0 Then
+            mStreet = mainStreet & vbCrLf & complement
+        Else
+            mStreet = complement
+        End If
+    Else
+        mStreet = mainStreet
+    End If
+End Sub
+
+Private Function EligibleStreetLine(ByVal s As String, ByVal li As Long) As Boolean
+    Dim low As String
+    If Len(s) = 0 Or Len(s) > 60 Then Exit Function
+    If IsPhoneLine(li) Then Exit Function
+    low = StripAccents(LCase$(s))
+    If InStr(s, "@") > 0 Or InStr(low, "http") > 0 Or InStr(low, "www.") > 0 Then Exit Function
+    If IsClosing(s) Then Exit Function
+    If LooksLikeName(s) Then Exit Function
+    EligibleStreetLine = HasDigit(s) Or HasHint(low, STREET_HINTS) Or HasHint(low, COMPLEMENT_HINTS)
+End Function
+
+Private Function IsComplement(ByVal s As String) As Boolean
+    Dim low As String, firstWord As String
+    low = StripAccents(LCase$(CollapseSpaces(Trim$(s))))
+    If Len(low) = 0 Then Exit Function
+    firstWord = low
+    If InStr(low, " ") > 0 Then firstWord = Left$(low, InStr(low, " ") - 1)
+    If InStr("|" & COMPLEMENT_HINTS & "|", "|" & firstWord & "|") > 0 Then
+        IsComplement = True
+    ElseIf HasHint(low & " ", COMPLEMENT_HINTS) And Len(s) <= 20 Then
+        IsComplement = True
+    End If
+End Function
+
+Private Function StripAddrLabel(ByVal s As String) As String
+    Dim low As String
+    StripAddrLabel = Trim$(s)
+    low = StripAccents(LCase$(StripAddrLabel))
+    If Left$(low, 7) = "adresse" Or Left$(low, 7) = "address" Then
+        If InStr(StripAddrLabel, ":") > 0 Then
+            StripAddrLabel = Trim$(Mid$(StripAddrLabel, InStr(StripAddrLabel, ":") + 1))
+        End If
+    End If
+End Function
+
+' ", France" / "FRANCE." / ligne seule -> nom de pays en MAJUSCULES, sinon "".
+Private Function CountryFromText(ByVal txt As String) As String
+    Dim low As String
+    low = StripAccents(LCase$(Trim$(txt)))
+    Do While Len(low) > 0
+        If InStr(",;:-. ", Left$(low, 1)) > 0 Then
+            low = Mid$(low, 2)
+        ElseIf InStr(",;:-. ", Right$(low, 1)) > 0 Then
+            low = Left$(low, Len(low) - 1)
+        Else
+            Exit Do
+        End If
+    Loop
+    If Len(low) = 0 Or Len(low) > 20 Then Exit Function
+    If InStr("|" & COUNTRY_NAMES & "|", "|" & low & "|") > 0 Then CountryFromText = UCase$(low)
+End Function
+
+' Ligne reduite a un seul jeton "domaine.tld" (emojis/fleches ignores) -> domaine.
+Private Function BareDomainOf(ByVal low As String) As String
+    Dim idx As Long, ch As String, cleaned As String
+    For idx = 1 To Len(low)
+        ch = Mid$(low, idx, 1)
+        Select Case ch
+            Case "a" To "z", "0" To "9", ".", "-"
+                cleaned = cleaned & ch
+            Case Else
+                cleaned = cleaned & " "
+        End Select
+    Next idx
+    cleaned = CollapseSpaces(Trim$(cleaned))
+    If Len(cleaned) = 0 Or InStr(cleaned, " ") > 0 Then Exit Function
+    Dim re As Object
+    Set re = CreateObject("VBScript.RegExp")
+    re.Pattern = "^[a-z0-9][a-z0-9\-]{1,40}\.[a-z]{2,6}$"
+    If re.Test(cleaned) Then BareDomainOf = cleaned
+End Function
+
+' Societe deduite du domaine e-mail ("inextenso-innovation.fr" ->
+' "Inextenso Innovation") ; fournisseurs grand public exclus.
+Private Function CompanyFromDomain() As String
+    Dim dom As String, base As String
+    If InStr(mSmtp, "@") = 0 Then Exit Function
+    dom = LCase$(Mid$(mSmtp, InStr(mSmtp, "@") + 1))
+    If InStr(dom, ".") = 0 Then Exit Function
+    base = Left$(dom, InStr(dom, ".") - 1)
+    If Len(base) < 3 Or Len(base) > 25 Then Exit Function
+    If InStr("|" & GENERIC_DOMAINS & "|", "|" & base & "|") > 0 Then Exit Function
+    base = Replace(Replace(base, "-", " "), "_", " ")
+    CompanyFromDomain = CapWords(base)
+End Function
+
+Private Function WebFromDomain() As String
+    Dim dom As String, base As String
+    If InStr(mSmtp, "@") = 0 Then Exit Function
+    dom = LCase$(Mid$(mSmtp, InStr(mSmtp, "@") + 1))
+    If InStr(dom, ".") = 0 Then Exit Function
+    base = Left$(dom, InStr(dom, ".") - 1)
+    If InStr("|" & GENERIC_DOMAINS & "|", "|" & base & "|") > 0 Then Exit Function
+    WebFromDomain = "www." & dom
+End Function
+
+Private Function LineHasPhone(ByVal s As String) As Boolean
+    Dim d As Long, idx As Long, ch As String
+    For idx = 1 To Len(s)
+        ch = Mid$(s, idx, 1)
+        If ch Like "#" Then d = d + 1
+    Next idx
+    LineHasPhone = (d >= 8) And (InStr(s, "@") = 0)
+End Function
+
+' Ligne = nom de la personne : porte le nom ou le prenom deja connus, en
+' MOTS ENTIERS ("IC" ne matche plus "Immobiliers").
+Private Function LooksLikeName(ByVal s As String) As Boolean
+    Dim low As String, k As String
+    low = " " & LCase$(NormKey(s)) & " "
+    If Len(mLast) > 1 Then
+        k = LCase$(NormKey(mLast))
+        If Len(k) > 1 Then
+            If InStr(low, " " & k & " ") > 0 Then
+                LooksLikeName = True
+                Exit Function
+            End If
+        End If
+    End If
+    If Len(mFirst) > 1 And Len(s) < 40 Then
+        k = LCase$(NormKey(mFirst))
+        If Len(k) > 1 Then
+            If InStr(low, " " & k & " ") > 0 Then LooksLikeName = True
+        End If
+    End If
+End Function
+
+' Mot de societe present (sarl, groupe, universite, cabinet...).
+Private Function HasCompanyHint(ByVal s As String) As Boolean
+    Dim low As String, hints() As String, idx As Long
+    If Len(s) = 0 Then Exit Function
+    low = " " & StripAccents(LCase$(s)) & " "
+    hints = Split(COMPANY_HINTS, "|")
+    For idx = LBound(hints) To UBound(hints)
+        If InStr(low, " " & hints(idx) & " ") > 0 Or InStr(low, " " & hints(idx)) > 0 And Right$(hints(idx), 1) = " " Then
+            HasCompanyHint = True
+            Exit Function
+        End If
+    Next idx
+End Function
+
+Private Function LooksLikeCompany(ByVal s As String) As Boolean
+    If Len(s) = 0 Then Exit Function
+    If HasCompanyHint(s) Then
+        LooksLikeCompany = True
+        Exit Function
+    End If
+    ' Tout en majuscules (sigle) et sans chiffre
+    If Len(s) >= 3 And UCase$(s) = s And s <> LCase$(s) And Not HasDigit(s) Then LooksLikeCompany = True
+End Function
+
+'=============================================================================
+' Compte \ dossier cible : liste groupee par compte (l'adresse n'est ecrite
+' qu'une fois), numeros continus. Validation par numero OU par un morceau du
+' nom du dossier ; ambiguite ou absence -> nouvelle saisie.
+'=============================================================================
+Private Function PickTargetFolder() As Outlook.MAPIFolder
+    On Error GoTo ErrH
+    Dim ns As Outlook.NameSpace, st As Outlook.Store, idx As Long
+    Dim folders As Collection, labels As Collection, listTxt As String
+    Set ns = Application.Session
+    Set folders = New Collection
+    Set labels = New Collection
+
+    For idx = 1 To ns.Stores.Count
+        Set st = ns.Stores(idx)
+        Dim mine As Collection
+        Set mine = New Collection
+        CollectContactFolders st.GetRootFolder, mine
+        If mine.Count > 0 Then
+            listTxt = listTxt & AnsiOnly(st.DisplayName) & vbCrLf
+            Dim j As Long
+            For j = 1 To mine.Count
+                folders.Add mine(j)
+                labels.Add ShortLabel(mine(j))
+                listTxt = listTxt & "   " & folders.Count & " - " & labels(folders.Count) & vbCrLf
+            Next j
+            listTxt = listTxt & vbCrLf
+        End If
+    Next idx
+    If folders.Count = 0 Then Exit Function
+
+    Dim defIdx As Long
+    defIdx = DefaultIndex(folders, labels)
+
+    Dim prompt As String, ans As String, hit As Long, cand As String
+    prompt = ""
+    Do
+        ans = Trim$(InputBox(prompt & _
+              T("Cr~eer la fiche de ", "Create the card of ") & AnsiOnly(mFirst & " " & mLast) & _
+              IIf(Len(mSmtp) > 0, " <" & mSmtp & ">", "") & vbCrLf & _
+              T("dans quel dossier ? Num~ero, ou un morceau du nom.", _
+                "in which folder? Number, or part of the name.") & _
+              vbCrLf & vbCrLf & listTxt, UiTitle(), CStr(defIdx)))
+        If Len(ans) = 0 Then Exit Function
+        hit = ResolveChoice(ans, folders, labels, cand)
+        If hit > 0 Then
+            Set PickTargetFolder = folders(hit)
+            Exit Function
+        End If
+        If Len(cand) > 0 Then
+            prompt = T("Plusieurs dossiers correspondent ~a ", "Several folders match ") & """" & ans & """ : " & _
+                     cand & vbCrLf & T("Pr~ecise, ou donne le num~ero." & vbCrLf & vbCrLf, _
+                                       "Be more specific, or give the number." & vbCrLf & vbCrLf)
+        Else
+            prompt = T("Aucun dossier ne correspond ~a ", "No folder matches ") & """" & ans & """." & vbCrLf & _
+                     T("Ressaisis un num~ero ou un morceau du nom." & vbCrLf & vbCrLf, _
+                       "Type a number or part of the name again." & vbCrLf & vbCrLf)
+        End If
+    Loop
+    Exit Function
+ErrH:
+    modDebugLog.DError MOD_NAME, "PickTargetFolder err " & Err.Number & " - " & Err.Description
+End Function
+
+' Saisie -> index (0 si aucun ou ambigu ; cand = liste des candidats).
+' Numero, puis egalite exacte, puis "commence par", puis "contient".
+' "compte\dossier" ("live\amis") permet de lever une ambiguite.
+Private Function ResolveChoice(ByVal ans As String, ByVal folders As Collection, _
+                               ByVal labels As Collection, ByRef cand As String) As Long
+    cand = ""
+    If IsNumeric(ans) Then
+        Dim num As Long
+        num = CLng(ans)
+        If num >= 1 And num <= folders.Count Then ResolveChoice = num
+        Exit Function
+    End If
+
+    Dim wantStore As String, wantFld As String, pos As Long
+    wantFld = ans
+    pos = InStr(ans, "\")
+    If pos > 0 Then
+        wantStore = NormTxt(Left$(ans, pos - 1))
+        wantFld = Mid$(ans, pos + 1)
+    End If
+    Dim want As String
+    want = NormTxt(wantFld)
+    If Len(want) = 0 Then Exit Function
+
+    Dim mode As Long, idx As Long, lbl As String, stName As String
+    Dim found As Long, cnt As Long
+    For mode = 1 To 3
+        found = 0: cnt = 0: cand = ""
+        For idx = 1 To folders.Count
+            lbl = NormTxt(CStr(labels(idx)))
+            stName = NormTxt(folders(idx).Store.DisplayName)
+            If Len(wantStore) = 0 Or InStr(stName, wantStore) > 0 Then
+                Dim ok As Boolean
+                ok = False
+                Select Case mode
+                    Case 1: ok = (lbl = want)
+                    Case 2: ok = (Left$(lbl, Len(want)) = want)
+                    Case 3: ok = (InStr(lbl, want) > 0)
+                End Select
+                If ok Then
+                    cnt = cnt + 1
+                    found = idx
+                    cand = cand & IIf(Len(cand) > 0, ", ", "") & idx & " - " & CStr(labels(idx))
+                End If
+            End If
+        Next idx
+        If cnt = 1 Then
+            ResolveChoice = found
+            cand = ""
+            Exit Function
+        ElseIf cnt > 1 Then
+            Exit Function
+        End If
+    Next mode
+    cand = ""
+End Function
+
+' Index propose : ContactFromMailDefaultFolder, sinon dossier Contacts par
+' defaut du compte courant, sinon 1.
+Private Function DefaultIndex(ByVal folders As Collection, ByVal labels As Collection) As Long
+    On Error Resume Next
+    Dim idx As Long, want As String, cur As Outlook.Store
+    want = NormTxt(mDefaultFolder)
+    If Len(want) > 0 Then
+        For idx = 1 To folders.Count
+            If InStr(NormTxt(folders(idx).Store.DisplayName & "\" & CStr(labels(idx))), want) > 0 Then
+                DefaultIndex = idx
+                Exit Function
+            End If
+        Next idx
+    End If
+    Set cur = Application.ActiveExplorer.CurrentFolder.Store
+    If Not cur Is Nothing Then
+        Dim defId As String
+        defId = cur.GetDefaultFolder(olFolderContacts).EntryID
+        If Err.Number = 0 Then
+            For idx = 1 To folders.Count
+                If folders(idx).EntryID = defId Then
+                    DefaultIndex = idx
+                    Exit Function
+                End If
+            Next idx
+        End If
+        Err.Clear
+    End If
+    DefaultIndex = 1
+End Function
+
+' Comparaison : sans accents, minuscules, sans emojis, espaces reduits.
+Private Function NormTxt(ByVal s As String) As String
+    NormTxt = CollapseSpaces(Trim$(LCase$(StripAccents(AnsiOnly(s)))))
+End Function
+
+Private Sub CollectContactFolders(ByVal fld As Outlook.MAPIFolder, ByVal acc As Collection)
+    On Error Resume Next
+    Dim isContacts As Boolean
+    isContacts = (fld.DefaultItemType = olContactItem)
+    If Err.Number <> 0 Then isContacts = False: Err.Clear
+    If isContacts Then
+        If Not IsSkippedFolder(fld) Then acc.Add fld
+    End If
+    Dim child As Outlook.MAPIFolder
+    For Each child In fld.Folders
+        CollectContactFolders child, acc
+    Next child
+End Sub
+
+' Libelle court : chemin relatif au compte, prefixe "Contacts\" retire,
+' dossier de contacts par defaut affiche [Racine] / [Root].
+Private Function ShortLabel(ByVal fld As Outlook.MAPIFolder) As String
+    On Error Resume Next
+    Dim rel As String, defId As String
+    rel = Replace(fld.FolderPath, "\\" & fld.Store.DisplayName & "\", "")
+    defId = fld.Store.GetDefaultFolder(olFolderContacts).EntryID
+    If Err.Number = 0 Then
+        If fld.EntryID = defId Then
+            ShortLabel = T("[Racine]", "[Root]")
+            Exit Function
+        End If
+    End If
+    Err.Clear
+    ' "Contacts\Amis" -> "Amis" (le 1er segment est le dossier racine)
+    If InStr(rel, "\") > 0 Then rel = Mid$(rel, InStr(rel, "\") + 1)
+    ShortLabel = AnsiOnly(rel)
+    If Len(ShortLabel) = 0 Then ShortLabel = AnsiOnly(fld.Name)
+End Function
+
+' InputBox / MsgBox n'affichent que la page de code ANSI (Windows-1252) :
+' les emojis et autres caracteres hors plage sortiraient en "??". On les
+' retire du libelle affiche (le nom reel du dossier n'est pas touche).
+Private Function AnsiOnly(ByVal s As String) As String
+    Dim idx As Long, code As Long, ch As String, out As String
+    For idx = 1 To Len(s)
+        ch = Mid$(s, idx, 1)
+        code = AscW(ch)
+        If code < 0 Then code = code + 65536
+        If code <= 255 Or (code >= 338 And code <= 339) Or code = 8364 Then
+            out = out & ch
+        ElseIf code >= 55296 And code <= 57343 Then
+            ' moitie de paire de substitution (emoji) : ignoree
+        ElseIf code = 65039 Or code = 8205 Then
+            ' selecteur de variante / joncteur : ignores
+        End If
+    Next idx
+    AnsiOnly = CollapseSpaces(Trim$(out))
+End Function
+
+Private Function IsSkippedFolder(ByVal fld As Outlook.MAPIFolder) As Boolean
+    ' Pack v3 (C3) : delegation modContactCommon (helper partage).
+    IsSkippedFolder = modContactCommon.IsSkippedFolder(fld, mSkipFolders)
+End Function
+
+' Dossier situe sous les Elements supprimes de son compte (corbeille) ?
+Private Function IsInDeletedItems(ByVal fld As Outlook.MAPIFolder) As Boolean
+    ' Pack v3 (C3) : delegation modContactCommon (helper partage).
+    IsInDeletedItems = modContactCommon.IsInDeletedItems(fld)
+End Function
+
+
+'=============================================================================
+' Anti-doublon dans le compte cible : e-mail, puis nom.
+'=============================================================================
+Private Function FindExisting(ByVal st As Outlook.Store) As Outlook.ContactItem
+    On Error Resume Next
+    Dim folders As Collection, idx As Long, itm As Object
+    Set folders = New Collection
+    CollectContactFolders st.GetRootFolder, folders
+    Dim wantKey As String
+    wantKey = NormKey(mFirst & " " & mLast)
+
+    ' Pack v3 (B11) : 1) adresse e-mail par Restrict (filtre evalue cote
+    ' MAPI, 3 champs Email) - avant : parcours de TOUTES les fiches avec
+    ' 3 CallByName chacune ; 2) nom : parcours restreint aux fiches dont le
+    ' nom de fichier commence par le nom de famille (Restrict LIKE), puis
+    ' repli parcours complet si aucune.
+    Dim flt As String, hits As Object, safeMail As String
+    If Len(mSmtp) > 0 Then
+        safeMail = Replace(mSmtp, "'", "''")
+        flt = "[Email1Address] = '" & safeMail & "' OR [Email2Address] = '" & safeMail & _
+              "' OR [Email3Address] = '" & safeMail & "'"
+        For idx = 1 To folders.Count
+            Set hits = Nothing
+            Err.Clear
+            Set hits = folders(idx).Items.Restrict(flt)
+            If Err.Number = 0 And Not hits Is Nothing Then
+                If hits.Count > 0 Then
+                    Set itm = hits.GetFirst
+                    If TypeName(itm) = "ContactItem" Then
+                        Set FindExisting = itm
+                        Exit Function
+                    End If
+                End If
+            End If
+            Err.Clear
+        Next idx
+    End If
+
+    Dim byNameHit As Outlook.ContactItem
+    If Len(wantKey) = 0 Then Exit Function
+    Dim k As Long
+    For k = 1 To 2
+        For idx = 1 To folders.Count
+            Set hits = Nothing
+            Err.Clear
+            If k = 1 And Len(mLast) > 1 Then
+                ' Passe 1 : candidats par nom de famille (LIKE, cote MAPI)
+                Set hits = folders(idx).Items.Restrict("@SQL=" & Chr(34) & _
+                    "urn:schemas:contacts:sn" & Chr(34) & " LIKE '%" & Replace(mLast, "'", "''") & "%'")
+            ElseIf k = 2 Then
+                Set hits = folders(idx).Items
+            End If
+            If Err.Number = 0 And Not hits Is Nothing Then
+                For Each itm In hits
+                    If TypeName(itm) = "ContactItem" Then
+                        If NormKey(SafeStr(itm.FirstName) & " " & SafeStr(itm.LastName)) = wantKey Or _
+                           NormKey(SafeStr(itm.FullName)) = wantKey Then
+                            Set FindExisting = itm
+                            Exit Function
+                        End If
+                    End If
+                Next itm
+            End If
+            Err.Clear
+        Next idx
+        If k = 1 And Len(mLast) <= 1 Then Exit For
+        ' Le parcours complet (passe 2) n'a de sens que si le nom porte des
+        ' accents (LIKE est sensible aux accents, NormKey ne l'est pas) :
+        ' sinon la passe 1 est exhaustive et on evite de re-lire toute la boite.
+        If k = 1 And StripAccents(mLast) = mLast Then Exit For
+    Next k
+    Set FindExisting = byNameHit
+    Err.Clear
+End Function
+
+'=============================================================================
+' Remplissage de la fiche (avant Display ; aucun Save ici).
+'=============================================================================
+Private Sub FillContact(ByVal ct As Outlook.ContactItem)
+    On Error Resume Next
+    If Len(mFirst) > 0 Or Len(mLast) > 0 Then
+        ct.FullName = Trim$(mFirst & " " & mLast)
+        ct.FirstName = mFirst
+        ct.LastName = mLast
+    End If
+    If Len(mSmtp) > 0 Then
+        ct.Email1Address = mSmtp
+        ct.Email1DisplayName = Trim$(mFirst & " " & mLast) & " (" & mSmtp & ")"
+    End If
+    If Len(mTitle) > 0 Then ct.JobTitle = mTitle
+    If Len(mCompany) > 0 Then ct.CompanyName = mCompany
+    If Len(mDept) > 0 Then ct.Department = mDept
+    If Len(mMobile) > 0 Then ct.MobileTelephoneNumber = mMobile
+    If Len(mPhone) > 0 Then ct.BusinessTelephoneNumber = mPhone
+    If Len(mPhone2) > 0 Then ct.Business2TelephoneNumber = mPhone2
+    If Len(mWeb) > 0 Then ct.WebPage = mWeb
+    If Len(mPostal) > 0 Or Len(mStreet) > 0 Then
+        ct.BusinessAddressStreet = mStreet
+        ct.BusinessAddressPostalCode = mPostal
+        ct.BusinessAddressCity = UCase$(mCity)
+        If Len(mCountry) > 0 Then
+            ct.BusinessAddressCountry = mCountry
+        ElseIf mCountryCode = "33" And Len(mPostal) = 5 Then
+            ct.BusinessAddressCountry = "FRANCE"
+        End If
+    End If
+    If Len(mCategory) > 0 Then ct.Categories = mCategory
+    ct.Body = NotesHeader() & vbCrLf & vbCrLf & Replace(mSig, vbLf, vbCrLf)
+    Err.Clear
+End Sub
+
+' "Signature extraite du mail du jj/mm/aaaa - Objet (message cite)".
+Private Function NotesHeader() As String
+    NotesHeader = T("Signature extraite du mail du ", "Signature extracted from the e-mail of ") & _
+                  Format$(mMailDate, "dd/mm/yyyy") & IIf(Len(mMailSubject) > 0, " - " & mMailSubject, "") & _
+                  IIf(mSigSource = 2, " (" & T("message cit~e", "quoted message") & ")", "")
+End Function
+
+'=============================================================================
+' Completion d'une fiche existante : liste des informations NOUVELLES
+' (champ extrait non vide ET champ de la fiche vide ; numeros compares
+' chiffres a chiffres entre tous les champs telephone pour eviter les
+' doublons croises ; e-mail pose dans le premier emplacement libre).
+'=============================================================================
+Private Function NewFieldsSummary(ByVal ct As Outlook.ContactItem) As String
+    On Error Resume Next
+    Dim res As String
+    If Len(mTitle) > 0 And Len(Trim$(SafeStr(ct.JobTitle))) = 0 Then _
+        res = res & "- " & T("Fonction : ", "Job title: ") & mTitle & vbCrLf
+    If Len(mCompany) > 0 And Len(Trim$(SafeStr(ct.CompanyName))) = 0 Then _
+        res = res & "- " & T("Soci~et~e : ", "Company: ") & mCompany & vbCrLf
+    If Len(mDept) > 0 And Len(Trim$(SafeStr(ct.Department))) = 0 Then _
+        res = res & "- " & T("Service : ", "Department: ") & mDept & vbCrLf
+    If Len(mMobile) > 0 And Len(Trim$(SafeStr(ct.MobileTelephoneNumber))) = 0 And Not PhoneKnown(ct, mMobile) Then _
+        res = res & "- " & T("T~el. mobile : ", "Mobile phone: ") & mMobile & vbCrLf
+    If Len(mPhone) > 0 And Len(Trim$(SafeStr(ct.BusinessTelephoneNumber))) = 0 And Not PhoneKnown(ct, mPhone) Then _
+        res = res & "- " & T("T~el. bureau : ", "Business phone: ") & mPhone & vbCrLf
+    If Len(mPhone2) > 0 And Len(Trim$(SafeStr(ct.Business2TelephoneNumber))) = 0 And Not PhoneKnown(ct, mPhone2) Then _
+        res = res & "- " & T("T~el. bureau 2 : ", "Business phone 2: ") & mPhone2 & vbCrLf
+    If Len(mWeb) > 0 And Len(Trim$(SafeStr(ct.WebPage))) = 0 Then _
+        res = res & "- " & T("Site web : ", "Web page: ") & mWeb & vbCrLf
+    If (Len(mStreet) > 0 Or Len(mPostal) > 0) And _
+       Len(Trim$(SafeStr(ct.BusinessAddressStreet) & SafeStr(ct.BusinessAddressPostalCode) & SafeStr(ct.BusinessAddressCity))) = 0 Then _
+        res = res & "- " & T("Adresse : ", "Address: ") & Replace(mStreet, vbCrLf, " / ") & _
+              IIf(Len(mPostal) > 0, " - " & mPostal & " " & UCase$(mCity), "") & vbCrLf
+    Dim slot As Long
+    slot = FirstFreeEmailSlot(ct)
+    If slot > 0 Then _
+        res = res & "- " & T("E-mail (", "E-mail (") & slot & ") : " & mSmtp & vbCrLf
+    NewFieldsSummary = res
+    Err.Clear
+End Function
+
+' Numero deja porte par la fiche (comparaison chiffres seuls, tous champs) ?
+Private Function PhoneKnown(ByVal ct As Outlook.ContactItem, ByVal e164 As String) As Boolean
+    On Error Resume Next
+    Dim props As Variant, idx As Long, digits As String, have As String
+    digits = DigitsOnly(e164)
+    If Len(digits) = 0 Then Exit Function
+    props = Array("MobileTelephoneNumber", "BusinessTelephoneNumber", "Business2TelephoneNumber", _
+                  "HomeTelephoneNumber", "CompanyMainTelephoneNumber", "OtherTelephoneNumber")
+    For idx = LBound(props) To UBound(props)
+        have = DigitsOnly(SafeStr(CallByName(ct, CStr(props(idx)), VbGet)))
+        If Len(have) > 0 And have = digits Then
+            PhoneKnown = True
+            Exit Function
+        End If
+    Next idx
+    Err.Clear
+End Function
+
+' Premier emplacement Email1..3 libre si l'adresse extraite est inconnue
+' de la fiche (0 = deja connue, ou pas d'adresse, ou aucun emplacement).
+Private Function FirstFreeEmailSlot(ByVal ct As Outlook.ContactItem) As Long
+    On Error Resume Next
+    Dim k As Long, cur As String, freeSlot As Long
+    If Len(mSmtp) = 0 Then Exit Function
+    For k = 1 To 3
+        cur = LCase$(Trim$(SafeStr(CallByName(ct, "Email" & k & "Address", VbGet))))
+        If StrComp(cur, mSmtp, vbTextCompare) = 0 Then Exit Function
+        If Len(cur) = 0 And freeSlot = 0 Then freeSlot = k
+    Next k
+    FirstFreeEmailSlot = freeSlot
+    Err.Clear
+End Function
+
+'=============================================================================
+' Pose les informations nouvelles dans la fiche existante (memes conditions
+' que NewFieldsSummary) et ajoute la signature datee EN TETE des notes,
+' l'existant est conserve dessous. AUCUN Save : la fiche s'ouvre, tu valides.
+'=============================================================================
+Private Sub ApplyToExisting(ByVal ct As Outlook.ContactItem)
+    On Error Resume Next
+    If Len(mTitle) > 0 And Len(Trim$(SafeStr(ct.JobTitle))) = 0 Then ct.JobTitle = mTitle
+    If Len(mCompany) > 0 And Len(Trim$(SafeStr(ct.CompanyName))) = 0 Then ct.CompanyName = mCompany
+    If Len(mDept) > 0 And Len(Trim$(SafeStr(ct.Department))) = 0 Then ct.Department = mDept
+    If Len(mMobile) > 0 And Len(Trim$(SafeStr(ct.MobileTelephoneNumber))) = 0 And Not PhoneKnown(ct, mMobile) Then ct.MobileTelephoneNumber = mMobile
+    If Len(mPhone) > 0 And Len(Trim$(SafeStr(ct.BusinessTelephoneNumber))) = 0 And Not PhoneKnown(ct, mPhone) Then ct.BusinessTelephoneNumber = mPhone
+    If Len(mPhone2) > 0 And Len(Trim$(SafeStr(ct.Business2TelephoneNumber))) = 0 And Not PhoneKnown(ct, mPhone2) Then ct.Business2TelephoneNumber = mPhone2
+    If Len(mWeb) > 0 And Len(Trim$(SafeStr(ct.WebPage))) = 0 Then ct.WebPage = mWeb
+    If (Len(mStreet) > 0 Or Len(mPostal) > 0) And _
+       Len(Trim$(SafeStr(ct.BusinessAddressStreet) & SafeStr(ct.BusinessAddressPostalCode) & SafeStr(ct.BusinessAddressCity))) = 0 Then
+        ct.BusinessAddressStreet = mStreet
+        ct.BusinessAddressPostalCode = mPostal
+        ct.BusinessAddressCity = UCase$(mCity)
+        If Len(mCountry) > 0 Then
+            ct.BusinessAddressCountry = mCountry
+        ElseIf mCountryCode = "33" And Len(mPostal) = 5 Then
+            ct.BusinessAddressCountry = "FRANCE"
+        End If
+    End If
+    Dim slot As Long
+    slot = FirstFreeEmailSlot(ct)
+    If slot > 0 Then CallByName ct, "Email" & slot & "Address", VbLet, mSmtp
+    ct.Body = NotesHeader() & vbCrLf & vbCrLf & Replace(mSig, vbLf, vbCrLf) & vbCrLf & vbCrLf & _
+              "----" & vbCrLf & SafeStr(ct.Body)
+    Err.Clear
+End Sub
+
+'=============================================================================
+' ContactFromMailProbeFolders (diagnostic, epinglable au QAT) : liste TOUS
+' les dossiers de contacts de TOUS les comptes - chemin complet, nombre de
+' fiches, motifs d'exclusion ([SKIP] motif ContactSkipFolders, [MASQUE]
+' dossier cache, [CORBEILLE]). Sert a retrouver un dossier disparu des
+' decomptes. Rapport texte dans Bureau\Macro VBA\Outlook, ouvert dans
+' Notepad sur demande.
+'=============================================================================
+Public Sub ContactFromMailProbeFolders()
+    Dim errNo As Long, errDesc As String
+    On Error GoTo ErrH
+    LoadSettings
+    Dim ns As Outlook.NameSpace, idx As Long, rpt As String, outPath As String
+    Set ns = Application.Session
+    rpt = "ContactFromMailProbeFolders " & ModVersion() & " - " & Format$(Now, "yyyy-mm-dd hh:nn:ss") & vbCrLf & _
+          "ContactSkipFolders = " & mSkipFolders & vbCrLf
+    For idx = 1 To ns.Stores.Count
+        rpt = rpt & vbCrLf & "=== " & ns.Stores(idx).DisplayName & " ===" & vbCrLf
+        rpt = rpt & ProbeBranch(ns.Stores(idx).GetRootFolder)
+    Next idx
+    outPath = modConfig.MacroVBADir() & "\ContactFolders-Probe.txt"
+    Dim ff As Integer
+    ff = FreeFile
+    Open outPath For Output As #ff
+    Print #ff, rpt
+    Close #ff
+    modDebugLog.DInfo MOD_NAME, "ProbeFolders -> " & outPath
+    If MsgBox(T("Diagnostic ~ecrit dans :", "Diagnostic written to:") & vbCrLf & outPath & vbCrLf & vbCrLf & _
+              T("Ouvrir le rapport ?", "Open the report?"), vbYesNo + vbInformation, UiTitle()) = vbYes Then
+        Shell "notepad.exe " & Chr$(34) & outPath & Chr$(34), vbNormalFocus
+    End If
+    Exit Sub
+ErrH:
+    errNo = Err.Number
+    errDesc = Err.Description
+    On Error Resume Next
+    Close
+    modDebugLog.DError MOD_NAME, "ProbeFolders err " & errNo & " - " & errDesc
+    MsgBox T("Erreur : ", "Error: ") & errNo & " - " & errDesc, vbExclamation, UiTitle()
+End Sub
+
+Private Function ProbeBranch(ByVal fld As Outlook.MAPIFolder) As String
+    On Error Resume Next
+    Dim res As String, isContacts As Boolean, flags As String, cnt As Long
+    isContacts = (fld.DefaultItemType = olContactItem)
+    If Err.Number <> 0 Then isContacts = False: Err.Clear
+    If isContacts Then
+        flags = ""
+        Dim pats() As String, pidx As Long, nm As String
+        nm = LCase$(fld.Name)
+        If Len(mSkipFolders) > 0 Then
+            pats = Split(mSkipFolders, "|")
+            For pidx = LBound(pats) To UBound(pats)
+                If Len(Trim$(pats(pidx))) > 0 Then
+                    If nm Like LCase$(Trim$(pats(pidx))) Then
+                        flags = flags & " [SKIP " & Trim$(pats(pidx)) & "]"
+                        Exit For
+                    End If
+                End If
+            Next pidx
+        End If
+        Dim hiddenFlag As Variant
+        hiddenFlag = fld.PropertyAccessor.GetProperty(PROPTAG_HIDDEN)
+        If Err.Number = 0 Then
+            If CBool(hiddenFlag) Then flags = flags & " [MASQUE]"
+        End If
+        Err.Clear
+        If IsInDeletedItems(fld) Then flags = flags & " [CORBEILLE]"
+        cnt = fld.Items.Count
+        If Err.Number <> 0 Then cnt = -1: Err.Clear
+        res = fld.FolderPath & "  (" & cnt & ")" & flags & vbCrLf
+    End If
+    Dim child As Outlook.MAPIFolder
+    For Each child In fld.Folders
+        res = res & ProbeBranch(child)
+    Next child
+    ProbeBranch = res
+    Err.Clear
+End Function
+
+'=============================================================================
+' Helpers
+'=============================================================================
+Private Function ToE164(ByVal raw As String) As String
+    Dim s As String, idx As Long, ch As String, digits As String, hasPlus As Boolean, cc As String
+    s = Trim$(raw)
+    For idx = 1 To Len(s)
+        ch = Mid$(s, idx, 1)
+        If ch Like "#" Then
+            digits = digits & ch
+        ElseIf ch = "+" And Len(digits) = 0 Then
+            hasPlus = True
+        End If
+    Next idx
+    cc = mCountryCode
+    If hasPlus Or (Left$(digits, 2) = "00" And Len(digits) >= 10) Then
+        If Not hasPlus Then digits = Mid$(digits, 3)
+        If Left$(digits, Len(cc)) = cc Then
+            If Mid$(digits, Len(cc) + 1, 1) = "0" And Len(digits) = Len(cc) + 10 Then digits = cc & Mid$(digits, Len(cc) + 2)
+        End If
+        If Len(digits) < 8 Or Len(digits) > 15 Then Exit Function
+        ToE164 = "+" & digits
+    ElseIf Len(digits) = 10 And Left$(digits, 1) = "0" Then
+        ToE164 = "+" & cc & Mid$(digits, 2)
+    End If
+End Function
+
+Private Function NormalizeLines(ByVal s As String) As String
+    s = Replace(s, vbCrLf, vbLf)
+    s = Replace(s, vbCr, vbLf)
+    s = Replace(s, ChrW$(160), " ")
+    s = Replace(s, vbTab, " ")
+    NormalizeLines = s
+End Function
+
+Private Function CapWords(ByVal s As String) As String
+    Dim parts() As String, idx As Long, segs() As String, si As Long
+    s = CollapseSpaces(Trim$(s))
+    If Len(s) = 0 Then Exit Function
+    parts = Split(s, " ")
+    For idx = LBound(parts) To UBound(parts)
+        segs = Split(parts(idx), "-")
+        For si = LBound(segs) To UBound(segs)
+            If Len(segs(si)) > 0 Then segs(si) = UCase$(Left$(segs(si), 1)) & LCase$(Mid$(segs(si), 2))
+        Next si
+        parts(idx) = Join(segs, "-")
+    Next idx
+    CapWords = Join(parts, " ")
+End Function
+
+Private Function NormKey(ByVal s As String) As String
+    ' Pack v3 (C3) : delegation modContactCommon (helper partage).
+    NormKey = modContactCommon.NormKey(s)
+End Function
+
+Private Function StripAccents(ByVal s As String) As String
+    ' Pack v3 (C3) : delegation modContactCommon (helper partage).
+    StripAccents = modContactCommon.StripAccents(s)
+End Function
+
+Private Function CollapseSpaces(ByVal s As String) As String
+    ' Pack v3 (C3) : delegation modContactCommon (helper partage).
+    CollapseSpaces = modContactCommon.CollapseSpaces(s)
+End Function
+
+Private Function HasDigit(ByVal s As String) As Boolean
+    ' Pack v3 (C3) : delegation modContactCommon (helper partage).
+    HasDigit = modContactCommon.HasDigit(s)
+End Function
+
+Private Function DigitsOnly(ByVal s As String) As String
+    ' Pack v3 (C3) : delegation modContactCommon (helper partage).
+    DigitsOnly = modContactCommon.DigitsOnly(s)
+End Function
+
+Private Function SafeStr(ByVal v As Variant) As String
+    ' Pack v3 (C3) : delegation modContactCommon (helper partage).
+    SafeStr = modContactCommon.SafeStr(v)
+End Function

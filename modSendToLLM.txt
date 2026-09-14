@@ -1,0 +1,619 @@
+Option Explicit
+
+' =====================================================================
+' modSendToLLM v3
+' v3 (2026-07-05) : lecture config via getter modConfig.SignatureTextMarker()
+' (EnsureLoaded-safe) au lieu de la globale g_ en direct.
+' Purpose (EN): copies the body (signature stripped) of the Outlook mail being
+'   composed to the clipboard, opens the target LLM (Claude / Mistral / ChatGPT)
+'   in the default browser, then auto-pastes (Ctrl+V [+ Enter] via SendKeys). A
+'   configurable prompt prefix is prepended. Three public entry points to bind
+'   to ribbon buttons. No API: the clipboard is the only injection path.
+'
+' Copie le texte du message Outlook en cours de redaction (corps sans
+' la signature) dans le presse-papiers, ouvre le LLM cible dans le
+' navigateur par defaut, puis colle + valide automatiquement
+' (Ctrl+V + Entree via SendKeys).
+'
+' v2 (2026-06-10) : fix B11 - suppression d'un appel sans effet
+' "HtmlTrim s" (resultat ignore, argument ByVal) juste avant le vrai
+' "CleanText = HtmlTrim(s)" dans CleanText.
+'
+' 3 points d'entree publics (a binder sur 3 boutons ruban) :
+'   - SendToClaude
+'   - SendToMistral
+'   - SendToChatGPT
+'
+' EXTRACTION DU TEXTE
+'   On lit HTMLBody, on tronque au bookmark de signature Outlook
+'   (_MailAutoSig), puis on convertit le HTML tronque en texte brut.
+'   Fallbacks en cascade :
+'     1. HTMLBody coupe a _MailAutoSig            (cas nominal)
+'     2. Body brut coupe au marqueur de signature config (manuelle)
+'     3. Body brut entier                         (aucun marqueur)
+'
+' AUTOMATISATION (full auto, choix assume)
+'   Apres ouverture du navigateur, on attend DELAI_CHARGEMENT ms que
+'   la page charge et prenne le focus, puis SendKeys "^v" + "~".
+'
+'   LIMITES CONNUES (pas de bullshit) :
+'   - SendKeys est AVEUGLE : il frappe la fenetre qui a le focus a cet
+'     instant. Si une notif (Teams, popup) vole le focus pendant le
+'     delai, le collage part ailleurs. Risque assume.
+'   - Le focus dans le champ de saisie du chat n'est pas garanti au
+'     chargement. Sur les 3 sites le champ a generalement le focus,
+'     mais si ca rate : augmenter DELAI_CHARGEMENT (config.ini) ou
+'     cliquer manuellement avant que SendKeys frappe.
+'   - Un EDR peut voir SendKeys inter-process comme de l'injection
+'     clavier et bloquer/loguer. A surveiller.
+'   - Pas d'injection par URL : ni Claude ni Mistral ni ChatGPT n'ont
+'     de parametre ?q= fiable pour pre-remplir le chat. Le presse-
+'     papiers est la seule voie sans API.
+'
+' CONFIG (config.ini, optionnel - valeurs par defaut si absent)
+'   LLM_DelayClaudeMs   = 4000    ' attente avant Ctrl+V sur Claude
+'   LLM_DelayMistralMs  = 12000   ' attente avant Ctrl+V sur Mistral
+'   LLM_DelayChatGPTMs  = 4000    ' attente avant Ctrl+V sur ChatGPT
+'   LLM_PromptPrefix   =         ' surcharge le prompt de contexte
+'                                 ' (si vide -> prompt de correction par defaut)
+'   LLM_UrlClaude       = https://claude.ai/new
+'   LLM_UrlMistral      = https://chat.mistral.ai/chat
+'   LLM_UrlChatGPT      = https://chatgpt.com/
+'   LLM_AutoEnter      = 1       ' 1 = Ctrl+V + Entree ; 0 = Ctrl+V seul
+'
+' Nom de module : modSendToLLM
+' Chaines ASCII uniquement dans les MsgBox.
+' Late binding partout. ASCII strict dans les identifiants.
+' =====================================================================
+
+Private Const MOD_NAME As String = "SendLLM"
+
+' Valeurs par defaut (surchargeables via config.ini)
+' Delais par defaut propres a chaque LLM (Mistral charge plus lentement).
+Private Const DEF_DELAY_CLAUDE  As Long = 4000
+Private Const DEF_DELAY_MISTRAL As Long = 12000
+Private Const DEF_DELAY_CHATGPT As Long = 4000
+Private Const DEF_URL_CLAUDE  As String = "https://claude.ai/new"
+Private Const DEF_URL_MISTRAL As String = "https://chat.mistral.ai/chat"
+Private Const DEF_URL_CHATGPT As String = "https://chatgpt.com/"
+
+' Marqueur de signature manuelle (fallback niveau 2) : externalise dans
+' config.ini (cle SignatureTextMarker, vide par defaut -> fallback ignore).
+
+
+' ---------------------------------------------------------------------
+' POINTS D'ENTREE PUBLICS (boutons ruban)
+' ---------------------------------------------------------------------
+
+Public Sub SendToClaude()
+    SendTo "Claude", _
+        ReadUrl("LLM_UrlClaude", DEF_URL_CLAUDE), _
+        modConfig.CfgL("LLM_DelayClaudeMs", DEF_DELAY_CLAUDE)
+End Sub
+
+Public Sub SendToMistral()
+    SendTo "Mistral", _
+        ReadUrl("LLM_UrlMistral", DEF_URL_MISTRAL), _
+        modConfig.CfgL("LLM_DelayMistralMs", DEF_DELAY_MISTRAL)
+End Sub
+
+Public Sub SendToChatGPT()
+    SendTo "ChatGPT", _
+        ReadUrl("LLM_UrlChatGPT", DEF_URL_CHATGPT), _
+        modConfig.CfgL("LLM_DelayChatGPTMs", DEF_DELAY_CHATGPT)
+End Sub
+
+
+' ---------------------------------------------------------------------
+' COEUR
+' ---------------------------------------------------------------------
+
+Private Sub SendTo(ByVal llmName As String, ByVal url As String, _
+                        ByVal defaultDelay As Long)
+    Dim text As String
+    Dim prefix As String
+    Dim payload As String
+
+    On Error GoTo ErrH
+
+    modDebugLog.DTrace MOD_NAME, "SendTo debut LLM=" & llmName
+
+    ' 1. Recuperer le texte du mail en cours (sans signature)
+    text = ExtractBodyWithoutSignature()
+    If Len(Trim$(text)) = 0 Then
+        MsgBox T("Aucun texte a envoyer." & vbCrLf & _
+               "Place-toi dans un message en cours de redaction.", _
+               "No text to send." & vbCrLf & _
+               "Put yourself in a mail being composed."), _
+               vbExclamation, T("Envoi vers ", "Send to ") & llmName
+        modDebugLog.DInfo MOD_NAME, "Abandon : corps vide (" & llmName & ")"
+        Exit Sub
+    End If
+
+    ' 2. Prefixe de contexte (config.ini sinon valeur par defaut codee)
+    prefix = modConfig.Cfg("LLM_PromptPrefix", "")
+    If Len(Trim$(prefix)) = 0 Then prefix = DefaultPrefix()
+    If Len(prefix) > 0 Then
+        payload = prefix & vbCrLf & vbCrLf & text
+    Else
+        payload = text
+    End If
+
+    ' 3. Presse-papiers
+    If Not PutInClipboard(payload) Then
+        MsgBox T("~Echec de la copie dans le presse-papiers.", "Clipboard copy failed."), _
+               vbCritical, T("Envoi vers ", "Send to ") & llmName
+        modDebugLog.DError MOD_NAME, "Echec presse-papiers (" & llmName & ")"
+        Exit Sub
+    End If
+    modDebugLog.DDebug MOD_NAME, "Copie OK, " & Len(payload) & " chars"
+
+    ' 4. Ouvrir le navigateur
+    OpenUrl url
+    modDebugLog.DInfo MOD_NAME, "Navigateur ouvert sur " & llmName
+
+    ' 5. Attendre le chargement (delai propre au LLM, cf. Subs publiques)
+    WaitMs defaultDelay
+    modDebugLog.DDebug MOD_NAME, "Attente " & defaultDelay & "ms (" & llmName & ")"
+
+    ' 6. Coller (+ Entree si configure)
+    Dim autoEnter As Boolean
+    autoEnter = modConfig.CfgB("LLM_AutoEnter", True)
+    PasteAndConfirm autoEnter
+
+    modDebugLog.DInfo MOD_NAME, "Payload envoye vers " & llmName & _
+        " (autoEntree=" & autoEnter & ")"
+    modDebugLog.DTrace MOD_NAME, "SendTo fin LLM=" & llmName
+    Exit Sub
+
+ErrH:
+    modDebugLog.DError MOD_NAME, "SendTo error " & Err.Number & _
+        " - " & Err.Description & " (" & llmName & ")"
+    MsgBox T("Erreur lors de l'envoi vers ", "Error while sending to ") & llmName & T(" :", ":") & vbCrLf & _
+           Err.Number & " - " & Err.Description, _
+           vbCritical, T("Envoi vers ", "Send to ") & llmName
+End Sub
+
+
+' ---------------------------------------------------------------------
+' EXTRACTION DU CORPS SANS SIGNATURE
+' ---------------------------------------------------------------------
+
+Private Function ExtractBodyWithoutSignature() As String
+    Dim insp As Object          ' Outlook.Inspector
+    Dim item As Object          ' MailItem
+    Dim html As String
+    Dim rawBody As String
+    Dim res As String
+    Dim pos As Long
+
+    On Error GoTo ErrH
+
+    ExtractBodyWithoutSignature = ""
+
+    Set insp = Application.ActiveInspector
+    If insp Is Nothing Then
+        modDebugLog.DDebug MOD_NAME, "Pas d'ActiveInspector"
+        Exit Function
+    End If
+
+    Set item = insp.CurrentItem
+    If item Is Nothing Then Exit Function
+
+    ' On ne traite que les mails (Class 43 = olMail)
+    If item.Class <> 43 Then
+        modDebugLog.DDebug MOD_NAME, "Item non-mail (Class=" & item.Class & ")"
+        Exit Function
+    End If
+
+    ' --- Niveau 1 : HTMLBody coupe a _MailAutoSig ---
+    html = item.HTMLBody
+    If Len(html) > 0 Then
+        pos = HtmlSignaturePos(html)
+        If pos > 0 Then
+            html = Left$(html, pos - 1)
+            modDebugLog.DDebug MOD_NAME, "Coupe a _MailAutoSig pos=" & pos
+        Else
+            modDebugLog.DDebug MOD_NAME, "_MailAutoSig absent, HTML entier"
+        End If
+        res = HtmlToText(html)
+        res = CleanText(res)
+        If Len(Trim$(res)) > 0 Then
+            ExtractBodyWithoutSignature = res
+            Exit Function
+        End If
+    End If
+
+    ' --- Niveau 2 : Body brut coupe au marqueur de signature (config) ---
+    rawBody = item.Body
+    Dim sigMarker As String
+    sigMarker = modConfig.SignatureTextMarker()
+    If Len(sigMarker) > 0 Then
+        pos = InStrRev(rawBody, sigMarker)
+    Else
+        pos = 0
+    End If
+    If pos > 0 Then
+        res = Left$(rawBody, pos - 1)
+        modDebugLog.DDebug MOD_NAME, "Fallback Body coupe a marqueur pos=" & pos
+    Else
+        ' --- Niveau 3 : Body entier ---
+        res = rawBody
+        modDebugLog.DDebug MOD_NAME, "Fallback Body entier"
+    End If
+
+    ExtractBodyWithoutSignature = CleanText(res)
+    Exit Function
+
+ErrH:
+    modDebugLog.DError MOD_NAME, "ExtractBodyWithoutSignature error " & _
+        Err.Number & " - " & Err.Description
+    ExtractBodyWithoutSignature = ""
+End Function
+
+' Position (1-based) du debut du bloc signature dans le HTML.
+' Cherche le bookmark Outlook _MailAutoSig sous ses deux formes.
+' Renvoie 0 si absent.
+Private Function HtmlSignaturePos(ByVal html As String) As Long
+    Dim p1 As Long, p2 As Long
+    Dim lc As String
+
+    lc = LCase$(html)
+
+    ' Forme 1 : <a ... name="_mailautosig">
+    p1 = InStr(1, lc, "name=" & Chr(34) & "_mailautosig" & Chr(34))
+    If p1 = 0 Then p1 = InStr(1, lc, "name=_mailautosig")  ' sans guillemets
+
+    ' Forme 2 : mso-bookmark:_mailautosig
+    p2 = InStr(1, lc, "mso-bookmark:_mailautosig")
+
+    ' On veut la PREMIERE occurrence non nulle
+    If p1 > 0 And p2 > 0 Then
+        HtmlSignaturePos = IIf(p1 < p2, p1, p2)
+    ElseIf p1 > 0 Then
+        HtmlSignaturePos = p1
+    Else
+        HtmlSignaturePos = p2
+    End If
+
+    ' On remonte au '<' de la balise contenant le marqueur pour ne pas
+    ' laisser un bout de balise ouverte dans le HTML tronque.
+    If HtmlSignaturePos > 1 Then
+        Dim q As Long
+        q = InStrRev(html, "<", HtmlSignaturePos)
+        If q > 0 Then HtmlSignaturePos = q
+    End If
+End Function
+
+' Conversion HTML -> texte brut, sans dependance externe.
+' Strip des balises de structure, conversion des sauts de ligne,
+' decodage des entites courantes. Suffisant pour du corps de mail.
+Private Function HtmlToText(ByVal html As String) As String
+    Dim s As String
+    s = html
+
+    ' Retirer les blocs non visibles en entier (script/style/head/comments)
+    s = RemoveBlock(s, "<script", "</script>")
+    s = RemoveBlock(s, "<style", "</style>")
+    s = RemoveBlock(s, "<head", "</head>")
+    s = RemoveComments(s)
+
+    ' Sauts de ligne : <br>, </p>, </div>, </tr>, fin de <li>
+    s = ReplaceCaseInsensitive(s, "<br>", vbCrLf)
+    s = ReplaceCaseInsensitive(s, "<br/>", vbCrLf)
+    s = ReplaceCaseInsensitive(s, "<br />", vbCrLf)
+    s = ReplaceCaseInsensitive(s, "</p>", vbCrLf)
+    s = ReplaceCaseInsensitive(s, "</div>", vbCrLf)
+    s = ReplaceCaseInsensitive(s, "</tr>", vbCrLf)
+    s = ReplaceCaseInsensitive(s, "</li>", vbCrLf)
+
+    ' Supprimer toutes les balises restantes
+    s = StripTags(s)
+
+    ' Decoder les entites HTML courantes
+    s = DecodeEntities(s)
+
+    HtmlToText = s
+End Function
+
+' Supprime tout ce qui se trouve entre une balise ouvrante (debutTag)
+' et sa fermeture (finTag), inclus. Insensible a la casse.
+Private Function RemoveBlock(ByVal s As String, ByVal startTag As String, _
+                               ByVal endTag As String) As String
+    Dim lc As String, lcDebut As String, lcFin As String
+    Dim p As Long, q As Long
+
+    lcDebut = LCase$(startTag)
+    lcFin = LCase$(endTag)
+
+    Do
+        lc = LCase$(s)
+        p = InStr(1, lc, lcDebut)
+        If p = 0 Then Exit Do
+        q = InStr(p, lc, lcFin)
+        If q = 0 Then
+            ' Pas de fermeture : on coupe a partir de l'ouverture
+            s = Left$(s, p - 1)
+            Exit Do
+        End If
+        s = Left$(s, p - 1) & Mid$(s, q + Len(endTag))
+    Loop
+
+    RemoveBlock = s
+End Function
+
+' Supprime les commentaires HTML <!-- ... --> (dont les blocs
+' conditionnels MSO <!--[if ...]> ... <![endif]-->).
+Private Function RemoveComments(ByVal s As String) As String
+    Dim p As Long, q As Long
+    Do
+        p = InStr(1, s, "<!--")
+        If p = 0 Then Exit Do
+        q = InStr(p, s, "-->")
+        If q = 0 Then
+            s = Left$(s, p - 1)
+            Exit Do
+        End If
+        s = Left$(s, p - 1) & Mid$(s, q + 3)
+    Loop
+    RemoveComments = s
+End Function
+
+' Supprime toutes les balises <...> restantes.
+Private Function StripTags(ByVal s As String) As String
+    Dim res As String
+    Dim i As Long
+    Dim c As String
+    Dim dansBalise As Boolean
+
+    dansBalise = False
+    For i = 1 To Len(s)
+        c = Mid$(s, i, 1)
+        If c = "<" Then
+            dansBalise = True
+        ElseIf c = ">" Then
+            dansBalise = False
+        ElseIf Not dansBalise Then
+            res = res & c
+        End If
+    Next i
+
+    StripTags = res
+End Function
+
+' Decode les entites HTML les plus courantes dans un corps de mail.
+Private Function DecodeEntities(ByVal s As String) As String
+    s = Replace(s, "&nbsp;", " ")
+    s = Replace(s, "&#160;", " ")
+    s = Replace(s, "&amp;", "&")
+    s = Replace(s, "&lt;", "<")
+    s = Replace(s, "&gt;", ">")
+    s = Replace(s, "&quot;", Chr(34))
+    s = Replace(s, "&#39;", "'")
+    s = Replace(s, "&apos;", "'")
+    s = Replace(s, "&eacute;", Chr(233))   ' e accent aigu
+    s = Replace(s, "&egrave;", Chr(232))   ' e accent grave
+    s = Replace(s, "&ecirc;", Chr(234))    ' e circonflexe
+    s = Replace(s, "&agrave;", Chr(224))   ' a accent grave
+    s = Replace(s, "&acirc;", Chr(226))    ' a circonflexe
+    s = Replace(s, "&ccedil;", Chr(231))   ' c cedille
+    s = Replace(s, "&ugrave;", Chr(249))   ' u accent grave
+    s = Replace(s, "&ocirc;", Chr(244))    ' o circonflexe
+    s = Replace(s, "&icirc;", Chr(238))    ' i circonflexe
+    s = Replace(s, "&iuml;", Chr(239))     ' i trema
+    s = Replace(s, "&euro;", Chr(128))     ' euro (cp1252)
+    s = Replace(s, "&#8217;", "'")         ' apostrophe typographique
+    s = Replace(s, "&#8230;", "...")       ' points de suspension
+    s = Replace(s, "&#8211;", "-")         ' tiret demi-cadratin
+    s = Replace(s, "&#8212;", "-")         ' tiret cadratin
+    DecodeEntities = s
+End Function
+
+' Normalise les espaces et lignes vides multiples du texte final.
+Private Function CleanText(ByVal s As String) As String
+    ' Uniformiser les fins de ligne
+    s = Replace(s, vbCr & vbLf, vbLf)
+    s = Replace(s, vbCr, vbLf)
+
+    ' Reduire les espaces / tabulations multiples sur chaque ligne
+    Do While InStr(s, "  ") > 0
+        s = Replace(s, "  ", " ")
+    Loop
+    s = Replace(s, vbTab, " ")
+
+    ' Reduire les lignes vides multiples (3+ -> 2)
+    Do While InStr(s, vbLf & vbLf & vbLf) > 0
+        s = Replace(s, vbLf & vbLf & vbLf, vbLf & vbLf)
+    Loop
+
+    ' Re-convertir en CRLF pour le presse-papiers Windows
+    s = Replace(s, vbLf, vbCrLf)
+
+    CleanText = HtmlTrim(s)
+End Function
+
+' Trim etendu : retire espaces, tabs et sauts de ligne en bordure.
+Private Function HtmlTrim(ByVal s As String) As String
+    Dim chrs As String
+    chrs = " " & vbCr & vbLf & vbTab
+
+    Do While Len(s) > 0
+        If InStr(chrs, Left$(s, 1)) > 0 Then
+            s = Mid$(s, 2)
+        Else
+            Exit Do
+        End If
+    Loop
+    Do While Len(s) > 0
+        If InStr(chrs, Right$(s, 1)) > 0 Then
+            s = Left$(s, Len(s) - 1)
+        Else
+            Exit Do
+        End If
+    Loop
+
+    HtmlTrim = s
+End Function
+
+' Replace insensible a la casse (pour les balises type </P> vs </p>).
+Private Function ReplaceCaseInsensitive(ByVal s As String, ByVal searchStr As String, _
+                                     ByVal replaceStr As String) As String
+    Dim res As String
+    Dim lc As String, lcCherche As String
+    Dim p As Long, depart As Long
+
+    lcCherche = LCase$(searchStr)
+    depart = 1
+    res = ""
+
+    Do
+        lc = LCase$(s)
+        p = InStr(depart, lc, lcCherche)
+        If p = 0 Then
+            res = res & Mid$(s, depart)
+            Exit Do
+        End If
+        res = res & Mid$(s, depart, p - depart) & replaceStr
+        depart = p + Len(searchStr)
+    Loop
+
+    ReplaceCaseInsensitive = res
+End Function
+
+
+' ---------------------------------------------------------------------
+' PRESSE-PAPIERS (late binding via HTMLFile / DataObject indispo
+' sans MSForms ; on passe par l'objet "HTMLFile" + clipboardData qui
+' est bloque hors IE. Methode robuste retenue : WScript via clip.exe)
+' ---------------------------------------------------------------------
+
+' Copie le texte dans le presse-papiers via clip.exe (present sur tout
+' Windows). On ecrit dans stdin du process. Gere l'UTF-16 pour les
+' accents (clip.exe lit l'OEM par defaut -> on force via un fichier
+' temp UTF-16LE puis "clip < fichier").
+Private Function PutInClipboard(ByVal text As String) As Boolean
+    Dim tmpPath As String
+    Dim fnum As Integer
+    Dim sh As Object
+    Dim cmd As String
+
+    On Error GoTo ErrH
+
+    ' Ecrire le texte dans un fichier temporaire UTF-16LE (Unicode natif
+    ' VBA), avec BOM, pour que clip.exe restitue les accents.
+    tmpPath = UniqueTempPath("llm_clip", "txt")
+    WriteUnicodeFile tmpPath, text
+
+    ' clip.exe lit le fichier et alimente le presse-papiers.
+    Set sh = CreateObject("WScript.Shell")
+    cmd = "cmd /c clip < " & Chr(34) & tmpPath & Chr(34)
+    sh.Run cmd, 0, True   ' fenetre cachee, attendre la fin
+
+    ' Menage
+    On Error Resume Next
+    Kill tmpPath
+    On Error GoTo ErrH
+
+    PutInClipboard = True
+    Exit Function
+
+ErrH:
+    modDebugLog.DError MOD_NAME, "PutInClipboard error " & _
+        Err.Number & " - " & Err.Description
+    PutInClipboard = False
+End Function
+
+' Ecrit une chaine en UTF-16LE avec BOM via ADODB.Stream (late binding).
+Private Sub WriteUnicodeFile(ByVal path As String, ByVal text As String)
+    Dim stm As Object
+    Set stm = CreateObject("ADODB.Stream")
+    stm.Type = 2                 ' adTypeText
+    stm.Charset = "unicode"      ' UTF-16LE + BOM
+    stm.Open
+    stm.WriteText text
+    stm.SaveToFile path, 2     ' adSaveCreateOverWrite
+    stm.Close
+    Set stm = Nothing
+End Sub
+
+Private Function UniqueTempPath(ByVal prefix As String, _
+                                  ByVal ext As String) As String
+    Dim dossier As String
+    Dim sh As Object
+    Set sh = CreateObject("WScript.Shell")
+    dossier = sh.ExpandEnvironmentStrings("%TEMP%")
+    UniqueTempPath = dossier & "\" & prefix & "_" & _
+        Format(Now, "yyyymmdd_hhnnss") & "_" & _
+        CStr(Int(Rnd * 100000)) & "." & ext
+End Function
+
+
+' ---------------------------------------------------------------------
+' NAVIGATEUR + SENDKEYS
+' ---------------------------------------------------------------------
+
+' Ouvre l'URL dans le navigateur par defaut.
+Private Sub OpenUrl(ByVal url As String)
+    Dim sh As Object
+    Set sh = CreateObject("WScript.Shell")
+    ' "" comme verbe = open par defaut. On passe par cmd start pour
+    ' viser le navigateur par defaut quel qu'il soit.
+    sh.Run "cmd /c start " & Chr(34) & Chr(34) & " " & Chr(34) & url & Chr(34), 0, False
+End Sub
+
+' Attente bloquante en millisecondes, sans API Sleep (pour rester
+' 100% late binding / sans Declare). Precision ~ a la seconde via
+' Application.Wait, complete par une boucle DoEvents pour le sous-seconde.
+Private Sub WaitMs(ByVal ms As Long)
+    Dim cible As Double
+    cible = Timer + (ms / 1000#)
+    ' Timer repart a 0 a minuit : garde-fou simple
+    Do While Timer < cible
+        DoEvents
+        If Timer < (cible - 86400) Then Exit Do   ' passage minuit
+    Loop
+End Sub
+
+' Colle (Ctrl+V) puis, si demande, valide (Entree) dans la fenetre
+' qui a actuellement le focus (= le navigateur, en principe).
+Private Sub PasteAndConfirm(ByVal withEnter As Boolean)
+    ' Petit delai supplementaire pour stabiliser le focus
+    WaitMs 300
+    SendKeys "^v", True
+    If withEnter Then
+        WaitMs 300
+        SendKeys "~", True       ' ~ = Entree
+    End If
+End Sub
+
+
+' ---------------------------------------------------------------------
+' CONFIG HELPER
+' ---------------------------------------------------------------------
+
+Private Function ReadUrl(ByVal keyName As String, ByVal defaultVal As String) As String
+    Dim v As String
+    v = modConfig.Cfg(keyName, defaultVal)
+    If Len(Trim$(v)) = 0 Then v = defaultVal
+    ReadUrl = v
+End Function
+
+' Prompt de contexte place devant le corps du mail.
+' Accents encodes via Chr() (ASCII strict dans le code source).
+'   E_aigu = Chr(201) ; e_aigu = Chr(233) ; e_grave = Chr(232)
+'   a_grave = Chr(224) ; u_grave = Chr(249)
+Private Function DefaultPrefix() As String
+    Dim s As String
+    s = T("Corrige ce courriel (orthographe, grammaire, ponctuation) en " & _
+        "conservant le ton et le fond. " & _
+        "Am" & Chr(233) & "liore la tournure g" & Chr(233) & "n" & Chr(233) & _
+        "rale (fluidit" & Chr(233) & ", all" & Chr(232) & "gement des lourdeurs) " & _
+        "uniquement l" & Chr(224) & " o" & Chr(249) & " c'est pertinent. " & _
+        "R" & Chr(233) & "ponds en ne donnant que le texte corrig" & Chr(233) & _
+        ", sans commentaire.", _
+        "Correct this email (spelling, grammar, punctuation) while keeping the " & _
+        "tone and substance. Improve the overall phrasing (fluency, removing " & _
+        "clumsiness) only where relevant. Reply with the corrected text only, " & _
+        "no comment.")
+    DefaultPrefix = s
+End Function

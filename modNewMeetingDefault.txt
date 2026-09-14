@@ -1,0 +1,189 @@
+Option Explicit
+
+' =====================================================================
+' modNewMeetingDefault v7
+' Purpose (EN): forces a default duration (config: DefaultAppointmentDuration)
+'   on every new appointment/meeting inspector opened in Outlook. End is set
+'   once on NewInspector, then re-applied ~1s later (modDefer) because
+'   converting an appointment to a meeting resets the duration.
+'
+' Force une duree par defaut (cle DefaultAppointmentDuration) sur toute
+' nouvelle fiche de RDV ou reunion ouverte depuis Outlook.
+' v5 (2026-06-10) : accesseurs InspectorEventsBound / InlineExplorerBound
+' (etat reel du binding porte par g_AppEvents/clsAppEvents, lus par
+' modMaintenance.AssertBindings).
+' v6 (2026-06-13) : (a) duree lue via modConfig.DefaultAppointmentDuration()
+' (getter EnsureLoaded-safe) au lieu de la globale g_* en direct - meme
+' classe de regression que modAntiOverlap v7 (Ctrl+S VBE -> globale a 0).
+' (b) Le differe +1s passe par modDefer : Application.OnTime n'existe pas
+' dans Outlook, la re-application apres conversion RDV->reunion ne
+' tournait JAMAIS.
+' v7 (2026-07-10) : DIFFERE ENCORE MORT apres v6 - OnNewInspector stockait
+' l'inspecteur par affectation Let (g_PendingInspectors(key) = Inspector,
+' sans Set) : sur un objet sans propriete par defaut, erreur 438 avalee
+' par On Error Resume Next -> cle jamais stockee -> DelayedAdjust sortait
+' sur Exists=False. Correctif : g_PendingInspectors.Add key, Inspector.
+' (Historique des versions -> CHANGELOG.)
+' =====================================================================
+
+Private Const MOD_NAME As String = "NewMeeting"
+
+' Duree par defaut externalisee dans config.ini :
+'   modConfig.DefaultAppointmentDuration() (cle DefaultAppointmentDuration, defaut 15)
+
+Private g_AppEvents As clsAppEvents
+
+' Pack v3 (C12) : la file des inspecteurs en attente du differe vit dans
+' modInspectorQueue (plus de dictionnaire + sequence prives ici).
+Private Const MOD_VERSION As String = "v7 - 2026-07-10"
+
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+Public Sub InitEvents()
+    If g_AppEvents Is Nothing Then
+        Set g_AppEvents = New clsAppEvents
+        modDebugLog.DInfo MOD_NAME, "clsAppEvents instancie"
+    End If
+End Sub
+
+Public Sub OnNewInspector(ByVal Inspector As Outlook.Inspector)
+    On Error Resume Next
+    
+    If Inspector Is Nothing Then Exit Sub
+    
+    Dim itm As Object
+    Set itm = Inspector.CurrentItem
+    If itm Is Nothing Then Exit Sub
+    If Not (TypeOf itm Is Outlook.AppointmentItem) Then Exit Sub
+    
+    Dim appt As Outlook.AppointmentItem
+    Set appt = itm
+    
+    Dim eid As String
+    eid = ""
+    eid = appt.entryID
+    If Len(eid) > 0 Then Exit Sub
+    
+    Dim allDay As Boolean
+    allDay = False
+    allDay = appt.AllDayEvent
+    If allDay Then Exit Sub
+    
+    Dim recState As Long
+    recState = olApptNotRecurring
+    recState = appt.RecurrenceState
+    If recState <> olApptNotRecurring Then Exit Sub
+    
+    Dim startVal As Date
+    startVal = appt.Start
+    If Err.Number <> 0 Then
+        modDebugLog.DDebug MOD_NAME, "OnNewInspector : Start illisible, abandon"
+        Err.Clear
+        Exit Sub
+    End If
+    
+    Dim durMin As Long
+    durMin = modConfig.DefaultAppointmentDuration()
+    appt.End = DateAdd("n", durMin, startVal)
+    If Err.Number <> 0 Then
+        modDebugLog.DError MOD_NAME, "OnNewInspector : pose End echouee " & _
+            Err.Number & " - " & Err.Description
+        Err.Clear
+        Exit Sub
+    End If
+    modDebugLog.DTrace MOD_NAME, "OnNewInspector : End pose Start+" & durMin & "min"
+    
+    Dim key As String
+    key = modInspectorQueue.Register(Inspector, "meet", 1)
+    If Len(key) > 0 Then modDefer.Arm "MeetingAdjust", 1, key
+End Sub
+
+Public Sub DelayedAdjust(ByVal key As String)
+    On Error Resume Next
+    
+    Dim Inspector As Object
+    Set Inspector = modInspectorQueue.Take(key)
+    If Inspector Is Nothing Then Exit Sub
+    
+    Dim itm As Object
+    Set itm = Inspector.CurrentItem
+    If itm Is Nothing Then Exit Sub
+    If Not (TypeOf itm Is Outlook.AppointmentItem) Then Exit Sub
+    
+    Dim appt As Outlook.AppointmentItem
+    Set appt = itm
+    
+    Dim eid As String
+    eid = ""
+    eid = appt.entryID
+    If Len(eid) > 0 Then Exit Sub
+    
+    Dim allDay As Boolean
+    allDay = False
+    allDay = appt.AllDayEvent
+    If allDay Then Exit Sub
+    
+    Dim recState As Long
+    recState = olApptNotRecurring
+    recState = appt.RecurrenceState
+    If recState <> olApptNotRecurring Then Exit Sub
+    
+    Dim dur As Long
+    dur = 0
+    dur = appt.Duration
+    Dim durMin As Long
+    durMin = modConfig.DefaultAppointmentDuration()
+    If dur = durMin Then Exit Sub
+    
+    Dim startVal As Date
+    startVal = appt.Start
+    If Err.Number <> 0 Then
+        Err.Clear
+        Exit Sub
+    End If
+    
+    appt.End = DateAdd("n", durMin, startVal)
+    If Err.Number <> 0 Then
+        modDebugLog.DError MOD_NAME, "DelayedAdjust pose End echouee " & _
+            Err.Number
+        Err.Clear
+        Exit Sub
+    End If
+    modDebugLog.DDebug MOD_NAME, "DelayedAdjust : End repose Start+" & durMin & _
+        " apres conversion Outlook (dur etait " & dur & ")"
+End Sub
+
+'=============================================================================
+' Accesseurs d'etat du binding Inspectors/Explorer (health-check, v5).
+' g_AppEvents (clsAppEvents) porte les WithEvents Application.Inspectors et
+' ActiveExplorer pour TOUS les consommateurs (NewMeetingDefault,
+' ReplyInPlace, MaximizeWindow, MeetingToAppointment). Un Ctrl+S VBE remet
+' g_AppEvents a Nothing -> plus aucun NewInspector / InlineResponse.
+'=============================================================================
+'=============================================================================
+' RebindInlineExplorer (pack v3 - A5) : re-lie l'InlineResponse de
+' clsAppEvents sur la fenetre courrier passee (fenetre recreee).
+'=============================================================================
+Public Sub RebindInlineExplorer(ByVal exp As Outlook.Explorer)
+    On Error Resume Next
+    If g_AppEvents Is Nothing Then Exit Sub
+    g_AppEvents.BindExplorer exp
+End Sub
+
+Public Function InspectorEventsBound() As Boolean
+    On Error Resume Next
+    InspectorEventsBound = False
+    If Not g_AppEvents Is Nothing Then
+        InspectorEventsBound = g_AppEvents.InspectorsBound
+    End If
+End Function
+
+Public Function InlineExplorerBound() As Boolean
+    On Error Resume Next
+    InlineExplorerBound = False
+    If Not g_AppEvents Is Nothing Then
+        InlineExplorerBound = g_AppEvents.ExplorerBound
+    End If
+End Function

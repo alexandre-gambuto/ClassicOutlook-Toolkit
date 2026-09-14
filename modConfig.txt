@@ -1,0 +1,1582 @@
+Option Explicit
+
+'=============================================================================
+' modConfig v3.15
+'
+' v3.15 (2026-08-18) : alertes nouveau mail par boite (modInboxAlert).
+'   Globales g_InboxAlert* + getters EnsureLoaded-safe : InboxAlertEnabled(),
+'   InboxAlertUnreadOnly(), InboxAlertSkipIfForeground(), InboxAlertGroupMs(),
+'   InboxAlertDurationMs(), InboxAlertDefaultColor(), InboxAlertDefaultSound().
+'   Les cles numerotees InboxAlertStoreN / ColorN / SoundN sont lues par
+'   modInboxAlert via Cfg() (pas de globale par boite).
+'
+' v3.14 (2026-07-05) : 3 getters OUBLIES par le lot v3.13 ajoutes -
+'   ProjectPrefix() / CrossPrefix() / ContractNumberLength(). modProjectTag
+'   v8.8 les appelait deja (lecture directe convertie cote consommateur
+'   mais getters non crees cote modConfig) -> erreur de compilation
+'   "Membre de methode ou de donnees introuvable". Le build verifie
+'   desormais la coherence appels <-> definitions.
+'
+' v3.13 (2026-07-05) : fin de la migration getters. 30 getters
+'   EnsureLoaded-safe ajoutes (archives, confidentialite, toasts, tag
+'   projet, tracker, suspicion, backup, signature, domaines internes...).
+'   Tous les modules consommateurs lisent desormais la config via ces
+'   fonctions ; plus AUCUNE lecture directe de g_* hors modConfig (une
+'   lecture directe ne declenche pas EnsureLoaded et renvoie 0/"" apres
+'   un Ctrl+S VBE). Les globales g_* restent publiques (compatibilite),
+'   mais la seule voie supportee est le getter.
+'
+' v3.12 (2026-07-05) : (a) getters EnsureLoaded-safe CampaignStepSec() /
+'   CampaignBatchSize() / CampaignPauseSec() / CampaignCap() pour
+'   modMailCampaign : la lecture directe des g_Campaign* renvoyait 0 apres
+'   un Ctrl+S VBE et le repli code (5 s) etait plus RAPIDE que le defaut
+'   config (20 s) -> cadence d'envoi x4 silencieuse (meme classe de
+'   regression que v3.10/v3.11). (b) EnsureLoaded passe PUBLIC : les
+'   modules qui lisent encore des g_* en direct peuvent le poser en tete
+'   de leurs points d'entree en attendant leur getter. (c) doc : l'en-tete
+'   recommandait encore la lecture directe des globales ; la convention
+'   est LES GETTERS.
+'
+' v3.11 (2026-06-13) : getter EnsureLoaded-safe DefaultAppointmentDuration()
+'   pour modNewMeetingDefault : lecture directe de la globale -> duree a 0
+'   apres un Ctrl+S VBE (meme classe de regression que v3.10/AntiOverlap).
+'
+' v3.10 (2026-06-10) : getters EnsureLoaded-safe MeetingDuration() /
+'   ShiftMinutes() / UpShiftName() pour modAntiOverlap. FIX REGRESSION :
+'   TryShift lisait g_MeetingDuration / g_ShiftMinutes / g_UpShift en
+'   direct ; un Ctrl+S dans le VBE remet ces globales a zero -> plus
+'   aucun decalage anti-chevauchement (silencieux) jusqu'au redemarrage.
+'
+' v3.9 : COMMUTATEUR DE LANGUE UI. Ajout de la cle "Language" (FR/EN) et de la
+'   fonction T(fr, en) (a cote de A()) : choisit la chaine affichee selon
+'   g_Language, avec repli FR automatique si l'EN manque. A utiliser pour toute
+'   chaine visible, comme A(). Les modules enrobent leurs chaines UI en
+'   T(fr, en) au fil de la passe d'anonymisation.
+'
+' v3.8 : VERSION GENERIQUE (preparation open-source). Valeurs par defaut
+'   neutralisees (domaines internes, codes metier, notebooks, UserProperty
+'   de tag), ajout des cles de delimiteur de signature (SignatureBookmark /
+'   SignatureMarqueurTexte), getter ProjectCodePattern renomme depuis
+'   PatternDV. Les valeurs reelles propres a un environnement vivent
+'   uniquement dans config.ini (non versionne). Voir config.ini.example.
+'
+' v3.7 : REINTEGRATION de la fonction A() (helper accents). Elle avait
+'   disparu d'une version anterieure du module ; toute la chaine UI du
+'   projet (15+ modules) en depend -> "Sub ou Function non definie". Table
+'   de decodage reconstruite a l'identique a partir des usages reels :
+'   ~e->e aigu, ~f->e grave, ~a->a grave, ~E->E aigu, ~i->i circ, ~o->o circ.
+'
+' v3.6 : ajout des parametres de notification toast (modNotify).
+'   g_ToastEnabled, g_ToastKeptInSent, g_ToastDurationMs,
+'   g_ToastColorFiled, g_ToastColorKept, g_ToastColorText.
+'   Couleurs d'accentuation par defaut (exemple, a personnaliser).
+'
+' v3.4
+'
+' Module de configuration centralisee. Source de verite unique pour les
+' chemins et constantes utilises par plusieurs modules.
+'
+' NOUVEAU v2 : chargement d'un fichier de configuration externe
+'   <Bureau>\Macro VBA\Outlook\config.ini
+' Format INI simple :  cle=valeur  (une par ligne)
+'   - lignes vides ignorees
+'   - lignes commencant par ; ou # ignorees (commentaires)
+'   - lignes [Section] ignorees (parse a plat, cles globales)
+'   - espaces autour de la cle et de la valeur supprimes
+'
+' Le fichier est OPTIONNEL : si absent ou illisible, on retombe sur les
+' valeurs par defaut codees en dur ici. Aucun plantage possible.
+'
+' Comme le VBA ne peut pas se reecrire (Project Object Model bloque par
+' l'IT), config.ini est le moyen de changer les parametres sans toucher
+' au code : editer le TXT puis Maintenance > Configuration > Recharger.
+'
+' v3.4 : LoadConfig lit desormais le fichier en bloc (Input$) puis split
+'   tolerant CRLF / CR / LF. Corrige un bug silencieux ou un config.ini
+'   en LF seul etait avale comme une ligne unique (0 cle lue), les defauts
+'   codes masquant l'absence de chargement.
+'
+' Points d'entree publics (chemins) :
+'   - DesktopPath()                : chemin du Bureau (avec cache)
+'   - TimeTrackingPath()          : Bureau\Suivi de temps.xlsm
+'   - MailTrackingPath()         : Bureau\Suivi des mails.xlsx
+'   - AppDataOutlookPath()        : %APPDATA%\Microsoft\Outlook
+'   - MacroVBADir()               : Bureau\Macro VBA\Outlook
+'   - VBADir()                    : Bureau\Macro VBA\Outlook\VBA
+'   - ConfigPath()                : chemin du config.ini
+'
+' Points d'entree publics (config externe) :
+'   - LoadConfig()                : peuple les globales g_* (appel au boot)
+'   - Cfg(key, default)           : valeur string d'une cle INI
+'   - CfgL(key, default)          : valeur Long
+'   - CfgB(key, default)          : valeur Boolean (1/true/oui/vrai = True)
+'   - ReloadConfig()              : relit config.ini + re-peuple les g_*
+'   - ConfigLoaded()              : True si un fichier a ete charge
+'   - EnsureLoaded()              : (public v3.12) charge la config a la demande
+'   - AllConfigKeys()             : Collection des cles chargees (diagnostic)
+'
+' ARCHITECTURE (v3) : les parametres metier sont exposes comme variables
+' globales g_* (ex. g_MeetingDuration, g_InternalDomains), peuplees UNE FOIS
+' par LoadConfig au demarrage. Les modules les lisent en RAM (cout nul,
+' comme une constante en dur) au lieu de relire le dictionnaire. Tous les
+' defauts sont regroupes dans LoadConfig.
+'
+' CODES METIER (v3.2) : approche "briques de construction". L'utilisateur
+' decrit ses codes via des elements simples dans config.ini (PrefixeProjet,
+' LongueurCodeProjet, TypesOpportunite, PrefixeTransversal...). LoadConfig
+' assemble les regex (g_ProjectCodePattern...). Helpers publics, config-pilotes :
+'   - IsOpportunity / ContainsOpportunityToken
+'   - ContainsProjectCode / ScanProjectCode
+'   - FindContractCode / ContainsContractCode
+'   - ContainsCrossCode
+' Portee : DETECTION (classement + scanners de tag), VALIDATION des tags
+' (anti-faux-retag) ET CONSTRUCTION des tags. Changer un prefixe adapte
+' l'ensemble de facon coherente, detection comme tags stockes.
+'=============================================================================
+
+
+Private Const MOD_NAME As String = "Config"
+Private Const MOD_VERSION As String = "v3.15 - 2026-08-18"
+
+' =====================================================================
+' === VARIABLES DE CONFIGURATION GLOBALES =============================
+' =====================================================================
+' Peuplees UNE SEULE FOIS par LoadConfig (appele depuis
+' Application_Startup). Lues ensuite par tous les modules comme des
+' variables en RAM : aussi rapide qu'une constante en dur, mais
+' configurable via config.ini. Les valeurs par defaut sont regroupees
+' dans LoadConfig (un seul endroit a maintenir).
+'
+' Convention open-source : prefixe g_ = global de configuration.
+' LECTURE PAR GETTER (v3.12) : les modules passent par les fonctions
+' getter (ex. modConfig.MeetingDuration()), qui appellent EnsureLoaded.
+' La lecture directe d'une globale (modConfig.g_MeetingDuration) ne
+' declenche PAS le chargement et renvoie 0/"" apres un Ctrl+S VBE
+' (regressions corrigees en v3.10/v3.11/v3.12). A defaut de getter,
+' poser modConfig.EnsureLoaded en tete du point d'entree.
+'
+' Filet de securite : si un module est appele avant le boot complet
+' (rare : bouton declenche tot), EnsureLoaded recharge a la demande.
+' =====================================================================
+
+' --- Referentiels Excel (noms de fichiers et feuilles) ---
+Public g_TimeTrackingFilename As String   ' "Suivi de temps.xlsm"
+Public g_TimeTrackingSheet    As String   ' "Temps par mois"
+Public g_MailTrackingFilename As String   ' "Suivi des mails.xlsx"
+Public g_MailTrackingSheet    As String   ' "Suivi"
+
+' --- Archivage automatique (modFolderScan) ---
+Public g_AutoArchiveFolders     As String   ' sous-dossiers Inbox a archiver, separes par |
+Public g_AutoArchiveMonths      As Long     ' seuil d'inactivite en mois
+Public g_ArchiveSubfolderName   As String   ' nom du sous-dossier d'archives
+
+' --- Coloration des reunions (modMeetingColor) ---
+Public g_InternalDomains   As String   ' "domaine1.fr|domaine2.fr"
+Public g_ExternalMeetingCategory  As String   ' nom categorie reunion externe
+Public g_InternalMeetingCategory  As String   ' nom categorie reunion interne
+
+' --- Mapping optionnel contrat -> categorie (modProjectTag) ---
+Public g_SpecialContractCode     As String   ' code contrat a mapper (vide = desactive)
+Public g_SpecialContractCategory As String   ' categorie appliquee si le contrat matche
+
+' --- Durees et decalages (RDV / anti-chevauchement) ---
+Public g_DefaultAppointmentDuration     As Long     ' duree par defaut nouveau RDV (min)
+Public g_MeetingDuration       As Long     ' duree attendue anti-chevauchement
+Public g_ShiftMinutes    As Long     ' pas de decalage si collision (min)
+
+' --- Suivi des mails / suspicion de reponse ---
+Public g_ReplyDelayDays  As Long     ' delai avant rappel suivi (jours)
+Public g_SuspicionThreshold     As Long     ' score declenchant
+Public g_KeywordsCap    As Long     ' plafond points mots-cles
+
+' --- Tag projet ---
+Public g_TagPageSize        As Long     ' nb projets affiches dans le picker
+
+' --- UserProperties (ATTENTION : voir warning config.ini) ---
+Public g_UpTag              As String   ' nom UserProperty du tag projet
+Public g_UpShift           As String   ' nom UserProperty decalage anti-chev
+
+' --- Backup ---
+Public g_BackupRetentionMonths As Long    ' nb de backups mensuels conserves
+
+' --- Emaileur (envoi cadence) ---
+Public g_CampaignStepSec      As Long    ' delai entre 2 livraisons (secondes)
+Public g_CampaignBatchSize As Long   ' nb d'envois avant pause longue
+Public g_CampaignPauseSec    As Long    ' pause longue entre paquets (secondes)
+Public g_CampaignCap     As Long    ' plafond dur d'envois par lancement
+
+' --- Signature : delimiteur de signature (modSendToLLM, modMailCampaign) ---
+' SignatureBookmark : nom du signet HTML qui marque le debut de la signature
+'   (Outlook natif = "_MailAutoSig" ; un autre outil de signature peut
+'   utiliser un autre signet). Sert a tronquer le corps avant la signature.
+' SignatureMarqueurTexte : repli en texte brut (sous-chaine marquant le debut
+'   de la signature) si le signet HTML est absent. Vide par defaut.
+Public g_SignatureBookmark      As String
+Public g_SignatureTextMarker As String
+
+' --- Banniere confidentialite (couleurs HTML) ---
+Public g_ConfidTextColorPersonal As String
+Public g_ConfidBandColorPersonal As String
+Public g_ConfidTextColorPrivate As String
+Public g_ConfidBandColorPrivate As String
+Public g_ConfidTextColorConf  As String
+Public g_ConfidBandColorConf  As String
+Public g_ConfidTextColorUrgent As String
+Public g_ConfidBandColorUrgent As String
+
+' --- Notification toast (modNotify) ---
+Public g_ToastEnabled         As Boolean  ' interrupteur general des toasts
+Public g_ToastKeptInSent  As Boolean  ' toast quand mail NON deplace (OFF defaut)
+Public g_ToastDurationMs       As Long     ' duree d'affichage en millisecondes
+Public g_ToastColorFiled  As String   ' bordure : range dans dossier (turquoise)
+Public g_ToastColorKept  As String   ' bordure : reste dans envoyes (marine)
+Public g_ToastColorText  As String   ' couleur du texte (marine)
+' Couleurs par NIVEAU de toast (modUi.Toast, 2026-08-22). Distinctes de
+' Filed/Kept, qui restent propres a modReplyInPlace (classe vs conserve).
+Public g_ToastColorSuccess As String  ' action aboutie
+Public g_ToastColorInfo  As String    ' information de service
+Public g_ToastColorWarn  As String    ' action partielle / attention
+Public g_ToastColorError As String    ' echec non bloquant
+
+' --- Alertes nouveau mail par boite (modInboxAlert) ---
+Public g_InboxAlertEnabled          As Boolean  ' interrupteur ON/OFF de la fonction
+Public g_InboxAlertUnreadOnly       As Boolean  ' ignorer les mails deja lus a l'arrivee
+Public g_InboxAlertSkipIfForeground As Boolean  ' pas de toast si Outlook au premier plan
+Public g_InboxAlertGroupMs          As Long     ' fenetre de regroupement des rafales (ms)
+Public g_InboxAlertDurationMs       As Long     ' duree d'affichage du toast (ms)
+Public g_InboxAlertDefaultColor     As String   ' couleur de bordure par defaut
+Public g_InboxAlertDefaultSound     As String   ' .wav de repli (vide = pas de son)
+
+' --- Categories Outlook fonctionnelles (pack v3 : externalisees) ---
+' Avant : "Personnel", "Interne", "Commercial" en dur dans 4 modules.
+Public g_PersonalCategory      As String   ' RDV personnel (exclu tag/couleur, passe prive)
+Public g_PersonalCategoryAlt   As String   ' variante courte acceptee (ex. "Perso")
+Public g_InternalTaskCategory  As String   ' tache transversale -> categorie interne
+Public g_CommercialCategory    As String   ' opportunite -> categorie commerciale
+
+' --- Libelles metier ecrits dans le referentiel (pack v3 : externalises) ---
+' Colonne B de "Temps par mois" : jamais vide (regles WriteNewFolder).
+Public g_ContractLabelOpportunity As String  ' ex. "Opportunite CRM"
+Public g_ContractLabelDefault     As String  ' ex. "Operations commerciales et support"
+
+' --- Mots-cles "attente de reponse" (modReplySuspicion, pack v3 : config) ---
+Public g_SuspicionKeywords    As String   ' separes par | ; vide = repli VBA
+
+' --- OneNote (noms des notebooks cibles) ---
+Public g_OneNoteNotebook1   As String
+Public g_OneNoteNotebook2   As String
+Public g_OneNoteNotebook3   As String
+
+' --- Langue de l'interface (UI) ---
+' "FR" (defaut) ou "EN". Pilote la fonction T(fr, en) qui choisit la chaine
+' affichee dans les MsgBox / InputBox / StatusBar. Repli FR si une traduction
+' EN manque : le projet reste 100% fonctionnel quel que soit l'etat de l'EN.
+Public g_Language             As String
+
+' --- Logging ---
+Public g_DefaultLogLevel    As Long     ' 0=OFF 1=INFO 2=DEBUG 3=TRACE
+
+' --- API Anthropic (NE JAMAIS COMMITER : config.ini en .gitignore) ---
+Public g_AnthropicApiKey    As String
+
+' --- CODES METIER : briques de construction (config.ini) ---------------
+' Approche "briques" : l'utilisateur decrit ses codes avec des elements
+' simples (prefixe, longueur, types) ; le code assemble les regex/motifs.
+' Permet d'adapter a un autre environnement sans connaitre les regex.
+Public g_ProjectPrefix          As String  ' ex. "DOSS" (prefixe code dossier)
+Public g_ProjectCodeLength     As Long    ' ex. 4    (nb chiffres du code)
+Public g_ContractYearPrefix    As String  ' ex. "202" (decennie contrat)
+Public g_ContractNumberLength  As Long    ' ex. 5    (chiffres apres annee)
+Public g_OpportunityTypes       As String  ' ex. "OP" (types, separes par |)
+Public g_OpportunityNumberLength As Long ' ex. 4    (chiffres du numero)
+Public g_CrossPrefix     As String  ' ex. "A/A" (prefixe code transversal)
+Public g_CrossCodeLength As Long   ' ex. 1    (chiffres apres le prefixe)
+Public g_YearExclusionMin      As Long    ' ex. 2023 (4-chiffres : exclut...)
+Public g_YearExclusionMax      As Long    ' ex. 2032 (...les annees [min,max])
+
+' --- CODES METIER : patterns regex ASSEMBLES (derives, ne pas saisir) ---
+' Construits par LoadConfig a partir des briques ci-dessus. Les modules
+' (modQuickMove) lisent ces patterns prets a l'emploi.
+Public g_ProjectCodePattern  As String  ' detecte le code dossier -> capture le numero
+Public g_FourDigitPattern   As String  ' detecte 4 chiffres isoles -> capture
+Public g_ContractPattern     As String  ' detecte "20YY_NNNNN"
+Public g_DigitsPattern    As String  ' \d{N} : extrait N chiffres d'un bloc
+
+' === Config externe ===
+Private Const CONFIG_SUBDIR As String = "Macro VBA\Outlook"
+Private Const CONFIG_FILENAME As String = "config.ini"
+
+' === Cache local du chemin Bureau (resolu une seule fois par session) ===
+Private mDesktopPath As String
+
+' === Cache du dictionnaire de config (charge a la demande) ===
+Private mCfg As Object              ' Scripting.Dictionary
+Private mCfgLoaded As Boolean       ' un fichier a-t-il ete charge ?
+Private mGlobalsLoaded As Boolean   ' LoadConfig a-t-il deja peuple les g_ ?
+
+'=============================================================================
+' DesktopPath
+' Renvoie le chemin complet du Bureau (avec redirection OneDrive suivie).
+' Valeur mise en cache apres premier appel.
+'=============================================================================
+Public Function DesktopPath() As String
+    If Len(mDesktopPath) > 0 Then
+        DesktopPath = mDesktopPath
+        Exit Function
+    End If
+
+    Dim p As String
+    p = ResolveDesktopPath()
+
+    ' Normalisation : retirer un eventuel separateur final
+    If Right(p, 1) = "\" Then p = Left(p, Len(p) - 1)
+
+    mDesktopPath = p
+    DesktopPath = mDesktopPath
+End Function
+
+'=============================================================================
+' TimeTrackingPath
+' Chemin complet de "Suivi de temps.xlsm".
+' Surchargeable par la cle INI "TimeTrackingPath" (chemin absolu complet).
+'=============================================================================
+Public Function TimeTrackingPath() As String
+    Dim o As String
+    o = Cfg("TimeTrackingPath", "")
+    If Len(o) > 0 Then
+        TimeTrackingPath = o
+    Else
+        EnsureLoaded
+        TimeTrackingPath = DesktopPath() & "\" & g_TimeTrackingFilename
+    End If
+End Function
+
+'=============================================================================
+' MailTrackingPath
+' Chemin complet de "Suivi des mails.xlsx".
+' Surchargeable par la cle INI "MailTrackingPath".
+'=============================================================================
+Public Function MailTrackingPath() As String
+    Dim o As String
+    o = Cfg("MailTrackingPath", "")
+    If Len(o) > 0 Then
+        MailTrackingPath = o
+    Else
+        EnsureLoaded
+        MailTrackingPath = DesktopPath() & "\" & g_MailTrackingFilename
+    End If
+End Function
+
+'=============================================================================
+' AppDataOutlookPath
+' %APPDATA%\Microsoft\Outlook (utilise par modQuickMove pour ses caches).
+'=============================================================================
+Public Function AppDataOutlookPath() As String
+    AppDataOutlookPath = Environ("APPDATA") & "\Microsoft\Outlook"
+End Function
+
+'=============================================================================
+' MacroVBADir
+' <Bureau>\Macro VBA\Outlook  (dossier debug.log, exports, etc.)
+'=============================================================================
+Public Function MacroVBADir() As String
+    MacroVBADir = DesktopPath() & "\" & CONFIG_SUBDIR
+End Function
+
+'=============================================================================
+' VBADir
+' <Bureau>\Macro VBA\Outlook\VBA  (dossier des sources VBA exportees).
+' Surchargeable par la cle INI "VBADir".
+'=============================================================================
+Public Function VBADir() As String
+    Dim o As String
+    o = Cfg("VBADir", "")
+    If Len(o) > 0 Then
+        VBADir = o
+    Else
+        VBADir = MacroVBADir() & "\VBA"
+    End If
+End Function
+
+'=============================================================================
+' ConfigPath
+' Chemin complet du fichier config.ini.
+'=============================================================================
+Public Function ConfigPath() As String
+    ConfigPath = MacroVBADir() & "\" & CONFIG_FILENAME
+End Function
+
+'=============================================================================
+' InvalidateDesktopCache
+' Reset du cache Bureau (utile si on change de session OneDrive, ou test).
+'=============================================================================
+Public Sub InvalidateDesktopCache()
+    mDesktopPath = ""
+End Sub
+
+' =====================================================================
+' === CONFIG EXTERNE (config.ini) ====================================
+' =====================================================================
+
+'=============================================================================
+' Cfg
+' Renvoie la valeur string d'une cle de config.ini.
+' Charge le fichier au premier appel (lazy). defaultVal si cle absente.
+'=============================================================================
+Public Function Cfg(ByVal key As String, ByVal defaultVal As String) As String
+    On Error Resume Next
+    EnsureConfigLoaded
+    If mCfg Is Nothing Then
+        Cfg = defaultVal
+        Exit Function
+    End If
+    If mCfg.Exists(LCase$(key)) Then
+        Cfg = mCfg(LCase$(key))
+    Else
+        Cfg = defaultVal
+    End If
+End Function
+
+'=============================================================================
+' CfgL
+' Valeur Long d'une cle. defaultVal si absente ou non numerique.
+'=============================================================================
+Public Function CfgL(ByVal key As String, ByVal defaultVal As Long) As Long
+    Dim s As String
+    s = Cfg(key, "")
+    If Len(s) = 0 Then
+        CfgL = defaultVal
+    ElseIf IsNumeric(s) Then
+        CfgL = CLng(s)
+    Else
+        CfgL = defaultVal
+    End If
+End Function
+
+'=============================================================================
+' CfgB
+' Valeur Boolean d'une cle. 1 / true / vrai / oui / yes = True.
+'=============================================================================
+Public Function CfgB(ByVal key As String, ByVal defaultVal As Boolean) As Boolean
+    Dim s As String
+    s = LCase$(Trim$(Cfg(key, "")))
+    If Len(s) = 0 Then
+        CfgB = defaultVal
+        Exit Function
+    End If
+    Select Case s
+        Case "1", "true", "vrai", "oui", "yes", "y", "o"
+            CfgB = True
+        Case "0", "false", "faux", "non", "no", "n"
+            CfgB = False
+        Case Else
+            CfgB = defaultVal
+    End Select
+End Function
+
+'=============================================================================
+' ReloadConfig
+' Force le rechargement complet : relit config.ini depuis le disque PUIS
+' re-peuple les variables globales g_*. C'est ce qu'appelle le bouton
+' "Recharger config" du menu Maintenance.
+'=============================================================================
+Public Sub ReloadConfig()
+    mCfgLoaded = False
+    Set mCfg = Nothing
+    EnsureConfigLoaded
+    mGlobalsLoaded = False
+    LoadConfig
+End Sub
+
+'=============================================================================
+' LoadConfig
+' Peuple les variables globales g_* a partir de config.ini.
+' A APPELER UNE FOIS au demarrage (Application_Startup), avant tout module
+' qui lit la config. Toutes les valeurs PAR DEFAUT sont regroupees ici :
+' c'est le seul endroit a maintenir. Une cle absente de config.ini ->
+' valeur par defaut. Aucun plantage si le fichier manque.
+'=============================================================================
+Public Sub LoadConfig()
+    On Error GoTo ErrH
+    EnsureConfigLoaded   ' s'assure que le dictionnaire est lu
+
+    ' --- Referentiels Excel ---
+    g_TimeTrackingFilename = Cfg("TimeTrackingFilename", "Suivi de temps.xlsm")
+    g_TimeTrackingSheet = Cfg("TimeTrackingSheet", "Temps par mois")
+    g_MailTrackingFilename = Cfg("MailTrackingFilename", "Suivi des mails.xlsx")
+    g_MailTrackingSheet = Cfg("MailTrackingSheet", "Suivi")
+
+    ' --- Archivage automatique ---
+    g_AutoArchiveFolders = Cfg("AutoArchiveFolders", "")
+    g_AutoArchiveMonths = CfgL("AutoArchiveMonths", 1)
+    g_ArchiveSubfolderName = Cfg("ArchiveSubfolderName", "_Archives")
+
+    ' --- Coloration reunions ---
+    g_InternalDomains = Cfg("InternalDomains", "domaine1.fr|domaine2.fr")
+    g_ExternalMeetingCategory = Cfg("ExternalMeetingCategory", "Reunion externe")
+    g_InternalMeetingCategory = Cfg("InternalMeetingCategory", "Reunion interne")
+    g_SpecialContractCode = Cfg("SpecialContractCode", "")
+    g_SpecialContractCategory = Cfg("SpecialContractCategory", "")
+
+    ' --- Durees et decalages ---
+    g_DefaultAppointmentDuration = CfgL("DefaultAppointmentDuration", 15)
+    g_MeetingDuration = CfgL("MeetingDuration", 15)
+    g_ShiftMinutes = CfgL("ShiftMinutes", 15)
+
+    ' --- Suivi mails / suspicion ---
+    g_ReplyDelayDays = CfgL("ReplyDelayDays", 7)
+    g_SuspicionThreshold = CfgL("SuspicionThreshold", 3)
+    g_KeywordsCap = CfgL("KeywordsCap", 3)
+
+    ' --- Tag projet ---
+    g_TagPageSize = CfgL("TagPageSize", 12)
+
+    ' --- UserProperties (warning : changer casse les RDV deja tagges) ---
+    g_UpTag = Cfg("UpTag", "ProjectTag")
+    g_UpShift = Cfg("UpShift", "AntiChevDecale")
+
+    ' --- Backup ---
+    g_BackupRetentionMonths = CfgL("BackupRetentionMonths", 12)
+
+    ' --- Emaileur (envoi cadence) ---
+    g_CampaignStepSec = CfgL("CampaignStepSec", 20)
+    g_CampaignBatchSize = CfgL("CampaignBatchSize", 50)
+    g_CampaignPauseSec = CfgL("CampaignPauseSec", 180)
+    g_CampaignCap = CfgL("CampaignCap", 200)
+
+    ' --- Signature : delimiteur de signature ---
+    g_SignatureBookmark = Cfg("SignatureBookmark", "_MailAutoSig")
+    g_SignatureTextMarker = Cfg("SignatureTextMarker", "")
+
+    ' --- Banniere confidentialite ---
+    g_ConfidTextColorPersonal = Cfg("ConfidTextColorPersonal", "#1F4E79")
+    g_ConfidBandColorPersonal = Cfg("ConfidBandColorPersonal", "#2E75B6")
+    g_ConfidTextColorPrivate = Cfg("ConfidTextColorPrivate", "#9C6500")
+    g_ConfidBandColorPrivate = Cfg("ConfidBandColorPrivate", "#BF8F00")
+    g_ConfidTextColorConf = Cfg("ConfidTextColorConf", "#C00000")
+    g_ConfidBandColorConf = Cfg("ConfidBandColorConf", "#C65911")
+    g_ConfidTextColorUrgent = Cfg("ConfidTextColorUrgent", "#B00020")
+    g_ConfidBandColorUrgent = Cfg("ConfidBandColorUrgent", "#D13438")
+
+    ' --- Notification toast (modNotify) ---
+    ' Couleurs d'accentuation par defaut (exemple). A personnaliser via
+    ' config.ini : bordure 'range' = classement reussi, 'reste' = en place.
+    g_ToastEnabled = CfgB("ToastEnabled", True)
+    g_ToastKeptInSent = CfgB("ToastKeptInSent", False)
+    g_ToastDurationMs = CfgL("ToastDurationMs", 3000)
+    g_ToastColorFiled = Cfg("ToastColorFiled", "#2E7D32")
+    g_ToastColorKept = Cfg("ToastColorKept", "#1565C0")
+    g_ToastColorText = Cfg("ToastColorText", "#1565C0")
+    g_ToastColorSuccess = Cfg("ToastColorSuccess", "#2E7D32")
+    g_ToastColorInfo = Cfg("ToastColorInfo", "#1565C0")
+    g_ToastColorWarn = Cfg("ToastColorWarn", "#EF6C00")
+    g_ToastColorError = Cfg("ToastColorError", "#C62828")
+
+    ' --- Alertes nouveau mail par boite (modInboxAlert) ---
+    g_InboxAlertEnabled = CfgB("InboxAlertEnabled", False)
+    g_InboxAlertUnreadOnly = CfgB("InboxAlertUnreadOnly", True)
+    g_InboxAlertSkipIfForeground = CfgB("InboxAlertSkipIfForeground", False)
+    g_InboxAlertGroupMs = CfgL("InboxAlertGroupMs", 1500)
+    g_InboxAlertDurationMs = CfgL("InboxAlertDurationMs", 5000)
+    g_InboxAlertDefaultColor = Cfg("InboxAlertDefaultColor", "#1565C0")
+    g_InboxAlertDefaultSound = Cfg("InboxAlertDefaultSound", "")
+
+    ' --- Categories fonctionnelles (pack v3) ---
+    g_PersonalCategory = Cfg("PersonalCategory", "Personnel")
+    g_PersonalCategoryAlt = Cfg("PersonalCategoryAlt", "Perso")
+    g_InternalTaskCategory = Cfg("InternalTaskCategory", "Interne")
+    g_CommercialCategory = Cfg("CommercialCategory", "Commercial")
+
+    ' --- Libelles metier du referentiel (pack v3) ---
+    g_ContractLabelOpportunity = Cfg("ContractLabelOpportunity", "Opportunite CRM")
+    g_ContractLabelDefault = Cfg("ContractLabelDefault", "Operations commerciales et support")
+
+    ' --- Mots-cles d'attente de reponse (pack v3) ---
+    g_SuspicionKeywords = Cfg("SuspicionKeywords", "")
+
+    ' --- OneNote ---
+    g_OneNoteNotebook1 = Cfg("OneNoteNotebook1", "Bloc-notes 1")
+    g_OneNoteNotebook2 = Cfg("OneNoteNotebook2", "Bloc-notes 2")
+    g_OneNoteNotebook3 = Cfg("OneNoteNotebook3", "Bloc-notes 3")
+
+    ' --- API Anthropic ---
+    g_AnthropicApiKey = Cfg("AnthropicApiKey", "")
+
+    ' --- Langue de l'interface (UI : FR par defaut, ou EN) ---
+    g_Language = UCase$(Trim$(Cfg("Language", "FR")))
+    If g_Language <> "EN" Then g_Language = "FR"
+
+    ' --- Logging (defaut INFO pour conserver le comportement historique) ---
+    g_DefaultLogLevel = CfgL("DefaultLogLevel", 1)
+
+    ' --- Codes metier : briques de construction ---
+    g_ProjectPrefix = Cfg("ProjectPrefix", "DOSS")
+    g_ProjectCodeLength = CfgL("ProjectCodeLength", 4)
+    g_ContractYearPrefix = Cfg("ContractYearPrefix", "202")
+    g_ContractNumberLength = CfgL("ContractNumberLength", 5)
+    g_OpportunityTypes = Cfg("OpportunityTypes", "OP")
+    g_OpportunityNumberLength = CfgL("OpportunityNumberLength", 4)
+    g_CrossPrefix = Cfg("CrossPrefix", "TR")
+    g_CrossCodeLength = CfgL("CrossCodeLength", 1)
+    g_YearExclusionMin = CfgL("YearExclusionMin", 2023)
+    g_YearExclusionMax = CfgL("YearExclusionMax", 2032)
+
+    ' --- Codes metier : assemblage des patterns regex a partir des briques ---
+    ' Reproduit a l'identique les patterns historiques avec les valeurs par
+    ' defaut. Le prefixe est echappe (caracteres speciaux regex) par securite.
+    ' Separateurs volontairement tolerants (espace/tiret apres prefixe,
+    ' underscore/tiret dans le contrat) : conserve la souplesse d'origine.
+    g_ProjectCodePattern = EscapeRegex(g_ProjectPrefix) & "[\s\-]?(\d{" & _
+                  g_ProjectCodeLength & "})\b"
+    g_FourDigitPattern = "(?:^|\D)(\d{" & g_ProjectCodeLength & "})(?:\D|$)"
+    g_ContractPattern = "(" & EscapeRegex(g_ContractYearPrefix) & _
+                       "\d[_\-]\d{" & g_ContractNumberLength & "})"
+    g_DigitsPattern = "\d{" & g_ProjectCodeLength & "}"
+
+    mGlobalsLoaded = True
+
+    ' Applique le niveau de log issu de la config.
+    On Error Resume Next
+    modDebugLog.SetGlobalLevel g_DefaultLogLevel
+    On Error GoTo ErrH
+
+    modDebugLog.DInfo MOD_NAME, "LoadConfig OK (defauts + overrides config.ini)"
+    Exit Sub
+
+ErrH:
+    modDebugLog.DError MOD_NAME, "LoadConfig err " & Err.Number & " - " & Err.Description
+    mGlobalsLoaded = True   ' on garde les valeurs deja posees, pas de replay en boucle
+End Sub
+
+'=============================================================================
+' EnsureLoaded (PUBLIC depuis v3.12)
+' Filet de securite : si un module lit une globale avant que
+' Application_Startup ait appele LoadConfig, on charge a la demande.
+' Public : les modules qui lisent encore des g_* en direct le posent en
+' tete de leurs points d'entree (ex. modNotify.Notify, modDefer.Dispatch).
+'=============================================================================
+Public Sub EnsureLoaded()
+    If Not mGlobalsLoaded Then LoadConfig
+End Sub
+
+'=============================================================================
+' GETTERS PATTERNS (EnsureLoaded-safe)
+' Les patterns g_Pattern* sont des VARIABLES publiques : les lire directement
+' ne declenche PAS EnsureLoaded. Si un module (modQuickMove) les lit avant que
+' LoadConfig ait tourne (boot incomplet, ou Ctrl+S dans le VBE qui remet a zero
+' le module-level), g_ProjectCodePattern vaut "" -> une regex vide matche partout avec
+' SubMatches.count=0 -> aucune detection (ni sujet ni corps). Ces getters
+' forcent le chargement avant de renvoyer le pattern. A utiliser a la place de
+' l'acces direct aux variables g_Pattern*.
+'=============================================================================
+Public Function ProjectCodePattern() As String
+    EnsureLoaded
+    ProjectCodePattern = g_ProjectCodePattern
+End Function
+
+Public Function FourDigitPattern() As String
+    EnsureLoaded
+    FourDigitPattern = g_FourDigitPattern
+End Function
+
+Public Function ContractPattern() As String
+    EnsureLoaded
+    ContractPattern = g_ContractPattern
+End Function
+
+Public Function DigitsPattern() As String
+    EnsureLoaded
+    DigitsPattern = g_DigitsPattern
+End Function
+
+Public Function YearExclusionMin() As Long
+    EnsureLoaded
+    YearExclusionMin = g_YearExclusionMin
+End Function
+
+Public Function YearExclusionMax() As Long
+    EnsureLoaded
+    YearExclusionMax = g_YearExclusionMax
+End Function
+
+' v3.10 : getters anti-chevauchement (cf. en-tete). Memes garanties que les
+' getters patterns ci-dessus : EnsureLoaded force le rechargement si un
+' Ctrl+S VBE a remis les globales module-level a zero.
+Public Function MeetingDuration() As Long
+    EnsureLoaded
+    MeetingDuration = g_MeetingDuration
+End Function
+
+Public Function ShiftMinutes() As Long
+    EnsureLoaded
+    ShiftMinutes = g_ShiftMinutes
+End Function
+
+Public Function UpShiftName() As String
+    EnsureLoaded
+    UpShiftName = g_UpShift
+End Function
+
+' v3.11 : duree par defaut des nouveaux RDV (modNewMeetingDefault).
+Public Function DefaultAppointmentDuration() As Long
+    EnsureLoaded
+    DefaultAppointmentDuration = g_DefaultAppointmentDuration
+End Function
+
+' v3.12 : cadence d'envoi des campagnes (modMailCampaign). La lecture
+' directe des g_Campaign* renvoyait 0 apres un Ctrl+S VBE, donc repli
+' code 5 s plus rapide que le defaut config 20 s : cadence x4 silencieuse.
+Public Function CampaignStepSec() As Long
+    EnsureLoaded
+    CampaignStepSec = g_CampaignStepSec
+End Function
+
+Public Function CampaignBatchSize() As Long
+    EnsureLoaded
+    CampaignBatchSize = g_CampaignBatchSize
+End Function
+
+Public Function CampaignPauseSec() As Long
+    EnsureLoaded
+    CampaignPauseSec = g_CampaignPauseSec
+End Function
+
+Public Function CampaignCap() As Long
+    EnsureLoaded
+    CampaignCap = g_CampaignCap
+End Function
+
+' v3.14 : les 3 getters manquants du lot v3.13 (appeles par modProjectTag).
+Public Function ProjectPrefix() As String
+    EnsureLoaded
+    ProjectPrefix = g_ProjectPrefix
+End Function
+
+Public Function CrossPrefix() As String
+    EnsureLoaded
+    CrossPrefix = g_CrossPrefix
+End Function
+
+Public Function ContractNumberLength() As Long
+    EnsureLoaded
+    ContractNumberLength = g_ContractNumberLength
+End Function
+
+' v3.13 : fin de la migration getters - un getter EnsureLoaded-safe par
+' globale encore lue en direct par les modules (archives, bandeaux de
+' confidentialite, toasts, tag projet, tracker de reponses, suspicion,
+' retention backup, signature LLM, domaines internes, categories reunion).
+
+Public Function TimeTrackingSheet() As String
+    EnsureLoaded
+    TimeTrackingSheet = g_TimeTrackingSheet
+End Function
+
+Public Function MailTrackingFilename() As String
+    EnsureLoaded
+    MailTrackingFilename = g_MailTrackingFilename
+End Function
+
+Public Function MailTrackingSheet() As String
+    EnsureLoaded
+    MailTrackingSheet = g_MailTrackingSheet
+End Function
+
+Public Function AutoArchiveFolders() As String
+    EnsureLoaded
+    AutoArchiveFolders = g_AutoArchiveFolders
+End Function
+
+Public Function AutoArchiveMonths() As Long
+    EnsureLoaded
+    AutoArchiveMonths = g_AutoArchiveMonths
+End Function
+
+Public Function ArchiveSubfolderName() As String
+    EnsureLoaded
+    ArchiveSubfolderName = g_ArchiveSubfolderName
+End Function
+
+Public Function InternalDomains() As String
+    EnsureLoaded
+    InternalDomains = g_InternalDomains
+End Function
+
+Public Function ExternalMeetingCategory() As String
+    EnsureLoaded
+    ExternalMeetingCategory = g_ExternalMeetingCategory
+End Function
+
+Public Function InternalMeetingCategory() As String
+    EnsureLoaded
+    InternalMeetingCategory = g_InternalMeetingCategory
+End Function
+
+Public Function SpecialContractCode() As String
+    EnsureLoaded
+    SpecialContractCode = g_SpecialContractCode
+End Function
+
+Public Function SpecialContractCategory() As String
+    EnsureLoaded
+    SpecialContractCategory = g_SpecialContractCategory
+End Function
+
+Public Function ReplyDelayDays() As Long
+    EnsureLoaded
+    ReplyDelayDays = g_ReplyDelayDays
+End Function
+
+Public Function SuspicionThreshold() As Long
+    EnsureLoaded
+    SuspicionThreshold = g_SuspicionThreshold
+End Function
+
+Public Function KeywordsCap() As Long
+    EnsureLoaded
+    KeywordsCap = g_KeywordsCap
+End Function
+
+Public Function TagPageSize() As Long
+    EnsureLoaded
+    TagPageSize = g_TagPageSize
+End Function
+
+Public Function UpTag() As String
+    EnsureLoaded
+    UpTag = g_UpTag
+End Function
+
+Public Function BackupRetentionMonths() As Long
+    EnsureLoaded
+    BackupRetentionMonths = g_BackupRetentionMonths
+End Function
+
+Public Function SignatureTextMarker() As String
+    EnsureLoaded
+    SignatureTextMarker = g_SignatureTextMarker
+End Function
+
+Public Function ConfidTextColorPersonal() As String
+    EnsureLoaded
+    ConfidTextColorPersonal = g_ConfidTextColorPersonal
+End Function
+
+Public Function ConfidBandColorPersonal() As String
+    EnsureLoaded
+    ConfidBandColorPersonal = g_ConfidBandColorPersonal
+End Function
+
+Public Function ConfidTextColorPrivate() As String
+    EnsureLoaded
+    ConfidTextColorPrivate = g_ConfidTextColorPrivate
+End Function
+
+Public Function ConfidBandColorPrivate() As String
+    EnsureLoaded
+    ConfidBandColorPrivate = g_ConfidBandColorPrivate
+End Function
+
+Public Function ConfidTextColorConf() As String
+    EnsureLoaded
+    ConfidTextColorConf = g_ConfidTextColorConf
+End Function
+
+Public Function ConfidBandColorConf() As String
+    EnsureLoaded
+    ConfidBandColorConf = g_ConfidBandColorConf
+End Function
+
+Public Function ConfidTextColorUrgent() As String
+    EnsureLoaded
+    ConfidTextColorUrgent = g_ConfidTextColorUrgent
+End Function
+
+Public Function ConfidBandColorUrgent() As String
+    EnsureLoaded
+    ConfidBandColorUrgent = g_ConfidBandColorUrgent
+End Function
+
+Public Function ToastEnabled() As Boolean
+    EnsureLoaded
+    ToastEnabled = g_ToastEnabled
+End Function
+
+Public Function ToastKeptInSent() As Boolean
+    EnsureLoaded
+    ToastKeptInSent = g_ToastKeptInSent
+End Function
+
+Public Function ToastDurationMs() As Long
+    EnsureLoaded
+    ToastDurationMs = g_ToastDurationMs
+End Function
+
+Public Function ToastColorSuccess() As String
+    EnsureLoaded
+    ToastColorSuccess = g_ToastColorSuccess
+End Function
+
+Public Function ToastColorInfo() As String
+    EnsureLoaded
+    ToastColorInfo = g_ToastColorInfo
+End Function
+
+Public Function ToastColorWarn() As String
+    EnsureLoaded
+    ToastColorWarn = g_ToastColorWarn
+End Function
+
+Public Function ToastColorError() As String
+    EnsureLoaded
+    ToastColorError = g_ToastColorError
+End Function
+
+Public Function ToastColorFiled() As String
+    EnsureLoaded
+    ToastColorFiled = g_ToastColorFiled
+End Function
+
+Public Function ToastColorKept() As String
+    EnsureLoaded
+    ToastColorKept = g_ToastColorKept
+End Function
+
+Public Function ToastColorText() As String
+    EnsureLoaded
+    ToastColorText = g_ToastColorText
+End Function
+
+' --- Alertes nouveau mail par boite (modInboxAlert, v3.15) ---
+Public Function InboxAlertEnabled() As Boolean
+    EnsureLoaded
+    InboxAlertEnabled = g_InboxAlertEnabled
+End Function
+
+Public Function InboxAlertUnreadOnly() As Boolean
+    EnsureLoaded
+    InboxAlertUnreadOnly = g_InboxAlertUnreadOnly
+End Function
+
+Public Function InboxAlertSkipIfForeground() As Boolean
+    EnsureLoaded
+    InboxAlertSkipIfForeground = g_InboxAlertSkipIfForeground
+End Function
+
+Public Function InboxAlertGroupMs() As Long
+    EnsureLoaded
+    InboxAlertGroupMs = g_InboxAlertGroupMs
+    If InboxAlertGroupMs < 250 Then InboxAlertGroupMs = 250
+End Function
+
+Public Function InboxAlertDurationMs() As Long
+    EnsureLoaded
+    InboxAlertDurationMs = g_InboxAlertDurationMs
+End Function
+
+Public Function InboxAlertDefaultColor() As String
+    EnsureLoaded
+    InboxAlertDefaultColor = g_InboxAlertDefaultColor
+    If Len(InboxAlertDefaultColor) = 0 Then InboxAlertDefaultColor = "#1565C0"
+End Function
+
+Public Function InboxAlertDefaultSound() As String
+    EnsureLoaded
+    InboxAlertDefaultSound = g_InboxAlertDefaultSound
+End Function
+
+'=============================================================================
+' PACK v3 : getters manquants (modOneNote lisait g_TimeTrackingFilename en
+' direct ; aucun getter pour Language, SignatureBookmark, OneNoteNotebookN,
+' ProjectCodeLength, ContractYearPrefix, OpportunityTypes,
+' OpportunityNumberLength, CrossCodeLength) + getters des nouvelles cles.
+'=============================================================================
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+Public Function TimeTrackingFilename() As String
+    EnsureLoaded
+    TimeTrackingFilename = g_TimeTrackingFilename
+End Function
+
+Public Function Language() As String
+    EnsureLoaded
+    Language = g_Language
+End Function
+
+Public Function SignatureBookmark() As String
+    EnsureLoaded
+    SignatureBookmark = g_SignatureBookmark
+End Function
+
+Public Function OneNoteNotebook(ByVal n As Long) As String
+    EnsureLoaded
+    Select Case n
+        Case 1: OneNoteNotebook = g_OneNoteNotebook1
+        Case 2: OneNoteNotebook = g_OneNoteNotebook2
+        Case 3: OneNoteNotebook = g_OneNoteNotebook3
+        Case Else: OneNoteNotebook = ""
+    End Select
+End Function
+
+Public Function AnthropicApiKey() As String
+    EnsureLoaded
+    AnthropicApiKey = g_AnthropicApiKey
+End Function
+
+Public Function ProjectCodeLength() As Long
+    EnsureLoaded
+    ProjectCodeLength = g_ProjectCodeLength
+    If ProjectCodeLength < 1 Then ProjectCodeLength = 4
+End Function
+
+Public Function ContractYearPrefix() As String
+    EnsureLoaded
+    ContractYearPrefix = g_ContractYearPrefix
+End Function
+
+Public Function OpportunityTypes() As String
+    EnsureLoaded
+    OpportunityTypes = g_OpportunityTypes
+End Function
+
+Public Function OpportunityNumberLength() As Long
+    EnsureLoaded
+    OpportunityNumberLength = g_OpportunityNumberLength
+    If OpportunityNumberLength < 1 Then OpportunityNumberLength = 4
+End Function
+
+Public Function CrossCodeLength() As Long
+    EnsureLoaded
+    CrossCodeLength = g_CrossCodeLength
+End Function
+
+Public Function PersonalCategory() As String
+    EnsureLoaded
+    PersonalCategory = g_PersonalCategory
+    If Len(PersonalCategory) = 0 Then PersonalCategory = "Personnel"
+End Function
+
+Public Function PersonalCategoryAlt() As String
+    EnsureLoaded
+    PersonalCategoryAlt = g_PersonalCategoryAlt
+End Function
+
+Public Function InternalTaskCategory() As String
+    EnsureLoaded
+    InternalTaskCategory = g_InternalTaskCategory
+End Function
+
+Public Function CommercialCategory() As String
+    EnsureLoaded
+    CommercialCategory = g_CommercialCategory
+End Function
+
+Public Function ContractLabelOpportunity() As String
+    EnsureLoaded
+    ContractLabelOpportunity = g_ContractLabelOpportunity
+End Function
+
+Public Function ContractLabelDefault() As String
+    EnsureLoaded
+    ContractLabelDefault = g_ContractLabelDefault
+End Function
+
+Public Function SuspicionKeywords() As String
+    EnsureLoaded
+    SuspicionKeywords = g_SuspicionKeywords
+End Function
+
+'=============================================================================
+' IsPersonalCategoryName (pack v3) : True si le nom de categorie donne est la
+' categorie "personnel" configuree (ou sa variante courte). Comparaison
+' insensible a la casse, sur un nom DEJA isole (pas la liste complete).
+'=============================================================================
+Public Function IsPersonalCategoryName(ByVal catName As String) As Boolean
+    Dim c As String
+    c = Trim$(catName)
+    If Len(c) = 0 Then Exit Function
+    If StrComp(c, PersonalCategory(), vbTextCompare) = 0 Then
+        IsPersonalCategoryName = True
+    ElseIf Len(PersonalCategoryAlt()) > 0 Then
+        If StrComp(c, PersonalCategoryAlt(), vbTextCompare) = 0 Then IsPersonalCategoryName = True
+    End If
+End Function
+
+'=============================================================================
+' ContainsPersonalCategory (pack v3) : True si la liste de categories d'un
+' item (separateurs , ; |) contient la categorie "personnel" configuree.
+' Remplace les tests InStr(cats, "Personnel") disperses dans 4 modules.
+'=============================================================================
+Public Function ContainsPersonalCategory(ByVal cats As String) As Boolean
+    If Len(cats) = 0 Then Exit Function
+    Dim tmp As String
+    tmp = Replace(Replace(cats, ";", ","), "|", ",")
+    Dim parts() As String, i As Long
+    parts = Split(tmp, ",")
+    For i = LBound(parts) To UBound(parts)
+        If IsPersonalCategoryName(parts(i)) Then
+            ContainsPersonalCategory = True
+            Exit Function
+        End If
+    Next i
+End Function
+
+'=============================================================================
+' ConfigLoaded
+' True si un fichier config.ini a effectivement ete charge.
+'=============================================================================
+Public Function ConfigLoaded() As Boolean
+    EnsureConfigLoaded
+    ConfigLoaded = mCfgLoaded
+End Function
+
+'=============================================================================
+' AllConfigKeys
+' Collection des cles chargees (pour diagnostic). Toujours en lowercase.
+'=============================================================================
+Public Function AllConfigKeys() As Collection
+    Dim c As New Collection
+    On Error Resume Next
+    EnsureConfigLoaded
+    If Not (mCfg Is Nothing) Then
+        Dim k As Variant
+        For Each k In mCfg.Keys
+            c.Add CStr(k)
+        Next k
+    End If
+    Set AllConfigKeys = c
+End Function
+
+'=============================================================================
+' EnsureConfigLoaded (interne)
+' Charge config.ini une seule fois. Cree mCfg meme si le fichier est absent
+' (dictionnaire vide) pour que les appels suivants soient stables.
+'=============================================================================
+Private Sub EnsureConfigLoaded()
+    On Error GoTo ErrH
+    If mCfgLoaded And Not (mCfg Is Nothing) Then Exit Sub
+
+    Set mCfg = CreateObject("Scripting.Dictionary")
+    mCfg.CompareMode = 1   ' TextCompare (insensible a la casse, mais on stocke deja en LCase)
+    mCfgLoaded = False
+
+    Dim path As String
+    path = ConfigPath()
+    If Dir(path) = "" Then
+        ' Pas de fichier : dictionnaire vide, defauts utilises partout.
+        Exit Sub
+    End If
+
+    ' Lecture du fichier ENTIER en un bloc, puis decoupage tolerant aux
+    ' terminateurs de ligne (CRLF Windows, CR Mac classique, LF Unix).
+    ' Motif : Line Input #f casse uniquement sur CR/CRLF. Un config.ini
+    ' reenregistre en LF seul (editeur Unix) est avale comme une unique
+    ' ligne geante, commencant par ';' (en-tete commentaire), donc 0 cle
+    ' lue. Ce bug etait silencieux : les defauts codes masquaient l'absence
+    ' de chargement. (v3.4)
+    Dim f As Integer, contenu As String
+    Dim eqPos As Long, k As String, v As String
+    f = FreeFile
+    Open path For Input As #f
+    If LOF(f) > 0 Then
+        contenu = Input$(LOF(f), f)
+    End If
+    Close #f
+
+    ' Normaliser tous les terminateurs vers vbLf avant Split.
+    contenu = Replace(contenu, vbCrLf, vbLf)
+    contenu = Replace(contenu, vbCr, vbLf)
+
+    Dim lignes() As String
+    lignes = Split(contenu, vbLf)
+
+    Dim i As Long, line As String
+    For i = LBound(lignes) To UBound(lignes)
+        line = Trim$(lignes(i))
+        If Len(line) = 0 Then GoTo NextLine
+        If Left$(line, 1) = ";" Or Left$(line, 1) = "#" Then GoTo NextLine
+        If Left$(line, 1) = "[" Then GoTo NextLine   ' section ignoree (parse plat)
+        eqPos = InStr(line, "=")
+        If eqPos < 2 Then GoTo NextLine               ' pas de cle valide
+        k = LCase$(Trim$(Left$(line, eqPos - 1)))
+        v = Trim$(Mid$(line, eqPos + 1))
+        If Len(k) > 0 Then mCfg(k) = v                ' derniere occurrence gagne
+NextLine:
+    Next i
+
+    mCfgLoaded = True
+    modDebugLog.DInfo MOD_NAME, "config.ini charge (" & mCfg.count & " cles)"
+    Exit Sub
+
+ErrH:
+    modDebugLog.DError MOD_NAME, "EnsureConfigLoaded err " & Err.Number & _
+        " - " & Err.Description
+    ' On garde un dictionnaire vide : defauts partout, pas de plantage.
+    If mCfg Is Nothing Then Set mCfg = CreateObject("Scripting.Dictionary")
+End Sub
+
+'=============================================================================
+' Resolution interne du Bureau (logique calquee sur modOneNote.GetDesktopPath)
+'=============================================================================
+Private Function ResolveDesktopPath() As String
+    ' Priorite 1 : WScript.Shell.SpecialFolders("Desktop")
+    ' -> suit la redirection OneDrive (Bureau / Desktop selon la langue Windows)
+    On Error Resume Next
+    Dim sH As Object
+    Set sH = CreateObject("WScript.Shell")
+    Dim p As String
+    p = sH.SpecialFolders("Desktop")
+    If Err.Number = 0 And Len(p) > 0 Then
+        Dim fso As Object
+        Set fso = CreateObject("Scripting.FileSystemObject")
+        If fso.FolderExists(p) Then
+            On Error GoTo 0
+            ResolveDesktopPath = p
+            Exit Function
+        End If
+    End If
+    Err.Clear
+
+    ' Fallbacks : emplacements connus. La variable OneDriveCommercial est
+    ' generique (independante du nom de l'organisation) : elle pointe la
+    ' racine OneDrive Entreprise quel que soit le tenant. Puis OneDrive
+    ' perso, puis Bureau/Desktop local.
+    Dim candidats As Variant
+    candidats = Array( _
+        Environ("OneDriveCommercial") & "\Bureau", _
+        Environ("OneDriveCommercial") & "\Desktop", _
+        Environ("OneDrive") & "\Bureau", _
+        Environ("OneDrive") & "\Desktop", _
+        Environ("USERPROFILE") & "\OneDrive\Bureau", _
+        Environ("USERPROFILE") & "\OneDrive\Desktop", _
+        Environ("USERPROFILE") & "\Bureau", _
+        Environ("USERPROFILE") & "\Desktop")
+
+    Dim fso2 As Object
+    Set fso2 = CreateObject("Scripting.FileSystemObject")
+    Dim candidat As Variant
+    For Each candidat In candidats
+        If Len(candidat) > 0 Then
+            If fso2.FolderExists(CStr(candidat)) Then
+                ResolveDesktopPath = CStr(candidat)
+                On Error GoTo 0
+                Exit Function
+            End If
+        End If
+    Next candidat
+
+    ' Dernier recours
+    ResolveDesktopPath = Environ("USERPROFILE")
+    On Error GoTo 0
+End Function
+
+' =====================================================================
+' === HELPERS CODES METIER (opportunites) ============================
+' =====================================================================
+
+'=============================================================================
+' IsOpportunity
+' True si la chaine correspond a un code opportunite, pour l'un des types
+' configures (g_OpportunityTypes, ex. "OP"). Reproduit le test
+' x Like "20##_OP_####" mais pilote par config (plusieurs types via |).
+' (## = annee 2000-2099 ; #### = numero de g_OpportunityNumberLength chiffres.)
+'=============================================================================
+Public Function IsOpportunity(ByVal s As String) As Boolean
+    On Error Resume Next
+    EnsureLoaded
+    Dim types() As String, i As Long, pat As String
+    types = Split(g_OpportunityTypes, "|")
+    For i = LBound(types) To UBound(types)
+        If Len(Trim$(types(i))) > 0 Then
+            pat = "20##_" & Trim$(types(i)) & "_" & _
+                  String(g_OpportunityNumberLength, "#")
+            If s Like pat Then
+                IsOpportunity = True
+                Exit Function
+            End If
+        End If
+    Next i
+End Function
+
+'=============================================================================
+' ScanOpportunityCode (pack v3 - A3)
+' Renvoie le 1er code opportunite trouve dans txt ("20YY_<type>_<N chiffres>"),
+' sinon "". Remplace les fenetres glissantes de 12 caracteres codees en dur
+' dans modProjectTag (ScanOpportunity / IsValidProjectTag) : la largeur est
+' DERIVEE de la config (types et longueur du numero), type par type.
+'=============================================================================
+Public Function ScanOpportunityCode(ByVal txt As String) As String
+    On Error Resume Next
+    EnsureLoaded
+    ScanOpportunityCode = ""
+    Dim types() As String, i As Long, pat As String, win As Long, p As Long
+    types = Split(g_OpportunityTypes, "|")
+    For i = LBound(types) To UBound(types)
+        If Len(Trim$(types(i))) > 0 Then
+            pat = "20##_" & Trim$(types(i)) & "_" & String(g_OpportunityNumberLength, "#")
+            win = Len(pat)
+            For p = 1 To Len(txt) - (win - 1)
+                If Mid$(txt, p, win) Like pat Then
+                    ScanOpportunityCode = Mid$(txt, p, win)
+                    Exit Function
+                End If
+            Next p
+        End If
+    Next i
+End Function
+
+'=============================================================================
+' ContainsOpportunityToken
+' True si la chaine contient un token de type opportunite entoure de "_"
+' (ex. "_OP_"), pour l'un des types configures. Reproduit le test
+' historique InStr(s, "_OP_") > 0 (plusieurs types possibles via |).
+'=============================================================================
+Public Function ContainsOpportunityToken(ByVal s As String) As Boolean
+    On Error Resume Next
+    EnsureLoaded
+    Dim types() As String, i As Long
+    types = Split(g_OpportunityTypes, "|")
+    For i = LBound(types) To UBound(types)
+        If Len(Trim$(types(i))) > 0 Then
+            If InStr(s, "_" & Trim$(types(i)) & "_") > 0 Then
+                ContainsOpportunityToken = True
+                Exit Function
+            End If
+        End If
+    Next i
+End Function
+
+'=============================================================================
+' EscapeRegex (interne)
+' Echappe les caracteres speciaux regex dans une chaine litterale, pour
+' qu'un prefixe metier (g_ProjectPrefix, g_ContractYearPrefix) puisse etre
+' insere dans un pattern sans casser la regex. Cas usuels (DOSS, 202) : aucun
+' caractere special, renvoi inchange.
+'=============================================================================
+Private Function EscapeRegex(ByVal s As String) As String
+    Dim i As Long, ch As String, out As String
+    Const SPECIAUX As String = "\.^$*+?()[]{}|"
+    For i = 1 To Len(s)
+        ch = Mid$(s, i, 1)
+        If InStr(SPECIAUX, ch) > 0 Then out = out & "\"
+        out = out & ch
+    Next i
+    EscapeRegex = out
+End Function
+
+'=============================================================================
+' A (helper accents)
+' Source de verite unique pour les chaines UI accentuees. Decode des
+' marqueurs ASCII inline "~X" en caracteres accentues, ce qui permet de
+' garder le source 100% ASCII (immunise au cycle export .txt / import VBE,
+' ou les accents litteraux se corrompent) tout en affichant correctement.
+'
+' A utiliser pour TOUTE chaine visible (MsgBox / InputBox / titres /
+' StatusBar). NE PAS utiliser pour les chaines fonctionnelles (categories
+' Outlook comparees, DASL, cles config, chemins, noms de fichiers) ni pour
+' les logs (DInfo/DError restent ASCII).
+'
+' Table des marqueurs (reconstruite a partir des usages du projet) :
+'   ~e -> e accent aigu        (ChrW 233)
+'   ~f -> e accent grave       (ChrW 232)
+'   ~a -> a accent grave       (ChrW 224)
+'   ~E -> E majuscule aigu     (ChrW 201)
+'   ~i -> i accent circonflexe (ChrW 238)
+'   ~o -> o accent circonflexe (ChrW 244)
+'   ~x -> e accent circonflexe (ChrW 234)   (pack v3)
+'   ~c -> c cedille             (ChrW 231)   (pack v3)
+'   ~u -> u accent circonflexe (ChrW 251)   (pack v3)
+'   ~U -> u accent grave       (ChrW 249)   (pack v3)
+'   ~A -> a accent circonflexe (ChrW 226)   (pack v3)
+'   ~y -> i trema              (ChrW 239)   (pack v3)
+'   ~I -> I accent circonflexe (ChrW 206)   (pack v3 : "BO~ITES" du projet analytics)
+' Un "~" non suivi d'une lettre connue est laisse tel quel.
+' PACK v3 : avant, "fen~etre" / "m~eme" / "~etre" etaient ecrits avec ~e
+' (e aigu) faute de marqueur e-circonflexe : 25 libelles affichaient
+' "fenetre" avec un accent aigu. Marqueur ~x ajoute, occurrences corrigees.
+'=============================================================================
+Public Function LangIsEN() As Boolean
+    EnsureLoaded
+    LangIsEN = (g_Language = "EN")
+End Function
+
+Public Function A(ByVal s As String) As String
+    Dim out As String, i As Long, n As Long, ch As String, nx As String
+    n = Len(s)
+    i = 1
+    Do While i <= n
+        ch = Mid$(s, i, 1)
+        If ch = "~" And i < n Then
+            nx = Mid$(s, i + 1, 1)
+            Select Case nx
+                Case "e": out = out & ChrW$(233): i = i + 2
+                Case "f": out = out & ChrW$(232): i = i + 2
+                Case "a": out = out & ChrW$(224): i = i + 2
+                Case "E": out = out & ChrW$(201): i = i + 2
+                Case "i": out = out & ChrW$(238): i = i + 2
+                Case "o": out = out & ChrW$(244): i = i + 2
+                Case "x": out = out & ChrW$(234): i = i + 2
+                Case "c": out = out & ChrW$(231): i = i + 2
+                Case "u": out = out & ChrW$(251): i = i + 2
+                Case "U": out = out & ChrW$(249): i = i + 2
+                Case "A": out = out & ChrW$(226): i = i + 2
+                Case "y": out = out & ChrW$(239): i = i + 2
+                Case "I": out = out & ChrW$(206): i = i + 2
+                Case Else
+                    ' Marqueur inconnu : on garde le ~ tel quel.
+                    out = out & ch
+                    i = i + 1
+            End Select
+        Else
+            out = out & ch
+            i = i + 1
+        End If
+    Loop
+    A = out
+End Function
+
+'=============================================================================
+' T (helper langue UI)
+' Choisit la chaine a afficher selon g_Language ("FR" par defaut, ou "EN").
+'   T(fr, en) -> en si g_Language="EN" ET en non vide, sinon fr.
+' Le repli FR (en="") garantit que le commutateur ne casse jamais l'UI, meme
+' a moitie traduite. Les deux chaines passent par A() : le FR decode ses
+' marqueurs d'accents (~e, ~f...), l'EN (nativement ASCII) est inchange.
+'
+' A utiliser pour TOUTE chaine visible (MsgBox / InputBox / titres /
+' StatusBar), exactement comme A(). NE PAS utiliser pour les chaines
+' fonctionnelles (categories Outlook comparees, DASL, cles config, chemins,
+' noms de fichiers) ni pour les logs (DInfo/DError restent ASCII, FR).
+'
+' Exemple :
+'   MsgBox T("Dossier d~ej~a rang~e.", "Already filed."), vbInformation
+'=============================================================================
+Public Function T(ByVal fr As String, ByVal en As String) As String
+    EnsureLoaded
+    If g_Language = "EN" And Len(en) > 0 Then
+        T = A(en)
+    Else
+        T = A(fr)
+    End If
+End Function
+
+' =====================================================================
+' === HELPERS CODES METIER (tags & scanners de projet) ===============
+' =====================================================================
+' Detection des codes pilotee par les briques de config (prefixes,
+' longueurs, types). Le comportement s'adapte entierement aux valeurs de
+' config.ini, sans toucher au code.
+' CRITIQUE : ces helpers alimentent la validation de tag (anti-faux-retag).
+' Toute modification doit preserver l'ensemble des chaines reconnues.
+
+'=============================================================================
+' ProjectPrefixUC : prefixe projet en majuscules (cache simple).
+'=============================================================================
+Public Function ProjectPrefixUC() As String
+    EnsureLoaded
+    ProjectPrefixUC = UCase$(g_ProjectPrefix)
+End Function
+
+'=============================================================================
+' ContainsProjectCode
+' True si le texte contient <prefixe><N chiffres> (ex. "DOSS1234").
+' Pilote par config (prefixe + longueur). Insensible a la casse.
+'=============================================================================
+Public Function ContainsProjectCode(ByVal s As String) As Boolean
+    On Error Resume Next
+    EnsureLoaded
+    ' Pack v3 : aligne sur ScanProjectCode (EXACTEMENT N chiffres). L'ancien
+    ' Like "*PFX####*" acceptait aussi PFX12345 (5 chiffres).
+    ContainsProjectCode = (Len(ScanProjectCode(s)) = g_ProjectCodeLength)
+End Function
+
+'=============================================================================
+' ScanProjectCode
+' Cherche <prefixe> suivi d'EXACTEMENT g_ProjectCodeLength chiffres et
+' renvoie ces chiffres (sinon ""). Pilote par config (prefixe + longueur).
+'=============================================================================
+Public Function ScanProjectCode(ByVal txt As String) As String
+    On Error Resume Next
+    EnsureLoaded
+    ScanProjectCode = ""
+    Dim pfx As String: pfx = UCase$(g_ProjectPrefix)
+    Dim lp As Long: lp = Len(pfx)
+    Dim up As String: up = UCase$(txt)
+    Dim pos As Long
+    pos = InStr(1, up, pfx)
+    Do While pos > 0
+        Dim j As Long: j = pos + lp
+        Dim num As String: num = ""
+        Do While j <= Len(txt)
+            Dim ch As String: ch = Mid$(txt, j, 1)
+            If ch >= "0" And ch <= "9" Then
+                num = num & ch
+                j = j + 1
+            Else
+                Exit Do
+            End If
+        Loop
+        If Len(num) = g_ProjectCodeLength Then
+            ScanProjectCode = num
+            Exit Function
+        End If
+        pos = InStr(pos + 1, up, pfx)
+    Loop
+End Function
+
+'=============================================================================
+' FindContractCode
+' Renvoie le 1er code contrat trouve (fenetre glissante "20##_<N chiffres>"),
+' sinon "". Pilote par config (prefixe annee + longueur du numero).
+' (Annee 20## = 2000-2099 ; un code opportunite "20XX_OP_..." ne matche pas,
+'  les lettres O/T ne pouvant tenir une position chiffre #.)
+'=============================================================================
+Public Function FindContractCode(ByVal txt As String) As String
+    On Error Resume Next
+    EnsureLoaded
+    FindContractCode = ""
+    Dim win As Long
+    win = 4 + 1 + g_ContractNumberLength   ' "20" + 2 chiffres + "_" + N chiffres
+    ' Pack v3 : le separateur accepte _ OU - comme le regex g_ContractPattern
+    ' (avant : "_" seul ici, "[_\-]" dans le regex -> detections divergentes).
+    Dim pat As String
+    pat = "20##[_-]" & String(g_ContractNumberLength, "#")
+    Dim i As Long
+    For i = 1 To Len(txt) - (win - 1)
+        Dim x As String: x = Mid$(txt, i, win)
+        If x Like pat Then
+            FindContractCode = x
+            Exit Function
+        End If
+    Next i
+End Function
+
+'=============================================================================
+' ContainsContractCode : True si FindContractCode renvoie un resultat.
+'=============================================================================
+Public Function ContainsContractCode(ByVal s As String) As Boolean
+    ContainsContractCode = (Len(FindContractCode(s)) > 0)
+End Function
+
+'=============================================================================
+' ContainsCrossCode
+' True si le texte contient <prefixeTransversal><N chiffres> (ex. "A/A1").
+' Pilote par config (prefixe transversal + longueur). Insensible a la casse.
+'=============================================================================
+Public Function ContainsCrossCode(ByVal s As String) As Boolean
+    On Error Resume Next
+    EnsureLoaded
+    Dim pfx As String: pfx = UCase$(g_CrossPrefix)
+    Dim win As Long: win = Len(pfx) + g_CrossCodeLength
+    Dim pat As String: pat = pfx & String(g_CrossCodeLength, "#")
+    Dim c As String: c = UCase$(s)
+    Dim i As Long
+    For i = 1 To Len(c) - (win - 1)
+        If Mid$(c, i, win) Like pat Then
+            ContainsCrossCode = True
+            Exit Function
+        End If
+    Next i
+End Function

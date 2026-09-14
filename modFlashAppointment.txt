@@ -1,0 +1,110 @@
+Option Explicit
+
+' =====================================================================
+' modFlashAppointment v3  (2026-08-22)
+' Purpose (EN): creates a 15-minute "flash" appointment whose END is snapped
+'   to the nearest quarter-hour, then opens it for editing.
+'
+' Cree un rendez-vous "flash" de 15 minutes.
+'
+' Logique :
+'   - L'heure de FIN est arrondie au quart d'heure le plus proche
+'     de l'heure actuelle.
+'     Exemples :
+'       15h04 -> fin 15h00, debut 14h45 (duree 15 min)
+'       15h09 -> fin 15h15, debut 15h00 (duree 15 min)
+'       15h07 -> fin 15h00 (plus proche que 15h15), debut 14h45
+'       15h08 -> fin 15h15 (plus proche que 15h00), debut 15h00
+'   - Duree fixe : 15 minutes.
+'   - Le RDV s'ouvre en mode edition pour que tu puisses saisir
+'     le sujet, les participants, le lieu, etc. avant d'enregistrer.
+'
+' Chaines ASCII uniquement dans les MsgBox.
+'
+' v3 (2026-08-22) : revue UX pop-ups. L'erreur de creation passe en TOAST
+'   (bordure d'alerte) au lieu d'une MsgBox vbCritical. Raisonnement : la
+'   commande est declenchee au vol, souvent entre deux reunions ; en cas
+'   d'echec il n'y a RIEN a decider - aucun choix, aucune reprise, le RDV
+'   n'existe simplement pas et l'utilisateur le voit immediatement (aucune
+'   fiche ne s'ouvre). Une modale captive ne fait qu'ajouter un clic. Le
+'   numero et la description d'erreur restent integralement dans debug.log,
+'   ou ils sont exploitables ; le toast ne porte que le fait.
+'   Le toast passe par modUi.Toast (v1.1), qui retombe sur la barre d'etat
+'   Outlook si ToastEnabled=0 : jamais muet. Pas de couleur de bordure
+'   dediee - il n'existe pas de cle ToastColor* pour les alertes dans
+'   config.ini, et en inventer une pour ce seul appel serait disproportionne ;
+'   la premiere ligne en gras suffit a distinguer le message.
+'
+' v2 (2026-07-25) : MOD_NAME (module invisible du filtre de log) +
+'   instrumentation de version (MOD_VERSION / ModVersion).
+' (Historique des versions -> CHANGELOG.)
+' =====================================================================
+
+Private Const MOD_NAME As String = "FlashAppt"
+Private Const MOD_VERSION As String = "v3 - 2026-08-22"
+
+' ---------------------------------------------------------------------
+' ModVersion - version REELLEMENT chargee dans le VBE.
+' ---------------------------------------------------------------------
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+Public Sub CreateFlashAppointment15()
+    Dim appt As Outlook.AppointmentItem
+    Dim now_ As Date
+    Dim endTime As Date
+    Dim startTime As Date
+
+    On Error GoTo ErrHandler
+
+    now_ = Now
+    endTime = RoundToNearestQuarter(now_)
+    startTime = DateAdd("n", -15, endTime)
+
+    Set appt = Application.CreateItem(olAppointmentItem)
+    With appt
+        .Start = startTime
+        .End = endTime
+        .ReminderSet = False           ' pas de rappel pour un flash
+        .BusyStatus = olBusy
+        .subject = ""                  ' laisse vide pour saisie rapide
+        .Display                       ' ouvre la fiche pour edition
+    End With
+
+    modDebugLog.DTrace MOD_NAME, "RDV flash " & Format$(startTime, "hh:nn") & _
+        "-" & Format$(endTime, "hh:nn")
+
+    Set appt = Nothing
+    Exit Sub
+
+ErrHandler:
+    modDebugLog.DError MOD_NAME, "CreateFlashAppointment15 err " & _
+        Err.Number & " - " & Err.Description
+
+    ' v3 : toast non bloquant, avec repli garanti (modUi.Toast retombe sur
+    ' la barre d'etat si les toasts sont coupes). Detail complet dans le log.
+    modUi.Toast T("Rendez-vous flash : ~echec de la cr~eation. Voir debug.log.", _
+                  "Flash appointment: creation failed. See debug.log."), uiError, True
+End Sub
+
+' ---------------------------------------------------------------------
+' Arrondit une date/heure au quart d'heure LE PLUS PROCHE.
+' Strategie : on travaille en minutes depuis minuit, on arrondit
+' au multiple de 15 le plus proche (banker-safe via Int(x + 0.5)).
+' ---------------------------------------------------------------------
+Private Function RoundToNearestQuarter(ByVal d As Date) As Date
+    Dim dayPart As Date
+    Dim minsSinceMidnight As Double
+    Dim roundedMins As Long
+    Dim result As Date
+
+    dayPart = DateSerial(Year(d), Month(d), Day(d))
+    minsSinceMidnight = (CDbl(d) - CDbl(dayPart)) * 24# * 60#
+
+    ' Arrondi au multiple de 15 le plus proche
+    roundedMins = Int((minsSinceMidnight / 15#) + 0.5) * 15
+
+    result = DateAdd("n", roundedMins, dayPart)
+    RoundToNearestQuarter = result
+End Function

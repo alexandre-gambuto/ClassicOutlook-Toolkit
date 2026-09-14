@@ -1,0 +1,324 @@
+Option Explicit
+
+'=============================================================================
+' modDefer v1.14  (2026-08-19)
+' Purpose (EN): reliable one-shot deferred execution for Outlook VBA.
+'   Outlook has NO Application.OnTime (that is Excel/Word): every such call
+'   raised error 438, swallowed by On Error Resume Next, so every deferred
+'   action in this project silently never ran. modDefer uses a windowless
+'   Win32 SetTimer + an AddressOf callback pumped by the Outlook message
+'   loop - the exact mechanism already validated in production by the
+'   modMsgBoxCustom v2 countdown. Hard-wired dispatch (Application.Run does
+'   not exist in Outlook either).
+'
+' Differe one-shot FIABLE. CONTEXTE : Outlook n'a PAS Application.OnTime
+' (methode Excel/Word). Chaque appel levait l'erreur 438, avalee par les
+' On Error Resume Next : tous les differes du projet etaient morts en
+' silence (prompt QuickMove des envoyes, pop-up ReplySuspicion, archivage
+' et rattrapages au demarrage, re-application duree RDV).
+'
+' USAGE :
+'   modDefer.Arm "SentPrompt", 1          ' execute la cible dans ~1 s
+'   modDefer.Arm "MeetingAdjust", 1, key  ' avec argument texte
+' Cles connues : voir Dispatch (Select Case en dur - ajouter une Case par
+' nouvelle cible ; pas de resolution par chaine possible sous Outlook).
+'
+' MECANISME : SetTimer(0, 0, ms, AddressOf TimerProc) cree un timer SANS
+' fenetre ; le WM_TIMER est dispatch par la boucle de messages du thread
+' (Outlook pompe en continu ; les dialogs modaux pompent aussi - prouve
+' par le compte a rebours MsgBoxC). One-shot : KillTimer en tete de
+' callback. Plancher 250 ms (piege timing observe par la sonde MsgBoxC).
+'
+' REGLES DE SECURITE :
+'   - TimerProc est un callback systeme : toute erreur non geree = crash
+'     Outlook. Tout est sous On Error Resume Next / erreurs loguees.
+'   - NE PAS recompiler le VBA (Ctrl+S) pendant qu'un timer est arme :
+'     le pointeur AddressOf devient invalide (risque de crash). Fenetres
+'     courtes (1-2 s) partout, sauf AutoArchive (120 s) et CleanFlags
+'     (180 s) au demarrage.
+'   - Un timer "orphelin" (reset d'etat entre Arm et l'echeance :
+'     dictionnaire vide) est tue puis ignore proprement.
+'
+' v1.5 (2026-07-05) : (a) CancelAll - tue TOUS les timers armes. Mesure
+'   PREVENTIVE avant edition VBE (modDevTools.PrepareForEdit) : un Ctrl+S
+'   invalide les pointeurs AddressOf des timers en attente (crash possible
+'   a l'echeance). Inutile APRES le Ctrl+S : la table est deja perdue.
+'   (b) Dispatch recharge la config (modConfig.EnsureLoaded) avant
+'   d'executer la cible : couvre les cibles qui lisent encore des g_* en
+'   direct apres un reset d'etat.
+' v1.7 (2026-07-10) : cible "TeamsPreClean" ->
+'   modMeetingToAppointment.DelayedTeamsPreClean (retrait des anciens
+'   blocs Teams cites, a l'ouverture d'une reunion en composition).
+' v1.8 (2026-07-11) : cible "ReplyGreeting" ->
+'   modReplyGreeting.InsertGreetingDeferred. La cle REELLEMENT armee par
+'   modReplyGreeting v1 est "ReplyGreeting" ; aucune Case ne la traitait
+'   (l'ancienne cible v1.6 s'appelait "Greeting") : chaque salutation
+'   partait en "Action inconnue" -> fonctionnalite jamais executee.
+' v1.10 (2026-07-15) : cible "CampaignSent" ->
+'   modMailCampaign.CampaignSentFlush (statut Excel "Envoye manuellement"
+'   apres l'envoi MANUEL d'un brouillon de campagne ; armee par
+'   ThisOutlookSession.Application_ItemSend via CampaignOnItemSend).
+' v1.9 (2026-07-11) : cibles "TagPreload" (modProjectTag.InitProjectTag)
+'   et "MonthlyBackup" (modBackupAuto.RunMonthlyBackupIfNeeded) - deux
+'   traitements sortis du chemin SYNCHRONE de Application_Startup :
+'   ouverture Excel du referentiel a +45 s, backup mensuel eventuel a
+'   +210 s (tous les timers restent < 4 min, la regle VBE est inchangee).
+' v1.11 (2026-07-25) : (a) ArmUnique / ArmUniqueMs - arme apres avoir tue tout
+'   timer deja en attente sur la MEME cle. Arm ne dedoublonnait pas :
+'   5 sites arment "MaxWindow", 4 arment "SentPrompt" - deux armements
+'   qui se chevauchent executaient la cible deux fois. Sans effet visible
+'   tant que les cibles sont idempotentes ; obligatoire des qu'une cible
+'   ecrit (Excel, envoi, deplacement). Arm reste inchange pour les cas ou
+'   l'empilement est voulu. (b) Instrumentation de version : MOD_VERSION
+'   + ModVersion(), lues par modMaintenance.MaintModuleVersions.
+' v1.13 (2026-08-18) : cible "InboxFlush" -> modInboxAlert.InboxAlertFlush
+'   (regroupement des alertes nouveau mail par boite ; armee en ArmUniqueMs
+'   a chaque arrivee, un seul toast a l'echeance).
+' v1.14 (2026-08-19) : cible "BirthdayView" ->
+'   ThisOutlookSession.SetupBirthdayViewDeferred (mise en place DIFFEREE de
+'   la vue calendrier des anniversaires, une fois la fenetre calendrier
+'   reellement construite ; argText = numero de tentative).
+' (Historique des versions -> CHANGELOG.)
+'=============================================================================
+
+Private Const MOD_NAME As String = "Defer"
+Private Const MOD_VERSION As String = "v1.14 - 2026-08-19"
+
+Private Declare PtrSafe Function SetTimer Lib "user32" _
+    (ByVal hWnd As LongPtr, ByVal nIDEvent As LongPtr, _
+     ByVal uElapse As Long, ByVal lpTimerFunc As LongPtr) As LongPtr
+Private Declare PtrSafe Function KillTimer Lib "user32" _
+    (ByVal hWnd As LongPtr, ByVal nIDEvent As LongPtr) As Long
+
+' Actions armees : CStr(timerId) -> "Cle|argTexte"
+Private g_Actions As Object   ' Scripting.Dictionary
+
+'=============================================================================
+' ModVersion - version REELLEMENT chargee dans le VBE (constante du module,
+' pas config.ini). Lue par modMaintenance.MaintModuleVersions.
+'=============================================================================
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+'=============================================================================
+' Arm - planifie une execution one-shot a +seconds secondes.
+' actionKey : cle de Dispatch (en dur). argText : argument optionnel
+' transmis tel quel a la cible (cibles avec parametre uniquement).
+'=============================================================================
+Public Sub Arm(ByVal actionKey As String, ByVal seconds As Long, _
+               Optional ByVal argText As String = "")
+    ' Pack v3 (D5) : Arm delegue a ArmMs (une seule mecanique SetTimer).
+    ArmMs actionKey, seconds * 1000, argText
+End Sub
+
+'=============================================================================
+' ArmMs - identique a Arm mais delai en MILLISECONDES (pour les besoins
+' < 1 s, ex. reactivation de fenetre apres rapatriement). Meme plancher
+' 250 ms. v1.3 (2026-06-17).
+'=============================================================================
+Public Sub ArmMs(ByVal actionKey As String, ByVal milliseconds As Long, _
+                 Optional ByVal argText As String = "")
+    On Error Resume Next
+
+    Dim ms As Long
+    Dim id As LongPtr
+
+    If g_Actions Is Nothing Then Set g_Actions = CreateObject("Scripting.Dictionary")
+
+    ms = milliseconds
+    If ms < 250 Then ms = 250
+
+    id = SetTimer(0, 0, ms, AddressOf TimerProc)
+    If id = 0 Then
+        modDebugLog.DError MOD_NAME, "SetTimer KO pour '" & actionKey & "' - action perdue"
+        Exit Sub
+    End If
+
+    g_Actions(CStr(id)) = actionKey & "|" & argText
+    modDebugLog.DTrace MOD_NAME, "Arme '" & actionKey & "' +" & ms & "ms"
+End Sub
+
+'=============================================================================
+' ArmUnique (v1.11) - comme Arm, mais tue d'abord tout timer deja en
+' attente sur la MEME cle. A utiliser des que la cible n'est pas idempotente
+' (ecriture Excel, envoi, deplacement) ou qu'elle est armee depuis plusieurs
+' sites. L'argText du dernier armement l'emporte.
+'=============================================================================
+Public Sub ArmUnique(ByVal actionKey As String, ByVal seconds As Long, _
+                     Optional ByVal argText As String = "")
+    On Error Resume Next
+    CancelKey actionKey
+    Arm actionKey, seconds, argText
+End Sub
+
+'=============================================================================
+' ArmUniqueMs (v1.11) - variante millisecondes de ArmUnique.
+'=============================================================================
+Public Sub ArmUniqueMs(ByVal actionKey As String, ByVal milliseconds As Long, _
+                       Optional ByVal argText As String = "")
+    On Error Resume Next
+    CancelKey actionKey
+    ArmMs actionKey, milliseconds, argText
+End Sub
+
+'=============================================================================
+' CancelKey (v1.11) - tue les timers en attente sur une cle donnee.
+' Les cles a supprimer sont collectees AVANT suppression : retirer d'un
+' Dictionary pendant l'iteration de ses Keys n'est pas fiable.
+'=============================================================================
+' Pack v3 : annulation publique d'une cle (modMailCampaign.CampaignStop).
+Public Sub Cancel(ByVal actionKey As String)
+    On Error Resume Next
+    CancelKey actionKey
+End Sub
+
+Private Sub CancelKey(ByVal actionKey As String)
+    On Error Resume Next
+    If g_Actions Is Nothing Then Exit Sub
+
+    Dim prefix As String
+    prefix = actionKey & "|"
+
+    Dim doomed As Collection
+    Set doomed = New Collection
+
+    Dim k As Variant
+    For Each k In g_Actions.Keys
+        If Left$(CStr(g_Actions(k)), Len(prefix)) = prefix Then doomed.Add k
+    Next k
+
+    Dim i As Long
+    For i = 1 To doomed.count
+        KillTimer 0, CLngPtr(doomed(i))
+        g_Actions.Remove CStr(doomed(i))
+    Next i
+
+    If doomed.count > 0 Then
+        modDebugLog.DTrace MOD_NAME, "ArmUnique : " & doomed.count & _
+            " timer(s) precedent(s) annule(s) sur '" & actionKey & "'"
+    End If
+End Sub
+
+'=============================================================================
+' CancelAll (v1.5) - tue TOUS les timers armes et vide la table des actions.
+' A appeler AVANT d'editer le code dans le VBE (modDevTools.PrepareForEdit) :
+' un Ctrl+S invalide les pointeurs AddressOf en attente. PREVENTIF seulement
+' (apres le Ctrl+S, la table est deja remise a zero : plus rien a tuer).
+'=============================================================================
+Public Sub CancelAll()
+    On Error Resume Next
+    If g_Actions Is Nothing Then Exit Sub
+    Dim k As Variant
+    Dim nb As Long
+    For Each k In g_Actions.Keys
+        KillTimer 0, CLngPtr(k)
+        nb = nb + 1
+    Next k
+    g_Actions.RemoveAll
+    modDebugLog.DInfo MOD_NAME, "CancelAll : " & nb & " timer(s) annule(s)"
+End Sub
+
+'=============================================================================
+' TimerProc - callback systeme WM_TIMER. BLINDAGE TOTAL OBLIGATOIRE.
+' (AddressOf exige un module standard ; Private suffit, meme module.)
+'=============================================================================
+Private Sub TimerProc(ByVal hWnd As LongPtr, ByVal uMsg As Long, _
+                      ByVal idEvent As LongPtr, ByVal dwTime As Long)
+    On Error Resume Next
+
+    KillTimer 0, idEvent          ' one-shot : tuer AVANT de dispatcher
+
+    Dim packed As String
+    Dim dictKey As String
+    Dim p As Long
+
+    packed = ""
+    If Not g_Actions Is Nothing Then
+        dictKey = CStr(idEvent)
+        If g_Actions.Exists(dictKey) Then
+            packed = CStr(g_Actions(dictKey))
+            g_Actions.Remove dictKey
+        End If
+    End If
+    If Len(packed) = 0 Then Exit Sub   ' timer orphelin (etat reinitialise)
+
+    p = InStr(1, packed, "|")
+    If p = 0 Then Exit Sub
+
+    Dispatch Left$(packed, p - 1), Mid$(packed, p + 1)
+End Sub
+
+'=============================================================================
+' Dispatch - table des cibles (en dur : pas d'Application.Run sous Outlook).
+'=============================================================================
+Private Sub Dispatch(ByVal actionKey As String, ByVal argText As String)
+    On Error Resume Next
+
+    ' v1.5 : certaines cibles differees lisent encore des g_* en direct ;
+    ' apres un Ctrl+S VBE elles vaudraient 0/"". Config garantie chargee.
+    modConfig.EnsureLoaded
+    modDebugLog.DTrace MOD_NAME, "Echeance '" & actionKey & "'"
+
+    Select Case actionKey
+        Case "SentPrompt"
+            ThisOutlookSession.ProcessNextSentPrompt
+        Case "ReplySusp"
+            modReplySuspicion.ProposeDeferredFollowup
+        Case "MeetingAdjust"
+            modNewMeetingDefault.DelayedAdjust argText
+        Case "AutoArchive"
+            modFolderScan.AutoArchiveMove_OnTime
+        Case "CatchUpColor"
+            modMeetingColor.CatchUpUncolored_OnTime
+        Case "RemindOverdue"
+            modMailResponseTracker.RemindOverdue
+        Case "FollowupSent"
+            modMailResponseTracker.RegisterFollowupSent argText
+        Case "UrgentFlush"
+            modMailResponseTracker.FlushUrgentTracking
+        Case "MaxWindow"
+            modMaximizeWindow.MaximizePass argText
+        Case "SentCatchUp"
+            modReplyInPlace.CatchUpRecentSent
+        Case "CleanFlags"
+            ThisOutlookSession.CleanOldFlags
+        Case "ActivateRole"
+            ThisOutlookSession.ActivateRoleDeferred argText
+        Case "TeamsPreClean"
+            modMeetingToAppointment.DelayedTeamsPreClean argText
+        Case "ReplyGreeting"
+            modReplyGreeting.InsertGreetingDeferred argText
+        Case "TagPreload"
+            modProjectTag.InitProjectTag
+        Case "MonthlyBackup"
+            modBackupAuto.RunMonthlyBackupIfNeeded
+        Case "CampaignSent"
+            modMailCampaign.CampaignSentFlush
+        Case "HideBcc"
+            modHideBcc.HideBccPass argText
+        Case "InboxFlush"
+            modInboxAlert.InboxAlertFlush
+        Case "BirthdayView"
+            ThisOutlookSession.SetupBirthdayViewDeferred argText
+        Case "Reindex"
+            ' Pack v3 (C6) : reindexation hebdomadaire QuickMove (remplace le
+            ' RDV technique QuickMove_BackgroundReindex + Application_Reminder).
+            modQuickMove.BackgroundReindex
+        Case "CampaignNext"
+            ' Pack v3 (C7) : envoi de campagne asynchrone, une ligne par
+            ' echeance (Outlook reste utilisable pendant la cadence).
+            modMailCampaign.CampaignSendNext
+        Case "QuickStart"
+            ' 2026-09-15 : guide de demarrage rapide (premier lancement sans
+            ' config.ini). Les conditions sont re-testees dans la cible.
+            modQuickStart.QuickStartAuto
+        Case Else
+            modDebugLog.DError MOD_NAME, "Action inconnue '" & actionKey & "'"
+    End Select
+
+    If Err.Number <> 0 Then
+        modDebugLog.DError MOD_NAME, "Dispatch '" & actionKey & "' err " & _
+            Err.Number & " - " & Err.Description
+    End If
+End Sub

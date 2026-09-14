@@ -1,0 +1,480 @@
+Option Explicit
+
+'=============================================================================
+' modFolderRename (v1.2)
+' v1.2 (2026-08-24) : le fichier d'export est prefixe par le nom du dossier
+'   parcouru (ex. "DV_folders_export.csv", "Contrats_folders_export.csv").
+'   Avant, le nom etait fixe : exporter une 2e racine ecrasait le 1er export.
+'   L'etape 2 demande le meme prefixe pour retrouver le CSV a appliquer, avec
+'   repli sur l'ancien nom fixe "dv_folders_rename.csv" s'il existe encore.
+' v1.1 (2026-08-17) : separateurs de blocs "," et "/" acceptes ; garde-fou
+'   contrat corrige (exigeait 5 chiffres mais acceptait 4 : "4314_4501" etait
+'   rejete) ; decodage %2F -> "/" des FolderPath (Outlook echappe le "/" dans
+'   FolderPath, GetFolderByPath ne le retrouvait pas) ; comparaison Trim$
+'   pour ne pas rejeter un renommage qui retire un espace de fin.
+' Purpose (EN): renames project subfolders (e.g. Inbox\DV) so that the leading
+'   4-digit project code blocks are sorted DESCENDING, followed by a label
+'   separator and the project / partner label. Two-step, review-first workflow:
+'     1) ExportProjectFolderNames    -> CSV (path ; current name ; auto proposal
+'                                       ; flag) written to <Macro VBA\Outlook>
+'                                       as "<RootFolder>_folders_export.csv".
+'                                       Nothing is modified.
+'     2) RenameProjectFoldersFromCSV -> applies a VALIDATED CSV
+'                                       (path ; new name), after a dry-run
+'                                       summary and one confirmation.
+'   ProposeSortedName() is public so the same rule can be reused elsewhere.
+'
+' FR : renommage des sous-dossiers projet (ex. Boite de reception\DV) pour
+'   trier les blocs de codes DV a 4 chiffres du plus grand au plus petit,
+'   puis separateur, puis libelle projet / partenaire.
+'   Etape 1 = export CSV de revue (aucune modification).
+'   Etape 2 = application d'un CSV valide (chemin ; nouveau nom).
+'
+' Regles de parsing des blocs de tete :
+'   - bloc = exactement 4 chiffres, borne par debut/fin de nom ou par un
+'     separateur parmi espace, "_", "-", "," ou "/" ;
+'   - garde-fou contrat : "20XX_XXXXX" (4 chiffres + "_" + 5 chiffres) n'est
+'     PAS un bloc ;
+'   - le libelle = tout ce qui suit le dernier bloc, separateurs de tete
+'     retires ;
+'   - un bloc compris entre YearExclusionMin et YearExclusionMax (config)
+'     est signale CHECK-YEAR dans l'export (annee possible, a verifier).
+'
+' Separateurs de la proposition automatique (BLOCK_SEP / LABEL_SEP) :
+'   " " entre blocs, " - " entre blocs et libelle. Ajustables ci-dessous.
+'
+' Dependances : modConfig (Cfg, MacroVBADir, YearExclusionMin/Max, T),
+'   modCommon (GetFolderByPath), modDebugLog, modQuickMove (QuickMoveReload,
+'   optionnel, appele apres renommage).
+'=============================================================================
+
+Private Const MOD_NAME As String = "FolderRen"
+Private Const MOD_VERSION As String = "1.2"
+
+' v1.2 : suffixes ; le prefixe est le nom du dossier parcouru
+Private Const EXPORT_SUFFIX As String = "_folders_export.csv"
+Private Const RENAME_SUFFIX As String = "_folders_rename.csv"
+' Ancien nom fixe (v <= 1.1), conserve pour le repli a l'etape 2
+Private Const LEGACY_RENAME_FILE As String = "dv_folders_rename.csv"
+Private Const CSV_SEP As String = ";"
+
+' Separateurs de la proposition automatique
+Private Const BLOCK_SEP As String = " "
+Private Const LABEL_SEP As String = " - "
+
+' Caracteres acceptes comme separateurs entre blocs de codes en ENTREE
+Private Const SEP_CHARS As String = " _-,/"
+
+'=============================================================================
+' Version (lue par modMaintenance)
+'=============================================================================
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+'=============================================================================
+' ETAPE 1 : export des noms de dossiers (revue). Aucune modification.
+' Sortie : <Macro VBA\Outlook>\<NomDuDossier>_folders_export.csv
+'   FolderPath ; CurrentName ; Proposal ; Flag
+'   Flag : RENAME (proposition differente), SAME (deja conforme),
+'          NOCODE (pas de bloc de tete), CHECK-YEAR (bloc = annee possible)
+'=============================================================================
+Public Sub ExportProjectFolderNames()
+    Dim rootFld As Object
+    Dim fldList As Collection
+    Dim csvPath As String
+    Dim fnum As Integer
+    Dim i As Long, nRename As Long, nCheck As Long
+    Dim fld As Object
+    Dim proposal As String, flag As String
+
+    On Error GoTo ErrHandler
+
+    Set rootFld = PickRootFolder(T("Export des noms de dossiers", "Folder name export"))
+    If rootFld Is Nothing Then Exit Sub
+
+    Set fldList = New Collection
+    CollectSubfolders rootFld, fldList
+    If fldList.Count = 0 Then
+        MsgBox T("Aucun sous-dossier trouv~e.", "No subfolder found."), _
+               vbInformation, T("Export des noms de dossiers", "Folder name export")
+        Exit Sub
+    End If
+
+    ' v1.2 : un fichier par racine exportee, plus d'ecrasement d'un export a l'autre
+    csvPath = modConfig.MacroVBADir() & "\" & SafeFileBase(rootFld.Name) & EXPORT_SUFFIX
+    fnum = FreeFile
+    Open csvPath For Output As #fnum
+    Print #fnum, "FolderPath" & CSV_SEP & "CurrentName" & CSV_SEP & _
+                 "Proposal" & CSV_SEP & "Flag"
+
+    For i = 1 To fldList.Count
+        Set fld = fldList(i)
+        proposal = ProposeSortedName(fld.Name, flag)
+        If flag = "RENAME" Then nRename = nRename + 1
+        If flag = "CHECK-YEAR" Then nCheck = nCheck + 1
+        Print #fnum, CsvCell(fld.FolderPath) & CSV_SEP & CsvCell(fld.Name) & _
+                     CSV_SEP & CsvCell(proposal) & CSV_SEP & flag
+    Next i
+    Close #fnum
+
+    modDebugLog.DInfo MOD_NAME, "Export " & fldList.Count & " dossiers -> " & csvPath
+    MsgBox fldList.Count & T(" dossiers export~es vers :", " folders exported to:") & vbCrLf & _
+           csvPath & vbCrLf & vbCrLf & _
+           nRename & T(" propositions de renommage, ", " rename proposals, ") & _
+           nCheck & T(" ~a v~erifier (ann~ee possible).", " to check (possible year)."), _
+           vbInformation, T("Export des noms de dossiers", "Folder name export")
+    Exit Sub
+
+ErrHandler:
+    If fnum <> 0 Then Close #fnum
+    modDebugLog.DError MOD_NAME, "ExportProjectFolderNames err " & Err.Number & _
+        " - " & Err.Description
+    MsgBox T("Erreur pendant l'export : ", "Error during export: ") & Err.Description, _
+           vbExclamation, T("Export des noms de dossiers", "Folder name export")
+End Sub
+
+'=============================================================================
+' ETAPE 2 : application d'un CSV valide.
+' Entree : <Macro VBA\Outlook>\<NomDuDossier>_folders_rename.csv (ANSI, ";")
+'   ligne 1 = en-tete ignore ; puis FolderPath ; NewName [; colonnes ignorees]
+'   Les cellules peuvent etre entre guillemets ("" = guillemet echappe).
+' Deroulement : resolution de TOUS les dossiers d'abord (les chemins des
+'   enfants deviendraient faux apres renommage d'un parent), dry-run avec
+'   bilan, confirmation unique, puis renommage. Collision de nom entre freres
+'   => ligne ignoree et signalee. Reindexation QuickMove a la fin.
+'=============================================================================
+Public Sub RenameProjectFoldersFromCSV()
+    Dim csvPath As String, raw As String
+    Dim lineArr() As String, cells() As String
+    Dim i As Long, fnum As Integer
+    Dim paths As Collection, names As Collection, objs As Collection
+    Dim fld As Object
+    Dim newName As String
+    Dim nMissing As Long, nSame As Long, nTodo As Long
+    Dim missingList As String
+    Dim titleTxt As String
+
+    titleTxt = T("Renommage des dossiers", "Folder rename")
+    On Error GoTo ErrHandler
+
+    csvPath = PickRenameCsvPath(titleTxt)
+    If Len(csvPath) = 0 Then Exit Sub
+    modDebugLog.DInfo MOD_NAME, "Fichier de renommage : " & csvPath
+
+    fnum = FreeFile
+    Open csvPath For Input As #fnum
+    raw = Input$(LOF(fnum), fnum)
+    Close #fnum
+    fnum = 0
+    raw = Replace(raw, vbCrLf, vbLf)
+    raw = Replace(raw, vbCr, vbLf)
+    lineArr = Split(raw, vbLf)
+
+    Set paths = New Collection
+    Set names = New Collection
+    Set objs = New Collection
+
+    ' --- Passe 1 : lecture + resolution ---------------------------------
+    For i = 1 To UBound(lineArr)                       ' saute l'en-tete (0)
+        If Len(Trim$(lineArr(i))) > 0 Then
+            cells = ParseCsvLine(lineArr(i))
+            If UBound(cells) >= 1 Then
+                newName = Trim$(cells(1))
+                If Len(newName) > 0 Then
+                    Set fld = Nothing
+                    ' Outlook echappe "/" en %2F dans FolderPath
+                    Set fld = modCommon.GetFolderByPath(Replace(Trim$(cells(0)), "%2F", "/"))
+                    If fld Is Nothing Then
+                        nMissing = nMissing + 1
+                        If nMissing <= 10 Then missingList = missingList & vbCrLf & cells(0)
+                    ElseIf StrComp(Trim$(fld.Name), newName, vbBinaryCompare) = 0 Then
+                        nSame = nSame + 1
+                    Else
+                        paths.Add cells(0)
+                        names.Add newName
+                        objs.Add fld
+                        nTodo = nTodo + 1
+                    End If
+                End If
+            End If
+        End If
+    Next i
+
+    ' --- Dry-run : bilan + confirmation ---------------------------------
+    Dim msg As String
+    msg = nTodo & T(" dossiers ~a renommer", " folders to rename") & vbCrLf & _
+          nSame & T(" d~ej~a conformes (ignor~es)", " already correct (skipped)") & vbCrLf & _
+          nMissing & T(" chemins introuvables (ignor~es)", " paths not found (skipped)")
+    If Len(missingList) > 0 Then msg = msg & vbCrLf & missingList
+    If nTodo = 0 Then
+        MsgBox msg, vbInformation, titleTxt
+        Exit Sub
+    End If
+    msg = msg & vbCrLf & vbCrLf & T("Appliquer le renommage ?", "Apply the rename?")
+    If MsgBox(msg, vbQuestion + vbYesNo + vbDefaultButton2, titleTxt) <> vbYes Then Exit Sub
+
+    ' --- Passe 2 : renommage --------------------------------------------
+    Dim nDone As Long, nFail As Long, failList As String
+    For i = 1 To objs.Count
+        Set fld = objs(i)
+        newName = names(i)
+        If SiblingExists(fld, newName) Then
+            nFail = nFail + 1
+            If nFail <= 10 Then failList = failList & vbCrLf & paths(i) & " -> " & newName & " (collision)"
+            modDebugLog.DError MOD_NAME, "Collision : " & paths(i) & " -> " & newName
+        Else
+            On Error Resume Next
+            Err.Clear
+            fld.Name = newName
+            If Err.Number <> 0 Then
+                nFail = nFail + 1
+                If nFail <= 10 Then failList = failList & vbCrLf & paths(i) & " -> " & newName & " (" & Err.Description & ")"
+                modDebugLog.DError MOD_NAME, "Rename echec " & paths(i) & " : " & Err.Number & " - " & Err.Description
+            Else
+                nDone = nDone + 1
+                modDebugLog.DInfo MOD_NAME, "Rename OK : " & paths(i) & " -> " & newName
+            End If
+            On Error GoTo ErrHandler
+        End If
+    Next i
+
+    ' Reindexation QuickMove (cache des chemins perime apres renommage)
+    On Error Resume Next
+    modQuickMove.QuickMoveReload
+    On Error GoTo ErrHandler
+
+    msg = nDone & T(" dossiers renomm~es.", " folders renamed.")
+    If nFail > 0 Then msg = msg & vbCrLf & nFail & T(" ~echecs :", " failures:") & failList
+    MsgBox msg, IIf(nFail > 0, vbExclamation, vbInformation), titleTxt
+    Exit Sub
+
+ErrHandler:
+    If fnum <> 0 Then Close #fnum
+    modDebugLog.DError MOD_NAME, "RenameProjectFoldersFromCSV err " & Err.Number & _
+        " - " & Err.Description
+    MsgBox T("Erreur : ", "Error: ") & Err.Description, vbExclamation, titleTxt
+End Sub
+
+'=============================================================================
+' ProposeSortedName
+' Nom propose : blocs 4 chiffres de tete tries decroissant + LABEL_SEP +
+' libelle. Renvoie "" s'il n'y a aucun bloc de tete. flagOut : voir export.
+'=============================================================================
+Public Function ProposeSortedName(ByVal currentName As String, _
+                                  Optional ByRef flagOut As String) As String
+    Dim s As String, tok As String, nextCh As String
+    Dim pos As Long, nb As Long, i As Long, j As Long
+    Dim blocks() As Long, tmp As Long
+    Dim label As String, result As String
+    Dim yMin As Long, yMax As Long, yearFlag As Boolean
+
+    s = Trim$(currentName)
+    pos = 1
+    ReDim blocks(1 To 1)
+
+    Do
+        ' saute les separateurs
+        Do While pos <= Len(s)
+            If InStr(1, SEP_CHARS, Mid$(s, pos, 1)) > 0 Then pos = pos + 1 Else Exit Do
+        Loop
+        If pos + 3 > Len(s) Then Exit Do
+        tok = Mid$(s, pos, 4)
+        If Not IsAllDigits(tok) Then Exit Do
+        nextCh = Mid$(s, pos + 4, 1)                 ' "" en fin de chaine
+        If Len(nextCh) > 0 Then
+            If InStr(1, SEP_CHARS, nextCh) = 0 Then Exit Do
+            ' garde-fou contrat 20XX_XXXXX
+            If nextCh = "_" Then
+                If IsAllDigits(Mid$(s, pos + 5, 5)) And Len(Mid$(s, pos + 5, 5)) = 5 _
+                   And Not IsAllDigits(Mid$(s, pos + 10, 1)) Then Exit Do
+            End If
+        End If
+        nb = nb + 1
+        ReDim Preserve blocks(1 To nb)
+        blocks(nb) = CLng(tok)
+        pos = pos + 4
+    Loop
+
+    If nb = 0 Then
+        flagOut = "NOCODE"
+        ProposeSortedName = ""
+        Exit Function
+    End If
+
+    ' libelle = reste, separateurs de tete retires
+    label = Mid$(s, pos)
+    Do While Len(label) > 0
+        If InStr(1, SEP_CHARS, Left$(label, 1)) > 0 Then label = Mid$(label, 2) Else Exit Do
+    Loop
+    label = Trim$(label)
+
+    ' tri decroissant (petit tableau : tri par insertion)
+    For i = 2 To nb
+        tmp = blocks(i)
+        j = i - 1
+        Do While j >= 1
+            If blocks(j) < tmp Then blocks(j + 1) = blocks(j) Else Exit Do
+            j = j - 1
+        Loop
+        blocks(j + 1) = tmp
+    Next i
+
+    yMin = modConfig.YearExclusionMin()
+    yMax = modConfig.YearExclusionMax()
+    For i = 1 To nb
+        If i > 1 Then result = result & BLOCK_SEP
+        result = result & Format$(blocks(i), "0000")
+        If blocks(i) >= yMin And blocks(i) <= yMax Then yearFlag = True
+    Next i
+    If Len(label) > 0 Then result = result & LABEL_SEP & label
+
+    If yearFlag Then
+        flagOut = "CHECK-YEAR"
+    ElseIf StrComp(result, s, vbBinaryCompare) = 0 Then
+        flagOut = "SAME"
+    Else
+        flagOut = "RENAME"
+    End If
+    ProposeSortedName = result
+End Function
+
+'=============================================================================
+' Helpers prives
+'=============================================================================
+' v1.2 : nettoie un nom de dossier Outlook pour en faire un prefixe de fichier
+Private Function SafeFileBase(ByVal s As String) As String
+    Dim k As Long, ch As String, out As String
+    Const BAD As String = "\/:*?""<>|"
+    For k = 1 To Len(s)
+        ch = Mid$(s, k, 1)
+        If InStr(1, BAD, ch) > 0 Then ch = "_"
+        out = out & ch
+    Next k
+    out = Trim$(out)
+    If Len(out) = 0 Then out = "export"
+    SafeFileBase = out
+End Function
+
+' v1.2 : retrouve le CSV a appliquer. Prefixe demande (defaut = FolderRenameRoot),
+' repli sur l'ancien nom fixe si le fichier prefixe n'existe pas.
+Private Function PickRenameCsvPath(ByVal titleTxt As String) As String
+    Dim baseName As String, p As String, legacy As String
+
+    baseName = InputBox(T("Nom du dossier export~e (pr~efixe du fichier ~a appliquer) :", _
+                          "Exported folder name (prefix of the file to apply):"), _
+                        titleTxt, modConfig.Cfg("FolderRenameRoot", "DV"))
+    baseName = Trim$(baseName)
+    If Len(baseName) = 0 Then Exit Function
+
+    p = modConfig.MacroVBADir() & "\" & SafeFileBase(baseName) & RENAME_SUFFIX
+    If Dir$(p) <> "" Then
+        PickRenameCsvPath = p
+        Exit Function
+    End If
+
+    legacy = modConfig.MacroVBADir() & "\" & LEGACY_RENAME_FILE
+    If Dir$(legacy) <> "" Then
+        If MsgBox(T("Fichier introuvable :", "File not found:") & vbCrLf & p & vbCrLf & vbCrLf & _
+                  T("Utiliser l'ancien fichier ?", "Use the legacy file instead?") & vbCrLf & _
+                  legacy, vbQuestion + vbYesNo, titleTxt) = vbYes Then
+            PickRenameCsvPath = legacy
+        End If
+        Exit Function
+    End If
+
+    MsgBox T("Fichier introuvable : ", "File not found: ") & p, vbExclamation, titleTxt
+End Function
+
+Private Function PickRootFolder(ByVal titleTxt As String) As Object
+    Dim rootName As String
+    Dim inbox As Object
+    rootName = InputBox(T("Sous-dossier de la Bo~ite de r~eception ~a parcourir :", _
+                          "Inbox subfolder to scan:"), titleTxt, _
+                        modConfig.Cfg("FolderRenameRoot", "DV"))
+    rootName = Trim$(rootName)
+    If Len(rootName) = 0 Then Exit Function
+    Set inbox = Application.GetNamespace("MAPI").GetDefaultFolder(olFolderInbox)
+    On Error Resume Next
+    Set PickRootFolder = inbox.Folders(rootName)
+    On Error GoTo 0
+    If PickRootFolder Is Nothing Then
+        MsgBox T("Dossier introuvable sous la Bo~ite de r~eception : ", _
+                 "Folder not found under Inbox: ") & rootName, vbExclamation, titleTxt
+    End If
+End Function
+
+Private Sub CollectSubfolders(ByVal parentFld As Object, ByRef acc As Collection)
+    Dim child As Object
+    On Error Resume Next
+    For Each child In parentFld.Folders
+        acc.Add child
+        CollectSubfolders child, acc
+    Next child
+End Sub
+
+Private Function SiblingExists(ByVal fld As Object, ByVal candidate As String) As Boolean
+    Dim sib As Object
+    On Error Resume Next
+    For Each sib In fld.Parent.Folders
+        If StrComp(sib.Name, candidate, vbTextCompare) = 0 Then
+            If sib.EntryID <> fld.EntryID Then
+                SiblingExists = True
+                Exit Function
+            End If
+        End If
+    Next sib
+End Function
+
+Private Function IsAllDigits(ByVal s As String) As Boolean
+    Dim k As Long
+    If Len(s) = 0 Then Exit Function
+    For k = 1 To Len(s)
+        If Mid$(s, k, 1) < "0" Or Mid$(s, k, 1) > "9" Then Exit Function
+    Next k
+    IsAllDigits = True
+End Function
+
+Private Function CsvCell(ByVal s As String) As String
+    If InStr(1, s, CSV_SEP) > 0 Or InStr(1, s, """") > 0 Then
+        CsvCell = """" & Replace(s, """", """""") & """"
+    Else
+        CsvCell = s
+    End If
+End Function
+
+' Decoupe une ligne CSV (";" ; guillemets optionnels ; "" = guillemet echappe)
+Private Function ParseCsvLine(ByVal rawLine As String) As String()
+    Dim out() As String, n As Long
+    Dim k As Long, ch As String, cur As String, inQ As Boolean
+    ReDim out(0 To 0)
+    For k = 1 To Len(rawLine)
+        ch = Mid$(rawLine, k, 1)
+        If inQ Then
+            If ch = """" Then
+                If Mid$(rawLine, k + 1, 1) = """" Then
+                    cur = cur & """"
+                    k = k + 1
+                Else
+                    inQ = False
+                End If
+            Else
+                cur = cur & ch
+            End If
+        Else
+            If ch = """" Then
+                inQ = True
+            ElseIf ch = CSV_SEP Then
+                ReDim Preserve out(0 To n)
+                out(n) = cur
+                n = n + 1
+                cur = ""
+            Else
+                cur = cur & ch
+            End If
+        End If
+    Next k
+    ReDim Preserve out(0 To n)
+    out(n) = cur
+    ParseCsvLine = out
+End Function

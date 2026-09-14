@@ -1,0 +1,804 @@
+Option Explicit
+
+'=============================================================================
+' modBackupAuto (v3.2 - 2026-08-22)
+'
+' v3.2 (2026-08-22) : revue UX pop-ups + traduction.
+'   (a) Le recapitulatif de SUCCES passe en toast : aucune decision a
+'       prendre, et le detail (summary) part dans debug.log ou il reste
+'       consultable. Le recapitulatif d'ECHEC PARTIEL reste MODAL a dessein
+'       - un backup incomplet doit etre vu, sinon on croit disposer d'une
+'       sauvegarde qu'on n'a pas. C'est exactement le cas ou un toast
+'       serait une regression.
+'   (b) Le titre de fenetre "Backup automatique" etait en dur a 6 endroits :
+'       factorise dans UiTitle() et passe par T().
+'   (c) MOD_VERSION / ModVersion ajoutes (le module n'en avait pas).
+'   Dependance ajoutee : modUi.
+'
+' v3.1 (2026-07-11)
+' v3.1 (2026-07-11) : retour HONNETE de DoFullBackup - la moindre section
+'   en ECHEC dans le recap => False (avant : True inconditionnel, le mois
+'   pouvait etre marque sauvegarde avec une section non copiee).
+' v3 (2026-07-05) : lecture config via getter modConfig.BackupRetentionMonths()
+' (EnsureLoaded-safe) au lieu de la globale g_ en direct.
+' Purpose (EN): monthly automatic backup of the whole Outlook VBA ecosystem
+'   (VbaProject.OTM, ribbon UI files, Excel referentials, a registry export and
+'   the QuickMove caches) into a YYYY-MM folder under the Desktop. Triggered
+'   idempotently from Application_Startup via a registry "LastRunMonth" flag so
+'   it runs at most once per calendar month. Folders beyond the retention count
+'   (modConfig.BackupRetentionMonths()) are pruned.
+'
+' Sauvegarde automatique mensuelle de l'environnement VBA Outlook + tous
+' les artefacts persistants associes (rubans, referentiels Excel, settings
+' registry, caches QuickMove).
+'
+'
+' Declenchement : appel depuis Application_Startup via
+'     modBackupAuto.RunMonthlyBackupIfNeeded
+' La sub teste un flag registry "LastRunMonth" : si le mois courant est
+' different, elle lance le backup et met a jour le flag. Donc au plus
+' une execution par mois civil, sur le premier demarrage du mois.
+'
+' Dossier racine : Bureau\Macro VBA\Outlook\Sauvegardes\Auto\YYYY-MM\
+' Avec sous-dossiers OTM, Ribbon_Active, Ribbon_Exported, Excel, Registry,
+' QuickMove. Chaque sous-dossier contient les fichiers source COPIES tels
+' quels (nom de fichier inchange).
+'
+' Retention : par defaut 12 dossiers Auto (12 mois) sont conserves, les
+' plus anciens sont supprimes. Modifiable via modConfig.BackupRetentionMonths().
+'
+' Points d'entree publics :
+'   - RunMonthlyBackupIfNeeded : appel idempotent depuis Application_Startup
+'   - RunBackupNow             : force un backup immediat (toujours, ignore
+'                                le flag mensuel - ecrase le dossier du mois)
+'   - ResetMonthlyFlag         : efface le flag pour forcer un re-trigger
+'   - OpenBackupsFolder     : ouvre le dossier racine dans l'Explorateur
+'
+' Module utilise modConfig (DesktopPath, AppDataOutlookPath, TimeTrackingPath,
+' MailTrackingPath) et modDebugLog conformement a la convention projet.
+'=============================================================================
+
+Private Const MOD_NAME As String = "BackupAuto"
+Private Const MOD_VERSION As String = "v3.2 - 2026-08-22"
+
+' Sous-dossier de backup, relatif a modConfig.MacroVBADir() (pack v3 - D11 :
+' le segment "Macro VBA\Outlook" n'est plus duplique ici).
+Private Const BACKUP_ROOT_SUBDIR As String = "Sauvegardes\Auto"
+
+' Pack v3 (A12) : TOUTES les branches registre du toolkit (avant : 3 sur 7).
+' Une branche = un nom d'application VBA (SaveSetting) ; les sections sont
+' enumerees a l'execution via GetAllSettings, aucun processus lance.
+Private Const REG_APPS As String = "QuickMove|Outlook_Calendrier|BackupAuto|Toolkit|FolderScan|MailResponseTracker|ClassicOutlookToolkit"
+
+' Nom du fichier OTM source
+Private Const OTM_NAME As String = "VbaProject.OTM"
+
+' Retention : nombre de dossiers Auto conserves (les plus recents).
+' Externalise dans config.ini : modConfig.BackupRetentionMonths()
+' (RetentionBackupMois, defaut 12).
+
+' Cle registry pour le flag "dernier mois execute"
+Private Const REG_APP As String = "BackupAuto"
+Private Const REG_SECTION As String = "Schedule"
+Private Const REG_KEY_LASTMONTH As String = "LastRunMonth"
+
+'=============================================================================
+' RunMonthlyBackupIfNeeded
+' A appeler depuis Application_Startup. Lance le backup uniquement si le
+' mois courant n'a pas encore ete sauvegarde.
+'=============================================================================
+
+'=============================================================================
+' ModVersion - version REELLEMENT chargee dans le VBE.
+'=============================================================================
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+'=============================================================================
+' UiTitle - titre de fenetre localise (etait en dur "Backup automatique").
+'=============================================================================
+Private Function UiTitle() As String
+    UiTitle = T("Backup automatique", "Automatic backup")
+End Function
+
+Public Sub RunMonthlyBackupIfNeeded()
+    On Error GoTo ErrH
+
+    Dim currentMonth As String
+    currentMonth = Format(Now, "YYYY-MM")
+
+    Dim lastMonth As String
+    lastMonth = GetSetting(REG_APP, REG_SECTION, REG_KEY_LASTMONTH, "")
+
+    If lastMonth = currentMonth Then
+        modDebugLog.DTrace MOD_NAME, "Skip: deja execute pour " & currentMonth
+        Exit Sub
+    End If
+
+    modDebugLog.DInfo MOD_NAME, "Lancement backup mensuel (mois courant " & _
+        currentMonth & ", dernier " & IIf(Len(lastMonth) = 0, "jamais", lastMonth) & ")"
+
+    Dim summary As String
+    If DoFullBackup(summary) Then
+        SaveSetting REG_APP, REG_SECTION, REG_KEY_LASTMONTH, currentMonth
+        modDebugLog.DInfo MOD_NAME, "Backup mensuel termine: " & summary
+    Else
+        modDebugLog.DError MOD_NAME, "Backup mensuel echoue, flag non pose"
+    End If
+    Exit Sub
+
+ErrH:
+    modDebugLog.DError MOD_NAME, "RunMonthlyBackupIfNeeded err " & Err.Number & _
+        " - " & Err.Description
+End Sub
+
+'=============================================================================
+' RunBackupNow
+' Force un backup immediat, ignore le flag mensuel. Affiche un MsgBox.
+' Si appele plusieurs fois dans le meme mois, ecrase le dossier du mois.
+'=============================================================================
+Public Sub RunBackupNow()
+    On Error GoTo ErrH
+
+    ' Modal explicatif avant lancement (annulable).
+    Dim destRoot As String
+    destRoot = GetBackupRoot()
+    If MsgBox( _
+        T("Backup mensuel COMPLET.", "Full monthly backup.") & vbCrLf & vbCrLf & _
+        T("Instantane global de tout l'ecosysteme :", "Global snapshot of the whole ecosystem:") & vbCrLf & _
+        T(" - VbaProject.OTM (code VBA)", " - VbaProject.OTM (VBA code)") & vbCrLf & _
+        T(" - fichiers UI du ruban", " - ribbon UI files") & vbCrLf & _
+        T(" - references Excel (referentiels, etc.)", " - Excel referentials (workbooks, etc.)") & vbCrLf & _
+        T(" - export registre", " - registry export") & vbCrLf & _
+        T(" - cache QuickMove", " - QuickMove cache") & vbCrLf & vbCrLf & _
+        T("Structure YYYY-MM, retention 12 mois.", "YYYY-MM structure, 12-month retention.") & vbCrLf & vbCrLf & _
+        T("Destination :", "Destination:") & vbCrLf & destRoot & vbCrLf & vbCrLf & _
+        T("Lancer le backup complet ?", "Run the full backup?"), _
+        vbQuestion + vbOKCancel + vbDefaultButton1, _
+        UiTitle()) <> vbOK Then
+        Exit Sub
+    End If
+
+    Dim summary As String
+    If DoFullBackup(summary) Then
+        ' On met aussi a jour le flag pour eviter un double-trigger le meme mois
+        SaveSetting REG_APP, REG_SECTION, REG_KEY_LASTMONTH, Format(Now, "YYYY-MM")
+        ' v3.2 : recapitulatif en toast - aucune decision a prendre. Le
+        ' detail (summary) part dans le log, ou il reste consultable.
+        modDebugLog.DInfo MOD_NAME, "Backup OK : " & Replace(summary, vbCrLf, " | ")
+        modUi.Toast T("Backup termin~e.", "Backup done."), uiSuccess, True
+    Else
+        ' Erreurs : reste MODAL. Un backup partiel doit etre vu, sinon on
+        ' croit disposer d'une sauvegarde qu'on n'a pas.
+        modUi.Fail T("Backup termin~e avec erreurs. Voir debug.log.", _
+                     "Backup done with errors. See debug.log.") & vbCrLf & vbCrLf & summary, _
+                   UiTitle()
+    End If
+    Exit Sub
+
+ErrH:
+    modUi.Fail T("Erreur: ", "Error: ") & Err.Number & " - " & Err.Description, UiTitle()
+End Sub
+
+'=============================================================================
+' ResetMonthlyFlag
+' Supprime le flag pour forcer un nouveau trigger au prochain Startup.
+'=============================================================================
+Public Sub ResetMonthlyFlag()
+    On Error Resume Next
+    DeleteSetting REG_APP, REG_SECTION, REG_KEY_LASTMONTH
+    On Error GoTo 0
+    modUi.Toast T("Flag reset. Le prochain d~emarrage Outlook lancera un backup.", _
+                  "Flag reset. The next Outlook startup will run a backup."), uiInfo
+End Sub
+
+'=============================================================================
+' OpenBackupsFolder
+' Ouvre le dossier racine des backups Auto dans l'Explorateur Windows.
+'=============================================================================
+Public Sub OpenBackupsFolder()
+    On Error Resume Next
+    Dim p As String
+    p = GetBackupRoot()
+    If Len(p) = 0 Then Exit Sub
+
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    If Not fso.FolderExists(p) Then
+        MsgBox T("Aucun dossier de backup encore cr~e~e:", "No backup folder created yet:") & vbCrLf & p, _
+               vbInformation, UiTitle()
+        Exit Sub
+    End If
+
+    shell "explorer.exe """ & p & """", vbNormalFocus
+    On Error GoTo 0
+End Sub
+
+'=============================================================================
+' DoFullBackup
+' Coeur : execute tous les backups, renvoie True si OK, False si erreurs.
+' summary recoit un recap multi-lignes pour MsgBox/log.
+'=============================================================================
+Private Function DoFullBackup(ByRef summary As String) As Boolean
+    DoFullBackup = False
+    summary = ""
+
+    ' --- Preparation du dossier mensuel ---
+    Dim monthStamp As String
+    monthStamp = Format(Now, "YYYY-MM")
+
+    Dim sessionDir As String
+    sessionDir = GetBackupRoot() & "\" & monthStamp
+    If Not EnsureFolder(sessionDir) Then
+        summary = "ECHEC creation dossier: " & sessionDir
+        Exit Function
+    End If
+
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    Dim totalFiles As Long
+    Dim totalKb As Double
+    Dim sectionLine As String
+
+    ' === 1. VbaProject.OTM ===========================================
+    sectionLine = BackupOTM(sessionDir, totalFiles, totalKb, fso)
+    summary = summary & sectionLine & vbCrLf
+
+    ' === 2. Rubans actifs (.officeUI) =================================
+    sectionLine = BackupRibbonActive(sessionDir, totalFiles, totalKb, fso)
+    summary = summary & sectionLine & vbCrLf
+
+    ' === 3. Rubans exportes (.exportedUI sur le Bureau) ===============
+    sectionLine = BackupRibbonExported(sessionDir, totalFiles, totalKb, fso)
+    summary = summary & sectionLine & vbCrLf
+
+    ' === 4. Referentiels Excel ========================================
+    sectionLine = BackupExcelRefs(sessionDir, totalFiles, totalKb, fso)
+    summary = summary & sectionLine & vbCrLf
+
+    ' === 5. Registry settings =========================================
+    sectionLine = BackupRegistrySettings(sessionDir, totalFiles, totalKb, fso)
+    summary = summary & sectionLine & vbCrLf
+
+    ' === 6. Caches QuickMove ==========================================
+    sectionLine = BackupQuickMoveCache(sessionDir, totalFiles, totalKb, fso)
+    summary = summary & sectionLine & vbCrLf
+
+    ' === Recap ========================================================
+    summary = summary & vbCrLf & _
+              "Total: " & totalFiles & " fichier(s), " & _
+              Format(totalKb, "#,##0") & " Ko" & vbCrLf & _
+              "Dossier: " & sessionDir
+
+    ' === Retention ====================================================
+    PurgeOldBackups fso
+
+    ' v3.1 : retour honnete - la moindre section en ECHEC => False.
+    DoFullBackup = (InStr(1, summary, "ECHEC", vbTextCompare) = 0)
+End Function
+
+'=============================================================================
+' Section 1 : OTM
+'=============================================================================
+Private Function BackupOTM(ByVal sessionDir As String, _
+                           ByRef totalFiles As Long, ByRef totalKb As Double, _
+                           ByVal fso As Object) As String
+    Dim subDir As String
+    subDir = sessionDir & "\OTM"
+    If Not EnsureFolder(subDir) Then
+        BackupOTM = "[OTM] ECHEC creation dossier"
+        Exit Function
+    End If
+
+    Dim srcPath As String
+    srcPath = modConfig.AppDataOutlookPath() & "\" & OTM_NAME
+    If Not fso.fileExists(srcPath) Then
+        BackupOTM = "[OTM] introuvable: " & srcPath
+        modDebugLog.DError MOD_NAME, "OTM introuvable: " & srcPath
+        Exit Function
+    End If
+
+    Dim destPath As String
+    destPath = subDir & "\" & fso.GetFileName(srcPath)
+
+    On Error Resume Next
+    fso.CopyFile srcPath, destPath, True
+    If Err.Number <> 0 Then
+        Dim msg As String
+        msg = "[OTM] echec copie: " & Err.Description
+        modDebugLog.DError MOD_NAME, msg
+        Err.Clear
+        On Error GoTo 0
+        BackupOTM = msg
+        Exit Function
+    End If
+    On Error GoTo 0
+
+    Dim szKb As Double
+    szKb = fso.GetFile(destPath).size / 1024
+    totalFiles = totalFiles + 1
+    totalKb = totalKb + szKb
+
+    BackupOTM = "[OTM] OK (" & Format(szKb, "#,##0") & " Ko)"
+End Function
+
+'=============================================================================
+' Section 2 : Rubans actifs (.officeUI dans %LOCALAPPDATA%\Microsoft\Office)
+'
+' Outlook Classic stocke les personnalisations du ruban dans:
+'   olkexplorer.officeUI         (fenetre principale Courrier/Calendrier)
+'   olkaddritem.officeUI         (lecture mail)
+'   olkmailitem.officeUI         (composition mail)
+'   olkapptitem.officeUI         (rendez-vous)
+'   olkmtgitem.officeUI          (reunion)
+'   olksrchitem.officeUI         (recherche)
+'   olktaskitem.officeUI         (tache)
+'   olknoteitem.officeUI         (note)
+'   olkcontactitem.officeUI      (contact)
+' On copie tous les .officeUI presents, sans hypothese sur la liste exacte.
+'=============================================================================
+Private Function BackupRibbonActive(ByVal sessionDir As String, _
+                                    ByRef totalFiles As Long, ByRef totalKb As Double, _
+                                    ByVal fso As Object) As String
+    Dim subDir As String
+    subDir = sessionDir & "\Ribbon_Active"
+    If Not EnsureFolder(subDir) Then
+        BackupRibbonActive = "[Ribbon_Active] ECHEC creation dossier"
+        Exit Function
+    End If
+
+    Dim srcDir As String
+    srcDir = Environ("LOCALAPPDATA") & "\Microsoft\Office"
+    If Not fso.FolderExists(srcDir) Then
+        BackupRibbonActive = "[Ribbon_Active] dossier source absent: " & srcDir
+        Exit Function
+    End If
+
+    Dim count As Long
+    Dim sumKb As Double
+    Dim folderObj As Object
+    Set folderObj = fso.GetFolder(srcDir)
+
+    Dim f As Object
+    Dim destPath As String
+
+    On Error Resume Next
+    For Each f In folderObj.files
+        If LCase(fso.GetExtensionName(f.name)) = "officeui" Then
+            destPath = subDir & "\" & f.name
+            fso.CopyFile f.path, destPath, True
+            If Err.Number = 0 Then
+                count = count + 1
+                sumKb = sumKb + (f.size / 1024)
+            Else
+                modDebugLog.DError MOD_NAME, "Ribbon_Active err sur " & f.name & ": " & Err.Description
+                Err.Clear
+            End If
+        End If
+    Next f
+    On Error GoTo 0
+
+    totalFiles = totalFiles + count
+    totalKb = totalKb + sumKb
+
+    If count = 0 Then
+        BackupRibbonActive = "[Ribbon_Active] aucun .officeUI trouve dans " & srcDir
+    Else
+        BackupRibbonActive = "[Ribbon_Active] OK (" & count & " fichier(s), " & _
+                             Format(sumKb, "#,##0") & " Ko)"
+    End If
+End Function
+
+'=============================================================================
+' Section 3 : Rubans exportes manuellement (.exportedUI sur le Bureau)
+'=============================================================================
+Private Function BackupRibbonExported(ByVal sessionDir As String, _
+                                      ByRef totalFiles As Long, ByRef totalKb As Double, _
+                                      ByVal fso As Object) As String
+    Dim subDir As String
+    subDir = sessionDir & "\Ribbon_Exported"
+    If Not EnsureFolder(subDir) Then
+        BackupRibbonExported = "[Ribbon_Exported] ECHEC creation dossier"
+        Exit Function
+    End If
+
+    Dim srcDir As String
+    srcDir = modConfig.DesktopPath()
+    If Not fso.FolderExists(srcDir) Then
+        BackupRibbonExported = "[Ribbon_Exported] Bureau introuvable"
+        Exit Function
+    End If
+
+    Dim count As Long
+    Dim sumKb As Double
+    Dim folderObj As Object
+    Set folderObj = fso.GetFolder(srcDir)
+
+    Dim f As Object
+    Dim destPath As String
+
+    On Error Resume Next
+    For Each f In folderObj.files
+        If LCase(fso.GetExtensionName(f.name)) = "exportedui" Then
+            destPath = subDir & "\" & f.name
+            fso.CopyFile f.path, destPath, True
+            If Err.Number = 0 Then
+                count = count + 1
+                sumKb = sumKb + (f.size / 1024)
+            Else
+                modDebugLog.DError MOD_NAME, "Ribbon_Exported err sur " & f.name & ": " & Err.Description
+                Err.Clear
+            End If
+        End If
+    Next f
+    On Error GoTo 0
+
+    totalFiles = totalFiles + count
+    totalKb = totalKb + sumKb
+
+    If count = 0 Then
+        BackupRibbonExported = "[Ribbon_Exported] aucun .exportedUI sur le Bureau"
+    Else
+        BackupRibbonExported = "[Ribbon_Exported] OK (" & count & " fichier(s), " & _
+                               Format(sumKb, "#,##0") & " Ko)"
+    End If
+End Function
+
+'=============================================================================
+' Section 4 : Referentiels Excel (Suivi de temps, Suivi des mails)
+'=============================================================================
+Private Function BackupExcelRefs(ByVal sessionDir As String, _
+                                 ByRef totalFiles As Long, ByRef totalKb As Double, _
+                                 ByVal fso As Object) As String
+    Dim subDir As String
+    subDir = sessionDir & "\Excel"
+    If Not EnsureFolder(subDir) Then
+        BackupExcelRefs = "[Excel] ECHEC creation dossier"
+        Exit Function
+    End If
+
+    Dim count As Long
+    Dim sumKb As Double
+    Dim missing As String
+
+    ' Suivi de temps.xlsm
+    sumKb = sumKb + CopyOneExcel(modConfig.TimeTrackingPath(), subDir, fso, count, missing)
+    ' Suivi des mails.xlsx
+    sumKb = sumKb + CopyOneExcel(modConfig.MailTrackingPath(), subDir, fso, count, missing)
+
+    totalFiles = totalFiles + count
+    totalKb = totalKb + sumKb
+
+    Dim res As String
+    res = "[Excel] OK (" & count & " fichier(s), " & Format(sumKb, "#,##0") & " Ko)"
+    If Len(missing) > 0 Then res = res & " - manquant: " & missing
+    BackupExcelRefs = res
+End Function
+
+' Helper pour Section 4
+Private Function CopyOneExcel(ByVal srcPath As String, ByVal subDir As String, _
+                              ByVal fso As Object, _
+                              ByRef count As Long, ByRef missing As String) As Double
+    CopyOneExcel = 0
+    If Not fso.fileExists(srcPath) Then
+        If Len(missing) > 0 Then missing = missing & ", "
+        missing = missing & fso.GetFileName(srcPath)
+        modDebugLog.DDebug MOD_NAME, "Excel introuvable: " & srcPath
+        Exit Function
+    End If
+
+    Dim destPath As String
+    destPath = subDir & "\" & fso.GetFileName(srcPath)
+
+    On Error Resume Next
+    fso.CopyFile srcPath, destPath, True
+    If Err.Number <> 0 Then
+        modDebugLog.DError MOD_NAME, "Excel copie err sur " & srcPath & ": " & Err.Description
+        Err.Clear
+        On Error GoTo 0
+        Exit Function
+    End If
+    On Error GoTo 0
+
+    count = count + 1
+    CopyOneExcel = fso.GetFile(destPath).size / 1024
+End Function
+
+'=============================================================================
+' Section 5 : Settings registry (HKCU\Software\VB and VBA Program Settings\)
+' On exporte les branches connues du stack au format .reg lisible.
+' Branches couvertes : QuickMove, Outlook_Calendrier, BackupAuto.
+' Nom de fichier : VBSettings.reg (sans date - pas de renommage par horodatage,
+' on s'appuie sur le dossier mensuel parent pour le contexte temporel).
+'=============================================================================
+Private Function BackupRegistrySettings(ByVal sessionDir As String, _
+                                        ByRef totalFiles As Long, ByRef totalKb As Double, _
+                                        ByVal fso As Object) As String
+    ' Pack v3 (C14) : export en VBA pur via GetAllSettings (plus de
+    ' "cmd /c reg export" - un shell lance depuis Outlook est un motif
+    ' surveille par l'EDR, et reg.exe ne ramenait que 3 branches sur 7).
+    ' Le fichier produit reste un .reg standard (Unicode, en-tete 5.00),
+    ' relisible par regedit ; les sections connues de chaque branche sont
+    ' listees dans REG_SECTIONS_* ci-dessous et completees a la volee.
+    Dim subDir As String
+    subDir = sessionDir & "\Registry"
+    If Not EnsureFolder(subDir) Then
+        BackupRegistrySettings = "[Registry] ECHEC creation dossier"
+        Exit Function
+    End If
+
+    Dim destPath As String
+    destPath = subDir & "\VBSettings.reg"
+
+    On Error GoTo ErrH
+
+    Dim ts As Object
+    Set ts = fso.CreateTextFile(destPath, True, True)  ' overwrite, unicode
+    ts.WriteLine "Windows Registry Editor Version 5.00"
+    ts.WriteLine ""
+    ts.WriteLine "; Backup des settings VBA - " & Format(Now, "YYYY-MM-DD HH:MM:SS")
+    ts.WriteLine "; Source: HKCU\Software\VB and VBA Program Settings\"
+    ts.WriteLine ""
+
+    Dim apps() As String, a As Long, appName As String
+    Dim sections() As String, s As Long, sectionName As String
+    Dim baseKey As String, nbKeys As Long
+    apps = Split(REG_APPS, "|")
+    For a = LBound(apps) To UBound(apps)
+        appName = Trim$(apps(a))
+        If Len(appName) = 0 Then GoTo NextApp
+        baseKey = "HKEY_CURRENT_USER\Software\VB and VBA Program Settings\" & appName
+        ts.WriteLine "; --- " & appName & " ---"
+        sections = Split(KnownSections(appName), "|")
+        For s = LBound(sections) To UBound(sections)
+            sectionName = Trim$(sections(s))
+            If Len(sectionName) > 0 Then
+                nbKeys = nbKeys + WriteRegSection(ts, baseKey, appName, sectionName)
+            End If
+        Next s
+        ts.WriteLine ""
+NextApp:
+    Next a
+
+    ts.Close
+
+    Dim szKb As Double
+    szKb = fso.GetFile(destPath).size / 1024
+    totalFiles = totalFiles + 1
+    totalKb = totalKb + szKb
+
+    BackupRegistrySettings = "[Registry] OK (" & nbKeys & " valeur(s), " & Format(szKb, "#,##0") & " Ko)"
+    Exit Function
+
+ErrH:
+    modDebugLog.DError MOD_NAME, "Registry err " & Err.Number & " - " & Err.Description
+    BackupRegistrySettings = "[Registry] ECHEC: " & Err.Description
+End Function
+
+' Sections connues par branche (SaveSetting app/section utilises par le code).
+Private Function KnownSections(ByVal appName As String) As String
+    Select Case appName
+        Case "QuickMove":             KnownSections = "Reindex|Flags"
+        Case "Outlook_Calendrier":    KnownSections = "Position"
+        Case "BackupAuto":            KnownSections = "Schedule"
+        Case "Toolkit":               KnownSections = "Session|InboxAlert"
+        Case "FolderScan":            KnownSections = "AutoArchive"
+        Case "MailResponseTracker":   KnownSections = "Rappel"
+        Case "ClassicOutlookToolkit": KnownSections = "Recents"
+        Case Else:                    KnownSections = ""
+    End Select
+End Function
+
+' Ecrit une section (cle registre) au format .reg : valeurs chaine
+' echappees. Renvoie le nombre de valeurs ecrites (0 si section absente).
+Private Function WriteRegSection(ByVal ts As Object, ByVal baseKey As String, _
+                                 ByVal appName As String, ByVal sectionName As String) As Long
+    On Error Resume Next
+    WriteRegSection = 0
+    Dim vals As Variant
+    Err.Clear
+    vals = GetAllSettings(appName, sectionName)
+    If Err.Number <> 0 Then Err.Clear: Exit Function
+    If IsEmpty(vals) Then Exit Function
+    If Not IsArray(vals) Then Exit Function
+    Dim i As Long, k As String, v As String
+    ts.WriteLine "[" & baseKey & "\" & sectionName & "]"
+    For i = LBound(vals, 1) To UBound(vals, 1)
+        k = CStr(vals(i, 0))
+        v = CStr(vals(i, 1))
+        v = Replace(v, "\", "\\")
+        v = Replace(v, Chr(34), "\" & Chr(34))
+        ts.WriteLine Chr(34) & k & Chr(34) & "=" & Chr(34) & v & Chr(34)
+        WriteRegSection = WriteRegSection + 1
+    Next i
+    ts.WriteLine ""
+End Function
+
+'=============================================================================
+' Section 6 : Caches QuickMove (txt) - utiles pour reindex post-restore
+'=============================================================================
+Private Function BackupQuickMoveCache(ByVal sessionDir As String, _
+                                      ByRef totalFiles As Long, ByRef totalKb As Double, _
+                                      ByVal fso As Object) As String
+    Dim subDir As String
+    subDir = sessionDir & "\QuickMove"
+    If Not EnsureFolder(subDir) Then
+        BackupQuickMoveCache = "[QuickMove] ECHEC creation dossier"
+        Exit Function
+    End If
+
+    Dim count As Long
+    Dim sumKb As Double
+    Dim files As Variant
+    files = Array("QuickMoveCache.txt", "QuickMoveRecents.txt")
+
+    Dim baseDir As String
+    baseDir = modConfig.AppDataOutlookPath()
+
+    Dim fname As Variant
+    For Each fname In files
+        Dim srcPath As String
+        srcPath = baseDir & "\" & CStr(fname)
+        If fso.fileExists(srcPath) Then
+            Dim destPath As String
+            destPath = subDir & "\" & fso.GetFileName(srcPath)
+
+            On Error Resume Next
+            fso.CopyFile srcPath, destPath, True
+            If Err.Number = 0 Then
+                count = count + 1
+                sumKb = sumKb + (fso.GetFile(destPath).size / 1024)
+            Else
+                modDebugLog.DError MOD_NAME, "QuickMove copie err sur " & srcPath & ": " & Err.Description
+                Err.Clear
+            End If
+            On Error GoTo 0
+        End If
+    Next fname
+
+    totalFiles = totalFiles + count
+    totalKb = totalKb + sumKb
+
+    BackupQuickMoveCache = "[QuickMove] OK (" & count & " fichier(s), " & _
+                           Format(sumKb, "#,##0") & " Ko)"
+End Function
+
+'=============================================================================
+' Retention : conserve modConfig.BackupRetentionMonths() dossiers les plus recents dans Auto\,
+' supprime les autres. Format des noms : YYYY-MM (7 chars, triable).
+'=============================================================================
+Private Sub PurgeOldBackups(ByVal fso As Object)
+    On Error GoTo ErrH
+
+    Dim root As String
+    root = GetBackupRoot()
+    If Not fso.FolderExists(root) Then Exit Sub
+
+    Dim folderObj As Object
+    Set folderObj = fso.GetFolder(root)
+
+    ' Collecte des noms YYYY-MM (triable lexicographiquement)
+    Dim names() As String
+    Dim n As Long
+    n = -1
+    Dim sub_ As Object
+    For Each sub_ In folderObj.SubFolders
+        ' Filtre strict sur le format YYYY-MM
+        If LooksLikeMonthFolder(sub_.name) Then
+            n = n + 1
+            ReDim Preserve names(n)
+            names(n) = sub_.name
+        End If
+    Next sub_
+
+    If n < 0 Then Exit Sub
+
+    ' Tri decroissant (les plus recents en premier)
+    SortDescString names
+
+    ' Suppression a partir de l'index modConfig.BackupRetentionMonths()
+    If (n + 1) <= modConfig.BackupRetentionMonths() Then Exit Sub
+
+    Dim purged As Long
+    Dim i As Long
+    For i = modConfig.BackupRetentionMonths() To n
+        Dim toDel As String
+        toDel = root & "\" & names(i)
+        On Error Resume Next
+        fso.DeleteFolder toDel, True
+        If Err.Number = 0 Then
+            purged = purged + 1
+            modDebugLog.DInfo MOD_NAME, "Purge: " & names(i)
+        Else
+            modDebugLog.DError MOD_NAME, "Purge echec " & names(i) & ": " & Err.Description
+            Err.Clear
+        End If
+        On Error GoTo ErrH
+    Next i
+
+    If purged > 0 Then
+        modDebugLog.DInfo MOD_NAME, "Retention: " & purged & " dossier(s) supprime(s), " & _
+            "modConfig.BackupRetentionMonths()=" & modConfig.BackupRetentionMonths()
+    End If
+    Exit Sub
+
+ErrH:
+    modDebugLog.DError MOD_NAME, "PurgeOldBackups err " & Err.Number & " - " & Err.Description
+End Sub
+
+' Verifie que le nom matche YYYY-MM (eg "2026-04")
+Private Function LooksLikeMonthFolder(ByVal name As String) As Boolean
+    LooksLikeMonthFolder = False
+    If Len(name) <> 7 Then Exit Function
+    If mid(name, 5, 1) <> "-" Then Exit Function
+    If Not IsNumeric(Left(name, 4)) Then Exit Function
+    If Not IsNumeric(Right(name, 2)) Then Exit Function
+    LooksLikeMonthFolder = True
+End Function
+
+' Tri decroissant simple (insertion sort, suffisant pour <100 elements)
+Private Sub SortDescString(ByRef arr() As String)
+    Dim i As Long, j As Long
+    Dim tmp As String
+    For i = 1 To UBound(arr)
+        tmp = arr(i)
+        j = i - 1
+        Do While j >= 0
+            If arr(j) < tmp Then
+                arr(j + 1) = arr(j)
+                j = j - 1
+            Else
+                Exit Do
+            End If
+        Loop
+        arr(j + 1) = tmp
+    Next i
+End Sub
+
+'=============================================================================
+' Helpers chemins / dossiers
+'=============================================================================
+Private Function GetBackupRoot() As String
+    GetBackupRoot = modConfig.MacroVBADir() & "\" & BACKUP_ROOT_SUBDIR
+End Function
+
+Private Function EnsureFolder(ByVal path As String) As Boolean
+    EnsureFolder = False
+    If Len(path) = 0 Then Exit Function
+
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    On Error Resume Next
+
+    If fso.FolderExists(path) Then
+        EnsureFolder = True
+        Exit Function
+    End If
+
+    Dim parts() As String
+    parts = Split(path, "\")
+
+    Dim acc As String
+    Dim i As Long
+    acc = parts(0)
+    For i = 1 To UBound(parts)
+        If Len(parts(i)) > 0 Then
+            acc = acc & "\" & parts(i)
+            If Not fso.FolderExists(acc) Then
+                fso.CreateFolder acc
+                If Err.Number <> 0 Then
+                    Err.Clear
+                    On Error GoTo 0
+                    Exit Function
+                End If
+            End If
+        End If
+    Next i
+
+    EnsureFolder = fso.FolderExists(path)
+    On Error GoTo 0
+End Function
+

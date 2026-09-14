@@ -1,0 +1,501 @@
+Option Explicit
+
+'=============================================================================
+' modAppointmentPrivacy v2.0
+'
+' v2.0 (2026-08-28) : deuxieme critere de declenchement = ORGANISATEUR.
+'   Une invitation dont l'organisateur figure dans la cle config.ini
+'   PrivateOrganizers passe automatiquement en Sensitivity = olPrivate,
+'   des sa reception (Outlook depose l'invitation en provisoire dans le
+'   calendrier avant meme l'acceptation, donc CalendarItems_ItemAdd suffit).
+'   Ajoute egalement le retrait des categories de coloration automatique
+'   quand le RDV bascule en prive (cle PrivateStripCategories), et un
+'   diagnostic unitaire PrivacyDiagnoseSelected.
+' v1.0 : bascule en prive sur presence de la categorie Personnel / Perso.
+'
+' Purpose (EN): automatically sets an appointment's Sensitivity to olPrivate
+'   when it carries the "Personnel" category OR when its organizer is listed
+'   in the PrivateOrganizers config key. Optionally strips the auto-coloring
+'   categories so that "private" visually overrides them. Idempotent, never
+'   downgrades olConfidential, targets the master of a recurring series.
+'-----------------------------------------------------------------------------
+' DECLENCHEMENT
+'   Appele depuis ThisOutlookSession.CalendarItems_ItemAdd et
+'   CalendarItems_ItemChange, c.a.d. au depot puis a chaque Save de l'item.
+'   Consequence importante : si l'organisateur modifie l'evenement et que la
+'   mise a jour reecrit Sensitivity, l'ItemChange suivant re-applique le
+'   prive tout seul. Un bouton manuel one-shot ne rattraperait pas ce cas.
+'
+' REGLES
+'   - Declenche si (categorie Personnel/Perso) OU (organisateur en liste).
+'   - N'ecrase PAS un Sensitivity deja olConfidential (choix plus restrictif
+'     de l'utilisateur). On accepte d'ecraser olNormal et olPersonal.
+'   - Recurrents : applique sur le master via GetRecurrencePattern.Parent.
+'   - Idempotent : si rien ne change (deja prive ET categories deja propres),
+'     aucun Save n'est emis. Indispensable, sinon boucle d'ItemChange.
+'   - Un seul Save par passage (Sensitivity + Categories groupees).
+'
+' CATEGORIES (cle PrivateStripCategories)
+'   auto (defaut) : retire uniquement les categories de coloration
+'                   automatique de modMeetingColor (ExternalMeetingCategory /
+'                   InternalMeetingCategory, lues dans config.ini). Les tags
+'                   projet/contrat poses par modProjectTag sont CONSERVES.
+'   all           : retire TOUTES les categories.
+'   none          : ne touche a aucune categorie.
+'   Le defaut est "auto" et non "all" volontairement : un RDV professionnel
+'   que l'utilisateur passe manuellement en prive porte souvent un tag projet
+'   dont depend le pointage des heures. Le vider serait destructif.
+'
+' ORDONNANCEMENT AVEC modMeetingColor
+'   ThisOutlookSession appelle ApplyCategory AVANT ApplyIfPersonal. Sur le
+'   premier passage, la coloration pose donc sa categorie puis on la retire :
+'   deux Save au lieu d'un. Sur les passages suivants ApplyCategory sort tout
+'   de suite (opt-out Sensitivity=olPrivate) et plus rien ne bouge. La
+'   convergence est garantie, on ne reordonne pas ThisOutlookSession.
+'
+' RESOLUTION DE L'ORGANISATEUR
+'   L'adresse SMTP d'un organisateur externe (iCloud, Gmail) n'est pas fiable
+'   sur une seule source. Chaine de repli, dans l'ordre :
+'     1. PropertyAccessor PR_SENT_REPRESENTING_SMTP_ADDRESS
+'     2. GetOrganizer() -> AddressEntry (Exchange ou PR_SMTP_ADDRESS)
+'     3. PropertyAccessor PR_SENT_REPRESENTING_EMAIL_ADDRESS
+'   Si aucune ne rend une adresse, la comparaison par NOM AFFICHE prend le
+'   relais (entrees de la liste sans "@"). Lancer PrivacyDiagnoseSelected
+'   pour voir ce que remonte reellement un item donne.
+'=============================================================================
+
+Private Const MOD_NAME As String = "ApptPrivacy"
+Private Const MOD_VERSION As String = "v2.0 - 2026-08-28"
+
+' Proptags MAPI (chaines, format Unicode 001F). Pack v3 : la resolution SMTP
+' est deleguee a modSmtp ; PROP_SENT_REPR_NAME reste utilise par le
+' diagnostic.
+Private Const PROP_SENT_REPR_NAME  As String = "http://schemas.microsoft.com/mapi/proptag/0x0042001F"
+
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+'=============================================================================
+' ApplyIfPersonal
+' Point d'entree appele depuis ThisOutlookSession (ItemAdd / ItemChange).
+' Nom conserve depuis la v1 : c'est une API interne referencee ailleurs, on
+' ne la renomme pas pour eviter une edition de ThisOutlookSession.
+'=============================================================================
+Public Sub ApplyIfPersonal(ByVal apt As Outlook.AppointmentItem)
+    On Error GoTo ErrH
+    If apt Is Nothing Then Exit Sub
+
+    ' --- 1) Un des deux criteres doit matcher ---
+    Dim reason As String
+    reason = ""
+
+    If HasPersonalCategory(apt.Categories) Then
+        reason = "categorie Personnel"
+    ElseIf IsPrivateOrganizer(apt) Then
+        reason = "organisateur en liste PrivateOrganizers"
+    End If
+
+    If Len(reason) = 0 Then Exit Sub
+
+    ' --- 2) Recurrence : viser le master, pas l'occurrence ---
+    Dim target As Outlook.AppointmentItem
+    Set target = ResolveTarget(apt)
+    If target Is Nothing Then Exit Sub
+
+    ' --- 3) Sensitivity : que faut-il changer ? ---
+    Dim needSensitivity As Boolean
+    needSensitivity = False
+
+    Select Case target.Sensitivity
+        Case olPrivate
+            ' deja au bon niveau
+        Case olConfidential
+            ' plus restrictif que Prive : on respecte le choix utilisateur
+            modDebugLog.DDebug MOD_NAME, "Sensitivity deja olConfidential - conservee"
+        Case Else
+            needSensitivity = True
+    End Select
+
+    ' --- 4) Categories : que faut-il retirer ? ---
+    Dim oldCats As String
+    Dim newCats As String
+    oldCats = target.Categories
+    newCats = ComputeStrippedCategories(oldCats)
+
+    Dim catsChanged As Boolean
+    catsChanged = (StrComp(Trim$(oldCats), Trim$(newCats), vbTextCompare) <> 0)
+
+    ' --- 5) Idempotence : rien a faire = pas de Save = pas de boucle ---
+    If (Not needSensitivity) And (Not catsChanged) Then Exit Sub
+
+    ' --- 6) Application, un seul Save ---
+    If needSensitivity Then target.Sensitivity = olPrivate
+    If catsChanged Then target.Categories = newCats
+    target.Save
+
+    modDebugLog.DInfo MOD_NAME, "RDV passe en Prive (" & reason & ") : '" & _
+        Left$(target.subject, 60) & "'" & _
+        IIf(catsChanged, " | categories '" & oldCats & "' -> '" & newCats & "'", "")
+    Exit Sub
+
+ErrH:
+    modDebugLog.DError MOD_NAME, "ApplyIfPersonal error " & Err.Number & _
+        " - " & Err.Description
+End Sub
+
+'=============================================================================
+' IsPrivateOrganizer
+' Compare l'organisateur du RDV a la liste config.ini PrivateOrganizers.
+'
+' Format de la liste : entrees separees par | (';' et ',' acceptes aussi).
+'   - entree contenant "@" : comparaison EXACTE sur l'adresse SMTP resolue.
+'   - entree sans "@"      : recherche (contient) dans le NOM AFFICHE de
+'                            l'organisateur. Filet de securite pour les
+'                            organisateurs externes dont le SMTP ne remonte
+'                            pas (iCloud notamment).
+'
+' Lecture via modConfig.Cfg() et non via une globale g_ : Cfg appelle
+' EnsureConfigLoaded en interne, donc la valeur reste correcte apres un
+' Ctrl+S dans le VBE (qui remet les globales module-level a zero).
+'=============================================================================
+Private Function IsPrivateOrganizer(ByVal apt As Outlook.AppointmentItem) As Boolean
+    IsPrivateOrganizer = False
+
+    Dim raw As String
+    raw = modConfig.Cfg("PrivateOrganizers", "")
+    If Len(Trim$(raw)) = 0 Then Exit Function
+
+    Dim smtp As String
+    Dim disp As String
+    smtp = LCase$(Trim$(GetOrganizerSmtp(apt)))
+    disp = LCase$(Trim$(GetOrganizerName(apt)))
+    If Len(smtp) = 0 And Len(disp) = 0 Then Exit Function
+
+    Dim arr() As String
+    arr = SplitListLoose(raw)
+
+    Dim i As Long
+    Dim entry As String
+    For i = LBound(arr) To UBound(arr)
+        entry = LCase$(Trim$(arr(i)))
+        If Len(entry) > 0 Then
+            If InStr(entry, "@") > 0 Then
+                If Len(smtp) > 0 Then
+                    If StrComp(entry, smtp, vbTextCompare) = 0 Then
+                        IsPrivateOrganizer = True
+                        modDebugLog.DDebug MOD_NAME, _
+                            "Organisateur reconnu par SMTP : " & smtp
+                        Exit Function
+                    End If
+                End If
+            Else
+                If Len(disp) > 0 Then
+                    If InStr(1, disp, entry, vbTextCompare) > 0 Then
+                        IsPrivateOrganizer = True
+                        modDebugLog.DDebug MOD_NAME, _
+                            "Organisateur reconnu par nom : " & disp
+                        Exit Function
+                    End If
+                End If
+            End If
+        End If
+    Next i
+End Function
+
+'=============================================================================
+' GetOrganizerSmtp - chaine de repli decrite en tete de module.
+'=============================================================================
+Private Function GetOrganizerSmtp(ByVal apt As Outlook.AppointmentItem) As String
+    ' Pack v3 (C2) : chaine unifiee et cachee (modSmtp.OrganizerSmtp).
+    GetOrganizerSmtp = modSmtp.OrganizerSmtp(apt)
+End Function
+
+'=============================================================================
+' GetOrganizerName - nom affiche de l'organisateur (repli si pas de SMTP).
+'=============================================================================
+Private Function GetOrganizerName(ByVal apt As Outlook.AppointmentItem) As String
+    GetOrganizerName = ""
+
+    Dim s As String
+    s = ""
+    On Error Resume Next
+    s = apt.Organizer
+    On Error GoTo 0
+    If Len(Trim$(s)) > 0 Then
+        GetOrganizerName = Trim$(s)
+        Exit Function
+    End If
+
+    s = ""
+    On Error Resume Next
+    s = apt.PropertyAccessor.GetProperty(PROP_SENT_REPR_NAME)
+    On Error GoTo 0
+    GetOrganizerName = Trim$(s)
+End Function
+
+'=============================================================================
+'=============================================================================
+' ComputeStrippedCategories
+' Renvoie la chaine de categories a poser sur un RDV qui bascule en prive,
+' selon la cle config.ini PrivateStripCategories (auto | all | none).
+'
+' Le mode "auto" duplique volontairement la notion de "categorie automatique"
+' de modMeetingColor plutot que d'appeler ce module : les deux modules de
+' pilotage RDV restent independants (meme parti pris que HasPersonalCategory
+' en v1). Aucun risque de derive : les NOMS de categories viennent tous les
+' deux de config.ini, pas d'un litteral.
+'=============================================================================
+Private Function ComputeStrippedCategories(ByVal cats As String) As String
+    ComputeStrippedCategories = cats
+
+    Dim mode As String
+    mode = LCase$(Trim$(modConfig.Cfg("PrivateStripCategories", "auto")))
+
+    Select Case mode
+        Case "none"
+            Exit Function
+        Case "all"
+            ComputeStrippedCategories = ""
+            Exit Function
+    End Select
+
+    ' mode "auto" (et tout mode inconnu, par prudence)
+    If Len(Trim$(cats)) = 0 Then
+        ComputeStrippedCategories = cats
+        Exit Function
+    End If
+
+    Dim extCat As String
+    Dim intCat As String
+    extCat = modConfig.ExternalMeetingCategory()
+    intCat = modConfig.InternalMeetingCategory()
+
+    Dim arr() As String
+    arr = SplitListLoose(Replace(cats, "|", ","))
+
+    Dim seen As Object
+    Set seen = CreateObject("Scripting.Dictionary")
+    seen.CompareMode = 1   ' vbTextCompare
+
+    Dim result As String
+    Dim i As Long
+    Dim c As String
+    result = ""
+
+    For i = LBound(arr) To UBound(arr)
+        c = Trim$(arr(i))
+        If Len(c) > 0 Then
+            If StrComp(c, extCat, vbTextCompare) <> 0 And _
+               StrComp(c, intCat, vbTextCompare) <> 0 Then
+                If Not seen.Exists(c) Then
+                    seen.Add c, True
+                    If Len(result) > 0 Then result = result & ", "
+                    result = result & c
+                End If
+            End If
+        End If
+    Next i
+
+    ComputeStrippedCategories = result
+End Function
+
+'=============================================================================
+' ResolveTarget
+' Reinjecte le master si l'item est une occurrence d'une serie recurrente.
+'=============================================================================
+Private Function ResolveTarget(ByVal apt As Outlook.AppointmentItem) As Outlook.AppointmentItem
+    On Error GoTo Fallback
+    Set ResolveTarget = apt
+
+    If Not apt.IsRecurring Then Exit Function
+
+    Dim rp As Outlook.RecurrencePattern
+    Set rp = apt.GetRecurrencePattern()
+    If rp Is Nothing Then Exit Function
+
+    Dim master As Outlook.AppointmentItem
+    Set master = rp.Parent
+    If Not master Is Nothing Then Set ResolveTarget = master
+    Exit Function
+
+Fallback:
+    Set ResolveTarget = apt
+End Function
+
+'=============================================================================
+' HasPersonalCategory
+' Detection categorie Personnel / Perso (tolerant a la casse et aux variantes).
+' Duplique volontairement la logique de modMeetingColor.HasPersonalCategory
+' pour ne pas creer de dependance croisee entre modules de pilotage RDV.
+'=============================================================================
+Private Function HasPersonalCategory(ByVal cats As String) As Boolean
+    ' Pack v3 (C10) : categorie configurable, test centralise (modConfig).
+    HasPersonalCategory = modConfig.ContainsPersonalCategory(cats)
+End Function
+
+'=============================================================================
+' SplitListLoose
+' Split tolerant : Outlook utilise ", " pour les categories mais le
+' ListSeparator regional peut donner ';'. La liste config.ini utilise '|'.
+'=============================================================================
+Private Function SplitListLoose(ByVal s As String) As String()
+    Dim tmp As String
+    tmp = Replace(s, ";", ",")
+    tmp = Replace(tmp, "|", ",")
+    SplitListLoose = Split(tmp, ",")
+End Function
+
+'=============================================================================
+' PrivacyDiagnoseSelected
+' Diagnostic unitaire. Selectionner SOIT un RDV dans le calendrier, SOIT une
+' invitation dans la boite de reception, puis lancer cette macro. Elle ecrit
+' dans debug.log tout ce que le module voit de l'organisateur, et affiche le
+' verdict. A lancer avant de se plaindre que la regle ne se declenche pas.
+'=============================================================================
+Public Sub PrivacyDiagnoseSelected()
+    On Error GoTo ErrH
+
+    Dim exp As Outlook.Explorer
+    Set exp = Application.ActiveExplorer
+    If exp Is Nothing Then
+        MsgBox T("Pas d'Explorer actif.", "No active Explorer."), vbExclamation
+        Exit Sub
+    End If
+    If exp.Selection.count = 0 Then
+        MsgBox T("Aucun ~el~ement s~electionn~e.", "No item selected."), vbExclamation
+        Exit Sub
+    End If
+
+    Dim itm As Object
+    Set itm = exp.Selection.Item(1)
+
+    Dim apt As Outlook.AppointmentItem
+    Set apt = Nothing
+
+    If TypeOf itm Is Outlook.AppointmentItem Then
+        Set apt = itm
+    ElseIf TypeOf itm Is Outlook.MeetingItem Then
+        Dim mi As Outlook.MeetingItem
+        Set mi = itm
+        On Error Resume Next
+        Set apt = mi.GetAssociatedAppointment(False)
+        On Error GoTo ErrH
+    End If
+
+    If apt Is Nothing Then
+        MsgBox T("S~electionnez un RDV du calendrier ou une invitation.", _
+                 "Select a calendar appointment or a meeting invitation."), vbExclamation
+        Exit Sub
+    End If
+
+    ' Forcer le niveau INFO pour ce diagnostic
+    Dim oldLevel As Long
+    oldLevel = modDebugLog.GlobalLevel
+    If oldLevel < modDebugLog.LOG_INFO Then
+        modDebugLog.SetGlobalLevel modDebugLog.LOG_INFO
+    End If
+
+    Dim smtp As String
+    Dim disp As String
+    Dim listRaw As String
+    Dim mode As String
+    smtp = GetOrganizerSmtp(apt)
+    disp = GetOrganizerName(apt)
+    listRaw = modConfig.Cfg("PrivateOrganizers", "")
+    mode = modConfig.Cfg("PrivateStripCategories", "auto")
+
+    Dim matched As Boolean
+    Dim personal As Boolean
+    matched = IsPrivateOrganizer(apt)
+    personal = HasPersonalCategory(apt.Categories)
+
+    modDebugLog.DInfo MOD_NAME, String(60, "=")
+    modDebugLog.DInfo MOD_NAME, "DIAGNOSTIC PRIVACY : " & apt.subject
+    modDebugLog.DInfo MOD_NAME, "  Sensitivity=" & apt.Sensitivity & _
+        " MeetingStatus=" & apt.MeetingStatus & _
+        " ResponseStatus=" & apt.ResponseStatus
+    modDebugLog.DInfo MOD_NAME, "  Organisateur nom  = '" & disp & "'"
+    modDebugLog.DInfo MOD_NAME, "  Organisateur SMTP = '" & smtp & "'"
+    modDebugLog.DInfo MOD_NAME, "  PrivateOrganizers = '" & listRaw & "'"
+    modDebugLog.DInfo MOD_NAME, "  Match organisateur = " & matched & _
+        " | categorie Personnel = " & personal
+    modDebugLog.DInfo MOD_NAME, "  Categories actuelles = '" & apt.Categories & "'"
+    modDebugLog.DInfo MOD_NAME, "  PrivateStripCategories = '" & mode & _
+        "' -> apres nettoyage = '" & ComputeStrippedCategories(apt.Categories) & "'"
+    modDebugLog.DInfo MOD_NAME, String(60, "=")
+
+    modDebugLog.SetGlobalLevel oldLevel
+
+    Dim msg As String
+    msg = T("Organisateur : ", "Organizer: ") & disp & vbCrLf & _
+          T("SMTP r~esolu : ", "Resolved SMTP: ") & _
+          IIf(Len(smtp) = 0, "(vide)", smtp) & vbCrLf & vbCrLf & _
+          T("Match liste priv~ee : ", "Private list match: ") & matched & vbCrLf & _
+          T("Cat~egorie Personnel : ", "Personnel category: ") & personal & vbCrLf & vbCrLf & _
+          T("Cat~egories : ", "Categories: ") & "'" & apt.Categories & "'" & vbCrLf & _
+          T("Apr~fs nettoyage : ", "After stripping: ") & _
+          "'" & ComputeStrippedCategories(apt.Categories) & "'" & vbCrLf & vbCrLf & _
+          T("D~etail complet dans :", "Full detail in:") & vbCrLf & _
+          modDebugLog.LogFilePath()
+
+    MsgBox msg, vbInformation, T("Diagnostic confidentialit~e RDV", "Appointment privacy diagnostic")
+    Exit Sub
+
+ErrH:
+    modDebugLog.DError MOD_NAME, "PrivacyDiagnoseSelected error " & Err.Number & _
+        " - " & Err.Description
+    MsgBox T("Erreur : ", "Error: ") & Err.Number & " - " & Err.Description, vbExclamation
+End Sub
+
+'=============================================================================
+' PrivacyApplyToSelected
+' Application manuelle sur le RDV selectionne dans le calendrier (ou sur
+' l'invitation selectionnee dans la boite de reception). Utile pour rattraper
+' les evenements deja presents avant l'activation de la regle, sans attendre
+' un ItemChange.
+'=============================================================================
+Public Sub PrivacyApplyToSelected()
+    On Error GoTo ErrH
+
+    Dim exp As Outlook.Explorer
+    Set exp = Application.ActiveExplorer
+    If exp Is Nothing Then Exit Sub
+    If exp.Selection.count = 0 Then
+        MsgBox T("Aucun ~el~ement s~electionn~e.", "No item selected."), vbExclamation
+        Exit Sub
+    End If
+
+    Dim done As Long
+    Dim i As Long
+    Dim itm As Object
+    Dim apt As Outlook.AppointmentItem
+
+    done = 0
+    For i = 1 To exp.Selection.count
+        Set itm = exp.Selection.Item(i)
+        Set apt = Nothing
+
+        If TypeOf itm Is Outlook.AppointmentItem Then
+            Set apt = itm
+        ElseIf TypeOf itm Is Outlook.MeetingItem Then
+            Dim mi As Outlook.MeetingItem
+            Set mi = itm
+            On Error Resume Next
+            Set apt = mi.GetAssociatedAppointment(False)
+            On Error GoTo ErrH
+        End If
+
+        If Not apt Is Nothing Then
+            ApplyIfPersonal apt
+            done = done + 1
+        End If
+    Next i
+
+    modDebugLog.DInfo MOD_NAME, "PrivacyApplyToSelected : " & done & " item(s) traite(s)"
+    Exit Sub
+
+ErrH:
+    modDebugLog.DError MOD_NAME, "PrivacyApplyToSelected error " & Err.Number & _
+        " - " & Err.Description
+End Sub

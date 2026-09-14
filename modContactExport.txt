@@ -1,0 +1,550 @@
+Option Explicit
+
+'=============================================================================
+' modContactExport v1.3  (2026-08-17)
+' Purpose (EN): export every contact of every contact folder of a chosen
+'   store to ONE UTF-8 CSV (Outlook property names as headers) plus a
+'   photos\ folder, in a time-stamped directory. Stamps each card with a
+'   permanent ContactSyncID so modContactImport can match cards back even
+'   after renames or moves. No UserForm.
+'
+' Exporte TOUS les contacts de TOUS les dossiers de contacts du compte
+' choisi vers un dossier horodate :
+'   <ContactExportDir>\Contacts-AAAAMMJJ-HHMMSS\
+'       contacts.csv     UTF-8 (BOM), separateur config (; par defaut),
+'                        tous les champs entre guillemets, RFC 4180
+'       photos\<SyncID>.jpg
+'       README.txt       contrat de colonnes + regles d'edition
+'   Le CSV s'ouvre dans Excel, se donne a relire / corriger par lot, et se
+'   REIMPORTE par modContactImport.
+'
+' ETIQUETTE PERMANENTE : chaque fiche recoit, si elle n'en a pas, une
+' UserProperty "ContactSyncID" (fonctionnelle, jamais traduite). C'est elle
+' qui permet au reimport de retrouver la fiche meme renommee ou deplacee
+' (l'EntryID mute au deplacement). Poser l'etiquette = un Save : le PREMIER
+' export d'un compte modifie donc chaque fiche (resynchronisation ActiveSync
+' vers le telephone, une seule fois). Les exports suivants sont en lecture.
+'
+' COLONNES : les en-tetes sont les NOMS DE PROPRIETES OUTLOOK (contrat
+' explicite, une seule liste FIELDS partagee a l'identique avec
+' modContactImport - le build verifie l'egalite). v1.2 : seules les
+' colonnes remplies sur AU MOINS UNE fiche sont ecrites (les autres restent
+' disponibles : ajouter la colonne au CSV suffit au reimport). Metadonnees
+' prefixees "_" : _Store (compte), _SyncID / _EntryID / _Modified /
+' _Exported (lecture seule), _Folder (dossier, MODIFIABLE : le reimport
+' deplace la fiche, dans le meme compte), _Photo (MODIFIABLE), _NameDay
+' (fete du prenom MM-JJ, MODIFIABLE), _Action (skip / creer / force).
+'
+' MULTI-COMPTES (v1.2) : la boite de saisie accepte plusieurs numeros
+' separes par des virgules ("1,3") ; un seul CSV, la colonne _Store porte
+' le compte de chaque fiche.
+'
+' SUB PUBLIQUE (epinglable au QAT) : ContactExportAll
+'
+' Dependances : modConfig (Cfg/CfgB, T, A, MacroVBADir), modDebugLog.
+' Cles config.ini : ContactExportDir, ContactCsvSeparator,
+'   ContactExportPhotos, ContactSkipFolders (partagee).
+'=============================================================================
+
+Private Const MOD_NAME As String = "ContExp"
+Private Const MOD_VERSION As String = "v1.3 - 2026-08-17"
+
+' UserProperty d'identite permanente (fonctionnelle, hors T()).
+Private Const UP_SYNC As String = "ContactSyncID"
+' UserProperty fete du prenom "MM-JJ" (posee par modContactNormalize).
+Private Const UP_NAMEDAY As String = "NameDay"
+Private Const PROPTAG_HIDDEN As String = "http://schemas.microsoft.com/mapi/proptag/0x10F4000B"
+Private Const DEFAULT_SKIP As String = "{*|Recipient Cache|*sugg*|GAL Contacts|Organizational Contacts|Companies|PeopleCentricConversation Buddies|*Lync*|*Skype*|ExternalContacts"
+Private Const NO_DATE_YEAR As Long = 4500
+
+' CONTRAT DE COLONNES - IDENTIQUE dans modContactImport (verifie au build).
+' _xxx = metadonnees ; le reste = proprietes ContactItem (CallByName).
+Private Const META_FIELDS As String = "_Store|_SyncID|_EntryID|_Folder|_Photo|_NameDay|_Modified|_Exported|_Action"
+Private Const FIELDS As String = "FullName|Title|FirstName|MiddleName|LastName|Suffix|NickName|FileAs|" & _
+    "CompanyName|JobTitle|Department|OfficeLocation|Profession|ManagerName|AssistantName|" & _
+    "Email1Address|Email1DisplayName|Email2Address|Email2DisplayName|Email3Address|Email3DisplayName|" & _
+    "MobileTelephoneNumber|HomeTelephoneNumber|Home2TelephoneNumber|BusinessTelephoneNumber|" & _
+    "Business2TelephoneNumber|OtherTelephoneNumber|PrimaryTelephoneNumber|CompanyMainTelephoneNumber|" & _
+    "AssistantTelephoneNumber|CarTelephoneNumber|PagerNumber|BusinessFaxNumber|HomeFaxNumber|OtherFaxNumber|" & _
+    "HomeAddressStreet|HomeAddressCity|HomeAddressPostalCode|HomeAddressState|HomeAddressCountry|" & _
+    "BusinessAddressStreet|BusinessAddressCity|BusinessAddressPostalCode|BusinessAddressState|BusinessAddressCountry|" & _
+    "OtherAddressStreet|OtherAddressCity|OtherAddressPostalCode|OtherAddressState|OtherAddressCountry|" & _
+    "Birthday|Anniversary|Spouse|Children|WebPage|IMAddress|Categories|Sensitivity|Body"
+Private Const DATE_FIELDS As String = "|Birthday|Anniversary|"
+Private Const LONG_FIELDS As String = "|Sensitivity|"
+
+' --- Reglages ---
+Private mExportDir As String
+Private mSep As String
+Private mPhotos As Boolean
+Private mSkipFolders As String
+
+' --- Etat de la passe ---
+Private mStamp As String
+Private mOutDir As String
+Private mCsv As String
+Private mRows As Collection        ' une entree par fiche : tableau de chaines (meta + FIELDS)
+Private mUsed() As Boolean         ' champ FIELDS(i) rempli sur au moins une fiche
+Private mNameDayUsed As Boolean
+Private mFolders As Long
+Private mScanned As Long
+Private mStamped As Long
+Private mPhotoN As Long
+Private mErrors As Long
+Private mSeq As Long
+
+'=============================================================================
+' ModVersion - version REELLEMENT chargee dans le VBE.
+'=============================================================================
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+'=============================================================================
+' ContactExportAll  (epinglable au QAT)
+'=============================================================================
+Public Sub ContactExportAll()
+    Dim errNo As Long, errDesc As String
+    On Error GoTo ErrH
+    LoadSettings
+    mFolders = 0: mScanned = 0: mStamped = 0: mPhotoN = 0: mErrors = 0: mSeq = 0
+    mCsv = ""
+    Set mRows = New Collection
+    Dim nF As Long
+    nF = UBound(Split(FIELDS, "|"))
+    ReDim mUsed(0 To nF)
+    mNameDayUsed = False
+
+    Dim stores As Collection
+    Set stores = PickStores()
+    If stores Is Nothing Then Exit Sub
+
+    Dim names As String, st As Outlook.Store, k As Variant
+    For Each k In stores
+        Set st = k
+        names = names & IIf(Len(names) > 0, ", ", "") & st.DisplayName
+    Next k
+
+    If MsgBox(T("Compte(s) : ", "Account(s): ") & names & vbCrLf & vbCrLf & _
+              T("Tous les dossiers de contacts seront export~es (CSV + photos)." & vbCrLf & _
+                "Les fiches sans ~etiquette ContactSyncID en recevront une (un Save par fiche, " & _
+                "premier export uniquement).", _
+                "Every contact folder will be exported (CSV + photos)." & vbCrLf & _
+                "Cards without a ContactSyncID stamp will get one (one Save per card, first export only)."), _
+              vbOKCancel + vbInformation, UiTitle()) <> vbOK Then Exit Sub
+
+    mStamp = Format$(Now, "yyyymmdd-hhnnss")
+    mOutDir = mExportDir & "\Contacts-" & mStamp
+    If Dir(mExportDir, vbDirectory) = "" Then MkDir mExportDir
+    MkDir mOutDir
+    If mPhotos Then MkDir mOutDir & "\photos"
+    modDebugLog.DInfo MOD_NAME, "Export start stores=" & names & " -> " & mOutDir
+
+    Randomize
+    ' Passe 1 : lecture de toutes les fiches (memoire), photos, etiquettes
+    For Each k In stores
+        Set st = k
+        ProcessFolderTree st.GetRootFolder, st
+    Next k
+    ' Passe 2 : ecriture CSV avec les seules colonnes utilisees
+    WriteCsvFromRows
+
+    SaveUtf8 mOutDir & "\contacts.csv", mCsv
+    SaveUtf8 mOutDir & "\README.txt", ReadmeText(names)
+
+    modDebugLog.DInfo MOD_NAME, "Export end folders=" & mFolders & " contacts=" & mScanned & _
+        " stamped=" & mStamped & " photos=" & mPhotoN & " errors=" & mErrors
+    Dim msg As String
+    msg = T("Export termin~e.", "Export done.") & vbCrLf & vbCrLf & _
+          T("Comptes : ", "Accounts: ") & stores.Count & "   " & _
+          T("Dossiers de contacts : ", "Contact folders: ") & mFolders & vbCrLf & _
+          T("Fiches export~ees : ", "Cards exported: ") & mScanned & vbCrLf & _
+          T("Colonnes ~ecrites : ", "Columns written: ") & UsedCount() & vbCrLf & _
+          T("~Etiquettes pos~ees : ", "Stamps added: ") & mStamped & vbCrLf & _
+          T("Photos : ", "Photos: ") & mPhotoN & vbCrLf & _
+          T("Erreurs : ", "Errors: ") & mErrors & vbCrLf & vbCrLf & _
+          mOutDir & vbCrLf & vbCrLf & _
+          T("Ouvrir le dossier ?", "Open the folder?")
+    If MsgBox(msg, vbYesNo + vbInformation, UiTitle()) = vbYes Then OpenFolder mOutDir
+    Exit Sub
+ErrH:
+    errNo = Err.Number
+    errDesc = Err.Description
+    On Error Resume Next
+    modDebugLog.DError MOD_NAME, "ContactExportAll err " & errNo & " - " & errDesc
+    If mRows.Count > 0 And Len(mOutDir) > 0 Then
+        WriteCsvFromRows
+        SaveUtf8 mOutDir & "\contacts.csv", mCsv
+    End If
+    MsgBox T("Erreur : ", "Error: ") & errNo & " - " & errDesc, vbExclamation, UiTitle()
+End Sub
+
+'=============================================================================
+' Reglages
+'=============================================================================
+Private Sub LoadSettings()
+    modConfig.EnsureLoaded
+    mExportDir = Trim$(modConfig.Cfg("ContactExportDir", ""))
+    If Len(mExportDir) = 0 Then mExportDir = modConfig.MacroVBADir()
+    If Right$(mExportDir, 1) = "\" Then mExportDir = Left$(mExportDir, Len(mExportDir) - 1)
+    mSep = modConfig.Cfg("ContactCsvSeparator", ";")
+    If Len(mSep) <> 1 Then mSep = ";"
+    mPhotos = modConfig.CfgB("ContactExportPhotos", True)
+    mSkipFolders = modConfig.Cfg("ContactSkipFolders", DEFAULT_SKIP)
+End Sub
+
+Private Function UiTitle() As String
+    UiTitle = T("Export des contacts", "Contact export")
+End Function
+
+'=============================================================================
+' Choix des comptes (stores) : numeros separes par des virgules ("1,3").
+' Defaut = store du dossier courant.
+'=============================================================================
+Private Function PickStores() As Collection
+    On Error GoTo ErrH
+    Dim ns As Outlook.NameSpace
+    Set ns = Application.Session
+    Dim cur As Outlook.Store
+    On Error Resume Next
+    Set cur = Application.ActiveExplorer.CurrentFolder.Store
+    On Error GoTo ErrH
+    Dim listTxt As String, idx As Long, defIdx As Long
+    For idx = 1 To ns.Stores.Count
+        listTxt = listTxt & idx & " - " & ns.Stores(idx).DisplayName & vbCrLf
+        If Not cur Is Nothing Then
+            If ns.Stores(idx).StoreID = cur.StoreID Then defIdx = idx
+        End If
+    Next idx
+    If defIdx = 0 Then defIdx = 1
+    Dim ans As String
+    ans = Trim$(InputBox(T("Compte(s) dont les contacts sont ~a exporter - num~eros s~epar~es par des virgules :", _
+                           "Account(s) whose contacts will be exported - comma-separated numbers:") & _
+                         vbCrLf & vbCrLf & listTxt, UiTitle(), CStr(defIdx)))
+    If Len(ans) = 0 Then Exit Function
+    Dim parts() As String, res As Collection, seen As String, num As Long
+    Set res = New Collection
+    parts = Split(Replace(ans, ";", ","), ",")
+    For idx = LBound(parts) To UBound(parts)
+        If Len(Trim$(parts(idx))) > 0 Then
+            If Not IsNumeric(Trim$(parts(idx))) Then GoTo BadChoice
+            num = CLng(Trim$(parts(idx)))
+            If num < 1 Or num > ns.Stores.Count Then GoTo BadChoice
+            If InStr(seen, "|" & num & "|") = 0 Then
+                res.Add ns.Stores(num)
+                seen = seen & "|" & num & "|"
+            End If
+        End If
+    Next idx
+    If res.Count = 0 Then GoTo BadChoice
+    Set PickStores = res
+    Exit Function
+BadChoice:
+    MsgBox T("Choix invalide.", "Invalid choice."), vbExclamation, UiTitle()
+    Exit Function
+ErrH:
+    modDebugLog.DError MOD_NAME, "PickStores err " & Err.Number & " - " & Err.Description
+End Function
+
+'=============================================================================
+' Parcours des dossiers de contacts (recursif, systeme et caches exclus).
+'=============================================================================
+Private Sub ProcessFolderTree(ByVal fld As Outlook.MAPIFolder, ByVal st As Outlook.Store)
+    On Error Resume Next
+    Dim isContacts As Boolean
+    isContacts = (fld.DefaultItemType = olContactItem)
+    If Err.Number <> 0 Then isContacts = False: Err.Clear
+    If isContacts Then
+        If IsSkippedFolder(fld) Then
+            modDebugLog.DDebug MOD_NAME, "Dossier ignore : " & fld.FolderPath
+        Else
+            ProcessContacts fld, st
+        End If
+    End If
+    Dim child As Outlook.MAPIFolder
+    For Each child In fld.Folders
+        ProcessFolderTree child, st
+    Next child
+End Sub
+
+Private Function IsSkippedFolder(ByVal fld As Outlook.MAPIFolder) As Boolean
+    ' Pack v3 (C3) : delegation modContactCommon (helper partage).
+    IsSkippedFolder = modContactCommon.IsSkippedFolder(fld, mSkipFolders)
+End Function
+
+' Dossier situe sous les Elements supprimes de son compte (corbeille) ?
+Private Function IsInDeletedItems(ByVal fld As Outlook.MAPIFolder) As Boolean
+    ' Pack v3 (C3) : delegation modContactCommon (helper partage).
+    IsInDeletedItems = modContactCommon.IsInDeletedItems(fld)
+End Function
+
+
+Private Sub ProcessContacts(ByVal fld As Outlook.MAPIFolder, ByVal st As Outlook.Store)
+    On Error GoTo ErrH
+    mFolders = mFolders + 1
+    Dim relPath As String
+    relPath = ShortPath(fld, st)
+    Dim itm As Object, cnt As Long
+    For Each itm In fld.Items
+        cnt = cnt + 1
+        If TypeName(itm) = "ContactItem" Then ExportOne itm, relPath, st.DisplayName
+        If (cnt Mod 20) = 0 Then DoEvents
+    Next itm
+    Exit Sub
+ErrH:
+    mErrors = mErrors + 1
+    modDebugLog.DError MOD_NAME, "ProcessContacts " & fld.FolderPath & " err " & Err.Number & " - " & Err.Description
+End Sub
+
+Private Function ShortPath(ByVal fld As Outlook.MAPIFolder, ByVal st As Outlook.Store) As String
+    On Error Resume Next
+    ShortPath = Replace(fld.FolderPath, "\\" & st.DisplayName & "\", "")
+    If Len(ShortPath) = 0 Then ShortPath = fld.Name
+End Function
+
+'=============================================================================
+' Une fiche -> un enregistrement en memoire (+ photo). Le CSV est ecrit en
+' passe 2, avec les seules colonnes remplies sur au moins une fiche.
+'=============================================================================
+Private Sub ExportOne(ByVal ct As Outlook.ContactItem, ByVal relPath As String, ByVal storeName As String)
+    Dim errNo As Long, errDesc As String
+    On Error GoTo ErrH
+    mScanned = mScanned + 1
+    mSeq = mSeq + 1
+
+    Dim syncId As String
+    syncId = EnsureSyncId(ct)
+
+    Dim photoName As String
+    If mPhotos Then photoName = ExportPhoto(ct, syncId)
+
+    Dim nameDay As String
+    nameDay = ReadNameDay(ct)
+    If Len(nameDay) > 0 Then mNameDayUsed = True
+
+    Dim props() As String, idx As Long, nMeta As Long
+    props = Split(FIELDS, "|")
+    nMeta = UBound(Split(META_FIELDS, "|")) + 1
+    Dim rec() As String
+    ReDim rec(0 To nMeta + UBound(props))
+    rec(0) = storeName
+    rec(1) = syncId
+    rec(2) = ct.EntryID
+    rec(3) = relPath
+    rec(4) = photoName
+    rec(5) = nameDay
+    rec(6) = Format$(ct.LastModificationTime, "yyyy-mm-dd hh:nn:ss")
+    rec(7) = Format$(Now, "yyyy-mm-dd hh:nn:ss")
+    rec(8) = ""
+    For idx = LBound(props) To UBound(props)
+        rec(nMeta + idx) = ReadField(ct, props(idx))
+        If Len(rec(nMeta + idx)) > 0 Then mUsed(idx) = True
+    Next idx
+    mRows.Add rec
+    Exit Sub
+ErrH:
+    errNo = Err.Number
+    errDesc = Err.Description
+    mErrors = mErrors + 1
+    modDebugLog.DError MOD_NAME, "ExportOne err " & errNo & " - " & errDesc & " (" & relPath & ")"
+End Sub
+
+' Passe 2 : en-tete + lignes, colonnes META toujours ecrites, colonnes FIELDS
+' seulement si remplies sur au moins une fiche (_NameDay idem).
+Private Sub WriteCsvFromRows()
+    Dim metas() As String, props() As String, idx As Long, nMeta As Long
+    metas = Split(META_FIELDS, "|")
+    props = Split(FIELDS, "|")
+    nMeta = UBound(metas) + 1
+    Dim hdr As String
+    For idx = LBound(metas) To UBound(metas)
+        If metas(idx) = "_NameDay" And Not mNameDayUsed Then
+            ' colonne omise si aucune fete posee
+        Else
+            hdr = hdr & IIf(Len(hdr) > 0, mSep, "") & Q(metas(idx))
+        End If
+    Next idx
+    For idx = LBound(props) To UBound(props)
+        If mUsed(idx) Then hdr = hdr & mSep & Q(props(idx))
+    Next idx
+    mCsv = hdr & vbCrLf
+    Dim k As Variant, rec() As String, rowTxt As String
+    For Each k In mRows
+        rec = k
+        rowTxt = ""
+        For idx = 0 To nMeta - 1
+            If metas(idx) = "_NameDay" And Not mNameDayUsed Then
+                ' omise
+            Else
+                rowTxt = rowTxt & IIf(Len(rowTxt) > 0, mSep, "") & Q(rec(idx))
+            End If
+        Next idx
+        For idx = LBound(props) To UBound(props)
+            If mUsed(idx) Then rowTxt = rowTxt & mSep & Q(rec(nMeta + idx))
+        Next idx
+        mCsv = mCsv & rowTxt & vbCrLf
+    Next k
+End Sub
+
+Private Function UsedCount() As Long
+    Dim idx As Long, cnt As Long
+    For idx = LBound(mUsed) To UBound(mUsed)
+        If mUsed(idx) Then cnt = cnt + 1
+    Next idx
+    UsedCount = cnt + UBound(Split(META_FIELDS, "|")) + 1 - IIf(mNameDayUsed, 0, 1)
+End Function
+
+Private Function ReadNameDay(ByVal ct As Outlook.ContactItem) As String
+    On Error Resume Next
+    Dim up As Outlook.UserProperty
+    Set up = ct.UserProperties.Find(UP_NAMEDAY)
+    If Not up Is Nothing Then
+        If Trim$(CStr(up.Value)) Like "##-##" Then ReadNameDay = Trim$(CStr(up.Value))
+    End If
+End Function
+
+' Lecture typee d'une propriete : dates ISO (vide si 4501), Long en texte,
+' chaine sinon. Toute lecture protegee.
+Private Function ReadField(ByVal ct As Outlook.ContactItem, ByVal nm As String) As String
+    On Error Resume Next
+    Dim v As Variant
+    v = CallByName(ct, nm, VbGet)
+    If Err.Number <> 0 Then
+        Err.Clear
+        ReadField = ""
+        Exit Function
+    End If
+    If InStr(DATE_FIELDS, "|" & nm & "|") > 0 Then
+        If IsDate(v) Then
+            If Year(CDate(v)) < NO_DATE_YEAR And CDate(v) > DateSerial(1600, 1, 1) Then
+                ReadField = Format$(CDate(v), "yyyy-mm-dd")
+            End If
+        End If
+    ElseIf InStr(LONG_FIELDS, "|" & nm & "|") > 0 Then
+        ReadField = CStr(CLng(v))
+    Else
+        ReadField = CStr(v)
+    End If
+    Err.Clear
+End Function
+
+' Etiquette permanente : lue si presente, posee + Save sinon.
+Private Function EnsureSyncId(ByVal ct As Outlook.ContactItem) As String
+    On Error Resume Next
+    Dim up As Outlook.UserProperty
+    Set up = ct.UserProperties.Find(UP_SYNC)
+    If Not up Is Nothing Then
+        If Len(Trim$(CStr(up.Value))) > 0 Then
+            EnsureSyncId = Trim$(CStr(up.Value))
+            Exit Function
+        End If
+    End If
+    Dim newId As String
+    newId = "CS" & mStamp & "-" & Format$(mSeq, "000000") & "-" & Format$(Int(Rnd * 10000), "0000")
+    Err.Clear
+    If up Is Nothing Then Set up = ct.UserProperties.Add(UP_SYNC, olText, False)
+    up.Value = newId
+    ct.Save
+    If Err.Number = 0 Then
+        mStamped = mStamped + 1
+    Else
+        modDebugLog.DError MOD_NAME, "Etiquette non posee err " & Err.Number & " - " & Err.Description
+        Err.Clear
+    End If
+    EnsureSyncId = newId
+End Function
+
+' Photo de la fiche (piece jointe ContactPicture.jpg) -> photos\<SyncID>.jpg
+Private Function ExportPhoto(ByVal ct As Outlook.ContactItem, ByVal syncId As String) As String
+    On Error Resume Next
+    ExportPhoto = ""
+    If Not ct.HasPicture Then Exit Function
+    Dim att As Outlook.Attachment, target As String
+    For Each att In ct.Attachments
+        If StrComp(att.FileName, "ContactPicture.jpg", vbTextCompare) = 0 Then
+            target = mOutDir & "\photos\" & syncId & ".jpg"
+            Err.Clear
+            att.SaveAsFile target
+            If Err.Number = 0 Then
+                ExportPhoto = syncId & ".jpg"
+                mPhotoN = mPhotoN + 1
+            Else
+                modDebugLog.DError MOD_NAME, "Photo non exportee err " & Err.Number & " (" & syncId & ")"
+                Err.Clear
+            End If
+            Exit Function
+        End If
+    Next att
+End Function
+
+'=============================================================================
+' CSV / fichiers
+'=============================================================================
+' Champ CSV : toujours entre guillemets, guillemets internes doubles.
+Private Function Q(ByVal s As String) As String
+    Q = """" & Replace(s, """", """""") & """"
+End Function
+
+' UTF-8 avec BOM (Excel et le Bloc-notes le lisent correctement).
+Private Sub SaveUtf8(ByVal path As String, ByVal content As String)
+    On Error Resume Next
+    Dim stm As Object
+    Set stm = CreateObject("ADODB.Stream")
+    stm.Type = 2
+    stm.Charset = "utf-8"
+    stm.Open
+    stm.WriteText content
+    stm.SaveToFile path, 2
+    stm.Close
+    If Err.Number <> 0 Then
+        modDebugLog.DError MOD_NAME, "SaveUtf8 err " & Err.Number & " - " & Err.Description & " (" & path & ")"
+        Err.Clear
+    End If
+End Sub
+
+Private Sub OpenFolder(ByVal targetFolder As String)
+    On Error Resume Next
+    Dim sh As Object
+    Set sh = CreateObject("WScript.Shell")
+    sh.Run """" & targetFolder & """", 1, False
+End Sub
+
+Private Function ReadmeText(ByVal storeNames As String) As String
+    Dim s As String
+    s = "EXPORT DES CONTACTS - " & storeNames & " - " & mStamp & vbCrLf
+    s = s & String$(70, "=") & vbCrLf & vbCrLf
+    s = s & "contacts.csv : UTF-8 (BOM), separateur '" & mSep & "', tous les champs entre guillemets." & vbCrLf
+    s = s & "photos\      : une photo par fiche, nommee <SyncID>.jpg (colonne _Photo)." & vbCrLf & vbCrLf
+    s = s & "COLONNES (seules les colonnes remplies sur au moins une fiche sont ecrites ;" & vbCrLf
+    s = s & "  toute propriete ContactItem absente peut etre ajoutee a la main)" & vbCrLf
+    s = s & "  _Store     compte (boite) de la fiche - NE PAS MODIFIER" & vbCrLf
+    s = s & "  _SyncID    etiquette permanente de la fiche - NE PAS MODIFIER" & vbCrLf
+    s = s & "  _EntryID   identifiant Outlook du moment - NE PAS MODIFIER" & vbCrLf
+    s = s & "  _Folder    dossier de la fiche - MODIFIABLE : le reimport deplace la fiche" & vbCrLf
+    s = s & "             (dossier cree s'il n'existe pas ; jamais d'un compte a l'autre)" & vbCrLf
+    s = s & "  _NameDay   fete du prenom MM-JJ - MODIFIABLE ('-' = retirer)" & vbCrLf
+    s = s & "  _Photo     fichier dans photos\ - MODIFIABLE : nouveau fichier = nouvelle photo," & vbCrLf
+    s = s & "             '-' = retirer la photo, vide = ne rien changer" & vbCrLf
+    s = s & "  _Modified  derniere modification Outlook (lecture seule)" & vbCrLf
+    s = s & "  _Exported  horodatage de l'export (lecture seule, sert a detecter les conflits)" & vbCrLf
+    s = s & "  _Action    vide = mettre a jour ; skip = ignorer la ligne ; creer = creer une" & vbCrLf
+    s = s & "             nouvelle fiche si aucune ne correspond ; force = ecraser meme si la" & vbCrLf
+    s = s & "             fiche a ete modifiee dans Outlook apres l'export" & vbCrLf
+    s = s & "  autres     proprietes Outlook (memes noms que l'objet ContactItem)" & vbCrLf & vbCrLf
+    s = s & "REGLES DE REIMPORT (modContactImport)" & vbCrLf
+    s = s & "  - cellule VIDE = champ laisse tel quel ; '-' = champ VIDE" & vbCrLf
+    s = s & "  - dates : AAAA-MM-JJ (JJ/MM/AAAA accepte) ; annee inconnue = 1604" & vbCrLf
+    s = s & "  - Sensitivity : 0 normal, 1 personnel, 2 prive, 3 confidentiel" & vbCrLf
+    s = s & "  - Categories : separees par des points-virgules" & vbCrLf
+    s = s & "  - une colonne supprimee = champ non touche ; une ligne supprimee = fiche non touchee" & vbCrLf
+    s = s & "    (le reimport ne SUPPRIME jamais de fiche)" & vbCrLf
+    s = s & "  - fiche modifiee dans Outlook apres l'export = ligne ignoree, sauf _Action=force" & vbCrLf
+    s = s & "  - toujours lancer le reimport en SIMULATION d'abord (rapport champ par champ)" & vbCrLf & vbCrLf
+    s = s & "EXCEL : ouvrir contacts.csv, editer, enregistrer au format 'CSV UTF-8 (delimite par" & vbCrLf
+    s = s & "  des virgules)' ou 'CSV (separateur : point-virgule)'. Le reimport detecte le" & vbCrLf
+    s = s & "  separateur et l'encodage. Ne pas editer les Notes (Body) dans le Bloc-notes." & vbCrLf & vbCrLf
+    s = s & "EN - Column headers are Outlook ContactItem property names. Empty cell = leave" & vbCrLf
+    s = s & "  unchanged, '-' = clear. _Folder move, _Photo replace, _Action skip/creer/force." & vbCrLf
+    s = s & "  Re-import never deletes a card. Always dry-run first." & vbCrLf
+    ReadmeText = s
+End Function

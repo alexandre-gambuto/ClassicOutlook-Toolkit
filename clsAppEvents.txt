@@ -1,0 +1,122 @@
+Option Explicit
+
+'=============================================================================
+' clsAppEvents v4.1  (2026-07-25)
+' Purpose (EN): central WithEvents listener on Application.Inspectors and the
+'   active Explorer; relays NewInspector / InlineResponse events to the modules
+'   that need them (late binding, no UserForm).
+' Classe d'ecoute des evenements de Application.Inspectors et Application.Explorers
+' pour relayer aux modules interesses :
+'   - modNewMeetingDefault.OnNewInspector  : force duree 15 min sur RDV vierge
+'   - modReplyInPlace.OnNewInspector       : memorise dossier parent des
+'                                            Reply/ReplyAll/Forward ouverts
+'                                            dans un Inspector (fenetre)
+'   - modMaximizeWindow.OnNewInspector  : force etat maximise sur fenetres
+'                                            de mail (taille non persistee par
+'                                            Outlook entre sessions)
+'   - modReplyInPlace.OnInlineResponse     : meme chose pour les Reply/
+'                                            ReplyAll/Forward rediges dans le
+'                                            volet de lecture (inline response)
+'
+' v2 (2026-06-10) : Property Get InspectorsBound / ExplorerBound (etat reel
+' des WithEvents internes, lues via modNewMeetingDefault par
+' modMaintenance.AssertBindings). NB : m_Explorer peut etre legitimement
+' Nothing si aucune fenetre Outlook n'existait a l'initialisation
+' (ActiveExplorer = Nothing) ; un Reinit le repare.
+'
+' v3 (2026-07-07) : FIL D'ARIANE de crash dans NewInspector. Motive par
+' l'evenement Windows 1000 du 06/07 ("Outlook s'est arrete pendant le
+' rappel NewInspector... complement Microsoft VBA") : Outlook est mort
+' pendant ce rappel, sans que l'on sache LEQUEL des 4 modules appeles
+' etait en cause. Une trace DTrace est ecrite AVANT chaque module (le
+' logger ecrit et ferme le fichier a chaque ligne) : en cas de nouveau
+' plantage, la DERNIERE ligne du debug.log designe le module coupable.
+'
+' v4 (2026-07-09) : relais NewInspector + InlineResponse vers
+' modReplyGreeting (salutation auto "Bonjour Prenom," sur les reponses a
+' destinataire unique). Fil d'Ariane DTrace conserve sur le nouveau relais.
+'
+' v4.2 (2026-08-18) : relais NewInspector + InlineResponse vers modHideBcc
+' (champ Cci force masque sur les fenetres de composition).
+'
+' v4.1 (2026-07-25) : MOD_NAME (le nom "AppEvents" etait ecrit en dur dans
+' chaque DTrace - une faute de frappe rendait la ligne invisible du filtre)
+' + ModVersion. NB : une classe n'est interrogeable par
+' modMaintenance qu'a travers une instance vivante (g_AppEvents).
+'=============================================================================
+
+Private Const MOD_NAME As String = "AppEvents"
+Private Const MOD_VERSION As String = "v4.2 - 2026-08-18"
+
+Private WithEvents m_Inspectors As Outlook.Inspectors
+Private WithEvents m_Explorer As Outlook.Explorer
+
+Private Sub Class_Initialize()
+    Set m_Inspectors = Application.Inspectors
+    Set m_Explorer = Application.ActiveExplorer
+End Sub
+
+Private Sub Class_Terminate()
+    Set m_Inspectors = Nothing
+    Set m_Explorer = Nothing
+End Sub
+
+'=============================================================================
+' BindExplorer (pack v3 - A5) : re-lie l'ecoute InlineResponse sur la fenetre
+' courrier courante (appele par ThisOutlookSession.AttachWatcher via
+' modNewMeetingDefault.RebindInlineExplorer quand la fenetre est recreee).
+'=============================================================================
+Public Sub BindExplorer(ByVal exp As Outlook.Explorer)
+    On Error Resume Next
+    If exp Is Nothing Then Exit Sub
+    Set m_Explorer = exp
+    modDebugLog.DTrace MOD_NAME, "InlineResponse re-lie sur la fenetre courrier"
+End Sub
+
+Private Sub m_Inspectors_NewInspector(ByVal Inspector As Outlook.Inspector)
+    On Error Resume Next
+    ' v3 : fil d'Ariane crash - une trace AVANT chaque module. Si Outlook
+    ' plante pendant ce rappel (Event 1000 "NewInspector"), la derniere
+    ' ligne de debug.log designe le module en cause (niveau TRACE requis).
+    modDebugLog.DTrace MOD_NAME, "NewInspector -> NewMeetingDefault"
+    modNewMeetingDefault.OnNewInspector Inspector
+    modDebugLog.DTrace MOD_NAME, "NewInspector -> ReplyInPlace"
+    modReplyInPlace.OnNewInspector Inspector
+    modDebugLog.DTrace MOD_NAME, "NewInspector -> MaximizeWindow"
+    modMaximizeWindow.OnNewInspector Inspector
+    modDebugLog.DTrace MOD_NAME, "NewInspector -> MeetingToAppointment"
+    modMeetingToAppointment.OnNewInspector Inspector
+    modDebugLog.DTrace MOD_NAME, "NewInspector -> ReplyGreeting"
+    modReplyGreeting.OnNewInspector Inspector
+    modDebugLog.DTrace MOD_NAME, "NewInspector -> HideBcc"
+    modHideBcc.OnNewInspector Inspector
+    modDebugLog.DTrace MOD_NAME, "NewInspector OK"
+    On Error GoTo 0
+End Sub
+
+Private Sub m_Explorer_InlineResponse(ByVal Item As Object)
+    On Error Resume Next
+    modReplyInPlace.OnInlineResponse Item
+    modReplyGreeting.OnInlineResponse Item
+    modHideBcc.OnInlineResponse Item
+    On Error GoTo 0
+End Sub
+
+'=============================================================================
+' Accesseurs d'etat (health-check, v2) : etat reel des WithEvents internes.
+'=============================================================================
+Public Property Get InspectorsBound() As Boolean
+    InspectorsBound = Not (m_Inspectors Is Nothing)
+End Property
+
+Public Property Get ExplorerBound() As Boolean
+    ExplorerBound = Not (m_Explorer Is Nothing)
+End Property
+
+'=============================================================================
+' ModVersion - version REELLEMENT chargee dans le VBE. Accessible seulement
+' via une instance vivante (modNewMeetingDefault.g_AppEvents).
+'=============================================================================
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
