@@ -1,3 +1,40 @@
+[2026-09-15] modQuickMove v11.4 - listes de resultats : nom de boite en en-tete
+  * Quand une recherche touche une boite autre que la boite par defaut, la
+    liste (QuickMoveSearch, PickFolder/GoTo) presente chaque boite sur sa
+    propre ligne, ses dossiers dessous en retrait de 3 espaces, ligne vide
+    entre deux boites - meme presentation que le choix du dossier de
+    modContactFromMail. Le prefixe "[Boite] " n'est plus repete sur chaque
+    fil d'Ariane (place gagnee a chaque ligne). Ordre v11.3 conserve : boite
+    active d'abord, numerotation continue dans l'ordre affiche.
+  * Liste nue, sans en-tete, quand tous les dossiers affiches sont dans la
+    boite par defaut (cas courant, presentation inchangee).
+  * Recents, toasts et log gardent DisplayPath (prefixe "[Boite] ").
+    Helper prive StoreNameOf (entree sans nom de boite = boite par defaut).
+
+[2026-09-15] modQuickMove v11.3 - GoTo : barre de saisie retablie ; listes de
+             resultats groupees par boite
+  * FIX GoToFolder (regression pack v3, C13). PickFolder prenait son prefill
+    (dernier mot-cle tape, mLastKeyword) pour un terme DEJA VALIDE et lancait
+    la recherche d'office : match unique -> l'explorateur changeait de dossier
+    SANS afficher la barre de saisie ; plusieurs matches -> la liste des
+    resultats s'ouvrait directement. Le mot-cle redevient la valeur PAR DEFAUT
+    de la barre, pre-selectionnee (contrat v10.2/v10.4 : une frappe la
+    remplace, Entree la valide), un seul pre-remplissage par commande.
+    modFolderMerge (prefill vide) : inchange. Le cas "message selectionne
+    hors du dossier affiche" (resultat de recherche -> saut direct au dossier
+    du message, v8) n'est pas concerne.
+  * Listes de resultats de QuickMoveSearch et PickFolder/GoTo groupees par
+    boite quand une recherche touche plusieurs boites : dossiers de la boite
+    ACTIVE (celle du dossier affiche dans l'explorateur,
+    modStoreContext.CurrentStore, repli boite par defaut) en tete, puis les
+    autres boites en blocs separes par une ligne vide. La numerotation suit
+    l'ordre affiche ; le plafond de 20 lignes s'applique apres regroupement
+    (la boite active n'est jamais evincee). Nouveaux helpers Public
+    GroupMatchesByStore (tri stable en place) / FormatMatchList.
+  * Non couvert : la fenetre de classement des envoyes
+    (ThisOutlookSession.PromptForSentItem) garde sa liste, sans prefixe de
+    boite ni regroupement.
+
 [2026-09-15] modQuickStart v1.0 (nouveau) + ThisOutlookSession v10.12, modDefer,
              modMaintenance - guide de demarrage rapide
   * Premier lancement sans config.ini : 8 s apres le demarrage (modDefer

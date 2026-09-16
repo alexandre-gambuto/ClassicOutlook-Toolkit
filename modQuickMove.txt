@@ -18,6 +18,34 @@ Option Explicit
 '   organises par DOSS (4 chiffres), contrat (202X_XXXXX) et nom de dossier
 '   client/partenaire.
 '
+' v11.4 (2026-09-15) : listes de resultats - NOM DE BOITE EN EN-TETE de
+'   groupe (comme le choix du dossier de modContactFromMail) au lieu du
+'   prefixe "[Boite] " repete sur chaque ligne : la boite sur sa propre
+'   ligne, ses dossiers dessous (3 espaces de retrait), ligne vide entre
+'   deux boites. Les en-tetes n'apparaissent que si au moins un dossier
+'   affiche est hors de la boite par defaut ; sinon la liste reste nue
+'   (cas courant, inchange). Recents, toasts et log gardent DisplayPath.
+'
+' v11.3 (2026-09-15) : (a) FIX GoToFolder "sans fenetre" (regression pack
+'   v3 / C13). PickFolder prenait son prefill pour un terme DEJA VALIDE et
+'   lancait la recherche d'office : des qu'un mot-cle etait memorise
+'   (mLastKeyword, alimente par chaque recherche QuickMove ou GoTo) et
+'   qu'il matchait 1 seul dossier, GoTo basculait l'explorateur sur ce
+'   dossier SANS afficher la barre de saisie ; avec plusieurs matches, la
+'   liste s'ouvrait directement. Retour au contrat v10.2/v10.4 : le mot-cle
+'   est la valeur PAR DEFAUT de la barre, pre-selectionnee (une frappe la
+'   remplace, Entree la valide), un seul pre-remplissage par commande.
+'   modFolderMerge (prefill vide) : inchange.
+'   (b) LISTES DE RESULTATS GROUPEES PAR BOITE (QuickMoveSearch et
+'   PickFolder/GoTo) : dossiers de la boite ACTIVE (celle du dossier affiche
+'   dans l'explorateur, modStoreContext.CurrentStore, repli boite par
+'   defaut) en tete, puis les autres boites en blocs separes par une ligne
+'   vide. La numerotation suit l'ordre affiche ; le plafond de 20 lignes
+'   s'applique APRES regroupement (la boite active n'est jamais evincee).
+'   Helpers GroupMatchesByStore / FormatMatchList (Public : reutilisables
+'   par ThisOutlookSession). La fenetre de classement des ENVOYES
+'   (ThisOutlookSession.PromptForSentItem) n'est pas touchee.
+'
 ' v11.2 (2026-08-28) : CREATION DE DOSSIER A LA VOLEE (recherche sans
 '   resultat). La boite "Aucun dossier" de QuickMoveSearch passe de
 '   modUi.Ask a modMsgBoxCustom.Confirm3, 3 boutons renommes :
@@ -150,6 +178,14 @@ Option Explicit
 '                     "A" ou "B". Plafond 200 resultats. FindMatches (match
 '                     sur tout le chemin) est conservee pour usage externe
 '                     eventuel mais plus appelee en interne.
+'   Affichage         (v11.3/v11.4) Les listes de resultats sont groupees
+'                     par boite : boite active d'abord, puis les autres ;
+'                     des qu'une boite autre que la boite par defaut est
+'                     presente, chaque groupe est coiffe du nom de sa boite
+'                     et ses lignes sont en retrait, ligne vide entre deux
+'                     boites (GroupMatchesByStore + FormatMatchList).
+'                     Ailleurs (recents, toasts, log) : chemins des boites
+'                     secondaires prefixes "[Boite] " (DisplayPath).
 '   Deplacement       DoMoveToFolder iter en marche arriere sur la selection
 '                     (parce que Item.Move modifie la collection), agrege
 '                     succes/erreurs, trace la progression dans le log, et
@@ -199,7 +235,7 @@ Public mRecentFolders(1 To 5) As Long
 Public mRecentCount As Long
 
 Private Const MOD_NAME As String = "QuickMove"
-Private Const MOD_VERSION As String = "v11.2 - 2026-08-28"
+Private Const MOD_VERSION As String = "v11.4 - 2026-09-15"
 
 Private Const CACHE_FILE = "QuickMoveCache.txt"
 Private Const RECENT_FILE = "QuickMoveRecents.txt"
@@ -377,9 +413,10 @@ Public Sub GoToFolder()
         Exit Sub
     End If
 
-    ' Pack v3 (C13) : boucle de selection partagee (PickFolder). Pre-remplie
-    ' avec le dernier mot-cle tape (v10.2/v10.4), qui est re-memorise par
-    ' PickFolder a chaque saisie.
+    ' Pack v3 (C13) : boucle de selection partagee (PickFolder). Le dernier
+    ' mot-cle tape (v10.2/v10.4) est la valeur PAR DEFAUT de la barre de
+    ' saisie, pre-selectionnee - v11.3 : il n'est plus recherche d'office,
+    ' la barre s'affiche toujours. PickFolder re-memorise chaque saisie.
     Dim idx As Long
     idx = PickFolder("GoTo - " & mFolderCount & T(" dossiers indexes", " indexed folders"), _
                      T("GoTo - Naviguer vers un dossier", "GoTo - Navigate to a folder"), _
@@ -904,6 +941,139 @@ Public Function DisplayPath(ByVal idx As Long) As String
     If Len(mFolders(idx).StoreName) = 0 Then Exit Function
     If StrComp(mFolders(idx).StoreName, mDefaultStoreName, vbTextCompare) = 0 Then Exit Function
     DisplayPath = "[" & mFolders(idx).StoreName & "] " & mFolders(idx).FolderPath
+End Function
+
+' ============================================================================
+' v11.3 / v11.4 - LISTES DE RESULTATS GROUPEES PAR BOITE
+' Quand une recherche remonte des dossiers de plusieurs boites, la liste
+' affiche d'abord ceux de la boite ACTIVE (celle du dossier affiche dans
+' l'explorateur : modStoreContext.CurrentStore, repli boite par defaut),
+' puis les autres boites, chacune en bloc, separees par une ligne vide.
+'   ActiveStoreName     : nom de la boite active ("" impossible : repli sur
+'                         la boite par defaut de l'index).
+'   StoreNameOf         : nom de boite d'une entree ("" = boite par defaut,
+'                         entrees d'un cache ancien format).
+'   GroupMatchesByStore : reordonne matchIndexes(1..matchCount) EN PLACE,
+'                         de facon stable (ordre d'index conserve dans une
+'                         boite). La numerotation [n] des listes suit ce
+'                         nouvel ordre : un choix par numero
+'                         (matchIndexes(n)) reste coherent.
+'   FormatMatchList     : au plus maxShown lignes "[n] chemin". v11.4 : des
+'                         qu'un dossier affiche est HORS de la boite par
+'                         defaut, chaque groupe est coiffe du nom de sa
+'                         boite sur sa propre ligne et ses lignes sont en
+'                         retrait de 3 espaces (meme presentation que le
+'                         choix du dossier de modContactFromMail), ligne
+'                         vide entre deux boites ; sinon liste nue, sans
+'                         en-tete (cas courant). Le chemin n'est jamais
+'                         prefixe du nom de boite ici.
+' Le plafond d'affichage (20) s'applique APRES le regroupement : les
+' dossiers de la boite active ne sont jamais evinces par une autre boite.
+' Public (GroupMatchesByStore / FormatMatchList) pour un usage ulterieur par
+' ThisOutlookSession.PromptForSentItem, qui garde sa liste pour l'instant.
+' ============================================================================
+Private Function ActiveStoreName() As String
+    On Error Resume Next
+    ActiveStoreName = ""
+    ActiveStoreName = modStoreContext.CurrentStore().DisplayName
+    If Len(ActiveStoreName) = 0 Then ActiveStoreName = mDefaultStoreName
+End Function
+
+Private Function StoreNameOf(ByVal idx As Long) As String
+    Dim sn As String
+    sn = mFolders(idx).StoreName
+    If Len(sn) = 0 Then sn = mDefaultStoreName
+    StoreNameOf = sn
+End Function
+
+Public Sub GroupMatchesByStore(ByRef matchIndexes() As Long, ByVal matchCount As Long)
+    On Error GoTo Fail
+    If matchCount < 2 Then Exit Sub
+
+    Dim activeName As String
+    activeName = ActiveStoreName()
+
+    ' Boites distinctes, dans l'ordre de premiere apparition, boite active en
+    ' tete (si elle n'a aucun resultat, son groupe est vide : sans effet).
+    Dim storeNames() As String, nStores As Long
+    Dim i As Long, k As Long, found As Boolean, sn As String
+    ReDim storeNames(1 To matchCount + 1)
+    nStores = 1
+    storeNames(1) = activeName
+    For i = 1 To matchCount
+        sn = StoreNameOf(matchIndexes(i))
+        found = False
+        For k = 1 To nStores
+            If StrComp(sn, storeNames(k), vbTextCompare) = 0 Then
+                found = True
+                Exit For
+            End If
+        Next k
+        If Not found Then
+            nStores = nStores + 1
+            storeNames(nStores) = sn
+        End If
+    Next i
+
+    ' Reconstruction stable, boite par boite.
+    Dim sorted() As Long, n As Long
+    ReDim sorted(1 To matchCount)
+    n = 0
+    For k = 1 To nStores
+        For i = 1 To matchCount
+            If StrComp(StoreNameOf(matchIndexes(i)), storeNames(k), vbTextCompare) = 0 Then
+                n = n + 1
+                sorted(n) = matchIndexes(i)
+            End If
+        Next i
+    Next k
+    If n <> matchCount Then Exit Sub   ' incoherence : on ne touche a rien
+
+    For i = 1 To matchCount
+        matchIndexes(i) = sorted(i)
+    Next i
+    Exit Sub
+Fail:
+    modDebugLog.DError MOD_NAME, "GroupMatchesByStore err " & Err.Number & " - " & Err.Description
+End Sub
+
+Public Function FormatMatchList(ByRef matchIndexes() As Long, ByVal matchCount As Long, _
+                                ByVal maxShown As Long) As String
+    Dim out As String
+    On Error GoTo Fail
+    Dim i As Long, shown As Long
+    Dim curStore As String, prevStore As String
+    Dim withHeaders As Boolean
+    shown = MinVal(matchCount, maxShown)
+
+    ' v11.4 : en-tetes de boite seulement si au moins un dossier affiche est
+    ' hors de la boite par defaut ; sinon la liste reste nue (cas courant).
+    withHeaders = False
+    For i = 1 To shown
+        If StrComp(StoreNameOf(matchIndexes(i)), mDefaultStoreName, vbTextCompare) <> 0 Then
+            withHeaders = True
+            Exit For
+        End If
+    Next i
+
+    For i = 1 To shown
+        curStore = StoreNameOf(matchIndexes(i))
+        If withHeaders Then
+            If i = 1 Or StrComp(curStore, prevStore, vbTextCompare) <> 0 Then
+                If i > 1 Then out = out & vbCrLf     ' ligne vide entre deux boites
+                out = out & curStore & vbCrLf        ' nom de la boite, une seule fois
+            End If
+            out = out & "   [" & i & "] " & mFolders(matchIndexes(i)).FolderPath & vbCrLf
+        Else
+            out = out & "[" & i & "] " & mFolders(matchIndexes(i)).FolderPath & vbCrLf
+        End If
+        prevStore = curStore
+    Next i
+    FormatMatchList = out
+    Exit Function
+Fail:
+    modDebugLog.DError MOD_NAME, "FormatMatchList err " & Err.Number & " - " & Err.Description
+    FormatMatchList = out
 End Function
 
 ' ============================================================================
@@ -1521,7 +1691,9 @@ End Function
 ' boucle "saisie -> liste numerotee -> numero ou affinage").
 '   headerText : lignes affichees en tete de chaque tour (deja localisees)
 '   titleText  : titre des fenetres
-'   prefill    : texte propose au premier tour
+'   prefill    : valeur PAR DEFAUT de la barre de saisie au premier tour
+'                (v11.3 : pre-selectionnee, jamais recherchee d'office ;
+'                les tours suivants repartent d'une barre vide)
 '   allowRescan: "!" / "rescan" relance l'indexation sans quitter
 ' Renvoie l'index mFolders choisi, ou 0 si abandon (vide / Annuler).
 ' Memorise le dernier terme tape dans mLastKeyword (pre-remplissage GoTo).
@@ -1533,8 +1705,14 @@ Public Function PickFolder(ByVal headerText As String, ByVal titleText As String
     If Not mLoaded Then SmartLoad
 
     Dim searchText As String, choice As String, prompt As String, resultList As String
-    Dim matchIndexes() As Long, matchCount As Long, i As Long, choiceNum As Long
-    searchText = prefill
+    Dim matchIndexes() As Long, matchCount As Long, choiceNum As Long
+    ' v11.3 : le prefill est la valeur par defaut de la barre, PAS un terme
+    ' deja valide. Avant (pack v3 / C13), searchText = prefill sautait la
+    ' barre et lancait la recherche : GoTo avec un mot-cle memorise qui
+    ' matchait 1 dossier naviguait sans afficher la moindre fenetre.
+    Dim defaultText As String
+    defaultText = prefill
+    searchText = ""
 
     Do
         If Len(Trim(searchText)) = 0 Then
@@ -1543,7 +1721,8 @@ Public Function PickFolder(ByVal headerText As String, ByVal titleText As String
                      T(" ou contrat", " code or contract")
             If allowRescan Then prompt = prompt & T(" (! = re-scanner)", " (! = re-scan)")
             prompt = prompt & " :"
-            searchText = modUi.AskText(prompt, titleText, "")
+            searchText = modUi.AskText(prompt, titleText, defaultText)
+            defaultText = ""   ' un seul pre-remplissage par commande
             If Len(Trim(searchText)) = 0 Then Exit Function
         End If
 
@@ -1575,10 +1754,11 @@ Public Function PickFolder(ByVal headerText As String, ByVal titleText As String
             PickFolder = matchIndexes(1)
             Exit Function
         Else
-            resultList = ""
-            For i = 1 To MinVal(matchCount, 20)
-                resultList = resultList & "[" & i & "] " & DisplayPath(matchIndexes(i)) & vbCrLf
-            Next i
+            ' v11.3/v11.4 : boite active d'abord, puis les autres boites, nom
+            ' de boite en en-tete de groupe des qu'une boite secondaire est
+            ' presente (la numerotation suit cet ordre).
+            GroupMatchesByStore matchIndexes, matchCount
+            resultList = FormatMatchList(matchIndexes, matchCount, 20)
             prompt = matchCount & T(" dossier(s) pour ""","  folder(s) for """) & searchText & """ :" & vbCrLf & vbCrLf & resultList
             If matchCount > 20 Then
                 prompt = prompt & T("... et ", "... and ") & (matchCount - 20) & T(" autres (affinez)", " more (refine)") & vbCrLf
@@ -1808,10 +1988,11 @@ Public Sub QuickMoveSearch(prefill As String)
 
         Else
 ShowResults:
-            resultList = ""
-            For i = 1 To MinVal(matchCount, 20)
-                resultList = resultList & "[" & i & "] " & DisplayPath(matchIndexes(i)) & vbCrLf
-            Next i
+            ' v11.3/v11.4 : boite active d'abord, puis les autres boites, nom
+            ' de boite en en-tete de groupe des qu'une boite secondaire est
+            ' presente (la numerotation suit cet ordre).
+            GroupMatchesByStore matchIndexes, matchCount
+            resultList = FormatMatchList(matchIndexes, matchCount, 20)
 
             choicePrompt = matchCount & T(" dossier(s) pour """, " folder(s) for """) & searchText & T(""" :", """:") & vbCrLf & vbCrLf
             choicePrompt = choicePrompt & resultList
