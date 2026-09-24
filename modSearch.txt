@@ -1,7 +1,7 @@
 Option Explicit
 
 ' =====================================================================
-' modSearch v3
+' modSearch v4
 ' Purpose (EN): native Outlook keyword searches on the active Explorer
 '   (this week's sent / received mail, and reset). The localized
 '   "received" keyword is rebuilt at runtime via Chr() so the source
@@ -20,11 +20,60 @@ Option Explicit
 '     ViewCompact / ViewPreview, defauts "Compacter" / "Apercu" cedille).
 '     Les noms de vues sont propres au profil (langue, renommages) : en
 '     dur, la bascule devenait un no-op silencieux. Dependance : modConfig.
+'
+' v4 (2026-09-17) : RECHERCHE LIMITEE A LA BOITE COURANTE.
+'   Les deux boutons du ruban ("Envoyes" / "Recus" de la semaine)
+'   passaient la portee 1 EN DUR a Explorer.Search. Or, dans
+'   l'enumeration OlSearchScope, 1 = olSearchScopeAllFolders, qui ne
+'   veut PAS dire "tous les dossiers de la boite courante" mais "tous
+'   les dossiers de meme type dans TOUTES les boites selectionnees pour
+'   la recherche" (doc Microsoft). D'ou des resultats venant des autres
+'   boites du profil.
+'   Portee utilisee desormais : olSearchScopeCurrentStore (4) = la boite
+'   du dossier affiche dans l'explorateur - exactement la convention
+'   multiboite du toolkit (la cible est DEDUITE du dossier courant, cf.
+'   modStoreContext), jamais demandee. La boite retenue est ecrite dans
+'   le log (pas de fenetre : la commande reste un simple bouton).
+'   - Valeurs OlSearchScope (constantes locales, pas de magie
+'     numerique) : 0 dossier courant / 1 tous les dossiers de meme type
+'     dans les boites selectionnees / 2 tous les elements Outlook /
+'     3 dossier courant + sous-dossiers / 4 boite du dossier courant.
+'   - Surcharge possible : cle SearchScope dans config.ini
+'     (currentstore par defaut, sinon currentfolder | subfolders |
+'     allfolders | allitems).
+'   - Repli automatique sur la portee 1 si la portee 4 est refusee
+'     (olSearchScopeCurrentStore n'existe qu'a partir d'Outlook 2013).
+'   - Si le dossier affiche n'est PAS un dossier de courrier (on vient
+'     du calendrier, des contacts...), on se place d'abord sur la boite
+'     de reception DE CETTE BOITE : sans cela la portee est calculee sur
+'     un contexte qui n'a rien a voir avec un filtre "kind:email".
+'   - ResetSearch revient sur la boite de reception de la BOITE
+'     COURANTE (avant : toujours celle de la boite par defaut, donc un
+'     retour de recherche faisait changer de boite).
+'   - L'alias "de:" est celui du compte de la BOITE COURANTE quand elle a
+'     un compte propre (une boite secondaire filtrait sur l'adresse du
+'     compte par defaut) ; repli sur l'utilisateur courant sinon.
+'   - Le corps commun des deux recherches est factorise (RunSearch) :
+'     les deux Subs ne portent plus que leur filtre et leur vue finale.
 ' (Historique des versions -> CHANGELOG.)
+'
+' Dependances : modConfig (Cfg), modDebugLog, modStoreContext.
 ' =====================================================================
 
 Private Const MOD_NAME As String = "Search"
-Private Const MOD_VERSION As String = "v3 - 2026-06-10"
+Private Const MOD_VERSION As String = "v4 - 2026-09-17"
+
+' OlSearchScope (valeurs de la doc Microsoft, nommees ici pour eviter
+' toute magie numerique - c'etait la cause du bug corrige en v4).
+Private Const OL_SCOPE_CURRENT_FOLDER As Long = 0
+Private Const OL_SCOPE_ALL_FOLDERS As Long = 1
+Private Const OL_SCOPE_ALL_ITEMS As Long = 2
+Private Const OL_SCOPE_SUBFOLDERS As Long = 3
+Private Const OL_SCOPE_CURRENT_STORE As Long = 4
+
+' olFolderInbox / olMailItem (late binding : pas de reference typee ici).
+Private Const OL_FOLDER_INBOX As Long = 6
+Private Const OL_MAIL_ITEM As Long = 0
 
 Public Function ModVersion() As String
     ModVersion = MOD_VERSION
@@ -52,6 +101,22 @@ Private Function ViewPreviewName() As String
     ViewPreviewName = modConfig.Cfg("ViewPreview", "Aper" & Chr(231) & "u")
 End Function
 
+'=============================================================================
+' Portee de recherche (v4). Defaut : la boite du dossier affiche.
+' Cle config.ini SearchScope (les valeurs sont fonctionnelles, hors T()).
+'=============================================================================
+Private Function ScopeFromConfig() As Long
+    Dim wanted As String
+    wanted = LCase$(Trim$(modConfig.Cfg("SearchScope", "currentstore")))
+    Select Case wanted
+        Case "currentfolder": ScopeFromConfig = OL_SCOPE_CURRENT_FOLDER
+        Case "subfolders": ScopeFromConfig = OL_SCOPE_SUBFOLDERS
+        Case "allfolders": ScopeFromConfig = OL_SCOPE_ALL_FOLDERS
+        Case "allitems", "alloutlookitems": ScopeFromConfig = OL_SCOPE_ALL_ITEMS
+        Case Else: ScopeFromConfig = OL_SCOPE_CURRENT_STORE
+    End Select
+End Function
+
 Public Sub SentMailsThisWeek()
     On Error GoTo ErrH
 
@@ -59,28 +124,18 @@ Public Sub SentMailsThisWeek()
     monday = Date - (Weekday(Date, vbMonday) - 1)
 
     Dim myEmail As String
-    myEmail = GetMyEmailAlias()
+    myEmail = GetMyEmailAlias(modStoreContext.CurrentStore())
 
     ' D'abord remettre la vue Compacter pour repartir proprement
     On Error Resume Next
     Application.ActiveExplorer.CurrentView = ViewCompactName()
     On Error GoTo ErrH
 
-    ' Lancer la recherche
-    Dim filter As String
-    filter = "de:" & myEmail & " " & ReceivedKeyword() & ":>=" & _
-             Format(monday, "DD/MM/YYYY") & " kind:email"
+    Dim qry As String
+    qry = "de:" & myEmail & " " & ReceivedKeyword() & ":>=" & _
+          Format(monday, "DD/MM/YYYY") & " kind:email"
 
-    modDebugLog.DInfo MOD_NAME, "SentMailsThisWeek filter='" & filter & "'"
-    Application.ActiveExplorer.Search filter, 1
-
-    ' Attendre qu'Outlook traite la recherche.
-    ' v3 (B7) : "Dim T" masquait le wrapper global T(fr,en) ici.
-    Dim t0 As Double
-    t0 = Timer
-    Do While Timer < t0 + 1
-        DoEvents
-    Loop
+    If Not RunSearch(qry, "SentMailsThisWeek") Then Exit Sub
 
     ' Maintenant basculer en Apercu
     On Error Resume Next
@@ -100,28 +155,18 @@ Public Sub ReceivedMailsThisWeek()
     monday = Date - (Weekday(Date, vbMonday) - 1)
 
     Dim myEmail As String
-    myEmail = GetMyEmailAlias()
+    myEmail = GetMyEmailAlias(modStoreContext.CurrentStore())
 
     ' D'abord remettre la vue Compacter
     On Error Resume Next
     Application.ActiveExplorer.CurrentView = ViewCompactName()
     On Error GoTo ErrH
 
-    ' Lancer la recherche
-    Dim filter As String
-    filter = ReceivedKeyword() & ":>=" & Format(monday, "DD/MM/YYYY") & _
-             " kind:email -de:" & myEmail
+    Dim qry As String
+    qry = ReceivedKeyword() & ":>=" & Format(monday, "DD/MM/YYYY") & _
+          " kind:email -de:" & myEmail
 
-    modDebugLog.DInfo MOD_NAME, "ReceivedMailsThisWeek filter='" & filter & "'"
-    Application.ActiveExplorer.Search filter, 1
-
-    ' Attendre qu'Outlook traite la recherche.
-    ' v3 (B7) : "Dim T" masquait le wrapper global T(fr,en) ici.
-    Dim t0 As Double
-    t0 = Timer
-    Do While Timer < t0 + 1
-        DoEvents
-    Loop
+    If Not RunSearch(qry, "ReceivedMailsThisWeek") Then Exit Sub
 
     ' Forcer la vue Compacter sur les resultats
     On Error Resume Next
@@ -134,11 +179,125 @@ ErrH:
         " - " & Err.Description
 End Sub
 
+'=============================================================================
+' RunSearch (v4) - corps commun des deux recherches.
+' 1) garantit un contexte de COURRIER dans la boite courante ;
+' 2) lance Explorer.Search avec la portee configuree (boite courante par
+'    defaut), avec repli sur olSearchScopeAllFolders si la portee est
+'    refusee par la version d'Outlook ;
+' 3) laisse a Outlook 1 s pour traiter la recherche (Sleep + DoEvents :
+'    Application.OnTime n'est pas fiable dans cette session).
+' Renvoie False si aucune recherche n'a pu etre lancee.
+'=============================================================================
+Private Function RunSearch(ByVal qry As String, ByVal label As String) As Boolean
+    On Error Resume Next
+
+    Dim xpl As Object
+    Set xpl = Application.ActiveExplorer
+    If xpl Is Nothing Then
+        modDebugLog.DError MOD_NAME, label & " : aucun explorateur actif"
+        Err.Clear
+        Exit Function
+    End If
+
+    Dim storeName As String
+    storeName = EnsureMailContext(xpl)
+
+    Dim scopeUsed As Long
+    scopeUsed = ScopeFromConfig()
+
+    modDebugLog.DInfo MOD_NAME, label & " scope=" & scopeUsed & " boite='" & _
+        storeName & "' filter='" & qry & "'"
+
+    Err.Clear
+    xpl.Search qry, scopeUsed
+    If Err.Number <> 0 Then
+        ' olSearchScopeCurrentStore (4) n'existe qu'a partir d'Outlook 2013.
+        modDebugLog.DError MOD_NAME, label & " Search scope=" & scopeUsed & _
+            " err " & Err.Number & " - repli scope=" & OL_SCOPE_ALL_FOLDERS
+        Err.Clear
+        xpl.Search qry, OL_SCOPE_ALL_FOLDERS
+        If Err.Number <> 0 Then
+            modDebugLog.DError MOD_NAME, label & " Search repli err " & Err.Number
+            Err.Clear
+            Exit Function
+        End If
+    End If
+
+    ' Attendre qu'Outlook traite la recherche.
+    ' v3 (B7) : "Dim T" masquait le wrapper global T(fr,en) ici.
+    Dim t0 As Double
+    t0 = Timer
+    Do While Timer < t0 + 1
+        DoEvents
+    Loop
+
+    RunSearch = True
+    Err.Clear
+End Function
+
+'=============================================================================
+' EnsureMailContext (v4) - la portee "boite courante" est calculee a partir
+' du dossier AFFICHE. Si ce dossier n'est pas un dossier de courrier (on
+' arrive du calendrier, des contacts, des taches), on se place sur la boite
+' de reception DE LA MEME BOITE : la portee reste la boite visee, et le
+' filtre "kind:email" a un sens. Renvoie le nom de la boite retenue.
+'=============================================================================
+Private Function EnsureMailContext(ByVal xpl As Object) As String
+    On Error Resume Next
+
+    Dim st As Object
+    Set st = modStoreContext.CurrentStore()
+    If Not st Is Nothing Then EnsureMailContext = st.DisplayName
+
+    Dim itemType As Long
+    itemType = -1
+    If Not xpl.CurrentFolder Is Nothing Then itemType = xpl.CurrentFolder.DefaultItemType
+    If Err.Number <> 0 Then itemType = -1: Err.Clear
+    If itemType = OL_MAIL_ITEM Then Exit Function
+
+    Dim inboxFolder As Object
+    Set inboxFolder = modStoreContext.SysFolder(st, OL_FOLDER_INBOX)
+    If inboxFolder Is Nothing Then
+        Set inboxFolder = Application.GetNamespace("MAPI").GetDefaultFolder(OL_FOLDER_INBOX)
+    End If
+    If inboxFolder Is Nothing Then
+        Err.Clear
+        Exit Function
+    End If
+
+    Set xpl.CurrentFolder = inboxFolder
+    If Err.Number <> 0 Then
+        modDebugLog.DDebug MOD_NAME, "EnsureMailContext : CurrentFolder err " & Err.Number
+        Err.Clear
+        Exit Function
+    End If
+    modDebugLog.DDebug MOD_NAME, "EnsureMailContext : dossier non-courrier -> " & _
+        inboxFolder.FolderPath
+    Err.Clear
+End Function
+
+'=============================================================================
+' ResetSearch - sort de la recherche et revient sur la boite de reception.
+' v4 : boite de reception de la BOITE COURANTE (avant : boite par defaut,
+' ce qui faisait changer de boite en sortant d'une recherche).
+'=============================================================================
 Public Sub ResetSearch()
     On Error GoTo ErrH
 
+    Dim st As Object
+    Set st = modStoreContext.CurrentStore()
+
     Dim inboxFolder As Object
-    Set inboxFolder = Application.GetNamespace("MAPI").GetDefaultFolder(olFolderInbox)
+    Set inboxFolder = modStoreContext.SysFolder(st, OL_FOLDER_INBOX)
+    If inboxFolder Is Nothing Then
+        Set inboxFolder = Application.GetNamespace("MAPI").GetDefaultFolder(OL_FOLDER_INBOX)
+    End If
+    If inboxFolder Is Nothing Then
+        modDebugLog.DError MOD_NAME, "ResetSearch : aucune boite de reception trouvee"
+        Exit Sub
+    End If
+
     Set Application.ActiveExplorer.CurrentFolder = inboxFolder
 
     On Error Resume Next
@@ -147,7 +306,7 @@ Public Sub ResetSearch()
     Application.ActiveExplorer.CurrentView.Apply
     On Error GoTo ErrH
 
-    modDebugLog.DInfo MOD_NAME, "ResetSearch OK"
+    modDebugLog.DInfo MOD_NAME, "ResetSearch OK -> " & inboxFolder.FolderPath
     Exit Sub
 
 ErrH:
@@ -156,14 +315,28 @@ ErrH:
 End Sub
 
 '=============================================================================
-' Helper : alias mail (partie avant @) de l'utilisateur courant.
-' Fallback en dur si la resolution Exchange echoue.
+' Helper : alias mail (partie avant @) utilise dans le filtre "de:".
+' v4 : si la boite visee a un COMPTE PROPRE, son adresse prime - une
+' recherche "envoyes" lancee dans une boite secondaire filtrait sinon sur
+' l'adresse du compte par defaut, donc sur zero resultat. Replis en
+' cascade : compte de la boite -> utilisateur courant -> valeur neutre.
 '=============================================================================
-Private Function GetMyEmailAlias() As String
+Private Function GetMyEmailAlias(Optional ByVal st As Object = Nothing) As String
     On Error Resume Next
     Dim addr As String
-    addr = Application.GetNamespace("MAPI").CurrentUser. _
-           AddressEntry.GetExchangeUser.PrimarySmtpAddress
+
+    If Not st Is Nothing Then
+        Dim acc As Object
+        Set acc = modStoreContext.AccountForStore(st)
+        If Not acc Is Nothing Then addr = CStr(acc.SmtpAddress)
+        If Err.Number <> 0 Then addr = "": Err.Clear
+    End If
+
+    If InStr(addr, "@") = 0 Then
+        addr = Application.GetNamespace("MAPI").CurrentUser. _
+               AddressEntry.GetExchangeUser.PrimarySmtpAddress
+        If Err.Number <> 0 Then addr = "": Err.Clear
+    End If
     On Error GoTo 0
 
     If InStr(addr, "@") > 0 Then

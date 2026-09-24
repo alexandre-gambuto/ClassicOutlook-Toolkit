@@ -1,3 +1,123 @@
+[2026-09-24] PACK v4 - demarrage sans gel + liste QuickMove a jour en direct
+             11 fichiers : modMailResponseTracker v6.2, modQuickMove v12.0,
+             clsFolderWatcher v1.0 (NOUVELLE classe), modDefer v1.15,
+             ThisOutlookSession v10.14, modProjectTag v9.1, modCommon v1.3,
+             modAntiOverlap v7.1, modReplyGreeting v1.1, modMaintenance v4.2,
+             CHANGELOG. Diagnostic tire de debug.log (17/08 au 24/09).
+  * GELS MESURES. 24/09 : 9 min 57 s au demarrage (scan de reparation du
+    suivi des mails) ; 23/09 : 5 min 30 (rappel des suivis, sans reparation) ;
+    22/09 : Outlook ferme de force pendant un scan de reparation, puis 3 min
+    12 s d'ouverture Excel au redemarrage ; 17/09 : 9 min 22 s (reparation
+    lancee depuis le tableau de bord). QuickMove : 4 a 28 s au premier
+    classement de chaque session (reconnexion des 1248 dossiers). Les
+    differes du demarrage s'executaient en outre les uns DANS les autres.
+  * modMailResponseTracker v6.2 :
+    - RemindOverdue (demarrage) ne relit plus aucun fil Outlook : retards
+      comptes sur la feuille seule (statut "En retard" ou date limite
+      depassee, lignes non terminales), lecture en bloc, classeur non
+      enregistre. Recalcul complet inchange a l'ouverture du tableau de bord
+      et avant toute relance (FollowUpOverdue). Contrepartie : un fil repondu
+      depuis le dernier recalcul compte encore dans le toast du matin.
+    - Scan de reparation borne a 20 s (respiration tous les 200 mails) ; un
+      fil non retrouve n'est plus recherche avant 7 jours (registre
+      MailResponseTracker\RepairFail). Avant : le MEME fil introuvable
+      relancait a chaque mise a jour le parcours de toute la boite.
+    - Duree de la mise a jour des statuts au journal.
+  * DATES DES FILTRES Restrict/Find (modCommon.FormatDaslDate v1.3,
+    modAntiOverlap v7.1, modReplyGreeting v1.1) : format DU POSTE (date
+    courte + hh:nn) au lieu de m/d/yyyy h:mm AM/PM en dur. Outlook relit la
+    chaine selon les reglages regionaux de Windows : sur un poste francais,
+    jour et mois etaient inverses des que le jour est <= 12. Preuve
+    (rattrapage couleurs, fenetre J-7..J+15) : 251 RDV examines le 14/09
+    (borne "9/7/2026" lue 9 juillet), puis 1 a 7 au lieu d'environ 80 du 16
+    au 24/09 (borne "10/1/2026" lue 10 janvier). Touchait aussi
+    l'anti-chevauchement, l'archivage automatique, la purge des drapeaux et
+    la formule d'appel. LA CONVENTION DU PROJET S'INVERSE : plus aucune date
+    ecrite en dur mois/jour, toujours modCommon.FormatDaslDate.
+  * modQuickMove v12.0 : liaison des dossiers a la demande (chargement
+    instantane) ; cache valable 7 jours ; reindexation par paquets (Outlook
+    reste utilisable) ; surveillance FolderAdd/FolderChange (clsFolderWatcher)
+    sur la Boite de reception, ses enfants directs, les dossiers ayant deja
+    des sous-dossiers et Elements supprimes : dossier cree, renomme, deplace
+    ou supprime dans Outlook pris en compte aussitot ; decodage "%2F" des
+    chemins (9 a 34 chemins "repares" par session) ; cible refusee si le
+    dossier est dans Elements supprimes ; duree par boite au journal.
+  * modDefer v1.15 : traitements lourds un par un (report de 5 s au lieu de
+    l'imbrication) ; BeginHeavy/EndHeavy ; duree de chaque tache >= 1 s au
+    journal ; cle "Reindex" -> ReindexStep, nouvelle cle "QMWatch".
+  * ThisOutlookSession v10.14 : reindexation seulement si le dernier parcours
+    complet a plus de 7 jours (+240 s, par paquets) ; surveillance des
+    dossiers a +60 s et dans RebindEvents.
+  * modProjectTag v9.1 : copie locale de la liste des projets
+    (ProjectTagCache.txt) ; Excel n'est plus ouvert au demarrage tant que
+    Suivi de temps.xlsm n'a pas change.
+  * modMaintenance v4.2 : FoldWatch ajoute a MODULES_DEFAULT.
+  * CHANGELOG : l'entree "[2026-09-02] PACK v3" figurait deux fois a
+    l'identique ; doublon retire.
+  * A COLLER : clsFolderWatcher = NOUVEAU module de classe (Insertion >
+    Module de classe, renommer clsFolderWatcher). Regle d'edition VBE :
+    PrepareForEdit avant toute edition dans les 6 premieres minutes.
+  * NON TRAITE : le VBA interne de Suivi de temps.xlsm (hors perimetre)
+    ecrit ses bornes en "mm/dd/yyyy hh:nn AM/PM" : meme inversion possible
+    (son commentaire v2.19 sur le 01/05 en est la trace).
+
+[2026-09-17] modSearch v4 - boutons "Envoyes" / "Recus" de la semaine : recherche
+             limitee a la BOITE COURANTE
+  * CAUSE. Les deux Subs passaient la portee 1 EN DUR a Explorer.Search. Dans
+    l'enumeration OlSearchScope, 1 = olSearchScopeAllFolders, qui ne signifie
+    pas "tous les dossiers de la boite courante" mais "tous les dossiers de
+    meme type dans TOUTES les boites selectionnees pour la recherche" (doc
+    Microsoft) : d'ou des resultats venant des autres boites du profil.
+  * Portee utilisee desormais : olSearchScopeCurrentStore (4) = la boite du
+    dossier affiche dans l'explorateur, conformement a la convention
+    multiboite du toolkit (cible DEDUITE du dossier courant, modStoreContext,
+    jamais demandee). Valeurs OlSearchScope nommees en constantes locales
+    (plus de magie numerique). Repli automatique sur la portee 1 si la
+    portee 4 est refusee (olSearchScopeCurrentStore existe depuis Outlook
+    2013). Boite retenue + portee + filtre traces en INFO.
+  * Surcharge : nouvelle cle config.ini SearchScope (currentstore par defaut,
+    sinon currentfolder | subfolders | allfolders | allitems).
+  * Contexte de courrier garanti (EnsureMailContext) : si le dossier affiche
+    n'est pas un dossier de courrier (arrivee depuis le calendrier, les
+    contacts...), on se place d'abord sur la boite de reception DE CETTE
+    BOITE - sinon la portee se calcule sur un contexte etranger au filtre
+    "kind:email".
+  * Le filtre "de:" prend l'adresse du COMPTE DE LA BOITE COURANTE quand elle
+    a un compte propre (une recherche "envoyes" lancee dans une boite
+    secondaire filtrait sur l'adresse du compte par defaut, donc sur zero
+    resultat) ; replis : utilisateur courant, puis valeur neutre.
+  * ResetSearch revient sur la boite de reception de la BOITE COURANTE (avant
+    : toujours celle de la boite par defaut, donc un retour de recherche
+    faisait changer de boite).
+  * Corps commun des deux recherches factorise (RunSearch prive) : les Subs
+    publiques ne portent plus que leur filtre et leur vue finale. Noms de Subs
+    publiques inchanges (API ruban stable). Dependance ajoutee :
+    modStoreContext.
+
+[2026-09-17] modContactBirthday v1.10 - vue calendrier : focus rendu au premier
+             calendrier
+  * CAUSE. Cocher un calendrier le rend ACTIF. Le calendrier des
+    anniversaires, coche en dernier par la mise en place (et ajoute en dernier
+    dans le groupe "Mes calendriers"), se retrouvait donc au premier plan :
+    c'etait lui qui recevait un nouveau rendez-vous.
+  * Le coche et la superposition sont conserves ; le DERNIER geste de la mise
+    en place redonne la main au premier calendrier encore coche (le calendrier
+    principal) via Explorer.SelectFolder, qui respecte la multi-selection du
+    volet - CurrentFolder ne sert que de repli, car il peut ramener
+    l'affichage a un seul calendrier.
+  * Cible du focus : cle BirthdayCalendarFocusPath si renseignee (chemin
+    Outlook complet), sinon le premier calendrier reste coche apres la passe
+    de decochage (donc un chemin de BirthdayCalendarKeepPaths /
+    BirthdayCalendarKeepDefaultOf). Aucun candidat = rien a faire.
+    BirthdayCalendarFocusFirst=0 retablit l'ancien comportement.
+  * Si la bascule de calendrier actif decoche le calendrier des anniversaires
+    (cas possible du repli CurrentFolder), il est RECOCHE : le coche prime sur
+    le focus. Un focus non confirme est logue mais ne rejoue pas la mise en
+    place (sinon coche et focus se disputeraient le dernier geste a chaque
+    tentative). Nouveau helper prive FocusCalendar.
+  * Aucun changement d'interface : ThisOutlookSession (ArmBirthdayViewSetup /
+    SetupBirthdayViewDeferred) et ContactBirthdayViewPending sont inchanges.
+
 [2026-09-15] modQuickMove v11.4 - listes de resultats : nom de boite en en-tete
   * Quand une recherche touche une boite autre que la boite par defaut, la
     liste (QuickMoveSearch, PickFolder/GoTo) presente chaque boite sur sa
@@ -65,206 +185,6 @@
   * validate.py : nouveau controle UNTERM (ligne terminee par "(", "&", ","
     ou un operateur sans " _") - aurait attrape ce cas. Aucun autre module
     concerne (verifie sur les 63 fichiers).
-
-[2026-09-02] PACK v3 - revue integrale du toolkit : bugs (A), performance (B),
-             architecture (C), nettoyage (D). Les constantes MOD_VERSION des
-             modules deja instrumentes sont INCHANGEES (pack global v3) ;
-             les modules qui n'en avaient pas en recoivent une, a leur
-             version d'en-tete du moment.
-             4 NOUVEAUX MODULES a coller AVANT les autres : modSmtp,
-             modExcelBridge, modContactCommon, modInspectorQueue.
-             2 nouvelles cles modDefer : "Reindex", "CampaignNext".
-             Nouvelle commande : modMailCampaign.CampaignStop.
-             config.ini : passer BirthdayCalendarAutoShow=1 (cause du "bug"
-             de vue anniversaires jamais posee : la cle etait a 0).
-  * A1 - ACCENTS : modConfig.A() decode 7 marqueurs de plus (~x e circ,
-    ~c c cedille, ~u u circ, ~U u grave, ~A a circ, ~y i trema, ~I I circ).
-    27 libelles ecrits "fen~etre / m~eme / ~etre / en-t~ete / F~etes" avec
-    un e AIGU sont corriges (~x). "BO~ITES" du projet analytics decodait
-    tel quel : ~I ajoute. validate.py signale desormais un marqueur
-    inconnu (MARKER) et les formes "e circonflexe ecrit ~e" (ECIRC).
-  * A2 - modProjectTag : le loader et la recherche de dossiers similaires
-    lisent jusqu'au max des colonnes B..E (avant : colonne D seule ->
-    lignes sans acronyme ignorees). modExcelBridge.DataLastRow.
-  * A3 - Formats de codes pilotes par la config : ScanOpportunityCode
-    (modConfig) derive la largeur des codes opportunite de OpportunityTypes
-    et OpportunityNumberLength (avant : fenetre de 12 caracteres en dur) ;
-    longueur du code projet (ProjectCodeLength) dans CreateFolderInline ;
-    code transversal par defaut = CrossPrefix & "00" (avant "A/A00").
-  * A4 - modReplyInPlace : ecriture Explorer.StatusBar retiree (propriete
-    inexistante dans Outlook : no-op silencieux). Le toast fait foi.
-  * A5 - Fenetre courrier recreee : clsAppEvents.BindExplorer +
-    modNewMeetingDefault.RebindInlineExplorer, appeles par
-    ThisOutlookSession.AttachWatcher (role mail). ReplyInPlace inline,
-    ReplyGreeting et HideBcc ne se perdent plus quand la fenetre courrier
-    est fermee puis reconstruite par EnsureMailExplorer.
-  * A6 - modOneNote lit modConfig.TimeTrackingFilename() /
-    OneNoteNotebook(n) (getters ajoutes, plus de g_* en direct) et
-    modConfig.DesktopPath() (liste de repli locale supprimee). Getters
-    ajoutes dans modConfig : TimeTrackingFilename, Language,
-    SignatureBookmark, OneNoteNotebook, AnthropicApiKey, ProjectCodeLength,
-    ContractYearPrefix, OpportunityTypes, OpportunityNumberLength,
-    CrossCodeLength.
-  * A8 - modContactBirthday : trace INFO explicite quand
-    BirthdayCalendarAutoShow=0 ("mise en place ignoree, passer la cle a 1").
-  * A9 - Versions : MOD_VERSION/ModVersion ajoutes sur modConfig (v3.15),
-    modDebugLog (v2.1), modCommon (v1.2), modNotify (v4.5),
-    ThisOutlookSession (v10.11), modReplyInPlace (v12), modAppointmentPrivacy
-    (v2.0), modReplyGreeting (v1), modNewMeetingDefault (v7),
-    modMaximizeWindow (v8), modFolderMerge (v2), modFolderScan (v6.1),
-    modMsgBoxCustom (v2), modMailExport (v3.1), modSearch (v3),
-    modShiftAppointment (v3.1), modAntiOverlap (v7), modOneNote (v1),
-    modOneNoteProbe (v1), clsExplorerWatcher (v1). modMaintenance.
-    ModuleVersionOf est GENERE (validate.py --gen-versions) : 54 modules,
-    dont MeetingColor / Mtg2Appt / BackupAuto / BackupVBA qui etaient
-    instrumentes mais oublies. MODULES_DEFAULT complete des 4 nouveaux.
-    modSendToLLM reste volontairement intact (non instrumente).
-  * A10 - config_ini.example : 92 cles lues par le code et absentes du
-    modele ajoutees (contacts, InboxAlert, ToastColor*, PrivateOrganizers,
-    NewFolderParent*, HideBccOnCompose, PersonalSlotToast, TeamsPreClean,
-    LLM_*, QuickMoveExcludeStores, ViewCompact/Preview, FolderRenameRoot) +
-    les nouvelles cles du pack. validate.py --gen-config regenere le bloc ;
-    validate.py --config config.ini signale les cles inconnues du code.
-  * A11 - Contrat de colonnes du tracker : modMailResponseTracker ecrit la
-    feuille masquee _Schema (nom logique -> indice, version 2026-09-02/20)
-    a chaque ouverture ; le code de la feuille Suivi (Suivi des mails.xlsm)
-    lit ses indices par nom (EnsureSchema), constantes historiques en
-    repli. Un decalage de colonne cote Outlook ne peut plus faire cliquer
-    la mauvaise action (incident v5.7).
-  * A12 - modBackupAuto : sauvegarde des 7 branches registre (QuickMove,
-    Outlook_Calendrier, BackupAuto, Toolkit, FolderScan,
-    MailResponseTracker, ClassicOutlookToolkit) via GetAllSettings, fichier
-    .reg standard ; plus de "cmd /c reg export" (shell depuis Outlook,
-    motif surveille par l'EDR ; 3 branches sur 7 seulement).
-  * B1 - modQuickMove : cache #QM3 (boite, chemin, EntryID, StoreID) ;
-    rebinding par GetFolderFromID (1 appel par dossier) au lieu de la
-    descente nominale ; dossier renomme/deplace -> chemin repare depuis
-    l'objet vivant et cache reecrit ; descente nominale en repli. Formats
-    #QM2 et ancien encore lus. PathLower / LeafLower precalcules a
-    l'indexation (plus de LCase par dossier a chaque frappe).
-  * B2 - ThisOutlookSession.CleanOldFlags : filtre Restrict (drapeau pose
-    ET recu avant le seuil ; Jet -> DASL proptag -> date seule en repli)
-    au lieu d'un parcours de toute la boite de reception.
-  * B3 - Lectures Excel en bloc : modProjectTag (WriteNewFolder,
-    FindSimilarFolders) et modMailResponseTracker (phase 1 des statuts) via
-    modExcelBridge.ReadBlock (1 aller-retour COM au lieu de 2 a 6 par ligne).
-  * B7 - Collections COM evaluees une fois par boucle : modQuickMove.
-    EnumerateFolders (le scan complet de l'index), modFolderScan,
-    modFolderSort, modMailCampaign (comptage/purge des brouillons),
-    modSnooze.SnoozeList. validate.py avertit (COMLOOP).
-  * B8 - Resolution SMTP mise en cache (modSmtp) : identite propre calculee
-    une fois, adresse Exchange -> SMTP memorisee par session, organisateur
-    memorise par EntryID.
-  * B9 - modMailConfidentiality.HasUrgentBanner : pre-filtre sans lecture
-    du corps (prefixe "[URGENT] " ou importance haute) - HTMLBody n'est
-    plus lu a chaque envoi sur le chemin critique d'ItemSend.
-  * B10 - modFolderScan.GetLastActivityDate : Restrict par plages de dates
-    decroissantes + GetFirst au lieu de Sort + 50 items par dossier.
-  * B11 - modContactFromMail.FindExisting : anti-doublon par Restrict sur
-    Email1/2/3Address puis LIKE sur le nom ; parcours complet reserve aux
-    noms accentues.
-  * C1 - modExcelBridge (nouveau) : GetExcelApp (fantome ecarte, instance
-    invisible adoptee, retry/backoff), OpenWorkbook furtif, CloseWorkbook
-    (fenetre re-affichee avant Save, Quit si instance a nous et vide),
-    ReadBlock, DataLastRow. modProjectTag l'utilise (OpenTimeTrackingCore +
-    CloseTimeTracking remplace 8 sequences Close/Quit) ; modMailCampaign.
-    ObtenirExcel et le tracker s'appuient sur modCommon.ExcelAlive (copie
-    privee du tracker supprimee). Le cycle de vie imbrique du tracker
-    (mWbDepth) reste tel quel, volontairement.
-  * C2 - modSmtp (nouveau) : MySmtp/MyName/IsMe, RecipientSmtp,
-    AddressEntrySmtp, OrganizerSmtp, SenderSmtp, ExtractDomain,
-    IsInternalDomain (egalite OU sous-domaine ; avant : egalite stricte
-    dans MeetingColor, sous-chaine dans ReplySuspicion), ClearCache,
-    SmtpDiag. modMeetingColor, modMeetingToAppointment,
-    modAppointmentPrivacy, modReplySuspicion, modReplyGreeting et
-    modMailResponseTracker deleguent (helpers prives conserves en
-    delegation d'une ligne, signatures inchangees).
-  * C3 - modContactCommon (nouveau) : IsSkippedFolder(fld, motifs),
-    IsInDeletedItems, IsHiddenFolder, StripAccents (variante etendue),
-    CollapseSpaces, NormKey, FlatText, SafeStr, HasDigit, DigitsOnly. Les 6
-    modules contacts deleguent (avant : jusqu'a 6 copies, 2 variantes).
-  * C4 - modQuickMove : scanner de codes unique (ScanPassProject / Digits /
-    Contract, ScanCodes, PrioritizedCodes, FirstCode, CleanBodyText,
-    PushCandidate) ; ExtractPrefill, ExtractPrefillSilent et
-    CollectBodyCandidates reecrits dessus (7 copies des 3 passes
-    supprimees, CandidateExists supprime). Contrat du classement
-    silencieux inchange : passe la plus prioritaire non vide, 1 seul
-    candidat.
-  * C5 - modProjectTag : AskNewFolderFields (assistant 5 champs partage),
-    NewFolderRecap, BuildProject (constructeur TProject unique pour le
-    loader et la creation inline), FindSimilarFoldersCached (depuis le
-    cache de session : Excel n'est plus ouvert AVANT la saisie, seulement
-    pour ecrire). ~300 lignes en moins.
-  * C6 - Reindexation QuickMove hebdomadaire via modDefer "Reindex" (+120 s,
-    premier demarrage de la semaine quel que soit le jour). Plus de RDV
-    technique QuickMove_BackgroundReindex ni de detour par
-    Application_Reminder ; un RDV technique herite est supprime.
-  * C7 - modMailCampaign : ENVOI ASYNCHRONE. CampaignSend prepare la file
-    (lignes valides), toast, et envoie la premiere ligne ; chaque suivante
-    est armee via modDefer "CampaignNext" (pas normal, pause longue a la
-    frontiere de paquet). CampaignSendNext / CampaignFinish / CampaignStop ;
-    CampaignResetSend annule le timer. Outlook reste utilisable pendant
-    toute la campagne (avant : Sleep + DoEvents, Outlook fige 17 min pour
-    50 mails). modDefer.Cancel(key) public ajoute.
-  * C8 - modReplyInPlace MULTIBOITE : post-it "eid|sid" (EntryID + StoreID
-    du dossier parent), resolution GetFolderFromID(eid, sid) ; exclusion
-    des dossiers systeme calculee PAR BOITE (SysIDsForStore / RootForStore,
-    dossiers publics exclus). Une reponse a un mail range dans une boite
-    partagee est desormais classee.
-  * C10 - Categories et libelles externalises : PersonalCategory,
-    PersonalCategoryAlt, InternalTaskCategory, CommercialCategory,
-    ContractLabelOpportunity, ContractLabelDefault (config.ini) ;
-    modConfig.IsPersonalCategoryName / ContainsPersonalCategory remplacent
-    les tests "Personnel" en dur (modProjectTag, modMeetingColor,
-    modAppointmentPrivacy).
-  * C12 - modInspectorQueue (nouveau) : Register(insp, tag, passes) /
-    Take(key) / Release / PendingCount. modNewMeetingDefault,
-    modMaximizeWindow (3 passes), modHideBcc (2 passes) et
-    modMeetingToAppointment (pre-nettoyage Teams, relance "pcr") l'utilisent ;
-    4 dictionnaires g_Pending* prives supprimes.
-  * C13 - modQuickMove.PickFolder(header, title, prefill, allowRescan) :
-    boucle de selection partagee ; GoToFolder et modFolderMerge
-    (ChooseIndexedFolder) passent par elle. Accesseurs IndexFolderObject /
-    IndexFolderPath / IndexCount / IsIndexLoaded pour les consommateurs
-    externes (ThisOutlookSession, modFolderMerge).
-  * C16 - modMsgBoxCustom : vbMsgBoxSetForeground sur tous les MsgBox du
-    module ; compte a rebours SUSPENDU tant qu'Outlook n'est pas au premier
-    plan (modUi.OutlookIsForeground).
-  * C17 - modReplySuspicion : mots-cles d'attente lus dans config.ini
-    (SuspicionKeywords, separateur |), liste FR historique en repli.
-  * C18 - modReplyGreeting : prenom lu dans l'annuaire Exchange
-    (GetExchangeUser.FirstName) en premier, deduction depuis l'adresse en
-    repli.
-  * D1 - Branches #If VBA7 / #Else supprimees (64-bit seul) : modNotify,
-    modMailCampaign (Sleep retire), modMailResponseTracker, modFolderMerge.
-  * D4 - modNotify : le moniteur epingle n'est consomme que par NotifyFiled.
-  * D5 - modDefer.Arm delegue a ArmMs (une seule mecanique SetTimer).
-  * D6 - modConfig.ContainsProjectCode exact (N chiffres, plus N+) ;
-    FindContractCode accepte "_" ou "-" comme le regex.
-  * D7 - modDebugLog : chemin du log derive de modConfig.MacroVBADir().
-  * D10 - modInboxAlert : donnee sortie du T() ("+ N autre(s)").
-  * D11 - Chemins "Macro VBA\Outlook" : modBackupAuto / modBackupVBA
-    relatifs a modConfig.MacroVBADir().
-  * D12 - modMigrateTags : table de renommage en cle config TagMigrationMap.
-  * D13 - Prefixe g_ retire des privees : modReplySuspicion (mCandidates,
-    mPending, mTimerArmed), modNewMeetingDefault, modMaximizeWindow,
-    modHideBcc, modMeetingToAppointment (gPreClean).
-  * D14 - validate.py : marqueurs inconnus (MARKER), e circonflexe ecrit
-    ~e (ECIRC), Dim en double dans une procedure (DUPDIM), collection COM
-    re-evaluee dans une boucle (COMLOOP), --config <ini> (cles inconnues),
-    --gen-versions (Select Case de ModuleVersionOf), --gen-config (modele
-    de config depuis le code). modOneNote instrumente (plus d'exclusion).
-    Option Explicit en ligne 1 : modConfig, modFolderMerge, modOneNote,
-    modMailExport, modOneNoteProbe.
-  * Docs : ARCHITECTURE.md (4 nouveaux modules, cles modDefer, cache #QM3,
-    feuille _Schema, CampaignStop), README.md (installation, --config,
-    BirthdayCalendarAutoShow).
-  * NON LIVRES (volontairement) : B4 (reparation tracker par
-    AdvancedSearch - sonde a faire), B5 (ACE OLEDB - sonde EDR), B6 (buffer
-    de log), B12 (GetTable analytics), C9 (noms FR de modMailCampaign), C11
-    (deplacement du hub d'evenements ; A5 traite a minima), C15
-    (modSendToLLM, sur consigne).
-
 
 [2026-09-02] PACK v3 - revue integrale du toolkit : bugs (A), performance (B),
              architecture (C), nettoyage (D). Les constantes MOD_VERSION des

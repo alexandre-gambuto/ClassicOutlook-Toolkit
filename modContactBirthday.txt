@@ -1,7 +1,7 @@
 Option Explicit
 
 '=============================================================================
-' modContactBirthday v1.9  (2026-08-19)
+' modContactBirthday v1.10  (2026-09-17)
 ' Purpose (EN): create and maintain ONE yearly all-day birthday event per
 '   contact (Birthday field) in a calendar of your choice, scanning ALL
 '   contact folders of a chosen store (sub-folders included, Exchange system
@@ -91,7 +91,8 @@ Option Explicit
 '      Exchange re-localise "Calendar" en "Calendrier" tout seul quand la
 '      langue de la boite change) ;
 '   5. force la vue Calendrier / Semaine (olCalendarViewWeek : samedi et
-'      dimanche inclus, contrairement a la semaine de travail).
+'      dimanche inclus, contrairement a la semaine de travail) ;
+'   6. v1.10 : REND LA MAIN AU PREMIER CALENDRIER (voir ci-dessous).
 ' A appeler au PREMIER passage dans le calendrier de la session. Dans ce
 ' projet : depuis ThisOutlookSession.SetupBirthdayViewDeferred (modDefer,
 ' cle "BirthdayView"), en passant la fenetre calendrier en parametre
@@ -105,6 +106,29 @@ Option Explicit
 ' mViewDone n'est posee que si c'est verifie (ou si rien a faire). Sinon
 ' l'appelant peut relancer (ContactBirthdayViewPending), au plus
 ' VIEW_MAX_ATTEMPTS fois. ContactBirthdayResetViewFlag pour re-tester.
+'
+' v1.10 (2026-09-17) : FOCUS RENDU AU PREMIER CALENDRIER.
+'   Cocher un calendrier le rend ACTIF : le calendrier des anniversaires
+'   (ajoute en dernier dans le groupe) se retrouvait donc au premier plan,
+'   et c'etait lui qui recevait un nouveau rendez-vous. Le coche est
+'   conserve (superposition), mais le dernier geste de la mise en place
+'   redonne la main au PREMIER calendrier coche - concretement le
+'   calendrier principal - via Explorer.SelectFolder, qui respecte la
+'   multi-selection du volet (contrairement a CurrentFolder, qui peut
+'   ramener l'affichage a un seul calendrier ; il reste le repli si
+'   SelectFolder echoue).
+'   - Cible du focus : BirthdayCalendarFocusPath si renseignee (chemin
+'     Outlook complet), sinon le PREMIER calendrier encore coche apres la
+'     passe de decochage (donc un chemin de BirthdayCalendarKeepPaths /
+'     KeepDefaultOf). Aucun candidat = rien a faire.
+'   - BirthdayCalendarFocusFirst=0 : ancien comportement (aucun focus
+'     force).
+'   - Si la bascule de calendrier actif a decoche le calendrier des
+'     anniversaires (comportement possible du repli CurrentFolder), il est
+'     RECOCHE : le coche prime sur le focus, et le resultat est logue.
+'   - Le focus n'est jamais bloquant : un focus non confirme est logue mais
+'     ne rejoue pas la mise en place (sinon coche et focus se disputeraient
+'     le dernier geste a chaque tentative).
 '
 ' SUBS PUBLIQUES (epinglables au QAT) :
 '   ContactBirthdaySync         compte -> calendrier cible -> Simulation /
@@ -126,7 +150,8 @@ Option Explicit
 '   AnniversaryReminderDaysBefore, BirthdayCalendarPath,
 '   BirthdayCalendarAutoShow, BirthdayCalendarOverlay,
 '   BirthdayCalendarUncheckOthers, BirthdayCalendarKeepPaths,
-'   BirthdayCalendarKeepDefaultOf,
+'   BirthdayCalendarKeepDefaultOf, BirthdayCalendarFocusFirst (v1.10),
+'   BirthdayCalendarFocusPath (v1.10),
 '   BirthdayCalendarWeekView, ContactSkipFolders (partagee).
 '
 ' UserProperties (fonctionnelles, jamais traduites) : BirthdayKey (sur les
@@ -137,7 +162,7 @@ Option Explicit
 '=============================================================================
 
 Private Const MOD_NAME As String = "ContBday"
-Private Const MOD_VERSION As String = "v1.9 - 2026-08-19"
+Private Const MOD_VERSION As String = "v1.10 - 2026-09-17"
 
 ' UserProperty posee sur chaque evenement genere (fonctionnelle, hors T()).
 Private Const UP_KEY As String = "BirthdayKey"
@@ -184,6 +209,9 @@ Private mCalPath As String
 Private mViewDone As Boolean      ' garde : une mise en place VERIFIEE par session
 Private mViewAttempts As Long     ' v1.9 : tentatives de mise en place (echecs compris)
 Private Const VIEW_MAX_ATTEMPTS As Long = 4
+' v1.10 : attente apres la bascule de calendrier actif (le volet applique
+' le changement au cycle de message suivant).
+Private Const FOCUS_SETTLE_MS As Long = 150
 
 ' --- Rapport (buffer texte, ecrit en UTF-8 a la fin) ---
 Private mReport As String
@@ -393,7 +421,8 @@ End Sub
 '=============================================================================
 ' ContactBirthdaySetupView
 ' Met en place la vue calendrier : calendrier des anniversaires dans "Mes
-' calendriers", coche, en superposition, les autres decoches, vue Semaine.
+' calendriers", coche, en superposition, les autres decoches, vue Semaine,
+' puis (v1.10) focus rendu au premier calendrier coche.
 ' Silencieuse (aucune boite, aucune erreur visible), une seule fois par
 ' session. A appeler au premier passage dans le calendrier (FolderSwitch).
 '=============================================================================
@@ -428,6 +457,11 @@ Public Sub ContactBirthdaySetupView(Optional ByVal targetExp As Outlook.Explorer
     ' Designation par ROLE : chemins des calendriers PAR DEFAUT des comptes
     ' listes, resolus a l'execution (insensible au nom / a la langue).
     keepPaths = keepPaths & DefaultCalendarPaths(modConfig.Cfg("BirthdayCalendarKeepDefaultOf", ""))
+
+    ' v1.10 : cible du focus final (voir en-tete).
+    Dim focusFirst As Boolean, focusPath As String
+    focusFirst = modConfig.CfgB("BirthdayCalendarFocusFirst", True)
+    focusPath = Trim$(modConfig.Cfg("BirthdayCalendarFocusPath", ""))
 
     Dim exp As Outlook.Explorer
     Set exp = targetExp
@@ -476,8 +510,12 @@ Public Sub ContactBirthdaySetupView(Optional ByVal targetExp As Outlook.Explorer
         Exit Sub
     End If
 
-    ' 2) cocher + superposer, decocher les autres (sauf exceptions)
+    ' 2) cocher + superposer, decocher les autres (sauf exceptions).
+    '    v1.10 : au passage, on retient le PREMIER calendrier qui reste coche
+    '    et qui n'est pas celui des anniversaires : c'est le candidat au
+    '    focus final.
     Dim grp As Outlook.NavigationGroup, nf As Outlook.NavigationFolder, pth As String
+    Dim firstKept As Outlook.NavigationFolder
     For Each grp In calMod.NavigationGroups
         For Each nf In grp.NavigationFolders
             pth = ""
@@ -488,7 +526,11 @@ Public Sub ContactBirthdaySetupView(Optional ByVal targetExp As Outlook.Explorer
             ElseIf uncheck Then
                 If InStr(keepPaths, "|" & LCase$(pth) & "|") = 0 Then
                     If nf.IsSelected Then nf.IsSelected = False
+                ElseIf firstKept Is Nothing Then
+                    If nf.IsSelected Then Set firstKept = nf
                 End If
+            ElseIf firstKept Is Nothing Then
+                If nf.IsSelected Then Set firstKept = nf
             End If
             Err.Clear
         Next nf
@@ -497,7 +539,29 @@ Public Sub ContactBirthdaySetupView(Optional ByVal targetExp As Outlook.Explorer
     ' 3) vue Calendrier / Semaine (samedi et dimanche visibles)
     If weekView Then ApplyWeekView exp
 
-    ' 4) VERIFICATION (v1.9) : on relit l'etat reel du volet. Si la fenetre
+    ' 4) FOCUS (v1.10) : cocher un calendrier le rend ACTIF. Sans ce dernier
+    '    geste, le calendrier des anniversaires (coche en dernier, et ajoute
+    '    en dernier dans le groupe) restait au premier plan et recevait les
+    '    nouveaux rendez-vous. On redonne la main au premier calendrier
+    '    coche - le calendrier principal.
+    Dim focusNav As Outlook.NavigationFolder
+    Dim focusOk As Boolean
+    focusOk = True
+    If focusFirst Then
+        If Len(focusPath) > 0 Then
+            Set focusNav = FindNavFolder(calMod, focusPath)
+            If focusNav Is Nothing Then _
+                modDebugLog.DInfo MOD_NAME, "Focus : BirthdayCalendarFocusPath introuvable dans le volet : " & focusPath
+        End If
+        If focusNav Is Nothing Then Set focusNav = firstKept
+        If focusNav Is Nothing Then
+            modDebugLog.DDebug MOD_NAME, "Focus : aucun autre calendrier coche, rien a faire"
+        Else
+            focusOk = FocusCalendar(exp, focusNav)
+        End If
+    End If
+
+    ' 5) VERIFICATION (v1.9) : on relit l'etat reel du volet. Si la fenetre
     '    n'etait pas encore construite, Outlook recharge ses calendriers
     '    coches apres nous et le coche est perdu : on NE pose PAS la garde,
     '    l'appelant relancera.
@@ -508,16 +572,83 @@ Public Sub ContactBirthdaySetupView(Optional ByVal targetExp As Outlook.Explorer
     If Not target Is Nothing Then applied = target.IsSelected
     If Err.Number <> 0 Then applied = False: Err.Clear
 
+    ' v1.10 : la bascule de calendrier actif peut avoir decoche notre
+    ' calendrier (cas du repli CurrentFolder). Le coche PRIME sur le focus :
+    ' on le recoche immediatement plutot que de rejouer toute la passe.
+    If Not applied And Not focusNav Is Nothing And Not target Is Nothing Then
+        Err.Clear
+        target.IsSelected = True
+        If overlay Then target.IsSideBySide = False
+        Set target = FindNavFolder(calMod, wantPath)
+        If Not target Is Nothing Then applied = target.IsSelected
+        If Err.Number <> 0 Then applied = False: Err.Clear
+        modDebugLog.DInfo MOD_NAME, "Focus : coche anniversaires recoche apres bascule (coche=" & applied & ")"
+    End If
+
     If applied Then
         mViewDone = True
         modDebugLog.DInfo MOD_NAME, "Vue calendrier mise en place (overlay=" & overlay & _
-            " uncheck=" & uncheck & " week=" & weekView & ", tentative " & mViewAttempts & ")"
+            " uncheck=" & uncheck & " week=" & weekView & " focus=" & focusOk & _
+            ", tentative " & mViewAttempts & ")"
     Else
         modDebugLog.DInfo MOD_NAME, "Vue calendrier : coche non confirme (tentative " & _
             mViewAttempts & "/" & VIEW_MAX_ATTEMPTS & ")"
     End If
     Err.Clear
 End Sub
+
+'=============================================================================
+' FocusCalendar (v1.10) - rend un calendrier ACTIF sans decocher les autres.
+' SelectFolder est la methode qui respecte la multi-selection du volet ;
+' CurrentFolder ne sert que de repli (il peut ramener l'affichage a un seul
+' calendrier - d'ou la re-verification du coche par l'appelant).
+' Renvoie True si le calendrier actif est bien devenu celui demande.
+' Aucune erreur visible : un focus impossible est logue, jamais bloquant.
+'=============================================================================
+Private Function FocusCalendar(ByVal exp As Outlook.Explorer, _
+                               ByVal nf As Outlook.NavigationFolder) As Boolean
+    On Error Resume Next
+    Dim fld As Outlook.MAPIFolder
+    Set fld = nf.Folder
+    If fld Is Nothing Then
+        Err.Clear
+        Exit Function
+    End If
+
+    Dim wantedPath As String
+    wantedPath = fld.FolderPath
+
+    ' Pas de raccourci "deja le dossier courant" : en superposition,
+    ' CurrentFolder ne reflete pas toujours le calendrier reellement au
+    ' premier plan. On re-affirme donc le focus a chaque mise en place.
+    Err.Clear
+    exp.SelectFolder fld
+    If Err.Number <> 0 Then
+        modDebugLog.DDebug MOD_NAME, "Focus : SelectFolder err " & Err.Number & " -> repli CurrentFolder"
+        Err.Clear
+        Set exp.CurrentFolder = fld
+        If Err.Number <> 0 Then
+            modDebugLog.DInfo MOD_NAME, "Focus impossible (err " & Err.Number & ") : " & wantedPath
+            Err.Clear
+            Exit Function
+        End If
+    End If
+
+    Sleep FOCUS_SETTLE_MS
+    DoEvents
+
+    Dim curPath As String
+    curPath = ""
+    curPath = exp.CurrentFolder.FolderPath
+    FocusCalendar = (StrComp(curPath, wantedPath, vbTextCompare) = 0)
+    If FocusCalendar Then
+        modDebugLog.DInfo MOD_NAME, "Focus rendu au calendrier : " & wantedPath
+    Else
+        modDebugLog.DInfo MOD_NAME, "Focus non confirme (actif = '" & curPath & _
+            "', demande = '" & wantedPath & "')"
+    End If
+    Err.Clear
+End Function
 
 ' True tant que la mise en place n'est pas verifiee (et pas abandonnee) :
 ' l'appelant peut re-armer un appel differe. Lu par ThisOutlookSession.

@@ -18,6 +18,37 @@ Option Explicit
 '   organises par DOSS (4 chiffres), contrat (202X_XXXXX) et nom de dossier
 '   client/partenaire.
 '
+' v12.0 (2026-09-24) : PACK v4 - CHARGEMENT INSTANTANE ET LISTE A JOUR.
+'   (a) LIAISON A LA DEMANDE. SmartLoad lit le cache et c'est tout : plus de
+'       reconnexion des 1248 dossiers un par un a chaque session (4 a 28 s
+'       de gel au premier classement de la journee, cf. debug.log). Un
+'       dossier n'est relie (1 GetFolderFromID) qu'au moment ou il sert
+'       (BindEntry), chemin repare au passage s'il a ete renomme/deplace.
+'   (b) CACHE VALABLE 7 JOURS (avant : 24 h, d'ou des parcours complets
+'       frequents). Au-dela, reindexation PAR PAQUETS (ReindexStep, cle
+'       modDefer "Reindex") : ~120 ms de travail, puis la main est rendue
+'       a Outlook. BackgroundReindex lance ce mode ; QuickMoveReload et le
+'       re-scan manuel restent immediats. Duree par boite au journal.
+'   (c) LISTE A JOUR SANS RE-SCAN. clsFolderWatcher (nouvelle classe)
+'       ecoute FolderAdd / FolderChange sur la Boite de reception, ses
+'       enfants directs et les dossiers qui ont deja des sous-dossiers
+'       (DV, _Archives, Direction Partenariats...), plafond 150. Un dossier
+'       CREE, RENOMME ou DEPLACE dans Outlook est pris en compte aussitot,
+'       ses sous-dossiers aussi ; un dossier cree recoit a son tour un
+'       surveillant. Elements supprimes est surveille : un dossier supprime
+'       sort de la liste. POURQUOI CA NE MARCHAIT PAS : seule la commande
+'       "+" (CreateFolderInteractive) ajoutait a l'index ; un dossier cree
+'       par clic droit > Nouveau dossier n'y entrait qu'au parcours complet
+'       suivant. Limite : boite par defaut seulement ; un sous-dossier cree
+'       dans un dossier sans enfant existant (non surveille) attend la
+'       reindexation hebdomadaire ou le re-scan.
+'   (d) Chemins : Folder.FolderPath ecrit "/" sous la forme "%2F". Le cache
+'       melangeait les deux ecritures ("C4XG %2F CCSK-ICE" affiche, 9 a 34
+'       chemins "repares" a chaque session). Decodage dans
+'       PathFromFolderObject et AddFolderToIndex.
+'   (e) Cible refusee si le dossier est passe dans Elements supprimes.
+'   NOUVELLE DEPENDANCE : clsFolderWatcher (module de classe).
+'
 ' v11.4 (2026-09-15) : listes de resultats - NOM DE BOITE EN EN-TETE de
 '   groupe (comme le choix du dossier de modContactFromMail) au lieu du
 '   prefixe "[Boite] " repete sur chaque ligne : la boite sur sa propre
@@ -148,8 +179,9 @@ Option Explicit
 '                       (code + nom + partenaire), l'indexe et garantit
 '                       la ligne correspondante dans Suivi de temps.xlsm.
 '   QuickMoveReload     Re-scan complet MAPI + reecriture du cache.
-'   BackgroundReindex   Idem, sans MsgBox (appel depuis ThisOutlookSession
-'                       au demarrage si besoin).
+'   BackgroundReindex   Lance la reindexation PAR PAQUETS (v12, asynchrone).
+'   ReindexStep         Un paquet de reindexation (cle modDefer "Reindex").
+'   FolderWatchStart    Surveillance des creations/renommages de dossiers.
 '
 '------------------------------------------------------------------------------
 ' Fonctionnement interne
@@ -159,9 +191,9 @@ Option Explicit
 '                     "Inbox > Reseau > SNA_Bloc-notes 3 > COPIL" et l'objet
 '                     MAPI associe.
 '   Cache             QuickMoveCache.txt (chemins texte) dans modConfig.
-'                     AppDataOutlookPath(). Valide 24h. Au demarrage,
-'                     SmartLoad lit le cache puis ResolveFromCache rebinde
-'                     les objets MAPI. Si <80% resolus -> rescan complet.
+'                     AppDataOutlookPath(). v12 : toujours utilise s'il
+'                     existe ; objets MAPI lies a la demande (BindEntry) ;
+'                     reindexation par paquets apres 7 jours.
 '   Recents           QuickMoveRecents.txt : top 5 des dossiers cibles
 '                     recents, ordre MRU. Affiche en tete quand on lance
 '                     QuickMove sans prefill.
@@ -216,6 +248,7 @@ Private Type FolderInfo
     StoreID As String         ' pack v3 (B1)
     PathLower As String       ' pack v3 : LCase(FolderPath), precalcule (FindMatches)
     LeafLower As String       ' pack v3 : dernier segment en minuscules (FindMatchesLeaf)
+    Dead As Boolean           ' v12 : dossier supprime -> ignore, non sauvegarde
 End Type
 
 Public mFolders() As FolderInfo
@@ -235,7 +268,7 @@ Public mRecentFolders(1 To 5) As Long
 Public mRecentCount As Long
 
 Private Const MOD_NAME As String = "QuickMove"
-Private Const MOD_VERSION As String = "v11.4 - 2026-09-15"
+Private Const MOD_VERSION As String = "v12.0 - 2026-09-24"
 
 Private Const CACHE_FILE = "QuickMoveCache.txt"
 Private Const RECENT_FILE = "QuickMoveRecents.txt"
@@ -260,6 +293,32 @@ Private mRegexDigits As Object
 ' Portee session : remis a zero au redemarrage d'Outlook ou apres un Reinit
 ' VBE (sans consequence : prefill vide).
 Private mLastKeyword As String
+
+' v12 (pack v4) : liaison a la demande, reindexation par paquets,
+' surveillance des dossiers.
+Private mEidIndex As Object            ' EntryID -> indice (construit a la demande)
+Private mDelEIDByStore As Object       ' StoreID -> EntryID des Elements supprimes
+Private mBgActive As Boolean           ' reindexation par paquets en cours
+Private mBgFolders() As FolderInfo
+Private mBgCount As Long
+Private mBgStkFld() As Object
+Private mBgStkPath() As String
+Private mBgStkStore() As String
+Private mBgStkRoot() As Boolean
+Private mBgTop As Long
+Private mBgExcluded As Object
+Private mBgT0 As Double
+Private mBgLastStep As Date
+Private mBgLiveAdded As Collection     ' EntryID ajoutes a chaud pendant le parcours
+Private mFolderWatchers As Collection  ' instances clsFolderWatcher (maintenues en vie)
+Private mWatchedEIDs As Object
+Private mWatchQueue As Collection      ' EntryID des dossiers restant a surveiller
+Private Const CACHE_MAX_AGE_DAYS As Long = 7
+Private Const REINDEX_DELAY_SEC As Long = 240
+Private Const BG_SLICE_MS As Long = 120
+Private Const BG_GAP_MS As Long = 150
+Private Const WATCH_MAX As Long = 150
+Private Const WATCH_SLICE As Long = 15
 
 '=============================================================================
 ' Version reellement chargee (lue par modMaintenance.MaintModuleVersions).
@@ -432,11 +491,22 @@ End Sub
 ' recharge le cache UNE fois et on reessaie. Invisible si tout est coherent.
 Private Sub NavigateToFolder(ByVal idx As Long)
     On Error GoTo Fail
+    ' v12 : liaison a la demande AVANT de lire le chemin attendu (chemin
+    ' repare par BindEntry si le dossier a ete renomme ou deplace).
+    Dim target As Object
+    Set target = BindEntry(idx)
+    If target Is Nothing Then
+        If mFolders(idx).Dead Then
+            MsgBox T("Ce dossier a ~et~e supprim~e.", "This folder was deleted."), _
+                   vbExclamation, "QuickMove"
+            Exit Sub
+        End If
+    End If
     Dim expectedPath As String, expectedStore As String
     expectedPath = mFolders(idx).FolderPath
     expectedStore = mFolders(idx).StoreName
 
-    If NavigateAndVerify(mFolders(idx).FolderObject, expectedPath) Then
+    If NavigateAndVerify(target, expectedPath) Then
         modDebugLog.DInfo MOD_NAME, "GoTo -> " & expectedPath
         Exit Sub
     End If
@@ -450,7 +520,7 @@ Private Sub NavigateToFolder(ByVal idx As Long)
     For j = 1 To mFolderCount
         If mFolders(j).FolderPath = expectedPath And _
            StrComp(mFolders(j).StoreName, expectedStore, vbTextCompare) = 0 Then
-            If NavigateAndVerify(mFolders(j).FolderObject, expectedPath) Then
+            If NavigateAndVerify(BindEntry(j), expectedPath) Then
                 modDebugLog.DInfo MOD_NAME, "GoTo -> " & expectedPath & " (apres rechargement)"
                 Exit Sub
             End If
@@ -519,23 +589,23 @@ End Sub
 ' CHARGEMENT INTELLIGENT
 ' ============================================================================
 Public Sub SmartLoad()
+    ' v12 (pack v4) : le cache suffit - aucun objet MAPI relie ici (liaison a
+    ' la demande, BindEntry). Avant : cache ignore au-dela de 24 h, puis
+    ' ResolveFromCache reconnectait les ~1250 dossiers un par un (4 a 28 s de
+    ' gel au premier classement de chaque session). Parcours complet
+    ' synchrone seulement s'il n'y a pas de cache du tout.
     Dim sCachePath As String
-    Dim cacheOK As Boolean
     sCachePath = CachePath()
-    cacheOK = False
     If Dir(sCachePath) <> "" Then
-        If (Now - FileDateTime(sCachePath)) < 1 Then
-            cacheOK = True
-        End If
-    End If
-    If cacheOK Then
         LoadFromCache sCachePath
         If mFolderCount > 0 Then
-            ResolveFromCache
-            If mLoaded Then
-                LoadRecents
-                Exit Sub
+            FinishCacheLoad
+            If CacheNeedsRefresh() Then
+                On Error Resume Next
+                modDefer.ArmUnique "Reindex", REINDEX_DELAY_SEC
+                On Error GoTo 0
             End If
+            Exit Sub
         End If
     End If
     LoadAllFolders
@@ -543,16 +613,30 @@ Public Sub SmartLoad()
     LoadRecents
 End Sub
 
+' Fin de chargement depuis le cache : boite par defaut, noms de boite des
+' entrees ancien format, recents. Aucun appel MAPI par dossier.
+Private Sub FinishCacheLoad()
+    On Error Resume Next
+    mDefaultStoreName = DefaultStoreNameSafe()
+    Dim i As Long
+    For i = 1 To mFolderCount
+        If Len(mFolders(i).StoreName) = 0 Then mFolders(i).StoreName = mDefaultStoreName
+    Next i
+    Set mEidIndex = Nothing
+    mLoaded = True
+    LoadRecents
+    modDebugLog.DInfo MOD_NAME, "Index charge depuis le cache : " & mFolderCount & _
+        " dossiers (liaison a la demande)"
+End Sub
+
 ' ============================================================================
 ' INDEXATION EN ARRIERE-PLAN
+' v12 : lance la reindexation PAR PAQUETS (asynchrone, ReindexStep) au lieu
+' d'un parcours complet d'un seul bloc. Signature inchangee (modFolderMerge).
 ' ============================================================================
 Public Sub BackgroundReindex()
-    Dim sCachePath As String
-    sCachePath = CachePath()
-    LoadAllFolders
-    SaveToCache sCachePath
-    LoadRecents   ' v10 - FIX : remapper les recents (cf. QuickMoveReload)
-    modDebugLog.DInfo MOD_NAME, "Reindexation arriere-plan terminee : " & mFolderCount & " dossiers."
+    On Error Resume Next
+    modDefer.ArmUniqueMs "Reindex", 500
 End Sub
 
 ' ============================================================================
@@ -564,6 +648,17 @@ Public Sub LoadAllFolders()
     Dim ns As Object
     Dim rootFolder As Object
     Dim st As Object
+
+    ' v12 : un parcours complet immediat rend caduc un parcours par paquets.
+    If mBgActive Then
+        BgAbort
+        On Error Resume Next
+        modDefer.Cancel "Reindex"
+        On Error GoTo 0
+    End If
+    Set mEidIndex = Nothing
+    Dim tAll As Double, storeLog As String
+    tAll = Timer
 
     mFolderCount = 0
     ReDim mFolders(1 To 2000)
@@ -608,14 +703,21 @@ Public Sub LoadAllFolders()
         Set rootFolder = st.GetRootFolder
         On Error GoTo 0
         If Not rootFolder Is Nothing Then
+            Dim tStore As Double, nBefore As Long
+            tStore = Timer
+            nBefore = mFolderCount
             EnumerateFolders rootFolder, "", stName
             nbStores = nbStores + 1
+            storeLog = storeLog & " | " & stName & " : " & (mFolderCount - nBefore) & _
+                       " en " & Format$(ElapsedSec(tStore), "0.0") & " s"
         End If
 NextStore:
     Next st
 
     mLoaded = True
-    modDebugLog.DInfo MOD_NAME, mFolderCount & " dossiers indexes (" & nbStores & " boite(s))."
+    SaveSetting "QuickMove", "Reindex", "LastFullScan", Str$(CDbl(Now))
+    modDebugLog.DInfo MOD_NAME, mFolderCount & " dossiers indexes (" & nbStores & _
+        " boite(s)) en " & Format$(ElapsedSec(tAll), "0.0") & " s" & storeLog
 End Sub
 
 ' ============================================================================
@@ -632,8 +734,10 @@ Public Sub SaveToCache(sCachePath As String)
     ' dossier) au lieu d'une descente nominale niveau par niveau.
     Print #f, "#QM3"
     For i = 1 To mFolderCount
-        Print #f, mFolders(i).StoreName & vbTab & mFolders(i).FolderPath & vbTab & _
-                  mFolders(i).EntryID & vbTab & mFolders(i).StoreID
+        If Not mFolders(i).Dead Then       ' v12 : dossiers supprimes non repris
+            Print #f, mFolders(i).StoreName & vbTab & mFolders(i).FolderPath & vbTab & _
+                      mFolders(i).EntryID & vbTab & mFolders(i).StoreID
+        End If
     Next i
     Close #f
     modDebugLog.DInfo MOD_NAME, "Cache sauvegarde (#QM3) : " & mFolderCount & " dossiers."
@@ -653,6 +757,7 @@ Public Sub LoadFromCache(sCachePath As String)
     On Error GoTo ErrLoad
     mFolderCount = 0
     ReDim mFolders(1 To 2000)
+    Set mEidIndex = Nothing                ' v12
     ' Formats acceptes : #QM3 (boite TAB chemin TAB EntryID TAB StoreID, pack
     ' v3), #QM2 (boite TAB chemin, v11) et l'ancien format (chemins nus =
     ' boite par defaut). Migration transparente : reecrit en #QM3 a la
@@ -824,7 +929,7 @@ Private Function PathFromFolderObject(ByVal fld As Object) As String
     If UBound(segs) < 1 Then Exit Function
     For k = 1 To UBound(segs)
         If Len(sPath) > 0 Then sPath = sPath & " > "
-        sPath = sPath & segs(k)
+        sPath = sPath & DecodePathSeg(segs(k))   ' v12 : "%2F" -> "/"
     Next k
     PathFromFolderObject = sPath
 End Function
@@ -850,9 +955,15 @@ End Function
 ' LoadFromCache, ResolveFromCache et AddFolderToIndex.
 ' ============================================================================
 Private Sub SetDerivedFields(ByVal idx As Long)
+    DeriveInfo mFolders(idx)
+End Sub
+
+' v12 : meme calcul sur une entree quelconque (index courant ou index en
+' construction par la reindexation par paquets).
+Private Sub DeriveInfo(ByRef fi As FolderInfo)
     Dim p As String, q As Long, lastSep As Long
-    p = mFolders(idx).FolderPath
-    mFolders(idx).PathLower = LCase$(p)
+    p = fi.FolderPath
+    fi.PathLower = LCase$(p)
     lastSep = 0
     q = InStr(1, p, " > ")
     Do While q > 0
@@ -860,14 +971,15 @@ Private Sub SetDerivedFields(ByVal idx As Long)
         q = InStr(q + 3, p, " > ")
     Loop
     If lastSep = 0 Then
-        mFolders(idx).LeafLower = mFolders(idx).PathLower
+        fi.LeafLower = fi.PathLower
     Else
-        mFolders(idx).LeafLower = LCase$(Mid$(p, lastSep + 3))
+        fi.LeafLower = LCase$(Mid$(p, lastSep + 3))
     End If
 End Sub
 
 Private Sub SetEntryFields(ByVal idx As Long, ByVal fld As Object)
     On Error Resume Next
+    Set mEidIndex = Nothing                ' v12 : table EntryID a reconstruire
     mFolders(idx).EntryID = ""
     mFolders(idx).StoreID = ""
     If fld Is Nothing Then Exit Sub
@@ -914,7 +1026,9 @@ Public Sub EnumerateFolders(parentFolder As Object, parentPath As String, _
             End If
             mFolders(mFolderCount).FolderPath = currentPath
             mFolders(mFolderCount).StoreName = storeName
-            Set mFolders(mFolderCount).FolderObject = folder
+            ' v12 : objet non conserve (liaison a la demande, BindEntry).
+            Set mFolders(mFolderCount).FolderObject = Nothing
+            mFolders(mFolderCount).Dead = False
             SetEntryFields mFolderCount, folder
             SetDerivedFields mFolderCount
             Dim kids As Object, nbKids As Long
@@ -1082,7 +1196,7 @@ End Function
 Public Sub AddToRecent(folderIndex As Long)
     Dim i As Long
     Dim j As Long
-    
+
     ' Verifier si deja present
     For i = 1 To mRecentCount
         If mRecentFolders(i) = folderIndex Then
@@ -1095,7 +1209,7 @@ Public Sub AddToRecent(folderIndex As Long)
             Exit Sub
         End If
     Next i
-    
+
     ' Decaler et ajouter
     If mRecentCount < 5 Then mRecentCount = mRecentCount + 1
     For i = mRecentCount To 2 Step -1
@@ -1132,14 +1246,14 @@ Public Sub LoadRecents()
     Dim f As Long
     Dim lineTxt As String
     Dim i As Long
-    
+
     sRecentPath = RecentPath()
     mRecentCount = 0
-    
+
     If Dir(sRecentPath) = "" Then Exit Sub
-    
+
     On Error GoTo ErrLoadR
-    
+
     ' v3 : dict cle -> index pour eviter la recherche lineaire O(n) par
     ' recent. v11 : cle = boite & "|" & chemin (chemins identiques possibles
     ' d'une boite a l'autre, ex "Inbox > X" des deux cotes).
@@ -1514,12 +1628,12 @@ Private Function ExtractContext(body As String, pos As Long, radius As Long) As 
     Dim startPos As Long
     Dim endPos As Long
     Dim snippet As String
-    
+
     startPos = pos - radius
     If startPos < 1 Then startPos = 1
     endPos = pos + radius
     If endPos > Len(body) Then endPos = Len(body)
-    
+
     snippet = Mid(body, startPos, endPos - startPos + 1)
     snippet = Replace(snippet, vbCrLf, " ")
     snippet = Replace(snippet, vbCr, " ")
@@ -1667,7 +1781,7 @@ Public Function IndexFolderObject(ByVal idx As Long) As Object
     On Error Resume Next
     Set IndexFolderObject = Nothing
     If idx < 1 Or idx > mFolderCount Then Exit Function
-    Set IndexFolderObject = mFolders(idx).FolderObject
+    Set IndexFolderObject = BindEntry(idx)     ' v12 : liaison a la demande
 End Function
 
 Public Function IndexFolderPath(ByVal idx As Long) As String
@@ -1799,10 +1913,12 @@ Public Function FindMatches(searchText As String, ByRef matchIndexes() As Long) 
     ' Pack v3 : PathLower precalcule a l'indexation (plus de LCase par dossier
     ' a chaque recherche).
     For i = 1 To mFolderCount
-        If InStr(1, mFolders(i).PathLower, searchLower, vbBinaryCompare) > 0 Then
-            matchCount = matchCount + 1
-            matchIndexes(matchCount) = i
-            If matchCount >= 200 Then Exit For
+        If Not mFolders(i).Dead Then           ' v12 : dossiers supprimes exclus
+            If InStr(1, mFolders(i).PathLower, searchLower, vbBinaryCompare) > 0 Then
+                matchCount = matchCount + 1
+                matchIndexes(matchCount) = i
+                If matchCount >= 200 Then Exit For
+            End If
         End If
     Next i
     FindMatches = matchCount
@@ -1829,10 +1945,12 @@ Public Function FindMatchesLeaf(searchText As String, ByRef matchIndexes() As Lo
     ' Pack v3 : LeafLower precalcule a l'indexation (avant : extraction du
     ' dernier segment + LCase sur chaque dossier a chaque frappe).
     For i = 1 To mFolderCount
-        If InStr(1, mFolders(i).LeafLower, searchLower, vbBinaryCompare) > 0 Then
-            matchCount = matchCount + 1
-            matchIndexes(matchCount) = i
-            If matchCount >= 200 Then Exit For
+        If Not mFolders(i).Dead Then           ' v12 : dossiers supprimes exclus
+            If InStr(1, mFolders(i).LeafLower, searchLower, vbBinaryCompare) > 0 Then
+                matchCount = matchCount + 1
+                matchIndexes(matchCount) = i
+                If matchCount >= 200 Then Exit For
+            End If
         End If
     Next i
     FindMatchesLeaf = matchCount
@@ -2088,7 +2206,7 @@ Public Sub DoMoveToFolder(folderIndex As Long)
     Dim activeWin As Object
     Dim winClass As Long
 
-    Set targetFolder = mFolders(folderIndex).FolderObject
+    Set targetFolder = BindEntry(folderIndex)     ' v12 : liaison a la demande
     If targetFolder Is Nothing Then
         MsgBox T("Dossier introuvable.", "Folder not found."), vbCritical, "QuickMove"
         Exit Sub
@@ -2185,29 +2303,29 @@ Public Sub GoToMailFolder()
         MsgBox T("Aucune fenetre Outlook active.", "No active Outlook window."), vbExclamation, T("Aller au dossier", "Go to folder")
         Exit Sub
     End If
-    
+
     If Application.ActiveExplorer.Selection.count = 0 Then
         MsgBox T("Selectionnez un message.", "Select a message."), vbExclamation, T("Aller au dossier", "Go to folder")
         Exit Sub
     End If
-    
+
     ' Recuperer le mail selectionne et son dossier parent
     Dim selectedItem As Object
     Dim parentFolder As Object
-    
+
     On Error Resume Next
     Set selectedItem = Application.ActiveExplorer.Selection.Item(1)
     Set parentFolder = selectedItem.parent
     On Error GoTo 0
-    
+
     If parentFolder Is Nothing Then
         MsgBox T("Impossible de trouver le dossier parent.", "Cannot find the parent folder."), vbExclamation, T("Aller au dossier", "Go to folder")
         Exit Sub
     End If
-    
+
     ' Basculer l'affichage sur ce dossier
     Set Application.ActiveExplorer.CurrentFolder = parentFolder
-    
+
     modDebugLog.DInfo MOD_NAME, "GoTo -> " & parentFolder.FolderPath
 End Sub
 
@@ -2521,17 +2639,28 @@ End Function
 Private Function AddFolderToIndex(ByVal newFolder As Object) As Long
     AddFolderToIndex = 0
     On Error GoTo Fail
+    If newFolder Is Nothing Then Exit Function
 
-    Dim fp As String
-    fp = CStr(newFolder.FolderPath)
-    If Left$(fp, 2) = "\\" Then fp = Mid$(fp, 3)
-    Dim segs() As String, sPath As String, k As Long
-    segs = Split(fp, "\")
-    If UBound(segs) < 1 Then Exit Function   ' au moins boite + 1 dossier
-    For k = 1 To UBound(segs)                ' segs(0) = nom de la boite
-        If Len(sPath) > 0 Then sPath = sPath & " > "
-        sPath = sPath & segs(k)
-    Next k
+    ' v12 : deja present (evenement FolderAdd ET commande "+" pour le meme
+    ' dossier, ou dossier restaure) -> pas de doublon.
+    Dim eid As String, have As Long
+    eid = CStr(newFolder.EntryID)
+    have = IndexOfEntryID(eid)
+    If have > 0 Then
+        If mFolders(have).Dead Then RepathEntry have, newFolder
+        AddFolderToIndex = have
+        Exit Function
+    End If
+
+    Dim sPath As String
+    sPath = PathFromFolderObject(newFolder)      ' v12 : segments decodes
+    If Len(sPath) = 0 Then Exit Function
+    Dim stName As String
+    stName = ""
+    On Error Resume Next
+    stName = CStr(newFolder.Store.DisplayName)
+    On Error GoTo Fail
+    If Len(stName) = 0 Then stName = mDefaultStoreName
 
     ' Tableau eventuellement non initialise ou plein.
     Dim ub As Long
@@ -2547,15 +2676,691 @@ Private Function AddFolderToIndex(ByVal newFolder As Object) As Long
 
     mFolderCount = mFolderCount + 1
     mFolders(mFolderCount).FolderPath = sPath
-    mFolders(mFolderCount).StoreName = segs(0)
+    mFolders(mFolderCount).StoreName = stName
+    mFolders(mFolderCount).Dead = False
     Set mFolders(mFolderCount).FolderObject = newFolder
     SetEntryFields mFolderCount, newFolder
     SetDerivedFields mFolderCount
+    If mBgActive Then
+        If Not mBgLiveAdded Is Nothing Then mBgLiveAdded.Add eid
+    End If
     SaveToCache CachePath()
-    modDebugLog.DInfo MOD_NAME, "Index +1 : [" & segs(0) & "] " & sPath
+    modDebugLog.DInfo MOD_NAME, "Index +1 : [" & stName & "] " & sPath
     AddFolderToIndex = mFolderCount
     Exit Function
 Fail:
     modDebugLog.DError MOD_NAME, "AddFolderToIndex err " & Err.Number & _
         " - " & Err.Description
+End Function
+
+' ============================================================================
+' v12 (PACK v4) : LIAISON A LA DEMANDE
+' ============================================================================
+
+' ----------------------------------------------------------------------------
+' BindEntry : objet dossier d'une entree, relie A LA DEMANDE (1 appel
+' GetFolderFromID) puis garde. Repli : descente nominale (entree ancien
+' format, EntryID perime). Refuse un dossier passe dans Elements supprimes
+' (entree retiree de l'index). Chemin repare si le dossier a ete renomme ou
+' deplace (meme EntryID), sous-dossiers compris. Nothing si introuvable.
+' ----------------------------------------------------------------------------
+Private Function BindEntry(ByVal idx As Long) As Object
+    On Error Resume Next
+    Set BindEntry = Nothing
+    If idx < 1 Or idx > mFolderCount Then Exit Function
+    If mFolders(idx).Dead Then Exit Function
+
+    Dim fld As Object, probe As String
+    Set fld = mFolders(idx).FolderObject
+    If Not fld Is Nothing Then
+        ' Objet deja relie : encore valide ?
+        Err.Clear
+        probe = CStr(fld.EntryID)
+        If Err.Number <> 0 Then
+            Set fld = Nothing
+            Set mFolders(idx).FolderObject = Nothing
+        End If
+        Err.Clear
+    End If
+
+    Dim changed As Boolean
+    changed = False
+    If fld Is Nothing Then
+        Dim ns As Object
+        Set ns = Application.GetNamespace("MAPI")
+        If Len(mFolders(idx).EntryID) > 0 Then
+            Err.Clear
+            If Len(mFolders(idx).StoreID) > 0 Then
+                Set fld = ns.GetFolderFromID(mFolders(idx).EntryID, mFolders(idx).StoreID)
+            Else
+                Set fld = ns.GetFolderFromID(mFolders(idx).EntryID)
+            End If
+            If Err.Number <> 0 Then Set fld = Nothing
+            Err.Clear
+        End If
+        If fld Is Nothing Then
+            Set fld = ResolveByPath(idx)
+            If Not fld Is Nothing Then
+                SetEntryFields idx, fld
+                changed = True
+            End If
+        End If
+        If fld Is Nothing Then
+            modDebugLog.DInfo MOD_NAME, "Dossier introuvable : " & DisplayPath(idx)
+            Exit Function
+        End If
+    End If
+
+    If IsUnderDeletedItems(fld) Then
+        MarkDeadTree idx
+        SaveToCache CachePath()
+        modDebugLog.DInfo MOD_NAME, "Cible refusee (dossier supprime) : " & DisplayPath(idx)
+        Exit Function
+    End If
+
+    Dim livePath As String
+    livePath = PathFromFolderObject(fld)
+    If Len(livePath) > 0 Then
+        If StrComp(livePath, mFolders(idx).FolderPath, vbBinaryCompare) <> 0 Then
+            RepathEntry idx, fld          ' sauvegarde le cache
+            changed = False
+        End If
+    End If
+    Set mFolders(idx).FolderObject = fld
+    If changed Then SaveToCache CachePath()
+    Set BindEntry = fld
+End Function
+
+' Descente nominale depuis la racine de la boite de l'entree (repli).
+Private Function ResolveByPath(ByVal idx As Long) As Object
+    On Error Resume Next
+    Set ResolveByPath = Nothing
+    Dim ns As Object, st As Object, rootFolder As Object
+    Set ns = Application.GetNamespace("MAPI")
+    For Each st In ns.Stores
+        If StrComp(CStr(st.DisplayName), mFolders(idx).StoreName, vbTextCompare) = 0 Then
+            Set rootFolder = st.GetRootFolder
+            Exit For
+        End If
+    Next st
+    If rootFolder Is Nothing Then Exit Function
+    Dim parts() As String, k As Long, fld As Object
+    parts = Split(mFolders(idx).FolderPath, " > ")
+    Set fld = rootFolder
+    For k = LBound(parts) To UBound(parts)
+        Set fld = ChildByName(fld, parts(k))
+        If fld Is Nothing Then Exit Function
+    Next k
+    Set ResolveByPath = fld
+End Function
+
+' True si le dossier est Elements supprimes de SA boite, ou dessous.
+Private Function IsUnderDeletedItems(ByVal fld As Object) As Boolean
+    On Error Resume Next
+    IsUnderDeletedItems = False
+    Dim delEID As String
+    delEID = DeletedEIDForStore(fld)
+    If Len(delEID) = 0 Then Exit Function
+    Dim f As Object, p As Object, guard As Long
+    Set f = fld
+    Do While Not f Is Nothing And guard < 40
+        guard = guard + 1
+        If StrComp(CStr(f.EntryID), delEID, vbBinaryCompare) = 0 Then
+            IsUnderDeletedItems = True
+            Exit Function
+        End If
+        Set p = Nothing
+        Set p = f.Parent
+        If p Is Nothing Then Exit Do
+        If Not TypeOf p Is Outlook.Folder Then Exit Do
+        Set f = p
+    Loop
+End Function
+
+Private Function DeletedEIDForStore(ByVal fld As Object) As String
+    On Error Resume Next
+    DeletedEIDForStore = ""
+    If mDelEIDByStore Is Nothing Then
+        Set mDelEIDByStore = CreateObject("Scripting.Dictionary")
+        mDelEIDByStore.CompareMode = 0
+    End If
+    Dim sid As String, eid As String
+    sid = CStr(fld.StoreID)
+    If Len(sid) = 0 Then Exit Function
+    If mDelEIDByStore.Exists(sid) Then
+        DeletedEIDForStore = CStr(mDelEIDByStore(sid))
+        Exit Function
+    End If
+    eid = ""
+    eid = CStr(fld.Store.GetDefaultFolder(olFolderDeletedItems).EntryID)
+    mDelEIDByStore(sid) = eid
+    DeletedEIDForStore = eid
+End Function
+
+' Indice d'une entree par EntryID (0 si absente). Table construite a la
+' premiere demande, remise a zero a chaque rechargement de l'index.
+Private Function IndexOfEntryID(ByVal eid As String) As Long
+    On Error Resume Next
+    IndexOfEntryID = 0
+    If Len(eid) = 0 Then Exit Function
+    If mEidIndex Is Nothing Then
+        Set mEidIndex = CreateObject("Scripting.Dictionary")
+        mEidIndex.CompareMode = 0
+        Dim i As Long
+        For i = 1 To mFolderCount
+            If Len(mFolders(i).EntryID) > 0 Then
+                If Not mEidIndex.Exists(mFolders(i).EntryID) Then mEidIndex.Add mFolders(i).EntryID, i
+            End If
+        Next i
+    End If
+    If mEidIndex.Exists(eid) Then IndexOfEntryID = CLng(mEidIndex(eid))
+End Function
+
+' Folder.FolderPath code les caracteres reserves ("/" -> "%2F"...) ; les
+' noms enumeres (.Name) ne le sont pas. On ramene tout a la forme .Name.
+Private Function DecodePathSeg(ByVal s As String) As String
+    s = Replace(s, "%2F", "/", , , vbTextCompare)
+    s = Replace(s, "%5C", "\", , , vbTextCompare)
+    s = Replace(s, "%25", "%", , , vbTextCompare)
+    DecodePathSeg = s
+End Function
+
+Private Function DefaultStoreNameSafe() As String
+    On Error Resume Next
+    DefaultStoreNameSafe = ""
+    DefaultStoreNameSafe = CStr(modStoreContext.DefaultStore().DisplayName)
+End Function
+
+Private Function ElapsedSec(ByVal t0 As Double) As Double
+    Dim d As Double
+    d = Timer - t0
+    If d < 0 Then d = d + 86400#
+    ElapsedSec = d
+End Function
+
+Private Function SegCount(ByVal p As String) As Long
+    Dim n As Long, q As Long
+    n = 1
+    q = InStr(1, p, " > ")
+    Do While q > 0
+        n = n + 1
+        q = InStr(q + 3, p, " > ")
+    Loop
+    SegCount = n
+End Function
+
+' True s'il faut reindexer : pas de cache, ou dernier parcours COMPLET de
+' plus de CACHE_MAX_AGE_DAYS jours (ou jamais). Registre et non date du
+' fichier : le cache est reecrit a chaque ajout ou reparation.
+Public Function CacheNeedsRefresh() As Boolean
+    On Error Resume Next
+    CacheNeedsRefresh = True
+    If Dir(CachePath()) = "" Then Exit Function
+    Dim v As Double
+    v = Val(GetSetting("QuickMove", "Reindex", "LastFullScan", "0"))
+    If v <= 0 Then Exit Function
+    If Now - v < CACHE_MAX_AGE_DAYS Then CacheNeedsRefresh = False
+End Function
+
+' ============================================================================
+' v12 (PACK v4) : REINDEXATION PAR PAQUETS
+' Meme resultat qu'un parcours complet (toutes les boites, Elements supprimes
+' exclus, dossiers publics exclus, QuickMoveExcludeStores), mais construit
+' dans un index SEPARE, par tranches de BG_SLICE_MS millisecondes espacees de
+' BG_GAP_MS : Outlook reste utilisable. L'index courant sert jusqu'a la
+' bascule finale (BgFinish). Pile explicite (parcours en profondeur, meme
+' ordre que EnumerateFolders).
+' ============================================================================
+Public Sub ReindexStep()
+    On Error GoTo Fail
+    If mBgActive Then
+        ' Etat orphelin (timers annules par PrepareForEdit...) : on repart.
+        If DateDiff("n", mBgLastStep, Now) > 10 Then BgAbort
+    End If
+    If Not mBgActive Then
+        If Not BgBegin() Then Exit Sub
+    End If
+    mBgLastStep = Now
+    Dim t0 As Double
+    t0 = Timer
+    Do While mBgTop > 0
+        BgProcessOne
+        If ElapsedSec(t0) * 1000# >= BG_SLICE_MS Then Exit Do
+    Loop
+    If mBgTop > 0 Then
+        modDefer.ArmUniqueMs "Reindex", BG_GAP_MS
+    Else
+        BgFinish
+    End If
+    Exit Sub
+Fail:
+    modDebugLog.DError MOD_NAME, "ReindexStep err " & Err.Number & " - " & Err.Description
+    BgAbort
+End Sub
+
+Private Function BgBegin() As Boolean
+    On Error GoTo Fail
+    BgBegin = False
+    Dim ns As Object, st As Object, rootFolder As Object
+    Dim stName As String, stType As Long, delEID As String, exclus As String
+    Set ns = Application.GetNamespace("MAPI")
+    mBgCount = 0
+    ReDim mBgFolders(1 To 2000)
+    mBgTop = 0
+    ReDim mBgStkFld(1 To 256)
+    ReDim mBgStkPath(1 To 256)
+    ReDim mBgStkStore(1 To 256)
+    ReDim mBgStkRoot(1 To 256)
+    Set mBgExcluded = CreateObject("Scripting.Dictionary")
+    mBgExcluded.CompareMode = 0
+    Set mBgLiveAdded = New Collection
+    exclus = "|" & LCase$(Trim$(modConfig.Cfg("QuickMoveExcludeStores", ""))) & "|"
+
+    Dim roots As Collection, stNames As Collection
+    Set roots = New Collection
+    Set stNames = New Collection
+    For Each st In ns.Stores
+        stName = ""
+        stType = -1
+        On Error Resume Next
+        stName = CStr(st.DisplayName)
+        stType = st.ExchangeStoreType
+        On Error GoTo Fail
+        If stType <> 2 And InStr(exclus, "|" & LCase$(stName) & "|") = 0 Then
+            delEID = ""
+            Set rootFolder = Nothing
+            On Error Resume Next
+            delEID = CStr(st.GetDefaultFolder(olFolderDeletedItems).EntryID)
+            Set rootFolder = st.GetRootFolder
+            On Error GoTo Fail
+            If Len(delEID) > 0 Then
+                If Not mBgExcluded.Exists(delEID) Then mBgExcluded.Add delEID, True
+            End If
+            If Not rootFolder Is Nothing Then
+                roots.Add rootFolder
+                stNames.Add stName
+            End If
+        End If
+    Next st
+
+    ' Racines empilees a l'envers : la premiere boite est parcourue en premier.
+    Dim i As Long
+    For i = roots.count To 1 Step -1
+        BgPush roots(i), "", CStr(stNames(i)), True
+    Next i
+    mDefaultStoreName = DefaultStoreNameSafe()
+    mBgActive = True
+    mBgT0 = Timer
+    mBgLastStep = Now
+    modDebugLog.DInfo MOD_NAME, "Reindexation par paquets : depart (" & roots.count & " boite(s))"
+    BgBegin = True
+    Exit Function
+Fail:
+    modDebugLog.DError MOD_NAME, "BgBegin err " & Err.Number & " - " & Err.Description
+    BgAbort
+End Function
+
+Private Sub BgPush(ByVal fld As Object, ByVal parentPath As String, _
+                   ByVal stName As String, ByVal isRoot As Boolean)
+    mBgTop = mBgTop + 1
+    If mBgTop > UBound(mBgStkFld) Then
+        ReDim Preserve mBgStkFld(1 To mBgTop + 256)
+        ReDim Preserve mBgStkPath(1 To mBgTop + 256)
+        ReDim Preserve mBgStkStore(1 To mBgTop + 256)
+        ReDim Preserve mBgStkRoot(1 To mBgTop + 256)
+    End If
+    Set mBgStkFld(mBgTop) = fld
+    mBgStkPath(mBgTop) = parentPath
+    mBgStkStore(mBgTop) = stName
+    mBgStkRoot(mBgTop) = isRoot
+End Sub
+
+' Depile UN dossier : l'enregistre (sauf racine de boite) et empile ses
+' enfants a l'envers (le premier enfant est traite en premier).
+Private Sub BgProcessOne()
+    On Error Resume Next
+    Dim fld As Object, parentPath As String, stName As String, isRoot As Boolean
+    Set fld = mBgStkFld(mBgTop)
+    parentPath = mBgStkPath(mBgTop)
+    stName = mBgStkStore(mBgTop)
+    isRoot = mBgStkRoot(mBgTop)
+    Set mBgStkFld(mBgTop) = Nothing
+    mBgTop = mBgTop - 1
+    If fld Is Nothing Then Exit Sub
+
+    Dim myPath As String
+    myPath = ""
+    If Not isRoot Then
+        Dim eid As String, nm As String
+        eid = ""
+        eid = CStr(fld.EntryID)
+        If Len(eid) > 0 Then
+            If mBgExcluded.Exists(eid) Then Exit Sub   ' Elements supprimes + sous-arbre
+        End If
+        nm = ""
+        nm = CStr(fld.Name)
+        If Len(parentPath) = 0 Then
+            myPath = nm
+        Else
+            myPath = parentPath & " > " & nm
+        End If
+        mBgCount = mBgCount + 1
+        If mBgCount > UBound(mBgFolders) Then ReDim Preserve mBgFolders(1 To mBgCount + 500)
+        mBgFolders(mBgCount).FolderPath = myPath
+        mBgFolders(mBgCount).StoreName = stName
+        mBgFolders(mBgCount).EntryID = eid
+        mBgFolders(mBgCount).StoreID = ""
+        mBgFolders(mBgCount).StoreID = CStr(fld.StoreID)
+        mBgFolders(mBgCount).Dead = False
+        DeriveInfo mBgFolders(mBgCount)
+    End If
+
+    Dim subs As Object, n As Long, k As Long, ch As Object
+    Set subs = Nothing
+    Set subs = fld.Folders
+    If subs Is Nothing Then Exit Sub
+    n = 0
+    n = subs.count
+    For k = n To 1 Step -1
+        Set ch = Nothing
+        Set ch = subs.Item(k)
+        If Not ch Is Nothing Then BgPush ch, myPath, stName, False
+    Next k
+End Sub
+
+' Bascule vers le nouvel index, cache disque, recents.
+Private Sub BgFinish()
+    On Error Resume Next
+    ' Dossiers ajoutes a chaud pendant le parcours et absents du resultat
+    ' (crees apres le passage du parcours sur leur parent) : conserves.
+    If Not mBgLiveAdded Is Nothing Then
+        If mBgLiveAdded.count > 0 Then
+            Dim have As Object, i As Long, v As Variant, oldIdx As Long
+            Set have = CreateObject("Scripting.Dictionary")
+            have.CompareMode = 0
+            For i = 1 To mBgCount
+                If Len(mBgFolders(i).EntryID) > 0 Then have(mBgFolders(i).EntryID) = True
+            Next i
+            For Each v In mBgLiveAdded
+                If Not have.Exists(CStr(v)) Then
+                    oldIdx = IndexOfEntryID(CStr(v))
+                    If oldIdx > 0 Then
+                        mBgCount = mBgCount + 1
+                        If mBgCount > UBound(mBgFolders) Then ReDim Preserve mBgFolders(1 To mBgCount + 50)
+                        mBgFolders(mBgCount) = mFolders(oldIdx)
+                        Set mBgFolders(mBgCount).FolderObject = Nothing
+                    End If
+                End If
+            Next v
+        End If
+    End If
+
+    If mBgCount > 0 Then
+        ReDim Preserve mBgFolders(1 To mBgCount)
+        mFolders = mBgFolders
+        mFolderCount = mBgCount
+        mLoaded = True
+        Set mExcludedEIDs = mBgExcluded
+        Set mEidIndex = Nothing
+        SaveToCache CachePath()
+        SaveSetting "QuickMove", "Reindex", "LastFullScan", Str$(CDbl(Now))
+        LoadRecents
+        modDebugLog.DInfo MOD_NAME, "Reindexation par paquets terminee : " & mFolderCount & _
+            " dossiers en " & Format$(ElapsedSec(mBgT0), "0") & " s"
+    Else
+        modDebugLog.DError MOD_NAME, "Reindexation par paquets : aucun dossier, index conserve"
+    End If
+    BgAbort
+End Sub
+
+Private Sub BgAbort()
+    On Error Resume Next
+    mBgActive = False
+    mBgTop = 0
+    mBgCount = 0
+    Erase mBgFolders
+    Erase mBgStkFld
+    Erase mBgStkPath
+    Erase mBgStkStore
+    Erase mBgStkRoot
+    Set mBgExcluded = Nothing
+    Set mBgLiveAdded = Nothing
+End Sub
+
+' ============================================================================
+' v12 (PACK v4) : SURVEILLANCE DES DOSSIERS (liste a jour sans re-scan)
+' Surveilles (boite par defaut) : Boite de reception, ses enfants directs,
+' les dossiers qui ont DEJA des sous-dossiers (calcul en memoire sur les
+' chemins de l'index, du moins profond au plus profond, plafond WATCH_MAX),
+' les dossiers crees depuis, et Elements supprimes. Liaison par paquets de
+' WATCH_SLICE (cle modDefer "QMWatch" / "step"). Evenements :
+'   FolderAdd    -> OnFolderAdded   (cree, deplace ou restaure ici)
+'   FolderChange -> OnFolderChanged (renomme ; les changements de compteurs,
+'                   tres frequents, sont ecartes par une simple comparaison
+'                   de nom)
+'   FolderAdd sur Elements supprimes -> OnFolderTrashed (supprime)
+' ============================================================================
+Public Sub FolderWatchStart()
+    On Error GoTo Fail
+    Set mFolderWatchers = New Collection
+    Set mWatchedEIDs = CreateObject("Scripting.Dictionary")
+    mWatchedEIDs.CompareMode = 0
+    Set mWatchQueue = New Collection
+    If Not mLoaded Then SmartLoad
+
+    Dim ns As Object, inbox As Object, trash As Object
+    Set ns = Application.GetNamespace("MAPI")
+    Set inbox = ns.GetDefaultFolder(olFolderInbox)
+    If inbox Is Nothing Then Exit Sub
+    AttachFolderWatch inbox, False
+    Set trash = Nothing
+    On Error Resume Next
+    Set trash = ns.GetDefaultFolder(olFolderDeletedItems)
+    On Error GoTo Fail
+    If Not trash Is Nothing Then AttachFolderWatch trash, True
+
+    Dim defStore As String, prefix As String
+    defStore = mDefaultStoreName
+    If Len(defStore) = 0 Then defStore = DefaultStoreNameSafe()
+    prefix = CStr(inbox.Name) & " > "
+
+    ' Chemins qui ont au moins un sous-dossier (boite par defaut).
+    Dim parents As Object, i As Long, p As String, q As Long, sn As String
+    Set parents = CreateObject("Scripting.Dictionary")
+    parents.CompareMode = 0
+    For i = 1 To mFolderCount
+        If Not mFolders(i).Dead Then
+            sn = mFolders(i).StoreName
+            If Len(sn) = 0 Or StrComp(sn, defStore, vbTextCompare) = 0 Then
+                p = mFolders(i).FolderPath
+                q = InStrRev(p, " > ")
+                If q > 0 Then
+                    p = Left$(p, q - 1)
+                    If Not parents.Exists(p) Then parents.Add p, True
+                End If
+            End If
+        End If
+    Next i
+
+    ' File d'attente : profondeur 1 (tous), puis conteneurs plus profonds.
+    Dim d As Long, depth As Long
+    For d = 1 To 8
+        For i = 1 To mFolderCount
+            If mWatchQueue.count + mFolderWatchers.count >= WATCH_MAX Then Exit For
+            If Not mFolders(i).Dead Then
+                p = mFolders(i).FolderPath
+                If Left$(p, Len(prefix)) = prefix Then
+                    sn = mFolders(i).StoreName
+                    If Len(sn) = 0 Or StrComp(sn, defStore, vbTextCompare) = 0 Then
+                        depth = SegCount(p) - 1
+                        If depth = d Then
+                            If d = 1 Or parents.Exists(p) Then
+                                If Len(mFolders(i).EntryID) > 0 Then mWatchQueue.Add mFolders(i).EntryID
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        Next i
+    Next d
+
+    modDebugLog.DInfo MOD_NAME, "Surveillance des dossiers : " & mWatchQueue.count & _
+        " dossier(s) a lier, plus reception et elements supprimes"
+    If mWatchQueue.count > 0 Then modDefer.ArmUniqueMs "QMWatch", 300, "step"
+    Exit Sub
+Fail:
+    modDebugLog.DError MOD_NAME, "FolderWatchStart err " & Err.Number & " - " & Err.Description
+End Sub
+
+Public Sub FolderWatchStep()
+    On Error Resume Next
+    If mWatchQueue Is Nothing Then Exit Sub
+    Dim n As Long, eid As String, idx As Long, fld As Object
+    n = 0
+    Do While mWatchQueue.count > 0 And n < WATCH_SLICE
+        eid = CStr(mWatchQueue(1))
+        mWatchQueue.Remove 1
+        n = n + 1
+        idx = IndexOfEntryID(eid)
+        If idx > 0 Then
+            Set fld = Nothing
+            Set fld = BindEntry(idx)
+            If Not fld Is Nothing Then AttachFolderWatch fld, False
+        End If
+    Loop
+    If mWatchQueue.count > 0 Then
+        modDefer.ArmUniqueMs "QMWatch", 300, "step"
+    Else
+        modDebugLog.DInfo MOD_NAME, "Surveillance des dossiers active : " & _
+            mFolderWatchers.count & " dossier(s)"
+    End If
+End Sub
+
+Private Sub AttachFolderWatch(ByVal parentFld As Object, ByVal isTrash As Boolean)
+    On Error Resume Next
+    If parentFld Is Nothing Then Exit Sub
+    If mFolderWatchers Is Nothing Then Set mFolderWatchers = New Collection
+    If mWatchedEIDs Is Nothing Then
+        Set mWatchedEIDs = CreateObject("Scripting.Dictionary")
+        mWatchedEIDs.CompareMode = 0
+    End If
+    If mFolderWatchers.count >= WATCH_MAX + 2 Then Exit Sub
+    Dim eid As String
+    eid = ""
+    eid = CStr(parentFld.EntryID)
+    If Len(eid) = 0 Then Exit Sub
+    If mWatchedEIDs.Exists(eid) Then Exit Sub
+    Dim w As clsFolderWatcher
+    Set w = New clsFolderWatcher
+    If w.Init(parentFld, isTrash) Then
+        mFolderWatchers.Add w
+        mWatchedEIDs.Add eid, True
+    End If
+End Sub
+
+' Dossier arrive sous un parent surveille : cree, deplace ou restaure.
+Public Sub OnFolderAdded(ByVal fld As Object)
+    On Error Resume Next
+    If fld Is Nothing Then Exit Sub
+    If Not mLoaded Then SmartLoad
+    Dim eid As String, idx As Long
+    eid = CStr(fld.EntryID)
+    idx = IndexOfEntryID(eid)
+    If idx > 0 Then
+        RepathEntry idx, fld           ' deja connu : nouveau chemin
+    Else
+        idx = AddFolderToIndex(fld)    ' nouveau : ajoute + cache
+    End If
+    AttachFolderWatch fld, False       ' ses futurs sous-dossiers aussi
+End Sub
+
+' Dossier modifie sous un parent surveille. Seul un changement de NOM
+' interesse l'index (l'evenement part aussi a chaque compteur de non-lus).
+Public Sub OnFolderChanged(ByVal fld As Object)
+    On Error Resume Next
+    If Not mLoaded Then Exit Sub
+    If fld Is Nothing Then Exit Sub
+    Dim idx As Long
+    idx = IndexOfEntryID(CStr(fld.EntryID))
+    If idx = 0 Then Exit Sub
+    If StrComp(LCase$(CStr(fld.Name)), mFolders(idx).LeafLower, vbBinaryCompare) = 0 Then Exit Sub
+    RepathEntry idx, fld
+End Sub
+
+' Dossier arrive dans Elements supprimes : retire de la liste (et ses
+' sous-dossiers). Restaure plus tard -> OnFolderAdded le reactive.
+Public Sub OnFolderTrashed(ByVal fld As Object)
+    On Error Resume Next
+    If Not mLoaded Then Exit Sub
+    If fld Is Nothing Then Exit Sub
+    Dim idx As Long, n As Long
+    idx = IndexOfEntryID(CStr(fld.EntryID))
+    If idx = 0 Then Exit Sub
+    If mFolders(idx).Dead Then Exit Sub
+    n = MarkDeadTree(idx)
+    SaveToCache CachePath()
+    modDebugLog.DInfo MOD_NAME, "Dossier supprime, retire de la liste : " & DisplayPath(idx) & _
+        " (" & n & " entree(s))"
+End Sub
+
+' Nouveau chemin d'une entree (renommage / deplacement / restauration),
+' repercute sur ses sous-dossiers ; entree reactivee ; cache reecrit.
+Private Sub RepathEntry(ByVal idx As Long, ByVal fld As Object)
+    On Error Resume Next
+    Dim newPath As String, oldPath As String, st As String, revived As Boolean
+    newPath = PathFromFolderObject(fld)
+    If Len(newPath) = 0 Then Exit Sub
+    oldPath = mFolders(idx).FolderPath
+    st = mFolders(idx).StoreName
+    revived = mFolders(idx).Dead
+    Set mFolders(idx).FolderObject = fld
+    If StrComp(newPath, oldPath, vbBinaryCompare) = 0 And Not revived Then Exit Sub
+    mFolders(idx).FolderPath = newPath
+    mFolders(idx).Dead = False
+    SetDerivedFields idx
+
+    Dim i As Long, n As Long, pre As String
+    pre = oldPath & " > "
+    For i = 1 To mFolderCount
+        If i <> idx Then
+            If StrComp(mFolders(i).StoreName, st, vbTextCompare) = 0 Then
+                If Left$(mFolders(i).FolderPath, Len(pre)) = pre Then
+                    mFolders(i).FolderPath = newPath & " > " & Mid$(mFolders(i).FolderPath, Len(pre) + 1)
+                    mFolders(i).Dead = False
+                    Set mFolders(i).FolderObject = Nothing
+                    SetDerivedFields i
+                    n = n + 1
+                End If
+            End If
+        End If
+    Next i
+    SaveToCache CachePath()
+    If n > 0 Then
+        modDebugLog.DInfo MOD_NAME, "Liste mise a jour : " & oldPath & " -> " & newPath & _
+            " (+" & n & " sous-dossier(s))"
+    Else
+        modDebugLog.DInfo MOD_NAME, "Liste mise a jour : " & oldPath & " -> " & newPath
+    End If
+End Sub
+
+' Marque une entree et ses sous-dossiers comme supprimes. Renvoie le nombre.
+Private Function MarkDeadTree(ByVal idx As Long) As Long
+    Dim base As String, st As String, i As Long, n As Long
+    base = mFolders(idx).FolderPath & " > "
+    st = mFolders(idx).StoreName
+    mFolders(idx).Dead = True
+    Set mFolders(idx).FolderObject = Nothing
+    n = 1
+    For i = 1 To mFolderCount
+        If Not mFolders(i).Dead Then
+            If StrComp(mFolders(i).StoreName, st, vbTextCompare) = 0 Then
+                If Left$(mFolders(i).FolderPath, Len(base)) = base Then
+                    mFolders(i).Dead = True
+                    Set mFolders(i).FolderObject = Nothing
+                    n = n + 1
+                End If
+            End If
+        End If
+    Next i
+    MarkDeadTree = n
 End Function

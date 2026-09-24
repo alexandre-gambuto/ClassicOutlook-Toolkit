@@ -1,7 +1,22 @@
 Option Explicit
 
 '=============================================================================
-' modDefer v1.14  (2026-08-19)
+' modDefer v1.15  (2026-09-24)
+' v1.15 (2026-09-24) : PACK v4 - traitements lourds UN PAR UN + duree.
+'   (a) Les differes lourds (CatchUpColor, RemindOverdue, SentCatchUp,
+'       TagPreload, AutoArchive, Reindex, CleanFlags, MonthlyBackup) ne
+'       s'imbriquent plus : si l'un tourne encore (DoEvents, appel COM qui
+'       pompe les messages), l'echeance d'un autre est reportee de 5 s au
+'       lieu de s'executer A L'INTERIEUR du premier. Constat debug.log du
+'       23/09 : rattrapage couleurs, rappel des suivis, envoyes, projets et
+'       archivage emboites les uns dans les autres pendant 5 min 30.
+'       BeginHeavy / EndHeavy : meme garde pour un traitement lourd lance
+'       hors differe (scan de reparation du suivi des mails).
+'   (b) Duree de chaque cible >= 1 s ecrite au journal (INFO) : le coupable
+'       d'un gel se lit directement dans debug.log.
+'   (c) Cles : "Reindex" -> modQuickMove.ReindexStep (reindexation par
+'       paquets) ; nouvelle cle "QMWatch" (surveillance des dossiers).
+' (historique anterieur : modDefer v1.14, 2026-08-19)
 ' Purpose (EN): reliable one-shot deferred execution for Outlook VBA.
 '   Outlook has NO Application.OnTime (that is Excel/Word): every such call
 '   raised error 438, swallowed by On Error Resume Next, so every deferred
@@ -82,7 +97,7 @@ Option Explicit
 '=============================================================================
 
 Private Const MOD_NAME As String = "Defer"
-Private Const MOD_VERSION As String = "v1.14 - 2026-08-19"
+Private Const MOD_VERSION As String = "v1.15 - 2026-09-24"
 
 Private Declare PtrSafe Function SetTimer Lib "user32" _
     (ByVal hWnd As LongPtr, ByVal nIDEvent As LongPtr, _
@@ -92,6 +107,12 @@ Private Declare PtrSafe Function KillTimer Lib "user32" _
 
 ' Actions armees : CStr(timerId) -> "Cle|argTexte"
 Private g_Actions As Object   ' Scripting.Dictionary
+
+' v1.15 : garde "un traitement lourd a la fois" (cf. en-tete).
+Private Const HEAVY_KEYS As String = _
+    "|CatchUpColor|RemindOverdue|SentCatchUp|TagPreload|AutoArchive|Reindex|CleanFlags|MonthlyBackup|"
+Private Const HEAVY_RETRY_SEC As Long = 5
+Private mHeavyDepth As Long
 
 '=============================================================================
 ' ModVersion - version REELLEMENT chargee dans le VBE (constante du module,
@@ -255,6 +276,23 @@ End Sub
 Private Sub Dispatch(ByVal actionKey As String, ByVal argText As String)
     On Error Resume Next
 
+    ' v1.15 : un traitement lourd a la fois. Appele depuis le DoEvents (ou
+    ' un appel COM qui pompe les messages) d'un autre traitement lourd : on
+    ' repasse dans HEAVY_RETRY_SEC secondes au lieu de s'executer dedans.
+    Dim isHeavy As Boolean
+    isHeavy = (InStr(1, HEAVY_KEYS, "|" & actionKey & "|", vbBinaryCompare) > 0)
+    If isHeavy Then
+        If mHeavyDepth > 0 Then
+            ArmUnique actionKey, HEAVY_RETRY_SEC, argText
+            modDebugLog.DTrace MOD_NAME, "'" & actionKey & "' reporte de " & _
+                HEAVY_RETRY_SEC & " s (traitement lourd en cours)"
+            Exit Sub
+        End If
+        mHeavyDepth = mHeavyDepth + 1
+    End If
+    Dim t0 As Double
+    t0 = Timer
+
     ' v1.5 : certaines cibles differees lisent encore des g_* en direct ;
     ' apres un Ctrl+S VBE elles vaudraient 0/"". Config garantie chargee.
     modConfig.EnsureLoaded
@@ -302,9 +340,18 @@ Private Sub Dispatch(ByVal actionKey As String, ByVal argText As String)
         Case "BirthdayView"
             ThisOutlookSession.SetupBirthdayViewDeferred argText
         Case "Reindex"
-            ' Pack v3 (C6) : reindexation hebdomadaire QuickMove (remplace le
-            ' RDV technique QuickMove_BackgroundReindex + Application_Reminder).
-            modQuickMove.BackgroundReindex
+            ' v1.15 (pack v4) : reindexation QuickMove PAR PAQUETS. Chaque
+            ' echeance traite ~120 ms de dossiers puis se re-arme : Outlook
+            ' reste utilisable pendant tout le parcours.
+            modQuickMove.ReindexStep
+        Case "QMWatch"
+            ' v1.15 (pack v4) : surveillance des creations / renommages /
+            ' suppressions de dossiers QuickMove, liee par paquets.
+            If argText = "step" Then
+                modQuickMove.FolderWatchStep
+            Else
+                modQuickMove.FolderWatchStart
+            End If
         Case "CampaignNext"
             ' Pack v3 (C7) : envoi de campagne asynchrone, une ligne par
             ' echeance (Outlook reste utilisable pendant la cadence).
@@ -320,5 +367,36 @@ Private Sub Dispatch(ByVal actionKey As String, ByVal argText As String)
     If Err.Number <> 0 Then
         modDebugLog.DError MOD_NAME, "Dispatch '" & actionKey & "' err " & _
             Err.Number & " - " & Err.Description
+        Err.Clear
     End If
+
+    If isHeavy Then
+        mHeavyDepth = mHeavyDepth - 1
+        If mHeavyDepth < 0 Then mHeavyDepth = 0
+    End If
+
+    ' v1.15 : duree au journal (>= 1 s) - le coupable d'un gel se lit dans
+    ' debug.log sans instrumentation supplementaire.
+    Dim dt As Double
+    dt = Timer - t0
+    If dt < 0 Then dt = dt + 86400#
+    If dt >= 1 Then
+        modDebugLog.DInfo MOD_NAME, "Tache '" & actionKey & "' : " & _
+            Format$(dt, "0.0") & " s"
+    End If
+End Sub
+
+'=============================================================================
+' BeginHeavy / EndHeavy (v1.15) - encadrent un traitement lourd lance HORS
+' differe (ex. scan de reparation du suivi des mails depuis le tableau de
+' bord) : pendant ce temps, les differes lourds qui echoient sont reportes
+' au lieu de s'executer a l'interieur. Toujours appeler EndHeavy apres.
+'=============================================================================
+Public Sub BeginHeavy()
+    mHeavyDepth = mHeavyDepth + 1
+End Sub
+
+Public Sub EndHeavy()
+    mHeavyDepth = mHeavyDepth - 1
+    If mHeavyDepth < 0 Then mHeavyDepth = 0
 End Sub

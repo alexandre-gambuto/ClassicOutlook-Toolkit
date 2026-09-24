@@ -1,7 +1,11 @@
 Option Explicit
 
 '=============================================================================
-' modReplyGreeting v1  (2026-07-09)
+' modReplyGreeting v1.1  (2026-09-24)
+' v1.1 (2026-09-24) : filtre [SentOn] au FORMAT DU POSTE (pack v4). La date
+'   ecrite en dur m/d/yyyy etait relue jour/mois sur un poste francais :
+'   "deja salue aujourd'hui" cherche sur une autre date les jours <= 12.
+'
 ' Purpose (EN): when a Reply draft has exactly ONE recipient in the To field,
 '   inserts a greeting line at the top of the body with the recipient's FIRST
 '   NAME, extracted from the SMTP address (firstname.lastname@domain). If a
@@ -39,7 +43,7 @@ Option Explicit
 '=============================================================================
 
 Private Const MOD_NAME As String = "ReplyGreet"
-Private Const MOD_VERSION As String = "v1 - 2026-07-09"
+Private Const MOD_VERSION As String = "v1.1 - 2026-09-24"
 
 Public Function ModVersion() As String
     ModVersion = MOD_VERSION
@@ -334,8 +338,8 @@ End Function
 ' ConversationIndex) a deja ete ENVOYE AUJOURD'HUI avec le mot de
 ' salutation dans SA partie redigee (le corps est tronque au premier
 ' marqueur de citation pour ne pas compter le "Bonjour" de l'interlocuteur
-' dans le fil cite). Items.Restrict sur [SentOn] (format date US en dur,
-' cf. piege DASL), garde-fou 300 items.
+' dans le fil cite). Items.Restrict sur [SentOn] (date au format du poste,
+' v1.1), garde-fou 300 items.
 '=============================================================================
 Private Function GreetedTodayInThread(ByVal threadKey As String, _
                                       ByVal greetWord As String) As Boolean
@@ -350,8 +354,7 @@ Private Function GreetedTodayInThread(ByVal threadKey As String, _
     If sentFld Is Nothing Then Exit Function
 
     Dim filterStr As String
-    filterStr = "[SentOn] >= '" & Month(Date) & "/" & Day(Date) & "/" & _
-                Year(Date) & " 12:00 AM'"
+    filterStr = "[SentOn] >= '" & Format$(Date, "ddddd") & " 00:00'"
 
     Dim itms As Object
     Set itms = sentFld.items.Restrict(filterStr)

@@ -1,7 +1,7 @@
 Option Explicit
 
 '=============================================================================
-' modCommon v1.2
+' modCommon v1.3
 ' Purpose (EN): shared, STATELESS helper functions used by several modules
 '   (file-name sanitizing, HTML escaping, folder resolution by full path,
 '   protected item-property accessors). No module-level state, no UI, no
@@ -16,7 +16,7 @@ Option Explicit
 '   SafeSubject       (ex modMailExport.SafeSubject)
 '   SetStatus         (v1.1 - fix B5 : progression -> log DEBUG)
 '   ExcelAlive        (v1.2 - instance Excel VRAIMENT vivante, anti-fantome)
-'   FormatDaslDate    (v1.2 - date filtre DASL m/d/yyyy h:mm AM/PM, locale-proof)
+'   FormatDaslDate    (v1.3 - date de filtre au format du poste, pack v4)
 '
 ' PERIMETRE VOLONTAIREMENT LIMITE : les helpers SMTP / categories /
 ' IsTechnical restent pour l'instant dans leurs modules consommateurs
@@ -35,7 +35,7 @@ Option Explicit
 '=============================================================================
 
 Private Const MOD_NAME As String = "Common"
-Private Const MOD_VERSION As String = "v1.2 - 2026-07-05"
+Private Const MOD_VERSION As String = "v1.3 - 2026-09-24"
 
 Public Function ModVersion() As String
     ModVersion = MOD_VERSION
@@ -200,29 +200,17 @@ Public Function ExcelAlive(ByVal xl As Object) As Boolean
 End Function
 
 '-----------------------------------------------------------------------------
-' FormatDaslDate (v1.2)
-' Date au format DASL m/d/yyyy h:mm AM/PM construite A LA MAIN : les jetons
-' "/" et ":" de Format() suivent les reglages regionaux Windows (separateur
-' personnalise = filtre casse en silence). Reprise du helper prive de
-' modAntiOverlap (FormatOutlookDate), centralisee pour modMeetingColor et
-' modPurgeCategories. modAntiOverlap garde sa copie privee (hot-path, cf.
-' regle "pas de swap de helper seul sur un module evenementiel").
+' FormatDaslDate (v1.3 - pack v4) : date d'un filtre Restrict/Find ecrite
+' au FORMAT DU POSTE (date courte + heure 24 h, sans secondes).
+' CORRECTION : Outlook relit la chaine selon les reglages regionaux de
+' Windows. L'ancien format m/d/yyyy h:mm AM/PM ecrit en dur etait donc relu
+' JOUR/MOIS sur un poste francais des que le jour est <= 12. Preuve
+' (debug.log, rattrapage couleurs J-7..J+15) : le 14/09, la borne
+' "9/7/2026" (7 septembre) etait lue 9 juillet -> 251 RDV examines ; du
+' 16 au 24/09, "10/1/2026" (1er octobre) etait lue 10 janvier -> 1 a 7 RDV
+' examines au lieu d'environ 80. Format() suit les MEMES reglages
+' qu'Outlook : la chaine est relue telle qu'elle est ecrite.
 '-----------------------------------------------------------------------------
 Public Function FormatDaslDate(ByVal d As Date) As String
-    Dim ampm As String
-    Dim h As Long
-    h = Hour(d)
-    If h = 0 Then
-        ampm = "AM"
-        h = 12
-    ElseIf h < 12 Then
-        ampm = "AM"
-    ElseIf h = 12 Then
-        ampm = "PM"
-    Else
-        ampm = "PM"
-        h = h - 12
-    End If
-    FormatDaslDate = Month(d) & "/" & Day(d) & "/" & Year(d) & " " & _
-                     h & ":" & Format$(Minute(d), "00") & " " & ampm
+    FormatDaslDate = Format$(d, "ddddd") & " " & Format$(d, "hh:nn")
 End Function

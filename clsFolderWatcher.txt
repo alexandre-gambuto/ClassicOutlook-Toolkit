@@ -1,0 +1,63 @@
+Option Explicit
+
+'=============================================================================
+' clsFolderWatcher v1.0  (2026-09-24)
+' Purpose (EN): listens to ONE Outlook Folders collection (FolderAdd /
+'   FolderChange) and forwards the events to modQuickMove, so that folders
+'   created, renamed, moved or deleted in Outlook show up in the QuickMove
+'   list at once, without a rescan.
+'
+' Role (FR) : un surveillant = UN dossier parent (sa collection .Folders).
+'   Cree et garde en vie par modQuickMove (FolderWatchStart /
+'   AttachFolderWatch). Evenements transmis :
+'     FolderAdd    -> modQuickMove.OnFolderAdded   (parent normal)
+'                  -> modQuickMove.OnFolderTrashed (parent = Elements supprimes)
+'     FolderChange -> modQuickMove.OnFolderChanged (parent normal)
+'   FolderRemove n'est pas ecoute : l'evenement ne dit pas QUEL dossier est
+'   parti (la suppression est vue via Elements supprimes).
+'   Gestionnaires silencieux (On Error Resume Next), aucune interface.
+'   A creer comme MODULE DE CLASSE nomme clsFolderWatcher (pack v4).
+'=============================================================================
+
+Private Const MOD_NAME As String = "FoldWatch"
+Private Const MOD_VERSION As String = "v1.0 - 2026-09-24"
+
+Private WithEvents m_Folders As Outlook.Folders
+Private m_IsTrash As Boolean
+
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+' Branche le surveillant sur les sous-dossiers de parentFld. False si echec.
+Public Function Init(ByVal parentFld As Object, Optional ByVal isTrash As Boolean = False) As Boolean
+    On Error GoTo Fail
+    Init = False
+    m_IsTrash = isTrash
+    Set m_Folders = parentFld.Folders
+    Init = True
+    Exit Function
+Fail:
+    modDebugLog.DDebug MOD_NAME, "Init KO : " & Err.Number & " - " & Err.Description
+    Set m_Folders = Nothing
+End Function
+
+Private Sub m_Folders_FolderAdd(ByVal Folder As Outlook.MAPIFolder)
+    On Error Resume Next
+    If m_IsTrash Then
+        modQuickMove.OnFolderTrashed Folder
+    Else
+        modQuickMove.OnFolderAdded Folder
+    End If
+End Sub
+
+Private Sub m_Folders_FolderChange(ByVal Folder As Outlook.MAPIFolder)
+    On Error Resume Next
+    If m_IsTrash Then Exit Sub
+    modQuickMove.OnFolderChanged Folder
+End Sub
+
+Private Sub Class_Terminate()
+    On Error Resume Next
+    Set m_Folders = Nothing
+End Sub

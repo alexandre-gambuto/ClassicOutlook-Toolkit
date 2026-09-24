@@ -1,7 +1,10 @@
 Option Explicit
 
 '=============================================================================
-' modMaintenance v4.1  (2026-08-22)
+' modMaintenance v4.2  (2026-09-24)
+'
+' v4.2 (2026-09-24) : MODULES_DEFAULT complete avec FoldWatch (nouvelle
+'   classe clsFolderWatcher du pack v4), pour le filtre de log par module.
 '
 ' v4.1 (2026-08-22) : MODULES_DEFAULT aligne sur les MOD_NAME REELS.
 '   Trois modules y figuraient sous un nom different de leur MOD_NAME :
@@ -131,7 +134,7 @@ Option Explicit
 '=============================================================================
 
 Private Const MOD_NAME As String = "Maint"
-Private Const MOD_VERSION As String = "v4.1 - 2026-08-22"
+Private Const MOD_VERSION As String = "v4.2 - 2026-09-24"
 Private Const TITLE As String = "Maintenance VBA"
 
 ' Copie locale du filtre de log courant. modDebugLog n'expose pas son
@@ -153,7 +156,7 @@ Private Const MODULES_DEFAULT As String = _
     "AppEvents|Defer|ExplWatch|MarkRead|ONProbe|ReplyGreet|" & _
     "ContBday|ContExp|ContImp|ContMail|ContNorm|ContNote|ContRel|" & _
     "FolderRen|FolderSort|HideBcc|InboxAlert|InboxWatch|StoreCtx|Ui|" & _
-    "Smtp|ExcelBridge|ContCommon|InspQueue|QuickStart"
+    "Smtp|ExcelBridge|ContCommon|InspQueue|QuickStart|FoldWatch"
 
 '=============================================================================
 ' Maintenance  (POINT D'ENTREE - a epingler au QAT)

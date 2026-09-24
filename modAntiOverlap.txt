@@ -1,7 +1,11 @@
 Option Explicit
 
 ' =====================================================================
-' modAntiOverlap v7
+' modAntiOverlap v7.1
+' v7.1 (2026-09-24) : date du filtre Find au FORMAT DU POSTE (pack v4, cf.
+'   modCommon.FormatDaslDate v1.3). Le m/d/yyyy h:mm AM/PM en dur etait relu
+'   jour/mois sur un poste francais quand le jour est <= 12 : fenetre de
+'   recherche fausse, chevauchement non detecte certains jours.
 ' Purpose (EN): automatically shifts a short appointment (of the configured
 '   duration) by +ShiftMinutes when it overlaps another calendar event. The
 '   "already shifted" UserProperty is set and saved BEFORE Start is changed,
@@ -24,7 +28,7 @@ Option Explicit
 ' =====================================================================
 
 Private Const MOD_NAME As String = "AntiOverlap"
-Private Const MOD_VERSION As String = "v7 - 2026-06-10"
+Private Const MOD_VERSION As String = "v7.1 - 2026-09-24"
 
 ' Parametres externalises dans config.ini, lus via les GETTERS
 ' EnsureLoaded-safe de modConfig (v7 ; jamais les globales g_* en direct) :
@@ -170,23 +174,9 @@ Done:
 End Function
 
 Private Function FormatOutlookDate(ByVal d As Date) As String
-    Dim ampm As String
-    Dim h As Long
-    h = Hour(d)
-    If h = 0 Then
-        ampm = "AM"
-        h = 12
-    ElseIf h < 12 Then
-        ampm = "AM"
-    ElseIf h = 12 Then
-        ampm = "PM"
-    Else
-        ampm = "PM"
-        h = h - 12
-    End If
-    
-    FormatOutlookDate = Month(d) & "/" & Day(d) & "/" & Year(d) & " " & _
-                        h & ":" & Format(Minute(d), "00") & " " & ampm
+    ' v7.1 : format du poste (Outlook relit la chaine selon les reglages
+    ' regionaux de Windows ; cf. modCommon.FormatDaslDate).
+    FormatOutlookDate = Format$(d, "ddddd") & " " & Format$(d, "hh:nn")
 End Function
 
 Private Function IsTechnical(ByVal a As Outlook.AppointmentItem) As Boolean

@@ -1,7 +1,22 @@
 Option Explicit
 
 '=============================================================================
-' ThisOutlookSession v10.11  (2026-08-28)
+' ThisOutlookSession v10.14  (2026-09-24)
+'
+' v10.14 (2026-09-24) : DEMARRAGE SANS GEL (pack v4).
+'   (a) Reindexation QuickMove : plus de parcours hebdomadaire d'un bloc a
+'       +120 s. modQuickMove.CacheNeedsRefresh() decide (dernier parcours
+'       complet de plus de 7 jours, ou jamais) et la reindexation tourne
+'       PAR PAQUETS (+240 s, cle modDefer "Reindex") : Outlook reste
+'       utilisable pendant le parcours.
+'   (b) Surveillance des creations / renommages / suppressions de dossiers
+'       (modQuickMove.FolderWatchStart, cle "QMWatch" a +60 s) : un dossier
+'       cree dans Outlook entre aussitot dans la liste QuickMove. Relancee
+'       par RebindEvents (WithEvents perdus a chaque Ctrl+S VBE).
+'   (c) Les traitements lourds du demarrage ne s'imbriquent plus les uns
+'       dans les autres : modDefer v1.15 les passe un par un.
+'   Regle d'edition VBE : dans les 6 premieres minutes (ou tant qu'une
+'   reindexation tourne), lancer PrepareForEdit avant toute edition.
 '
 ' v10.11 (2026-08-28) : classement des ENVOYES - creation de dossier a la
 '   volee. Apres un tour "Aucun dossier pour X", la fenetre unique accepte
@@ -255,7 +270,7 @@ Private Const SWITCH_GUARD_MS As Long = 1500   ' v10.2 : duree (ms) de la garde 
 Private Const BIRTHDAY_VIEW_DELAY_MS As Long = 1200   ' v10.13 : attente construction fenetre calendrier
 Private Const BIRTHDAY_VIEW_RETRY_MS As Long = 1500   ' v10.13 : espacement des tentatives suivantes
 Private Const MOD_NAME As String = "ThisOutlook"
-Private Const MOD_VERSION As String = "v10.11 - 2026-08-28"
+Private Const MOD_VERSION As String = "v10.14 - 2026-09-24"
 
 ' === QUICKMOVE ENVOYES - prompt asynchrone ===
 ' Garde de reentrance : un seul prompt ouvert a la fois.
@@ -389,16 +404,16 @@ Private Sub Application_Startup()
     ' "QuickMove_BackgroundReindex" + Application_Reminder est abandonne : il
     ' polluait le calendrier (synchro telephone) et declenchait les
     ' ItemAdd/ItemChange que 4 modules devaient filtrer.
-    Dim lastReindex As String
-    lastReindex = GetSetting("QuickMove", "Reindex", "LastWeek", "")
-    Dim thisWeek As String
-    thisWeek = Format(Now, "YYYY") & "-W" & Format(DatePart("ww", Now, vbMonday), "00")
-    If lastReindex <> thisWeek Then
-        On Error Resume Next
-        modDefer.Arm "Reindex", 120
-        On Error GoTo 0
-        SaveSetting "QuickMove", "Reindex", "LastWeek", thisWeek
-    End If
+    ' v10.14 (pack v4) : ce parcours hebdomadaire d'un seul bloc est
+    ' remplace. Reindexation seulement si le dernier parcours COMPLET a plus
+    ' de 7 jours (ou n'a jamais eu lieu), PAR PAQUETS (Outlook reste
+    ' utilisable), a +240 s : apres les autres rattrapages.
+    On Error Resume Next
+    If modQuickMove.CacheNeedsRefresh() Then modDefer.ArmUnique "Reindex", 240
+    ' v10.14 (pack v4) : surveillance des creations / renommages /
+    ' suppressions de dossiers (liste QuickMove a jour sans re-scan).
+    modDefer.ArmUnique "QMWatch", 60
+    On Error GoTo 0
 
     ' v10.5 : purge mensuelle des vieux drapeaux DIFFEREE (+180 s). Elle
     ' parcourait TOUTE la boite de reception en SYNCHRONE : gel du premier
@@ -556,6 +571,12 @@ Public Sub RebindEvents()
     ' v10.12 : rearmer les watchers d'alertes nouveau mail (WithEvents perdus).
     On Error Resume Next
     modInboxAlert.InboxAlertStart
+    On Error GoTo 0
+
+    ' v10.14 (pack v4) : surveillants de dossiers QuickMove (WithEvents
+    ' perdus aussi a chaque reinitialisation du projet VBA).
+    On Error Resume Next
+    modQuickMove.FolderWatchStart
     On Error GoTo 0
 
     modDebugLog.DInfo MOD_NAME, "RebindEvents OK"

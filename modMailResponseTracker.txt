@@ -1,7 +1,27 @@
 Option Explicit
 
 '=============================================================================
-' modMailResponseTracker v6.1  (2026-08-22)
+' modMailResponseTracker v6.2  (2026-09-24)
+'
+' v6.2 (2026-09-24) : FIN DES GELS DE PLUSIEURS MINUTES (pack v4).
+'   Mesures debug.log : 9 min 22 s le 17/09 (tableau de bord), Outlook
+'   ferme de force le 22/09, 5 min 30 le 23/09 et 9 min 57 s le 24/09 au
+'   demarrage (RemindOverdue).
+'   (a) RemindOverdue ne relit plus AUCUN fil Outlook : les retards sont
+'       comptes sur la FEUILLE seule (statut "En retard", ou date limite
+'       depassee sur une ligne non terminale), en une lecture en bloc, et
+'       le classeur n'est plus enregistre au demarrage. Le recalcul complet
+'       reste fait a l'ouverture du tableau de bord et avant toute relance
+'       (FollowUpOverdue). Contrepartie : un fil repondu depuis le dernier
+'       recalcul compte encore dans le toast du matin.
+'   (b) Scan de reparation (ancrage perime) BORNE a REPAIR_BUDGET_SEC
+'       secondes, avec respiration tous les 200 mails ; un fil non retrouve
+'       n'est plus recherche avant REPAIR_RETRY_DAYS jours (registre
+'       MailResponseTracker\RepairFail). Avant : le MEME fil introuvable
+'       relancait, a chaque mise a jour, le parcours de toute la boite mail
+'       par mail. Pendant le scan, les differes lourds sont reportes
+'       (modDefer.BeginHeavy / EndHeavy).
+'   (c) Duree de la mise a jour des statuts ecrite au journal (INFO).
 '
 ' v6.1 (2026-08-22) : 5 T() contenant des donnees, detectes par validate.py
 '   (le controle TVAR). Sortis de T() : le CHEMIN du Bureau (L443 - un
@@ -205,7 +225,7 @@ Option Explicit
 '=============================================================================
 
 Private Const MOD_NAME As String = "MailTrack"
-Private Const MOD_VERSION As String = "v6.1 - 2026-08-22"
+Private Const MOD_VERSION As String = "v6.2 - 2026-09-24"
 
 ' v5.7 (2026-07-13) [PARTIE 2b] : tableau de bord. (a) Nouvelle colonne
 '   d'action "Valider reponse" (entre Prolonger et Supprimer) -> colonnes
@@ -284,6 +304,10 @@ Private Const FOLLOWUP_PROP As String = "FollowupConvID"
 Private Const REG_TRACK_APP As String = "MailResponseTracker"
 Private Const REG_TRACK_SECTION As String = "Rappel"
 Private Const REG_KEY_LASTPOP As String = "LastPopupDate"
+' v6.2 : reparation bornee + memoire des fils introuvables.
+Private Const REG_REPAIR_SECTION As String = "RepairFail"
+Private Const REPAIR_BUDGET_SEC As Long = 20
+Private Const REPAIR_RETRY_DAYS As Long = 7
 
 ' Variable module pour garder Excel en cache
 Private mXlApp As Object
@@ -297,6 +321,10 @@ Private mWbDepth As Long              ' v5.9 : niveau d'imbrication des detenteu
 ' Chaque element = Array(subject, recipients, count, delayDays, sentDate,
 ' dueDate, convID, entryID).
 Private mUrgentQueue As Collection
+
+' v6.2 : chronometre du scan de reparation (RepairOverBudget).
+Private mRepairT0 As Double
+Private mRepairAborted As Boolean
 
 ' Mise au premier plan de la fenetre Excel (best effort).
 ' Pack v3 (D1) : 64-bit seul, branche #Else supprimee.
@@ -1594,6 +1622,9 @@ NextCollect:
     Dim ownerSMTP As String
     ownerSMTP = GetOwnerSMTP(olNS)
 
+    Dim tPhase0 As Double
+    tPhase0 = Timer
+
     Dim convKey As Variant
     Dim respD As Object
     For Each convKey In dExpected.keys
@@ -1605,9 +1636,13 @@ NextCollect:
         If Not ok Then dDead(convKey) = True
     Next convKey
 
-    modDebugLog.DDebug MOD_NAME, "MAJ statuts : " & _
+    ' v6.2 : duree au journal (INFO).
+    Dim tPhase As Double
+    tPhase = Timer - tPhase0
+    If tPhase < 0 Then tPhase = tPhase + 86400#
+    modDebugLog.DInfo MOD_NAME, "MAJ statuts : " & _
         (dExpected.count - dDead.count) & "/" & dExpected.count & _
-        " fil(s) via index de conversations"
+        " fil(s) via index de conversations en " & Format$(tPhase, "0.0") & " s"
 
     ' --- Phase 2b : REPARATION (uniquement si necessaire) ---
     ' Scan d'arbre unique facon v4.3, limite aux fils morts, depuis la
@@ -1615,9 +1650,24 @@ NextCollect:
     ' y compris hors du sous-arbre Reception). Des qu'un mail d'un fil
     ' mort est croise, on rebascule sur le chemin rapide et on memorise
     ' son EntryID comme nouvel ancrage. Arret des que dDead est vide.
+    ' v6.2 (pack v4) : scan BORNE a REPAIR_BUDGET_SEC secondes, et un fil
+    ' deja cherche sans succes n'est plus recherche avant REPAIR_RETRY_DAYS
+    ' jours. Avant : le MEME fil introuvable relancait a chaque mise a jour
+    ' un parcours de TOUTE la boite, mail par mail (9 min 22 s le 17/09,
+    ' Outlook ferme de force le 22/09, 9 min 57 s le 24/09).
+    If dDead.count > 0 Then
+        Dim skippedRepair As Long
+        skippedRepair = SkipRecentRepairFailures(dDead)
+        If skippedRepair > 0 Then
+            modDebugLog.DInfo MOD_NAME, "MAJ statuts : " & skippedRepair & _
+                " fil(s) introuvable(s) deja cherche(s) depuis moins de " & _
+                REPAIR_RETRY_DAYS & " j, reparation sautee"
+        End If
+    End If
+
     If dDead.count > 0 Then
         modDebugLog.DInfo MOD_NAME, "MAJ statuts : " & dDead.count & _
-            " ancrage(s) perime(s), scan de reparation"
+            " ancrage(s) perime(s), scan de reparation (" & REPAIR_BUDGET_SEC & " s max)"
 
         Dim rootFolder As Outlook.MAPIFolder
         Set rootFolder = Nothing
@@ -1626,10 +1676,25 @@ NextCollect:
         On Error GoTo 0
         If rootFolder Is Nothing Then Set rootFolder = olNS.GetDefaultFolder(olFolderInbox)
 
+        mRepairT0 = Timer
+        mRepairAborted = False
+        modDefer.BeginHeavy
         RepairScanTree rootFolder, olNS, dDead, dExpected, dRespondents, dRepaired, dFloor, ownerSMTP
+        modDefer.EndHeavy
 
-        modDebugLog.DInfo MOD_NAME, "Reparation : " & dRepaired.count & _
-            " ancrage(s) retrouve(s), " & dDead.count & " fil(s) introuvable(s)"
+        ' Fils toujours introuvables : memorises (pas de nouvel essai avant
+        ' REPAIR_RETRY_DAYS jours) ; fils repares : oublies.
+        RecordRepairFailures dDead
+        ClearRepairFailures dRepaired
+
+        If mRepairAborted Then
+            modDebugLog.DInfo MOD_NAME, "Reparation : " & dRepaired.count & _
+                " ancrage(s) retrouve(s), " & dDead.count & _
+                " fil(s) non retrouve(s) - arret au bout de " & REPAIR_BUDGET_SEC & " s"
+        Else
+            modDebugLog.DInfo MOD_NAME, "Reparation : " & dRepaired.count & _
+                " ancrage(s) retrouve(s), " & dDead.count & " fil(s) introuvable(s)"
+        End If
     End If
 
     ' --- Phase 3 : appliquer les resultats ligne par ligne ---
@@ -1841,6 +1906,7 @@ Private Sub RepairScanTree(folder As Outlook.MAPIFolder, _
     On Error Resume Next
 
     If dDead.count = 0 Then Exit Sub
+    If RepairOverBudget() Then Exit Sub       ' v6.2
 
     ' Elagage : dossiers non-mail ignores avec toute leur descendance.
     ' (Si la lecture de DefaultItemType echoue, le If est saute sous
@@ -1852,6 +1918,7 @@ Private Sub RepairScanTree(folder As Outlook.MAPIFolder, _
     Dim sub_ As Outlook.MAPIFolder
     For Each sub_ In folder.Folders
         DoEvents
+        If RepairOverBudget() Then Exit Sub   ' v6.2
         RepairScanTree sub_, olNS, dDead, dExpected, dRespondents, dRepaired, dFloor, ownerSMTP
         If dDead.count = 0 Then Exit Sub
     Next sub_
@@ -1883,6 +1950,12 @@ Private Sub RepairScanFolder(folder As Outlook.MAPIFolder, _
 
     Dim i As Long
     For i = 1 To cnt
+        ' v6.2 : respiration + budget (un dossier peut compter des milliers
+        ' de mails ; avant, DoEvents seulement entre deux dossiers).
+        If (i Mod 200) = 0 Then
+            DoEvents
+            If RepairOverBudget() Then Exit Sub
+        End If
         Dim Item As Object
         Set Item = Nothing
         Set Item = items.Item(i)
@@ -1934,6 +2007,58 @@ NextItem:
     Next i
 
     On Error GoTo 0
+End Sub
+
+'=============================================================================
+' v6.2 (pack v4) : BUDGET ET MEMOIRE DE LA REPARATION
+'   RepairOverBudget         : True au-dela de REPAIR_BUDGET_SEC secondes.
+'   SkipRecentRepairFailures : retire de dDead les fils deja cherches sans
+'                              succes depuis moins de REPAIR_RETRY_DAYS jours.
+'   RecordRepairFailures     : memorise les fils non retrouves (registre).
+'   ClearRepairFailures      : oublie les fils repares.
+' Registre HKCU : MailResponseTracker\RepairFail, valeur = ConversationID,
+' donnee = numero de jour (Str$ : independant de la locale).
+'=============================================================================
+Private Function RepairOverBudget() As Boolean
+    Dim dt As Double
+    dt = Timer - mRepairT0
+    If dt < 0 Then dt = dt + 86400#
+    If dt > REPAIR_BUDGET_SEC Then mRepairAborted = True
+    RepairOverBudget = mRepairAborted
+End Function
+
+Private Function SkipRecentRepairFailures(ByVal dDead As Object) As Long
+    On Error Resume Next
+    SkipRecentRepairFailures = 0
+    If dDead.count = 0 Then Exit Function
+    Dim ks As Variant, i As Long, v As String, n As Long
+    ks = dDead.keys
+    For i = LBound(ks) To UBound(ks)
+        v = GetSetting(REG_TRACK_APP, REG_REPAIR_SECTION, CStr(ks(i)), "")
+        If Len(v) > 0 Then
+            If CDbl(Date) - Val(v) < REPAIR_RETRY_DAYS Then
+                dDead.Remove ks(i)
+                n = n + 1
+            End If
+        End If
+    Next i
+    SkipRecentRepairFailures = n
+End Function
+
+Private Sub RecordRepairFailures(ByVal dDead As Object)
+    On Error Resume Next
+    Dim k As Variant
+    For Each k In dDead.keys
+        SaveSetting REG_TRACK_APP, REG_REPAIR_SECTION, CStr(k), Str$(CLng(Date))
+    Next k
+End Sub
+
+Private Sub ClearRepairFailures(ByVal dRepaired As Object)
+    On Error Resume Next
+    Dim k As Variant
+    For Each k In dRepaired.keys
+        DeleteSetting REG_TRACK_APP, REG_REPAIR_SECTION, CStr(k)
+    Next k
 End Sub
 
 '=============================================================================
@@ -2116,78 +2241,55 @@ Public Sub RemindOverdue()
     Dim ws As Object
     Set ws = wb.Sheets(modConfig.MailTrackingSheet())
 
-    ' v5.1 : PRE-SCAN sur la FEUILLE (zero acces Outlook). Une ligne est
-    ' candidate au retard si son statut est deja "En retard" OU si sa date
-    ' limite est depassee (statuts terminaux exclus). Zero candidate ->
-    ' sortie immediate : le recalcul complet (un parcours de fil Outlook
-    ' par suivi actif) ne gele plus le demarrage les jours sans retard.
-    Dim lastRowPre As Long
-    lastRowPre = ws.Cells(ws.Rows.count, COL_ID).End(-4162).row
-    If lastRowPre < 2 Then GoTo Done
-
-    Dim candidateCount As Long, rPre As Long
-    candidateCount = 0
-    For rPre = 2 To lastRowPre
-        Dim stPre As String
-        stPre = CStr(ws.Cells(rPre, COL_STATUS).Value)
-        If stPre = "R" & Chr(233) & "pondu" Then GoTo NextPre
-        If stPre = "Trait" & Chr(233) Then GoTo NextPre
-        If InStr(1, stPre, "En retard", vbTextCompare) > 0 Then
-            candidateCount = candidateCount + 1
-        Else
-            Dim duePre As Date
-            duePre = 0
-            On Error Resume Next
-            duePre = CDate(ws.Cells(rPre, COL_DUE_DATE).Value)
-            On Error GoTo Done
-            If duePre > 0 And duePre < Date Then candidateCount = candidateCount + 1
-        End If
-NextPre:
-    Next rPre
-
-    If candidateCount = 0 Then
-        SaveSetting REG_TRACK_APP, REG_TRACK_SECTION, REG_KEY_LASTPOP, today
-        modDebugLog.DDebug MOD_NAME, "RemindOverdue : 0 candidat (pre-scan feuille)"
-        GoTo Done
-    End If
-
-    ' Recalcul LIMITE aux candidates (v5.1) : verifie qu'elles sont encore
-    ' reellement en attente (une reponse a pu arriver Outlook ferme).
-    UpdateAllTrackingStatuses ws, True
-    SaveWorkbookVisible xlApp, wb
-
-    ' Comptage des retards + collecte des 3 premiers objets
+    ' v6.2 (pack v4) : AUCUN parcours Outlook au demarrage. Les retards sont
+    ' comptes A PARTIR DE LA FEUILLE seule, en une lecture en bloc : statut
+    ' "En retard", ou date limite depassee sur une ligne non terminale.
+    ' Avant, ce rappel relisait le fil Outlook de chaque ligne candidate et,
+    ' sur ancrage perime, parcourait TOUTE la boite : 5 min 30 de gel le
+    ' 23/09, 9 min 57 s le 24/09. Le recalcul complet reste fait a
+    ' l'ouverture du tableau de bord et avant toute relance
+    ' (FollowUpOverdue), la ou il sert. Rien n'est enregistre ici.
     Dim lastRow As Long
     lastRow = ws.Cells(ws.Rows.count, COL_ID).End(-4162).row
     If lastRow < 2 Then GoTo Done
 
+    Dim blk As Variant
+    blk = modExcelBridge.ReadBlock(ws, 2, 1, lastRow, LAST_COL)
+
     Dim overdueCount As Long
     Dim preview As String
-    Dim row As Long
+    Dim r As Long, st As String, dueV As Date, isLate As Boolean, obj As String
     overdueCount = 0
     preview = ""
-
-    For row = 2 To lastRow
-        Dim status As String
-        status = CStr(ws.Cells(row, COL_STATUS).Value)
-        ' v4.6 : le statut binaire "En retard" est l'unique etat de retard
-        If InStr(1, status, "En retard", vbTextCompare) > 0 Then
+    For r = 1 To lastRow - 1
+        st = CStr(SafeVal(blk, r, COL_STATUS))
+        If st = "R" & Chr(233) & "pondu" Then GoTo NextRow
+        If st = "R" & Chr(233) & "pondu ?" Then GoTo NextRow
+        If st = "Trait" & Chr(233) Then GoTo NextRow
+        isLate = (InStr(1, st, "En retard", vbTextCompare) > 0)
+        If Not isLate Then
+            dueV = 0
+            On Error Resume Next
+            dueV = CDate(SafeVal(blk, r, COL_DUE_DATE))
+            On Error GoTo Done
+            If dueV > 0 And dueV < Date Then isLate = True
+        End If
+        If isLate Then
             overdueCount = overdueCount + 1
             If overdueCount <= 3 Then
-                Dim obj As String
-                obj = CStr(ws.Cells(row, COL_SUBJECT).Value)
+                obj = CStr(SafeVal(blk, r, COL_SUBJECT))
                 If Len(obj) > 55 Then obj = Left(obj, 55) & "..."
                 preview = preview & "  - " & obj & vbCrLf
             End If
         End If
-    Next row
+NextRow:
+    Next r
 
-    ' On marque la pop comme faite pour aujourd'hui (qu'il y ait des retards
-    ' ou non : si zero retard, on ne re-scannera pas inutilement aujourd'hui).
+    ' Rappel du jour marque (qu'il y ait des retards ou non).
     SaveSetting REG_TRACK_APP, REG_TRACK_SECTION, REG_KEY_LASTPOP, today
 
     If overdueCount = 0 Then
-        modDebugLog.DDebug MOD_NAME, "RemindOverdue : 0 retard"
+        modDebugLog.DDebug MOD_NAME, "RemindOverdue : 0 retard (feuille)"
         GoTo Done                          ' v5.1 : liberer le classeur (fuite)
     End If
 
