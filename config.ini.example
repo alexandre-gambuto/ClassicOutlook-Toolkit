@@ -44,6 +44,19 @@ GreetingEnabled=1
 GreetingWord=
 
 ; ------------------------------------------------------------
+; PIECES JOINTES DU FIL (modThreadAttachments)
+;   Bouton "PJ du fil" d'une reponse ou d'un transfert : remet les
+;   fichiers qui ont circule plus tot dans le fil (ajout direct si un
+;   seul mail du fil en porte, sinon liste de choix).
+;   ThreadAttachWarnMB : alerte avant l'ajout si les pieces jointes du
+;     message depassent ce poids, en Mo (defaut 20). 0 = jamais d'alerte.
+;     La vraie limite depend de la messagerie. Exchange Online : 35 Mo par
+;     message par defaut, encodage compris, soit environ 25 Mo de
+;     fichiers ; votre organisation a pu changer cette valeur.
+; ------------------------------------------------------------
+ThreadAttachWarnMB=20
+
+; ------------------------------------------------------------
 ; CHEMINS (laisser vide = calcul auto depuis le Bureau, qui suit
 ; la redirection OneDrive). Ne renseigner que pour forcer un
 ; emplacement non standard (chemin absolu complet).

@@ -1,7 +1,25 @@
 Option Explicit
 
 '=============================================================================
-' ThisOutlookSession v10.14  (2026-09-24)
+' ThisOutlookSession v10.16  (2026-10-09)
+'
+' v10.16 (2026-10-09) : CANAL DE COMMANDES Excel -> Outlook. Le bouton
+'   Actualiser du classeur appelait RefreshMailTracking a travers l'objet
+'   Application d'Outlook. Ce raccourci (procedures publiques de
+'   ThisOutlookSession vues des autres applications) n'est pas documente et
+'   n'est pas expose sur le poste : erreur 438 a chaque clic. Remplacement
+'   par un mecanisme documente : le classeur ecrit une note dans le dossier
+'   Notes\ClassicOutlook-Toolkit (cree au demarrage), dont Outlook surveille
+'   les ajouts et modifications (mCmdItems). Texte de la note :
+'   "TOOLKIT|REFRESH|aaaammjjhhnnss-mmm". Une commande deja traitee, ou
+'   datee de plus de CMD_MAX_AGE_SEC secondes (echo de synchronisation au
+'   demarrage), est ignoree. Liaison refaite par RebindEvents.
+'   RefreshMailTracking est conserve (utilise s'il fonctionne).
+'
+' v10.15 (2026-10-05) : RefreshMailTracking - le bouton Actualiser du
+'   classeur Suivi des mails demande le recalcul a Outlook (procedure
+'   publique exposee aux autres applications ; travail differe, cf. fin du
+'   module).
 '
 ' v10.14 (2026-09-24) : DEMARRAGE SANS GEL (pack v4).
 '   (a) Reindexation QuickMove : plus de parcours hebdomadaire d'un bloc a
@@ -270,7 +288,7 @@ Private Const SWITCH_GUARD_MS As Long = 1500   ' v10.2 : duree (ms) de la garde 
 Private Const BIRTHDAY_VIEW_DELAY_MS As Long = 1200   ' v10.13 : attente construction fenetre calendrier
 Private Const BIRTHDAY_VIEW_RETRY_MS As Long = 1500   ' v10.13 : espacement des tentatives suivantes
 Private Const MOD_NAME As String = "ThisOutlook"
-Private Const MOD_VERSION As String = "v10.14 - 2026-09-24"
+Private Const MOD_VERSION As String = "v10.16 - 2026-10-09"
 
 ' === QUICKMOVE ENVOYES - prompt asynchrone ===
 ' Garde de reentrance : un seul prompt ouvert a la fois.
@@ -294,6 +312,12 @@ Private bWatchdogBusy As Boolean
 ' v10.10 : fermeture plus courte que ce seuil = "redemarrage rapide" ->
 ' les rattrapages de demarrage (couleurs, envoyes, archivage) sont sautes.
 Private Const QUICK_RESTART_MIN As Long = 30
+
+' v10.16 : canal de commandes Excel -> Outlook (cf. en-tete).
+Private WithEvents mCmdItems As Outlook.items
+Private mLastCmdStamp As String
+Private Const CMD_FOLDER_NAME As String = "ClassicOutlook-Toolkit"
+Private Const CMD_MAX_AGE_SEC As Long = 120
 
 '=============================================================================
 ' Property d'acces au flag de suspension d'evenements calendar.
@@ -386,6 +410,9 @@ Private Sub Application_Startup()
     On Error Resume Next
     modInboxAlert.InboxAlertStart
     On Error GoTo 0
+
+    ' v10.16 : canal de commandes du classeur Suivi des mails.
+    BindCommandChannel
 
     ' v5 (2026-06-10) : archivage differe a +2 min (P1). AutoArchiveMove
     ' parcourait toute l'arborescence configuree de maniere SYNCHRONE au
@@ -578,6 +605,9 @@ Public Sub RebindEvents()
     On Error Resume Next
     modQuickMove.FolderWatchStart
     On Error GoTo 0
+
+    ' v10.16 : canal de commandes (WithEvents perdu aussi).
+    BindCommandChannel
 
     modDebugLog.DInfo MOD_NAME, "RebindEvents OK"
 End Sub
@@ -1844,5 +1874,111 @@ Sub Sensitivity_Confidential()
     ' v6.1 : cycle neant -> CONFIDENTIEL -> PRIVE -> PERSONNEL -> neant -> ...
     modMailConfidentiality.ToggleSensitivityCycle
 End Sub
- 
+
+'=============================================================================
+' v10.15 - ACTUALISATION DU SUIVI DES MAILS DEMANDEE PAR LE CLASSEUR EXCEL
+' Appelee depuis Excel via l'objet Application d'Outlook (les procedures
+' publiques de ThisOutlookSession y sont exposees) :
+'   GetObject(, "Outlook.Application").RefreshMailTracking ThisWorkbook
+' Rien n'est fait ici meme : la demande est DIFFEREE (modDefer "DashRefresh")
+' pour rendre la main a Excel tout de suite. Sinon Outlook ecrirait dans un
+' classeur dont le code attend encore la reponse de cet appel (appel
+' imbrique, refus possible de COM). Le classeur transmis sert a viser la
+' bonne instance d'Excel.
+'=============================================================================
+Public Sub RefreshMailTracking(Optional ByVal wb As Object)
+    On Error Resume Next
+    modMailResponseTracker.RequestDashboardRefresh wb
+End Sub
+
+'=============================================================================
+' v10.16 - CANAL DE COMMANDES Excel -> Outlook
+' BindCommandChannel : cree au besoin le dossier de notes
+' Notes\ClassicOutlook-Toolkit et surveille ses elements (ajout ET
+' modification : le classeur reutilise une seule note). Appele par
+' Application_Startup et RebindEvents. Silencieux ; un echec est journalise.
+' HandleToolkitCommand : lit la note "TOOLKIT|<commande>|<horodatage>" ;
+' ignore une commande deja traitee ou trop ancienne ; REFRESH -> meme
+' actualisation differee que RefreshMailTracking (classeur retrouve par son
+' nom). Aucune fenetre, aucun traitement lourd dans l'evenement.
+'=============================================================================
+Private Sub BindCommandChannel()
+    On Error Resume Next
+    Set mCmdItems = Nothing
+    Dim notesFld As Outlook.folder
+    Set notesFld = Nothing
+    Set notesFld = Application.Session.GetDefaultFolder(olFolderNotes)
+    If notesFld Is Nothing Then
+        modDebugLog.DError MOD_NAME, "Canal de commandes : dossier Notes introuvable (" & Err.Number & ")"
+        Err.Clear
+        Exit Sub
+    End If
+    Dim fld As Outlook.folder
+    Set fld = Nothing
+    Set fld = notesFld.Folders(CMD_FOLDER_NAME)
+    If fld Is Nothing Then
+        Err.Clear
+        Set fld = notesFld.Folders.Add(CMD_FOLDER_NAME, olFolderNotes)
+    End If
+    If fld Is Nothing Then
+        modDebugLog.DError MOD_NAME, "Canal de commandes : creation du dossier impossible (" & Err.Number & ")"
+        Err.Clear
+        Exit Sub
+    End If
+    Set mCmdItems = fld.items
+    modDebugLog.DInfo MOD_NAME, "Canal de commandes pret (" & fld.FolderPath & ")"
+    Err.Clear
+End Sub
+
+Private Sub mCmdItems_ItemAdd(ByVal Item As Object)
+    On Error Resume Next
+    HandleToolkitCommand Item
+End Sub
+
+Private Sub mCmdItems_ItemChange(ByVal Item As Object)
+    On Error Resume Next
+    HandleToolkitCommand Item
+End Sub
+
+Private Sub HandleToolkitCommand(ByVal Item As Object)
+    On Error Resume Next
+    Dim txt As String
+    txt = ""
+    txt = CStr(Item.body)
+    txt = Replace(txt, vbCr, vbLf)
+    If InStr(1, txt, vbLf) > 0 Then txt = Left$(txt, InStr(1, txt, vbLf) - 1)
+    txt = Trim$(txt)
+
+    Dim parts() As String
+    parts = Split(txt, "|")
+    If UBound(parts) < 2 Then Exit Sub
+    If parts(0) <> "TOOLKIT" Then Exit Sub
+
+    Dim stamp As String
+    stamp = parts(2)
+    If Len(stamp) < 14 Then Exit Sub
+    If stamp = mLastCmdStamp Then Exit Sub
+
+    Dim sentAt As Date
+    sentAt = 0
+    sentAt = DateSerial(CInt(Mid$(stamp, 1, 4)), CInt(Mid$(stamp, 5, 2)), CInt(Mid$(stamp, 7, 2))) + _
+             TimeSerial(CInt(Mid$(stamp, 9, 2)), CInt(Mid$(stamp, 11, 2)), CInt(Mid$(stamp, 13, 2)))
+    If Err.Number <> 0 Or sentAt = 0 Then
+        Err.Clear
+        Exit Sub
+    End If
+    If Abs(DateDiff("s", sentAt, Now)) > CMD_MAX_AGE_SEC Then
+        modDebugLog.DDebug MOD_NAME, "Canal de commandes : commande ancienne ignoree (" & stamp & ")"
+        Exit Sub
+    End If
+    mLastCmdStamp = stamp
+
+    Select Case UCase$(parts(1))
+        Case "REFRESH"
+            modDebugLog.DInfo MOD_NAME, "Canal de commandes : actualisation du suivi demandee par Excel"
+            modMailResponseTracker.RequestDashboardRefresh Nothing
+        Case Else
+            modDebugLog.DInfo MOD_NAME, "Canal de commandes : commande inconnue '" & parts(1) & "'"
+    End Select
+End Sub
 

@@ -1,0 +1,41 @@
+Option Explicit
+
+'=============================================================================
+' Code du module "ThisWorkbook" (Ce classeur) - Suivi des mails.xlsm - v7
+' A coller dans ThisWorkbook : VBE Excel (Alt+F11) -> double-clic sur
+' "ThisWorkbook" (ou "Ce classeur") sous VBAProject(Suivi des mails.xlsm) ->
+' tout remplacer par ce code.
+'
+' v7 (2026-10-05) : tous les evenements du classeur sont branches ici et
+'   delegues a modMailTracker (prerequis : ce module standard existe, et le
+'   module de la feuille Suivi est VIDE) :
+'     - ouverture         : colonne coche, colonnes techniques masquees,
+'                           surlignage de la ligne active, compteurs du ruban
+'     - activation        : onglet "Suivi des mails" re-selectionne
+'     - changement de feuille : libelle Archiver / Restaurer, compteurs
+'     - changement de selection (Suivi, Archives) : coche d'une ligne,
+'                           surlignage
+'     - modification (Suivi) : edition du delai -> recalcul de la ligne
+'=============================================================================
+Private Sub Workbook_Open()
+    On Error Resume Next
+    modMailTracker.OnWorkbookOpen
+End Sub
+
+Private Sub Workbook_Activate()
+    On Error Resume Next
+    modMailTracker.ActivateRibbonTab
+End Sub
+
+Private Sub Workbook_SheetActivate(ByVal Sh As Object)
+    On Error Resume Next
+    modMailTracker.OnSheetActivated Sh
+End Sub
+
+Private Sub Workbook_SheetSelectionChange(ByVal Sh As Object, ByVal Target As Range)
+    modMailTracker.OnSelectionChanged Sh, Target
+End Sub
+
+Private Sub Workbook_SheetChange(ByVal Sh As Object, ByVal Target As Range)
+    modMailTracker.OnSheetChanged Sh, Target
+End Sub

@@ -1,0 +1,420 @@
+Option Explicit
+
+'=============================================================================
+' modViewGuard v1.0  (2026-10-09)
+' Purpose (EN): one-click "Standardize view" command (View tab of the ribbon):
+'   makes the sender/recipient column consistent across the mail folders of
+'   the current mailbox - "From" everywhere, "To" only in Sent Items, Drafts
+'   and Outbox - by swapping the wrong column in each folder's current table
+'   view definition (View.XML).
+'
+' Commande manuelle "Standardiser l'affichage" (onglet Affichage du ruban,
+' Sub publique StandardizeView - API ruban STABLE, ne pas renommer).
+' Coherence de la colonne expediteur / destinataire dans les vues :
+'   - "De" dans tous les dossiers de courrier ;
+'   - "A" seulement dans Elements envoyes, Brouillons et Boite d'envoi.
+' Symptome corrige : la boite de reception (ou un dossier projet) affiche
+' les destinataires au lieu de l'expediteur, en general apres avoir applique
+' la vue des Elements envoyes aux autres dossiers.
+'
+' FONCTIONNEMENT (aucun automatisme : rien ne tourne sans le clic)
+'   - Boite visee : celle du dossier affiche (convention multiboite du
+'     toolkit, cf. modStoreContext). Dossiers "A" d'abord, puis toute
+'     l'arborescence des dossiers de courrier (budget SCAN_BUDGET_SEC).
+'   - Controle : vue courante du dossier (Folder.CurrentView), vues de type
+'     tableau seulement ; la definition contient-elle la colonne De
+'     (fromname / PR_SENT_REPRESENTING_NAME / PR_SENDER_NAME) ou la colonne
+'     A (displayto / PR_DISPLAY_TO) ? Incoherent = la colonne attendue
+'     manque ET l'autre est presente. Une vue qui montre les DEUX, ou
+'     aucune, n'est pas touchee.
+'   - Correction immediate : propriete de la colonne remplacee (et son
+'     en-tete De / A), tri et regroupement compris ; View.Save, puis Apply
+'     si le dossier est affiche.
+'   - Garde-fou VUE PARTAGEE : une vue enregistree pour "tous les dossiers
+'     de courrier" et utilisee AUSSI par un dossier "A" n'est jamais
+'     modifiee (corriger l'un casserait l'autre) : listee dans le compte
+'     rendu, avec la marche a suivre.
+'   - Compte rendu : toast si tout est regle ; fenetre seulement s'il reste
+'     quelque chose a faire a la main.
+'
+' Dependances : modConfig (LangIsEN, T), modDebugLog, modNotify,
+' modStoreContext (CurrentStore, SysFolder).
+'=============================================================================
+
+Private Const MOD_NAME As String = "ViewGuard"
+Private Const MOD_VERSION As String = "v1.0 - 2026-10-09"
+
+' Proprietes de colonne (syntaxe des definitions de vue Outlook).
+Private Const PROP_FROM As String = "urn:schemas:httpmail:fromname"
+Private Const PROP_FROM_MAPI1 As String = "http://schemas.microsoft.com/mapi/proptag/0x0042001f"
+Private Const PROP_FROM_MAPI2 As String = "http://schemas.microsoft.com/mapi/proptag/0x0c1a001f"
+Private Const PROP_TO As String = "urn:schemas:httpmail:displayto"
+Private Const PROP_TO_MAPI As String = "http://schemas.microsoft.com/mapi/proptag/0x0e04001f"
+
+Private Const OL_TABLE_VIEW As Long = 0          ' olTableView
+Private Const OL_MAIL_ITEM As Long = 0           ' olMailItem
+Private Const OL_FOLDER_OUTBOX As Long = 4
+Private Const OL_FOLDER_SENT As Long = 5
+Private Const OL_FOLDER_DRAFTS As Long = 16
+Private Const OL_SAVE_ALL_FOLDERS As Long = 2    ' olViewSaveOptionAllFoldersOfType
+
+Private Const SCAN_BUDGET_SEC As Long = 90
+Private Const MAX_LISTED As Long = 10
+
+' Etat d'une passe (remis a zero par ResetPass).
+Private mSentKeys As Object        ' EntryID des dossiers "A" -> True
+Private mSharedSentViews As Object ' nom (minuscules) des vues partagees utilisees par un dossier "A"
+Private mShared As Collection      ' chemins non corriges (vue partagee avec un dossier "A")
+Private mChecked As Long
+Private mWrong As Long
+Private mFixed As Long
+Private mFailed As Long
+Private mT0 As Double
+Private mAborted As Boolean
+
+'=============================================================================
+' ModVersion - version reellement chargee dans le VBE.
+'=============================================================================
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+'=============================================================================
+' StandardizeView - bouton "Standardiser l'affichage" (onglet Affichage).
+' Controle ET corrige la boite du dossier affiche, puis compte rendu.
+'=============================================================================
+Public Sub StandardizeView()
+    On Error GoTo ErrH
+    Dim st As Object
+    Set st = modStoreContext.CurrentStore()
+    If st Is Nothing Then Set st = Application.GetNamespace("MAPI").DefaultStore
+
+    ResetPass
+    mT0 = Timer
+    ProcessStore st
+
+    Dim stName As String
+    stName = ""
+    On Error Resume Next
+    stName = CStr(st.DisplayName)
+    On Error GoTo ErrH
+    modDebugLog.DInfo MOD_NAME, "Standardisation (" & stName & ") : " & mChecked & " dossier(s), " & _
+        mWrong & " incoherent(s), " & mFixed & " corrige(s), " & mShared.Count & _
+        " vue(s) partagee(s) non touchee(s), " & mFailed & " echec(s), en " & _
+        Format$(ElapsedSec(mT0), "0.0") & " s" & IIf(mAborted, " (budget atteint)", "")
+
+    If mShared.Count = 0 And mFailed = 0 And Not mAborted Then
+        If mFixed > 0 Then
+            modNotify.Notify TA("Affichage standardis~e : De / {A} corrig~e dans ", "Display standardized: From / To fixed in ") & _
+                             mFixed & T(" dossier(s)", " folder(s)")
+        Else
+            modNotify.Notify T("Affichage d~ej~a coh~erent (", "Display already consistent (") & mChecked & _
+                             T(" dossiers contr~ol~es)", " folders checked)")
+        End If
+        Exit Sub
+    End If
+
+    ' Il reste quelque chose a faire : fenetre de compte rendu.
+    Dim msg As String
+    msg = mFixed & T(" dossier(s) corrig~e(s) sur ", " folder(s) fixed out of ") & mChecked & _
+          T(" contr~ol~e(s).", " checked.")
+    If mShared.Count > 0 Then
+        msg = msg & vbCrLf & vbCrLf & _
+              T("Non corrig~e(s) - leur vue est partag~ee avec les ~El~ements envoy~es :", _
+                "Not fixed - their view is shared with Sent Items:") & vbCrLf & PathList(mShared) & vbCrLf & _
+              T("Dans chacun : Affichage > Modifier l'affichage > Enregistrer l'affichage actuel en tant que nouvel affichage,", _
+                "In each one: View > Change View > Save Current View As a New View,") & vbCrLf & _
+              T("option ""Ce dossier"", puis relancer Standardiser l'affichage.", _
+                "option ""This folder"", then run Standardize view again.")
+    End If
+    If mFailed > 0 Then
+        msg = msg & vbCrLf & vbCrLf & mFailed & T(" ~echec(s) d'enregistrement de vue (voir debug.log).", _
+                                                   " view save failure(s) (see debug.log).")
+    End If
+    If mAborted Then
+        msg = msg & vbCrLf & vbCrLf & T("Arr~xt au bout de ", "Stopped after ") & SCAN_BUDGET_SEC & _
+              T(" s : relancez pour la suite.", " s: run it again for the rest.")
+    End If
+    MsgBox msg, vbInformation, T("Standardiser l'affichage", "Standardize view")
+    Exit Sub
+ErrH:
+    modDebugLog.DError MOD_NAME, "StandardizeView err " & Err.Number & " - " & Err.Description
+    MsgBox T("Erreur ", "Error ") & Err.Number & " : " & Err.Description, vbExclamation, _
+           T("Standardiser l'affichage", "Standardize view")
+End Sub
+
+Private Sub ResetPass()
+    Set mSentKeys = CreateObject("Scripting.Dictionary")
+    Set mSharedSentViews = CreateObject("Scripting.Dictionary")
+    Set mShared = New Collection
+    mChecked = 0
+    mWrong = 0
+    mFixed = 0
+    mFailed = 0
+    mAborted = False
+End Sub
+
+'=============================================================================
+' ProcessStore - d'abord les dossiers "A" (ils fixent les vues partagees a
+' proteger), puis toute l'arborescence des dossiers de courrier.
+'=============================================================================
+Private Sub ProcessStore(ByVal st As Object)
+    On Error Resume Next
+    Dim ids As Variant, i As Long, fld As Object
+    ids = Array(OL_FOLDER_SENT, OL_FOLDER_DRAFTS, OL_FOLDER_OUTBOX)
+    For i = LBound(ids) To UBound(ids)
+        Set fld = Nothing
+        Set fld = modStoreContext.SysFolder(st, CLng(ids(i)))
+        If Not fld Is Nothing Then
+            mSentKeys(CStr(fld.EntryID)) = True
+            RememberSharedView fld
+        End If
+    Next i
+    For i = LBound(ids) To UBound(ids)
+        Set fld = Nothing
+        Set fld = modStoreContext.SysFolder(st, CLng(ids(i)))
+        If Not fld Is Nothing Then CheckFolder fld, True
+    Next i
+
+    Dim root As Object
+    Set root = Nothing
+    Set root = st.GetRootFolder
+    If root Is Nothing Then Exit Sub
+    Dim sub_ As Object
+    For Each sub_ In root.Folders
+        If mAborted Then Exit Sub
+        WalkTree sub_
+    Next sub_
+End Sub
+
+' Vue partagee ("tous les dossiers de courrier") utilisee par un dossier "A".
+Private Sub RememberSharedView(ByVal fld As Object)
+    On Error Resume Next
+    Dim v As Object
+    Set v = Nothing
+    Set v = fld.CurrentView
+    If v Is Nothing Then Exit Sub
+    Dim so As Long
+    so = -1
+    so = CLng(v.SaveOption)
+    If so = OL_SAVE_ALL_FOLDERS Then mSharedSentViews(LCase$(CStr(v.Name))) = True
+End Sub
+
+' Parcours recursif des dossiers de courrier (les autres types sont elagues
+' avec leur descendance). Les dossiers "A" ont deja ete traites.
+Private Sub WalkTree(ByVal fld As Object)
+    On Error Resume Next
+    If mAborted Then Exit Sub
+    Dim itemType As Long
+    itemType = -1
+    itemType = CLng(fld.DefaultItemType)
+    If itemType <> OL_MAIL_ITEM Then Exit Sub
+
+    If Not mSentKeys.Exists(CStr(fld.EntryID)) Then CheckFolder fld, False
+
+    If (mChecked Mod 10) = 0 Then
+        DoEvents
+        If ElapsedSec(mT0) > SCAN_BUDGET_SEC Then
+            mAborted = True
+            Exit Sub
+        End If
+    End If
+
+    Dim sub_ As Object
+    For Each sub_ In fld.Folders
+        If mAborted Then Exit Sub
+        WalkTree sub_
+    Next sub_
+End Sub
+
+'=============================================================================
+' CheckFolder - controle et correction de la vue courante d'UN dossier.
+' wantTo = True pour un dossier "A" (envoyes, brouillons, boite d'envoi).
+'=============================================================================
+Private Sub CheckFolder(ByVal fld As Object, ByVal wantTo As Boolean)
+    On Error Resume Next
+    Dim v As Object
+    Set v = Nothing
+    Set v = fld.CurrentView
+    If v Is Nothing Then
+        Err.Clear
+        Exit Sub
+    End If
+    mChecked = mChecked + 1
+
+    Dim vt As Long
+    vt = -1
+    vt = CLng(v.ViewType)
+    If vt <> OL_TABLE_VIEW Then Exit Sub
+
+    Dim x As String
+    x = ""
+    x = CStr(v.XML)
+    If Len(x) = 0 Then Exit Sub
+
+    Dim hasFrom As Boolean, hasTo As Boolean
+    hasFrom = HasProp(x, PROP_FROM) Or HasProp(x, PROP_FROM_MAPI1) Or HasProp(x, PROP_FROM_MAPI2)
+    hasTo = HasProp(x, PROP_TO) Or HasProp(x, PROP_TO_MAPI)
+
+    Dim wrong As Boolean
+    If wantTo Then
+        wrong = hasFrom And Not hasTo
+    Else
+        wrong = hasTo And Not hasFrom
+    End If
+    If Not wrong Then Exit Sub
+
+    mWrong = mWrong + 1
+    Dim path As String
+    path = ""
+    path = CStr(fld.FolderPath)
+    modDebugLog.DInfo MOD_NAME, "Vue incoherente (" & IIf(wantTo, "De au lieu de A", "A au lieu de De") & _
+        ", vue '" & CStr(v.Name) & "') : " & path
+
+    ' Garde-fou : vue partagee. Corriger une vue "tous les dossiers" casse
+    ' l'autre camp si un dossier de ce camp l'utilise aussi.
+    Dim so As Long
+    so = -1
+    so = CLng(v.SaveOption)
+    If so = OL_SAVE_ALL_FOLDERS Then
+        If wantTo Or mSharedSentViews.Exists(LCase$(CStr(v.Name))) Then
+            mShared.Add path
+            modDebugLog.DInfo MOD_NAME, "Vue partagee avec un dossier A, non modifiee : " & path
+            Exit Sub
+        End If
+    End If
+
+    Dim newX As String
+    newX = SwapColumn(x, wantTo)
+    If newX = x Then
+        mFailed = mFailed + 1
+        modDebugLog.DError MOD_NAME, "Colonne introuvable dans la definition de vue : " & path
+        Exit Sub
+    End If
+
+    Err.Clear
+    v.XML = newX
+    v.Save
+    If Err.Number <> 0 Then
+        mFailed = mFailed + 1
+        modDebugLog.DError MOD_NAME, "Enregistrement de vue impossible (" & Err.Number & " - " & _
+            Err.Description & ") : " & path
+        Err.Clear
+        Exit Sub
+    End If
+    mFixed = mFixed + 1
+    modDebugLog.DInfo MOD_NAME, "Vue corrigee : " & path
+    ApplyIfDisplayed fld, v
+End Sub
+
+Private Function HasProp(ByVal x As String, ByVal prop As String) As Boolean
+    HasProp = (InStr(1, x, "<prop>" & prop & "</prop>", vbTextCompare) > 0)
+End Function
+
+'=============================================================================
+' SwapColumn - remplace la colonne De par A (toTo = True) ou A par De dans
+' une definition de vue : propriete, et en-tete du MEME bloc (colonne, tri,
+' regroupement). L'en-tete est celui qui precede la propriete sans limite
+' de bloc entre les deux.
+'=============================================================================
+Private Function SwapColumn(ByVal x As String, ByVal toTo As Boolean) As String
+    Dim oldProps As Variant, newProp As String, newHead As String
+    If toTo Then
+        oldProps = Array(PROP_FROM, PROP_FROM_MAPI1, PROP_FROM_MAPI2)
+        newProp = PROP_TO
+        newHead = HeadingTo()
+    Else
+        oldProps = Array(PROP_TO, PROP_TO_MAPI)
+        newProp = PROP_FROM
+        newHead = HeadingFrom()
+    End If
+
+    Dim i As Long, oldTag As String, newTag As String
+    Dim p As Long, h1 As Long, h2 As Long, delta As Long
+    newTag = "<prop>" & newProp & "</prop>"
+    For i = LBound(oldProps) To UBound(oldProps)
+        oldTag = "<prop>" & CStr(oldProps(i)) & "</prop>"
+        p = InStr(1, x, oldTag, vbTextCompare)
+        Do While p > 0
+            h1 = InStrRev(x, "<heading>", p, vbTextCompare)
+            If h1 > 0 Then
+                h2 = InStr(h1, x, "</heading>", vbTextCompare)
+                If h2 > 0 And h2 < p Then
+                    If Not CrossesBlock(Mid$(x, h2, p - h2)) Then
+                        delta = Len(newHead) - (h2 - h1 - 9)
+                        x = Left$(x, h1 + 8) & newHead & Mid$(x, h2)
+                        p = p + delta
+                    End If
+                End If
+            End If
+            x = Left$(x, p - 1) & newTag & Mid$(x, p + Len(oldTag))
+            p = InStr(p + Len(newTag), x, oldTag, vbTextCompare)
+        Loop
+    Next i
+    SwapColumn = x
+End Function
+
+' Le texte entre l'en-tete et la propriete franchit-il une limite de bloc ?
+Private Function CrossesBlock(ByVal s As String) As Boolean
+    Dim marks As Variant, i As Long
+    CrossesBlock = False
+    marks = Array("</column>", "<column>", "</order>", "<order>", "</groupby>", "<groupby>")
+    For i = LBound(marks) To UBound(marks)
+        If InStr(1, s, CStr(marks(i)), vbTextCompare) > 0 Then
+            CrossesBlock = True
+            Exit Function
+        End If
+    Next i
+End Function
+
+' En-tetes de colonne, dans la langue de l'interface (config Language).
+' "A" majuscule accentue : ChrW(192), absent de la table des marqueurs A().
+Private Function HeadingFrom() As String
+    HeadingFrom = T("De", "From")
+End Function
+
+Private Function HeadingTo() As String
+    If modConfig.LangIsEN() Then
+        HeadingTo = "To"
+    Else
+        HeadingTo = ChrW$(192)
+    End If
+End Function
+
+' Re-applique la vue si le dossier est affiche dans la fenetre active.
+Private Sub ApplyIfDisplayed(ByVal fld As Object, ByVal v As Object)
+    On Error Resume Next
+    Dim xpl As Object
+    Set xpl = Nothing
+    Set xpl = Application.ActiveExplorer
+    If xpl Is Nothing Then Exit Sub
+    Dim curId As String
+    curId = ""
+    curId = CStr(xpl.CurrentFolder.EntryID)
+    If curId = CStr(fld.EntryID) Then v.Apply
+    Err.Clear
+End Sub
+
+' T() + "A" majuscule accentue : le marqueur {A} de la branche FR devient
+' ChrW(192) (absent de la table des marqueurs de A()).
+Private Function TA(ByVal fr As String, ByVal en As String) As String
+    TA = Replace(T(fr, en), "{A}", ChrW$(192))
+End Function
+
+' Liste de chemins pour un message (MAX_LISTED premiers).
+Private Function PathList(ByVal c As Collection) As String
+    Dim s As String, i As Long
+    For i = 1 To c.Count
+        If i > MAX_LISTED Then
+            s = s & T("  ... et ", "  ... and ") & (c.Count - MAX_LISTED) & T(" autre(s)", " more") & vbCrLf
+            Exit For
+        End If
+        s = s & "  - " & CStr(c(i)) & vbCrLf
+    Next i
+    PathList = s
+End Function
+
+Private Function ElapsedSec(ByVal since As Double) As Double
+    ElapsedSec = Timer - since
+    If ElapsedSec < 0 Then ElapsedSec = ElapsedSec + 86400#
+End Function

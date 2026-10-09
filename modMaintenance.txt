@@ -1,7 +1,10 @@
 Option Explicit
 
 '=============================================================================
-' modMaintenance v4.2  (2026-09-24)
+' modMaintenance v4.3  (2026-10-05)
+'
+' v4.3 (2026-10-05) : nouveau module modThreadAttachments (pieces jointes
+'   du fil) : ThreadAtt ajoute a MODULES_DEFAULT et a ModuleVersionOf.
 '
 ' v4.2 (2026-09-24) : MODULES_DEFAULT complete avec FoldWatch (nouvelle
 '   classe clsFolderWatcher du pack v4), pour le filtre de log par module.
@@ -134,7 +137,7 @@ Option Explicit
 '=============================================================================
 
 Private Const MOD_NAME As String = "Maint"
-Private Const MOD_VERSION As String = "v4.2 - 2026-09-24"
+Private Const MOD_VERSION As String = "v4.3 - 2026-10-05"
 Private Const TITLE As String = "Maintenance VBA"
 
 ' Copie locale du filtre de log courant. modDebugLog n'expose pas son
@@ -156,7 +159,7 @@ Private Const MODULES_DEFAULT As String = _
     "AppEvents|Defer|ExplWatch|MarkRead|ONProbe|ReplyGreet|" & _
     "ContBday|ContExp|ContImp|ContMail|ContNorm|ContNote|ContRel|" & _
     "FolderRen|FolderSort|HideBcc|InboxAlert|InboxWatch|StoreCtx|Ui|" & _
-    "Smtp|ExcelBridge|ContCommon|InspQueue|QuickStart|FoldWatch"
+    "Smtp|ExcelBridge|ContCommon|InspQueue|QuickStart|FoldWatch|ThreadAtt"
 
 '=============================================================================
 ' Maintenance  (POINT D'ENTREE - a epingler au QAT)
@@ -720,6 +723,7 @@ Private Function ModuleVersionOf(ByVal shortName As String) As String
         Case "Snooze":       ModuleVersionOf = modSnooze.ModVersion()
         Case "StoreCtx":     ModuleVersionOf = modStoreContext.ModVersion()
         Case "ThisOutlook":  ModuleVersionOf = ThisOutlookSession.ModVersion()
+        Case "ThreadAtt":    ModuleVersionOf = modThreadAttachments.ModVersion()
         Case "Ui":           ModuleVersionOf = modUi.ModVersion()
         Case Else:        ModuleVersionOf = ""
     End Select

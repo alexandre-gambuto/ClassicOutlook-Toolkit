@@ -1,7 +1,10 @@
 Option Explicit
 
 '=============================================================================
-' modDefer v1.15  (2026-09-24)
+' modDefer v1.16  (2026-10-05)
+' v1.16 (2026-10-05) : cle "DashRefresh" (lourde) -> modMailResponseTracker.
+'   RefreshDashboard : actualisation du suivi des mails demandee par le
+'   classeur Excel (bouton Actualiser), executee en differe.
 ' v1.15 (2026-09-24) : PACK v4 - traitements lourds UN PAR UN + duree.
 '   (a) Les differes lourds (CatchUpColor, RemindOverdue, SentCatchUp,
 '       TagPreload, AutoArchive, Reindex, CleanFlags, MonthlyBackup) ne
@@ -97,7 +100,7 @@ Option Explicit
 '=============================================================================
 
 Private Const MOD_NAME As String = "Defer"
-Private Const MOD_VERSION As String = "v1.15 - 2026-09-24"
+Private Const MOD_VERSION As String = "v1.16 - 2026-10-05"
 
 Private Declare PtrSafe Function SetTimer Lib "user32" _
     (ByVal hWnd As LongPtr, ByVal nIDEvent As LongPtr, _
@@ -110,7 +113,7 @@ Private g_Actions As Object   ' Scripting.Dictionary
 
 ' v1.15 : garde "un traitement lourd a la fois" (cf. en-tete).
 Private Const HEAVY_KEYS As String = _
-    "|CatchUpColor|RemindOverdue|SentCatchUp|TagPreload|AutoArchive|Reindex|CleanFlags|MonthlyBackup|"
+    "|CatchUpColor|RemindOverdue|SentCatchUp|TagPreload|AutoArchive|Reindex|CleanFlags|MonthlyBackup|DashRefresh|"
 Private Const HEAVY_RETRY_SEC As Long = 5
 Private mHeavyDepth As Long
 
@@ -315,6 +318,9 @@ Private Sub Dispatch(ByVal actionKey As String, ByVal argText As String)
             modMailResponseTracker.RegisterFollowupSent argText
         Case "UrgentFlush"
             modMailResponseTracker.FlushUrgentTracking
+        Case "DashRefresh"
+            ' v1.16 : bouton Actualiser du classeur Suivi des mails.
+            modMailResponseTracker.RefreshDashboard
         Case "MaxWindow"
             modMaximizeWindow.MaximizePass argText
         Case "SentCatchUp"

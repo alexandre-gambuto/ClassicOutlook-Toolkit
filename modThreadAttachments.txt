@@ -1,0 +1,1726 @@
+Option Explicit
+
+' =====================================================================
+' modThreadAttachments v1.0  (2026-10-05)
+' Purpose (EN): re-attach, in one click, files that circulated earlier in
+'   a mail thread to the reply or forward being written (compose window
+'   or reading-pane reply). The thread is the Exchange conversation of the
+'   replied-to mail, so mails already filed by QuickMove / modReplyInPlace
+'   in project folders are included. Existing mails are never modified:
+'   only the draft receives files.
+'
+' Pieces jointes du fil : remet dans la reponse (ou le transfert) en cours
+' de redaction des fichiers qui ont circule plus tot dans le fil.
+' Cas d'usage type : repondre a son propre envoi (avec PJ) en changeant de
+' destinataire. Repondre retire les PJ ; Transferer les garde mais change
+' l'objet (TR:) et l'en-tete.
+'
+' PARCOURS (commande ruban AddThreadAttachments) :
+'   1. Brouillon : fenetre active (Inspector) ou reponse dans le volet de
+'      lecture (ActiveInlineResponse). Nouveau message -> refuse : index
+'      de conversation sans descendance (22 octets) ET objet identique au
+'      sujet du fil (une reponse porte un prefixe RE:/TR:/AW:..., quelle
+'      que soit la langue). Une reponse dont Outlook n'a pas derive l'index
+'      (mail venu d'un client tiers) passe donc, et s'accroche par le sujet.
+'   2. Point d'ancrage dans le fil, du plus sur au plus large :
+'      a. mail selectionne ou ouvert dont le ConversationIndex prefixe
+'         strictement celui du brouillon (= mail auquel on repond ; meme
+'         test que modReplyInPlace.IsDraftChildOf) ;
+'      b. autre mail du meme fil selectionne ou ouvert (meme en-tete
+'         d'index, ou meme sujet de fil : choix explicite de l'utilisateur) ;
+'      c. recherche par sujet de fil dans le dossier affiche, la Boite de
+'         reception et les Elements envoyes, en-tete d'index identique
+'         EXIGE (evite les fils homonymes : "Point", "Reunion"...).
+'      Rien -> message "selectionnez un mail de ce fil, puis cliquez a
+'      nouveau sur le bouton".
+'   3. Fil complet : GetConversation -> GetTable (index de conversations
+'      Exchange ; pattern valide par modMailResponseTracker v4.5 et
+'      modReplyInPlace v10), garde 500 lignes. Le mail auquel on repond
+'      est celui dont l'index est le plus long prefixe de celui du
+'      brouillon.
+'   4. Tri : vrais fichiers seulement (olByValue, olEmbeddeditem).
+'      Ecartes : pieces masquees, images referencees dans le HTML (cid:),
+'      images de signature (imageNNN / Outlook-xxx, < 30 Ko), liens cloud
+'      (PR_ATTACH_METHOD = 7) et objets OLE, fichiers bloques par Outlook,
+'      smime.p7s / smime.p7m, winmail.dat, .emz / .wmz.
+'      Doublons ENTRE mails (meme nom, taille a 4 Ko pres) fusionnes :
+'      priorite au mail auquel on repond, puis au plus recent.
+'      Fichiers deja presents dans le brouillon non reproposes.
+'   5. Choix : tous les fichiers du fil viennent d'UN seul mail -> ajout
+'      direct, sans fenetre (la barre des pieces jointes fait foi). Sinon
+'      liste numerotee (modUi.AskText) pre-remplie avec les fichiers du
+'      mail auquel on repond (a defaut : ceux du mail le plus recent).
+'      12 lignes max par page (InputBox ~1 024 caracteres), "+" = page
+'      suivante, "*" = tout, "1,3" ou "2-4".
+'   6. Alerte de poids (ThreadAttachWarnMB), puis copie : SaveAsFile dans
+'      %TEMP%\COTK-ThreadAtt\<horodatage>\<n>\ -> Attachments.Add ->
+'      dossier temporaire supprime (restes de plus d'un jour purges au
+'      passage). Le brouillon n'est pas enregistre par le module.
+'
+' CONFIG : ThreadAttachWarnMB (Mo, defaut 20 ; 0 = jamais d'alerte).
+' DIAGNOSTIC : ThreadAttachDiagnose (lecture seule) : meme analyse sur le
+'   brouillon courant, synthese a l'ecran + detail dans debug.log (INFO).
+' RUBAN : onAction="Projet.AddThreadAttachments" - fenetre de redaction
+'   (onglet Message) et reponse dans le volet de lecture (Outils de
+'   composition > Message).
+' EDR : SaveAsFile et Attachments.Add sont deja en service dans le projet
+'   (modContactExport, modMailCampaign). Aucun processus lance.
+' PIEGE VBA : sous On Error Resume Next, une erreur DANS la condition d'un
+'   If peut faire executer la branche Then (reprise a la ligne suivante,
+'   donc dans le bloc). Toute lecture COM est faite dans une variable AVANT
+'   le test (jamais "If obj.Prop = x Then").
+' DEPENDANCES : modConfig (T, CfgL, LangIsEN), modDebugLog, modUi,
+'   modMsgBoxCustom, modSmtp, modCommon.
+' =====================================================================
+
+Private Const MOD_NAME As String = "ThreadAtt"
+Private Const MOD_VERSION As String = "v1.0 - 2026-10-05"
+
+Private Const HEADER_LEN As Long = 44            ' en-tete d'index : 22 octets en hexa
+Private Const ROW_GUARD As Long = 500            ' lignes de fil lues au maximum
+Private Const POOL_MAX As Long = 50              ' mails selectionnes examines
+Private Const TOPIC_SCAN_MAX As Long = 50        ' resultats lus par dossier (recherche par sujet)
+Private Const SAME_FILE_TOL As Long = 4096       ' octets : meme fichier recopie d'un mail a l'autre
+Private Const SIG_IMAGE_MAX As Long = 30720      ' 30 Ko : plafond d'une image de signature
+Private Const PAGE_MAX As Long = 12              ' lignes par page de la liste
+Private Const PROMPT_BUDGET As Long = 740        ' caracteres de lignes par page (InputBox ~1 024)
+Private Const NAME_MAX As Long = 40              ' nom de fichier affiche
+Private Const WHO_MAX As Long = 20               ' expediteur affiche
+Private Const ASK_GUARD As Long = 30             ' tours de saisie au maximum
+Private Const DIAG_LINES As Long = 6             ' fichiers detailles dans la synthese
+Private Const MAX_PATH_SAFE As Long = 240        ' marge sous MAX_PATH (260)
+Private Const TEMP_SUBDIR As String = "COTK-ThreadAtt"
+Private Const MAX_VALID_DATE As Date = #1/1/4000#    ' Outlook : date vide = 01/01/4501
+
+Private Const OL_FOLDER_INBOX As Long = 6
+Private Const OL_FOLDER_SENT As Long = 5
+Private Const OL_MAIL_ITEM_TYPE As Long = 0      ' Folder.DefaultItemType d'un dossier de mails
+Private Const ATT_BY_VALUE As Long = 1           ' olByValue
+Private Const ATT_EMBEDDED As Long = 5           ' olEmbeddeditem
+Private Const ATTACH_BY_WEB_REF As Long = 7      ' PR_ATTACH_METHOD : piece jointe cloud
+Private Const BODY_FORMAT_HTML As Long = 2       ' olFormatHTML
+
+Private Const PR_ATTACH_HIDDEN As String = "http://schemas.microsoft.com/mapi/proptag/0x7FFE000B"
+Private Const PR_ATTACH_CONTENT_ID As String = "http://schemas.microsoft.com/mapi/proptag/0x3712001F"
+Private Const PR_ATTACH_METHOD As String = "http://schemas.microsoft.com/mapi/proptag/0x37050003"
+Private Const PR_CONVERSATION_TOPIC As String = "http://schemas.microsoft.com/mapi/proptag/0x0070001F"
+
+' Motifs d'ecart (Classify)
+Private Const RS_KEEP As Long = 0
+Private Const RS_INLINE As Long = 1
+Private Const RS_LINK As Long = 2
+Private Const RS_BLOCKED As Long = 3
+Private Const RS_TECH As Long = 4
+Private Const RS_OTHER As Long = 5
+
+' Origine du point d'ancrage (journal + diagnostic)
+Private Const HOW_NONE As Long = 0
+Private Const HOW_SELECTION As Long = 1
+Private Const HOW_WINDOW As Long = 2
+Private Const HOW_SAME_THREAD As Long = 3
+Private Const HOW_TOPIC As Long = 4
+Private Const HOW_DRAFT As Long = 5
+
+Private Type TCand
+    FileName As String       ' nom affiche (= nom du fichier joint)
+    SizeB As Long            ' Attachment.Size (octets, proprietes comprises)
+    MailEID As String        ' EntryID du mail qui porte le fichier
+    StoreID As String
+    AttIndex As Long         ' rang dans Attachments du mail source
+    MailTime As Date
+    Who As String            ' "moi" ou nom de l'expediteur (court)
+    FromParent As Boolean    ' fichier du mail auquel on repond
+    Attached As Boolean      ' deja present dans le brouillon
+    Dropped As Boolean       ' doublon fusionne (travail interne du tri)
+End Type
+
+Private mCand() As TCand
+Private mCount As Long
+Private mParentEID As String
+Private mParentLen As Long
+Private mHow As Long
+Private mConvOK As Boolean
+Private mThreadMails As Long
+Private mMailsWithFiles As Long
+Private mUnreadable As Long
+Private mSkipInline As Long
+Private mSkipLink As Long
+Private mSkipBlocked As Long
+Private mSkipTech As Long
+Private mSkipOther As Long
+Private mDupes As Long
+Private mPoolSel As Long
+
+'=============================================================================
+' ModVersion - version REELLEMENT chargee dans le VBE (lue par
+' modMaintenance.MaintModuleVersions).
+'=============================================================================
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+'=============================================================================
+' AddThreadAttachments - commande ruban (API STABLE : onAction
+' "Projet.AddThreadAttachments"). Voir le parcours en tete de module.
+'=============================================================================
+Public Sub AddThreadAttachments()
+    RunThreadAttach False
+End Sub
+
+'=============================================================================
+' ThreadAttachDiagnose - meme analyse, LECTURE SEULE : rien n'est ajoute.
+' A lancer avec la reponse ouverte (Alt+F8 depuis sa fenetre, ou fenetre
+' Execution du VBE).
+'=============================================================================
+Public Sub ThreadAttachDiagnose()
+    RunThreadAttach True
+End Sub
+
+'=============================================================================
+' RunThreadAttach - corps commun de la commande et du diagnostic.
+'=============================================================================
+Private Sub RunThreadAttach(ByVal diagOnly As Boolean)
+    Dim errNo As Long, errDesc As String
+    On Error GoTo ErrH
+
+    Dim draft As Object
+    Set draft = GetComposeItem()
+    If draft Is Nothing Then
+        modUi.Inform T("Ce bouton s'utilise dans une r~eponse ou un transfert " & _
+                       "en cours de r~edaction.", _
+                       "Use this button in a reply or a forward being written."), _
+                     UiTitle(), vbInformation, False
+        Exit Sub
+    End If
+
+    Dim draftCI As String
+    draftCI = SafeCI(draft)
+    If Not LooksLikeReply(draft, draftCI) Then
+        modUi.Inform T("Ce bouton s'utilise dans une r~eponse ou un transfert, " & _
+                       "pas dans un nouveau message.", _
+                       "Use this button in a reply or a forward, not in a new message."), _
+                     UiTitle(), vbInformation, False
+        Exit Sub
+    End If
+
+    ResetState
+    If Not AnalyzeThread(draft, draftCI) Then
+        modDebugLog.DInfo MOD_NAME, "Mail d'origine introuvable (en-tete d'index " & _
+            Left$(draftCI, HEADER_LEN) & ")"
+        modUi.Inform T("Mail d'origine introuvable." & vbCrLf & vbCrLf & _
+                       "S~electionnez un mail de ce fil dans la liste, puis cliquez " & _
+                       "~a nouveau sur le bouton.", _
+                       "Original mail not found." & vbCrLf & vbCrLf & _
+                       "Select a mail of this thread in the list, then click the " & _
+                       "button again."), _
+                     UiTitle(), vbExclamation, False
+        Exit Sub
+    End If
+    MarkAlreadyAttached draft
+    LogSummary
+
+    If diagOnly Then
+        ShowDiagnostic
+        Exit Sub
+    End If
+
+    If mCount = 0 Then
+        modUi.Inform T("Aucune pi~fce jointe dans ce fil.", "No attachments in this thread."), _
+                     UiTitle(), vbInformation, False
+        Exit Sub
+    End If
+    If RemainingCount() = 0 Then
+        modUi.Inform T("Les pi~fces jointes du fil sont d~ej~a dans le message.", _
+                       "The thread's attachments are already in your message."), _
+                     UiTitle(), vbInformation, False
+        Exit Sub
+    End If
+
+    Dim sel() As Long, nSel As Long
+    If DistinctMailCount() = 1 Then
+        nSel = SelectRemaining(sel)
+        modDebugLog.DInfo MOD_NAME, "Cas simple (un seul mail porte des fichiers) : ajout direct de " & _
+            nSel & " fichier(s)"
+    Else
+        nSel = AskSelection(sel)
+        If nSel = 0 Then
+            modDebugLog.DDebug MOD_NAME, "Choix annule"
+            Exit Sub
+        End If
+    End If
+
+    If Not ConfirmWeight(draft, sel, nSel) Then
+        modDebugLog.DInfo MOD_NAME, "Ajout annule a l'alerte de poids"
+        Exit Sub
+    End If
+    AddSelected draft, sel, nSel
+    Exit Sub
+
+ErrH:
+    errNo = Err.Number
+    errDesc = Err.Description
+    modDebugLog.DError MOD_NAME, "RunThreadAttach err " & errNo & " - " & errDesc
+    modUi.Fail T("Erreur inattendue : ", "Unexpected error: ") & errNo & " - " & errDesc, UiTitle()
+End Sub
+
+'=============================================================================
+' === BROUILLON COURANT ======================================================
+'=============================================================================
+
+' Mail en cours de redaction : fenetre ACTIVE d'abord (un bouton clique dans
+' une fenetre de reponse vise cette fenetre, meme si une reponse en ligne est
+' ouverte ailleurs), puis reponse du volet de lecture, puis inspecteur actif.
+Private Function GetComposeItem() As Object
+    Set GetComposeItem = Nothing
+    On Error Resume Next
+    Dim w As Object, itm As Object
+    Set w = Nothing
+    Set w = Application.ActiveWindow
+    Set itm = Nothing
+    If Not w Is Nothing Then
+        If TypeOf w Is Outlook.Inspector Then
+            Set itm = w.CurrentItem
+        ElseIf TypeOf w Is Outlook.Explorer Then
+            Set itm = w.ActiveInlineResponse
+        End If
+    End If
+    If Not IsDraftMail(itm) Then
+        Set itm = Nothing
+        Set itm = Application.ActiveExplorer.ActiveInlineResponse
+    End If
+    If Not IsDraftMail(itm) Then
+        Set itm = Nothing
+        Set itm = Application.ActiveInspector.CurrentItem
+    End If
+    If IsDraftMail(itm) Then Set GetComposeItem = itm
+End Function
+
+' MailItem non envoye (brouillon).
+Private Function IsDraftMail(ByVal itm As Object) As Boolean
+    IsDraftMail = False
+    If itm Is Nothing Then Exit Function
+    If Not (TypeOf itm Is Outlook.MailItem) Then Exit Function
+    On Error Resume Next
+    Dim snt As Boolean
+    snt = True
+    snt = itm.Sent
+    IsDraftMail = Not snt
+End Function
+
+' MailItem envoye ou recu, enregistre (EntryID) : membre possible du fil.
+Private Function IsThreadMail(ByVal itm As Object) As Boolean
+    IsThreadMail = False
+    If itm Is Nothing Then Exit Function
+    If Not (TypeOf itm Is Outlook.MailItem) Then Exit Function
+    On Error Resume Next
+    Dim snt As Boolean, eid As String
+    snt = False
+    snt = itm.Sent
+    If Not snt Then Exit Function
+    eid = ""
+    eid = CStr(itm.EntryID)
+    If Len(eid) = 0 Then Exit Function
+    IsThreadMail = True
+End Function
+
+' Reponse ou transfert ? Index derive du mail parent (cas normal), ou, a
+' defaut, objet different du sujet du fil (prefixe RE:/TR:/AW:... pose par
+' Outlook dans toutes les langues). Nouveau message : objet = sujet du fil
+' (ou sujet encore vide tant qu'il n'est pas enregistre).
+Private Function LooksLikeReply(ByVal draft As Object, ByVal draftCI As String) As Boolean
+    LooksLikeReply = True
+    If Len(draftCI) > HEADER_LEN Then Exit Function
+    On Error Resume Next
+    Dim subj As String, topic As String
+    subj = ""
+    subj = Trim$(CStr(draft.Subject))
+    topic = ""
+    topic = Trim$(CStr(draft.ConversationTopic))
+    LooksLikeReply = (Len(topic) > 0 And StrComp(subj, topic, vbTextCompare) <> 0)
+End Function
+
+'=============================================================================
+' === ANALYSE DU FIL =========================================================
+'=============================================================================
+
+Private Sub ResetState()
+    Erase mCand
+    mCount = 0
+    mParentEID = ""
+    mParentLen = 0
+    mHow = HOW_NONE
+    mConvOK = False
+    mThreadMails = 0
+    mMailsWithFiles = 0
+    mUnreadable = 0
+    mSkipInline = 0
+    mSkipLink = 0
+    mSkipBlocked = 0
+    mSkipTech = 0
+    mSkipOther = 0
+    mDupes = 0
+    mPoolSel = 0
+End Sub
+
+' True si un point d'ancrage (ou l'index du brouillon) a ete trouve. Les
+' candidats sont alors dans mCand(1..mCount), tries et dedoublonnes.
+Private Function AnalyzeThread(ByVal draft As Object, ByVal draftCI As String) As Boolean
+    AnalyzeThread = False
+
+    Dim anchor As Object, conv As Object, sid As String
+    Set anchor = FindAnchor(draft, draftCI)
+    Set conv = Nothing
+    If Not anchor Is Nothing Then
+        Set conv = SafeConversation(anchor)
+    Else
+        ' Dernier recours : index du brouillon (rarement disponible avant envoi).
+        Set conv = SafeConversation(draft)
+        If conv Is Nothing Then Exit Function
+        mHow = HOW_DRAFT
+    End If
+
+    If Not anchor Is Nothing Then
+        sid = SafeStoreID(anchor)
+    Else
+        sid = SafeStoreID(draft)
+    End If
+
+    If Not conv Is Nothing Then
+        mConvOK = True
+        ScanConversation conv, sid, draftCI
+    End If
+    ' Index indisponible ou fil vide : on se limite au mail d'ancrage.
+    If mThreadMails = 0 And Not anchor Is Nothing Then
+        mConvOK = False
+        ScanOneMail anchor, draftCI
+    End If
+    If mThreadMails = 0 Then Exit Function      ' rien de lisible : introuvable
+
+    MarkParent
+    SortAndDedupe
+    AnalyzeThread = True
+End Function
+
+' Point d'ancrage dans le fil : voir l'en-tete du module (etapes 2a/2b/2c).
+Private Function FindAnchor(ByVal draft As Object, ByVal draftCI As String) As Object
+    Set FindAnchor = Nothing
+    On Error Resume Next
+
+    Dim pool As Collection
+    Set pool = CandidatePool()
+
+    Dim i As Long, itm As Object, ci As String
+    ' (a) mail auquel on repond (ou l'un de ses ancetres) : prefixe strict
+    For i = 1 To pool.Count
+        Set itm = pool.Item(i)
+        ci = SafeCI(itm)
+        If IsDraftChildOf(draftCI, ci) Then
+            If i <= mPoolSel Then
+                mHow = HOW_SELECTION
+            Else
+                mHow = HOW_WINDOW
+            End If
+            Set FindAnchor = itm
+            Exit Function
+        End If
+    Next i
+
+    ' (b) autre mail du meme fil, selectionne ou ouvert par l'utilisateur
+    Dim topic As String, itemTopic As String
+    topic = ""
+    topic = Trim$(CStr(draft.ConversationTopic))
+    For i = 1 To pool.Count
+        Set itm = pool.Item(i)
+        ci = SafeCI(itm)
+        If SameHeader(ci, draftCI) Then
+            mHow = HOW_SAME_THREAD
+            Set FindAnchor = itm
+            Exit Function
+        End If
+        itemTopic = ""
+        itemTopic = Trim$(CStr(itm.ConversationTopic))
+        If Len(topic) > 0 And StrComp(itemTopic, topic, vbTextCompare) = 0 Then
+            mHow = HOW_SAME_THREAD
+            Set FindAnchor = itm
+            Exit Function
+        End If
+    Next i
+
+    ' (c) recherche par sujet de fil (dossier affiche, Reception, Envoyes)
+    Set itm = Nothing
+    Set itm = TopicSearch(draft, draftCI)
+    If Not itm Is Nothing Then
+        mHow = HOW_TOPIC
+        Set FindAnchor = itm
+    End If
+End Function
+
+' Mails du fil a portee de main : selection de l'explorateur (comptee dans
+' mPoolSel), puis fenetres ouvertes. Brouillons exclus (IsThreadMail).
+Private Function CandidatePool() As Collection
+    Dim c As Collection
+    Set c = New Collection
+    mPoolSel = 0
+    On Error Resume Next
+
+    Dim xpl As Object, sel As Object, n As Long, i As Long, itm As Object
+    Set xpl = Nothing
+    Set xpl = Application.ActiveExplorer
+    If Not xpl Is Nothing Then
+        Set sel = Nothing
+        Set sel = xpl.Selection
+        If Not sel Is Nothing Then
+            n = 0
+            n = sel.Count
+            If n > POOL_MAX Then n = POOL_MAX
+            For i = 1 To n
+                Set itm = Nothing
+                Set itm = sel.Item(i)
+                If IsThreadMail(itm) Then
+                    c.Add itm
+                    mPoolSel = mPoolSel + 1
+                End If
+            Next i
+        End If
+    End If
+
+    Dim insps As Object, insp As Object, m As Long
+    Set insps = Nothing
+    Set insps = Application.Inspectors
+    If Not insps Is Nothing Then
+        m = 0
+        m = insps.Count
+        For i = 1 To m
+            Set insp = Nothing
+            Set insp = insps.Item(i)
+            If Not insp Is Nothing Then
+                Set itm = Nothing
+                Set itm = insp.CurrentItem
+                If IsThreadMail(itm) Then c.Add itm
+            End If
+        Next i
+    End If
+    Set CandidatePool = c
+End Function
+
+' Recherche par sujet de fil. En-tete d'index identique a celui du
+' brouillon EXIGE : un sujet banal ("Point", "Reunion") ne doit pas
+' accrocher un autre fil.
+Private Function TopicSearch(ByVal draft As Object, ByVal draftCI As String) As Object
+    Set TopicSearch = Nothing
+    On Error Resume Next
+
+    Dim topic As String
+    topic = ""
+    topic = Trim$(CStr(draft.ConversationTopic))
+    If Len(topic) = 0 Then Exit Function
+
+    Dim flt As String
+    flt = "@SQL=""" & PR_CONVERSATION_TOPIC & """ = '" & Replace(topic, "'", "''") & "'"
+
+    Dim folders As Collection
+    Set folders = SearchFolders()
+
+    Dim i As Long, fld As Object, its As Object, res As Object
+    Dim itm As Object, n As Long, ci As String
+    For i = 1 To folders.Count
+        Set fld = folders.Item(i)
+        Set its = Nothing
+        Set its = fld.Items
+        Set res = Nothing
+        If Not its Is Nothing Then Set res = its.Restrict(flt)
+        If Not res Is Nothing Then
+            n = 0
+            Set itm = Nothing
+            Set itm = res.GetFirst
+            Do While Not itm Is Nothing
+                n = n + 1
+                If n > TOPIC_SCAN_MAX Then Exit Do
+                If IsThreadMail(itm) Then
+                    ci = SafeCI(itm)
+                    If SameHeader(ci, draftCI) Then
+                        Set TopicSearch = itm
+                        Exit Function
+                    End If
+                End If
+                Set itm = Nothing
+                Set itm = res.GetNext
+            Loop
+        End If
+    Next i
+End Function
+
+' Dossier affiche, Boite de reception, Elements envoyes (sans doublon).
+Private Function SearchFolders() As Collection
+    Dim c As Collection
+    Set c = New Collection
+    Dim seen As String
+    On Error Resume Next
+
+    Dim fld As Object, ns As Object
+    Set fld = Nothing
+    Set fld = Application.ActiveExplorer.CurrentFolder
+    AddFolderOnce c, fld, seen
+    Set ns = Application.GetNamespace("MAPI")
+    Set fld = Nothing
+    Set fld = ns.GetDefaultFolder(OL_FOLDER_INBOX)
+    AddFolderOnce c, fld, seen
+    Set fld = Nothing
+    Set fld = ns.GetDefaultFolder(OL_FOLDER_SENT)
+    AddFolderOnce c, fld, seen
+    Set SearchFolders = c
+End Function
+
+Private Sub AddFolderOnce(ByVal c As Collection, ByVal fld As Object, ByRef seen As String)
+    On Error Resume Next
+    If fld Is Nothing Then Exit Sub
+    Dim itemType As Long, eid As String
+    itemType = -1
+    itemType = fld.DefaultItemType
+    If itemType <> OL_MAIL_ITEM_TYPE Then Exit Sub
+    eid = ""
+    eid = CStr(fld.EntryID)
+    If Len(eid) = 0 Then Exit Sub
+    If InStr(1, seen, "|" & eid & "|", vbTextCompare) > 0 Then Exit Sub
+    seen = seen & "|" & eid & "|"
+    c.Add fld
+End Sub
+
+' Parcours du fil via l'index de conversations Exchange.
+Private Sub ScanConversation(ByVal conv As Object, ByVal sid As String, ByVal draftCI As String)
+    On Error Resume Next
+    Dim tbl As Object
+    Set tbl = Nothing
+    Set tbl = conv.GetTable
+    If tbl Is Nothing Then Exit Sub
+
+    Dim ns As Object
+    Set ns = Application.GetNamespace("MAPI")
+
+    Dim guard As Long, atEnd As Boolean, r As Object, eid As String, itm As Object
+    Do
+        guard = guard + 1
+        If guard > ROW_GUARD Then Exit Do
+        atEnd = True
+        atEnd = tbl.EndOfTable
+        If atEnd Then Exit Do
+        Set r = Nothing
+        Set r = tbl.GetNextRow
+        If r Is Nothing Then Exit Do
+        eid = ""
+        eid = CStr(r("EntryID"))
+        If Len(eid) > 0 Then
+            Set itm = Nothing
+            Set itm = GetItemSafe(ns, eid, sid)
+            If itm Is Nothing Then
+                mUnreadable = mUnreadable + 1
+            ElseIf IsThreadMail(itm) Then
+                mThreadMails = mThreadMails + 1
+                RegisterParent itm, eid, draftCI
+                CollectFromMail itm, eid
+            End If
+        End If
+    Loop
+End Sub
+
+' Repli sans index de conversations : le mail d'ancrage seul.
+Private Sub ScanOneMail(ByVal itm As Object, ByVal draftCI As String)
+    On Error Resume Next
+    Dim eid As String
+    eid = ""
+    eid = CStr(itm.EntryID)
+    If Len(eid) = 0 Then Exit Sub
+    mThreadMails = mThreadMails + 1
+    RegisterParent itm, eid, draftCI
+    CollectFromMail itm, eid
+End Sub
+
+' Le mail auquel on repond = plus long index qui prefixe celui du brouillon.
+Private Sub RegisterParent(ByVal itm As Object, ByVal eid As String, ByVal draftCI As String)
+    Dim ci As String
+    ci = SafeCI(itm)
+    If Not IsDraftChildOf(draftCI, ci) Then Exit Sub
+    If Len(ci) > mParentLen Then
+        mParentLen = Len(ci)
+        mParentEID = eid
+    End If
+End Sub
+
+' Fichiers retenus d'un mail du fil -> mCand ; ecarts comptes par motif.
+Private Sub CollectFromMail(ByVal itm As Object, ByVal eid As String)
+    On Error Resume Next
+    Dim atts As Object, n As Long
+    Set atts = Nothing
+    Set atts = itm.Attachments
+    If atts Is Nothing Then Exit Sub
+    n = 0
+    n = atts.Count
+    If n <= 0 Then Exit Sub
+
+    Dim sid As String, mt As Date, who As String
+    Dim html As String, htmlLoaded As Boolean, kept As Long
+    Dim j As Long, att As Object, reason As Long
+    sid = SafeStoreID(itm)
+    mt = SafeMailTime(itm)
+    For j = 1 To n
+        Set att = Nothing
+        Set att = atts.Item(j)
+        If att Is Nothing Then
+            mSkipOther = mSkipOther + 1
+        Else
+            reason = Classify(att, itm, html, htmlLoaded)
+            Select Case reason
+                Case RS_KEEP
+                    If kept = 0 Then who = WhoLabel(itm)
+                    kept = kept + 1
+                    PushCand AttName(att), AttSize(att), eid, sid, j, mt, who
+                Case RS_INLINE
+                    mSkipInline = mSkipInline + 1
+                Case RS_LINK
+                    mSkipLink = mSkipLink + 1
+                Case RS_BLOCKED
+                    mSkipBlocked = mSkipBlocked + 1
+                Case RS_TECH
+                    mSkipTech = mSkipTech + 1
+                Case Else
+                    mSkipOther = mSkipOther + 1
+            End Select
+        End If
+    Next j
+    If kept > 0 Then mMailsWithFiles = mMailsWithFiles + 1
+End Sub
+
+' Vrai fichier (RS_KEEP) ou motif d'ecart. html / htmlLoaded : corps HTML du
+' mail, charge une seule fois et seulement si une piece porte un Content-ID.
+Private Function Classify(ByVal att As Object, ByVal itm As Object, _
+                          ByRef html As String, ByRef htmlLoaded As Boolean) As Long
+    Classify = RS_OTHER
+    On Error Resume Next
+
+    Dim ty As Long
+    ty = -1
+    ty = att.Type
+    If ty = -1 Then Exit Function
+    If ty <> ATT_BY_VALUE And ty <> ATT_EMBEDDED Then
+        Classify = RS_LINK
+        Exit Function
+    End If
+
+    Dim pa As Object, meth As Long
+    Set pa = Nothing
+    Set pa = att.PropertyAccessor
+    meth = 0
+    If Not pa Is Nothing Then meth = CLng(pa.GetProperty(PR_ATTACH_METHOD))
+    If meth = ATTACH_BY_WEB_REF Then
+        Classify = RS_LINK
+        Exit Function
+    End If
+
+    If IsHiddenAtt(att) Then
+        Classify = RS_INLINE
+        Exit Function
+    End If
+
+    Dim bl As Long
+    bl = 0
+    bl = att.BlockLevel
+    If bl <> 0 Then
+        Classify = RS_BLOCKED
+        Exit Function
+    End If
+
+    Dim nm As String
+    nm = AttName(att)
+    If Len(nm) = 0 Then Exit Function
+    If IsTechnicalName(nm) Then
+        Classify = RS_TECH
+        Exit Function
+    End If
+
+    Dim cid As String
+    cid = ""
+    If Not pa Is Nothing Then cid = Trim$(CStr(pa.GetProperty(PR_ATTACH_CONTENT_ID)))
+    cid = Replace(Replace(cid, "<", ""), ">", "")
+    If Len(cid) > 0 Then
+        If Not htmlLoaded Then
+            html = LoadHtml(itm)
+            htmlLoaded = True
+        End If
+        If Len(html) > 0 Then
+            If InStr(1, html, "cid:" & cid, vbTextCompare) > 0 Then
+                Classify = RS_INLINE
+                Exit Function
+            End If
+        End If
+    End If
+
+    If IsSignatureImage(nm, AttSize(att)) Then
+        Classify = RS_INLINE
+        Exit Function
+    End If
+
+    Classify = RS_KEEP
+End Function
+
+Private Sub PushCand(ByVal nm As String, ByVal sz As Long, ByVal eid As String, _
+                     ByVal sid As String, ByVal attIdx As Long, ByVal mt As Date, _
+                     ByVal who As String)
+    If mCount = 0 Then
+        ReDim mCand(1 To 16)
+    ElseIf mCount >= UBound(mCand) Then
+        ReDim Preserve mCand(1 To UBound(mCand) * 2)
+    End If
+    mCount = mCount + 1
+    With mCand(mCount)
+        .FileName = nm
+        .SizeB = sz
+        .MailEID = eid
+        .StoreID = sid
+        .AttIndex = attIdx
+        .MailTime = mt
+        .Who = who
+        .FromParent = False
+        .Attached = False
+        .Dropped = False
+    End With
+End Sub
+
+Private Sub MarkParent()
+    Dim i As Long
+    If Len(mParentEID) = 0 Then Exit Sub
+    For i = 1 To mCount
+        If StrComp(mCand(i).MailEID, mParentEID, vbTextCompare) = 0 Then mCand(i).FromParent = True
+    Next i
+End Sub
+
+' Tri (mail auquel on repond d'abord, puis du plus recent au plus ancien,
+' ordre d'origine dans un meme mail) puis fusion des doublons ENTRE mails :
+' le premier exemplaire rencontre est garde.
+Private Sub SortAndDedupe()
+    If mCount = 0 Then Exit Sub
+    Dim i As Long, k As Long, keep As Long
+    Dim tmp As TCand
+    For i = 2 To mCount
+        tmp = mCand(i)
+        k = i - 1
+        Do While k >= 1
+            If Not CandBefore(tmp, mCand(k)) Then Exit Do
+            mCand(k + 1) = mCand(k)
+            k = k - 1
+        Loop
+        mCand(k + 1) = tmp
+    Next i
+
+    For i = 1 To mCount
+        If Not mCand(i).Dropped Then
+            For k = i + 1 To mCount
+                If Not mCand(k).Dropped Then
+                    If StrComp(mCand(k).MailEID, mCand(i).MailEID, vbTextCompare) <> 0 Then
+                        If SameFile(mCand(i).FileName, mCand(i).SizeB, _
+                                    mCand(k).FileName, mCand(k).SizeB) Then
+                            mCand(k).Dropped = True
+                            mDupes = mDupes + 1
+                        End If
+                    End If
+                End If
+            Next k
+        End If
+    Next i
+
+    keep = 0
+    For i = 1 To mCount
+        If Not mCand(i).Dropped Then
+            keep = keep + 1
+            If keep <> i Then mCand(keep) = mCand(i)
+        End If
+    Next i
+    mCount = keep
+End Sub
+
+Private Function CandBefore(ByRef x As TCand, ByRef y As TCand) As Boolean
+    If x.FromParent <> y.FromParent Then
+        CandBefore = x.FromParent
+    ElseIf x.MailTime <> y.MailTime Then
+        CandBefore = (x.MailTime > y.MailTime)
+    ElseIf StrComp(x.MailEID, y.MailEID, vbTextCompare) <> 0 Then
+        CandBefore = (StrComp(x.MailEID, y.MailEID, vbTextCompare) < 0)
+    Else
+        CandBefore = (x.AttIndex < y.AttIndex)
+    End If
+End Function
+
+' Meme fichier : meme nom (casse ignoree), taille a SAME_FILE_TOL pres
+' (Attachment.Size inclut les proprietes MAPI, qui varient d'une copie a
+' l'autre). Taille inconnue (0) : le nom suffit.
+Private Function SameFile(ByVal n1 As String, ByVal s1 As Long, _
+                          ByVal n2 As String, ByVal s2 As Long) As Boolean
+    SameFile = False
+    If StrComp(n1, n2, vbTextCompare) <> 0 Then Exit Function
+    If s1 <= 0 Or s2 <= 0 Then
+        SameFile = True
+    Else
+        SameFile = (Abs(s1 - s2) <= SAME_FILE_TOL)
+    End If
+End Function
+
+' Fichiers deja presents (visibles) dans le brouillon : non reproposes.
+Private Sub MarkAlreadyAttached(ByVal draft As Object)
+    If mCount = 0 Then Exit Sub
+    On Error Resume Next
+    Dim atts As Object, n As Long, j As Long, att As Object
+    Dim nm As String, sz As Long, i As Long, clean As String
+    Set atts = Nothing
+    Set atts = draft.Attachments
+    If atts Is Nothing Then Exit Sub
+    n = 0
+    n = atts.Count
+    For j = 1 To n
+        Set att = Nothing
+        Set att = atts.Item(j)
+        If Not att Is Nothing Then
+            If Not IsHiddenAtt(att) Then
+                nm = AttName(att)
+                sz = AttSize(att)
+                For i = 1 To mCount
+                    If Not mCand(i).Attached Then
+                        clean = modCommon.SanitizeFileName(mCand(i).FileName)
+                        If SameFile(mCand(i).FileName, mCand(i).SizeB, nm, sz) Or _
+                           SameFile(clean, mCand(i).SizeB, nm, sz) Then
+                            mCand(i).Attached = True
+                        End If
+                    End If
+                Next i
+            End If
+        End If
+    Next j
+End Sub
+
+Private Function RemainingCount() As Long
+    Dim i As Long, n As Long
+    For i = 1 To mCount
+        If Not mCand(i).Attached Then n = n + 1
+    Next i
+    RemainingCount = n
+End Function
+
+Private Function AttachedCount() As Long
+    AttachedCount = mCount - RemainingCount()
+End Function
+
+' Nombre de mails distincts qui portent les fichiers retenus (deja joints
+' compris) : 1 = cas simple, ajout direct.
+Private Function DistinctMailCount() As Long
+    Dim i As Long, n As Long, seen As String, key As String
+    For i = 1 To mCount
+        key = "|" & mCand(i).MailEID & "|"
+        If InStr(1, seen, key, vbTextCompare) = 0 Then
+            seen = seen & key
+            n = n + 1
+        End If
+    Next i
+    DistinctMailCount = n
+End Function
+
+' Indices (dans mCand) des fichiers non encore joints, dans l'ordre du tri.
+Private Function SelectRemaining(ByRef idx() As Long) As Long
+    Dim i As Long, n As Long
+    SelectRemaining = 0
+    If mCount = 0 Then Exit Function
+    ReDim idx(1 To mCount)
+    For i = 1 To mCount
+        If Not mCand(i).Attached Then
+            n = n + 1
+            idx(n) = i
+        End If
+    Next i
+    SelectRemaining = n
+End Function
+
+'=============================================================================
+' === CHOIX DE L'UTILISATEUR =================================================
+'=============================================================================
+
+' Liste numerotee 1..nRem (fichiers non encore joints). Renvoie le nombre de
+' fichiers choisis (indices mCand dans sel) ; 0 = Annuler.
+Private Function AskSelection(ByRef sel() As Long) As Long
+    AskSelection = 0
+    Dim remIdx() As Long, nRem As Long
+    nRem = SelectRemaining(remIdx)
+    If nRem = 0 Then Exit Function
+
+    Dim i As Long, anyParent As Boolean
+    For i = 1 To nRem
+        If mCand(remIdx(i)).FromParent Then anyParent = True
+    Next i
+
+    Dim lines() As String
+    ReDim lines(1 To nRem)
+    For i = 1 To nRem
+        lines(i) = CandLine(i, mCand(remIdx(i)), anyParent)
+    Next i
+
+    Dim pageStart() As Long, nPages As Long
+    nPages = BuildPages(lines, nRem, pageStart)
+
+    Dim prefill As String
+    prefill = DefaultChoice(remIdx, nRem)
+
+    Dim page As Long, guard As Long, answer As String, errLine As String
+    Dim picked() As Boolean, nPicked As Long, k As Long
+    page = 1
+    For guard = 1 To ASK_GUARD
+        answer = modUi.AskText(ListPrompt(lines, pageStart, nRem, nPages, page, anyParent, errLine), _
+                               UiTitle(), prefill)
+        answer = Trim$(answer)
+        If Len(answer) = 0 Then Exit Function          ' Annuler ou champ vide
+        If answer = "+" Then
+            page = (page Mod nPages) + 1
+            errLine = ""
+        Else
+            ReDim picked(1 To nRem)
+            If answer = "*" Then
+                For k = 1 To nRem
+                    picked(k) = True
+                Next k
+                nPicked = nRem
+            Else
+                nPicked = ParseChoice(answer, nRem, picked)
+            End If
+            If nPicked > 0 Then
+                ReDim sel(1 To nPicked)
+                nPicked = 0
+                For k = 1 To nRem
+                    If picked(k) Then
+                        nPicked = nPicked + 1
+                        sel(nPicked) = remIdx(k)
+                    End If
+                Next k
+                modDebugLog.DDebug MOD_NAME, "Choix '" & answer & "' -> " & nPicked & " fichier(s)"
+                AskSelection = nPicked
+                Exit Function
+            End If
+            errLine = T("Saisie non reconnue : ", "Input not understood: ") & Left$(answer, 30)
+            prefill = answer
+        End If
+    Next guard
+End Function
+
+' Decoupe en pages : PAGE_MAX lignes au plus, et PROMPT_BUDGET caracteres
+' au plus (InputBox tronque au-dela de ~1 024). pageStart(p) = 1re ligne de
+' la page p ; pageStart(nPages + 1) = sentinelle (nRem + 1).
+Private Function BuildPages(ByRef lines() As String, ByVal n As Long, _
+                            ByRef pageStart() As Long) As Long
+    Dim p As Long, used As Long, cnt As Long, i As Long, lineLen As Long
+    ReDim pageStart(1 To n + 1)
+    p = 1
+    pageStart(1) = 1
+    For i = 1 To n
+        lineLen = Len(lines(i)) + 2
+        If cnt > 0 And (cnt >= PAGE_MAX Or used + lineLen > PROMPT_BUDGET) Then
+            p = p + 1
+            pageStart(p) = i
+            used = 0
+            cnt = 0
+        End If
+        used = used + lineLen
+        cnt = cnt + 1
+    Next i
+    pageStart(p + 1) = n + 1
+    BuildPages = p
+End Function
+
+Private Function ListPrompt(ByRef lines() As String, ByRef pageStart() As Long, _
+                            ByVal n As Long, ByVal nPages As Long, ByVal page As Long, _
+                            ByVal anyParent As Boolean, ByVal errLine As String) As String
+    Dim s As String, i As Long
+    If Len(errLine) > 0 Then s = errLine & vbCrLf & vbCrLf
+    s = s & T("Pi~fces jointes du fil : ", "Thread attachments: ") & n
+    If nPages > 1 Then s = s & T("   (page ", "   (page ") & page & "/" & nPages & ")"
+    s = s & vbCrLf
+    If anyParent Then
+        s = s & ChrW$(187) & T(" = mail auquel vous r~epondez", " = the mail you are replying to") & vbCrLf
+    End If
+    s = s & vbCrLf
+    For i = pageStart(page) To pageStart(page + 1) - 1
+        s = s & lines(i) & vbCrLf
+    Next i
+    s = s & vbCrLf & T("Num~eros ~a ajouter (ex. 1,3 ou 2-4 ; * = tout) :", _
+                       "Numbers to add (e.g. 1,3 or 2-4; * = all):")
+    If nPages > 1 Then s = s & vbCrLf & T("+ = page suivante", "+ = next page")
+    ListPrompt = s
+End Function
+
+' Ligne de liste : [marque ChrW(187) si mail auquel on repond] "1. Contrat_v3.docx - 245 Ko - moi, 12/09"
+Private Function CandLine(ByVal num As Long, ByRef c As TCand, ByVal withMarks As Boolean) As String
+    Dim mark As String
+    mark = ""
+    If withMarks Then
+        If c.FromParent Then
+            mark = ChrW$(187) & " "
+        Else
+            mark = "   "
+        End If
+    End If
+    CandLine = mark & num & ". " & ClipName(c.FileName, NAME_MAX) & " - " & _
+               FormatSize(c.SizeB) & " - " & c.Who & ", " & ShortDate(c.MailTime)
+End Function
+
+' Pre-remplissage : fichiers du mail auquel on repond ; a defaut, ceux du
+' mail le plus recent (premier de la liste apres le tri).
+Private Function DefaultChoice(ByRef remIdx() As Long, ByVal nRem As Long) As String
+    Dim nums() As Long, n As Long, i As Long, anyParent As Boolean, refEID As String
+    ReDim nums(1 To nRem)
+    For i = 1 To nRem
+        If mCand(remIdx(i)).FromParent Then anyParent = True
+    Next i
+    If Not anyParent Then refEID = mCand(remIdx(1)).MailEID
+    For i = 1 To nRem
+        If anyParent Then
+            If mCand(remIdx(i)).FromParent Then
+                n = n + 1
+                nums(n) = i
+            End If
+        ElseIf StrComp(mCand(remIdx(i)).MailEID, refEID, vbTextCompare) = 0 Then
+            n = n + 1
+            nums(n) = i
+        End If
+    Next i
+    DefaultChoice = CompactNumbers(nums, n)
+End Function
+
+' 1,2,3,5 -> "1-3,5" ; 1,2 -> "1,2".
+Private Function CompactNumbers(ByRef nums() As Long, ByVal n As Long) As String
+    Dim s As String, i As Long, j As Long
+    i = 1
+    Do While i <= n
+        j = i
+        Do While j < n
+            If nums(j + 1) <> nums(j) + 1 Then Exit Do
+            j = j + 1
+        Loop
+        If Len(s) > 0 Then s = s & ","
+        If j - i >= 2 Then
+            s = s & nums(i) & "-" & nums(j)
+        ElseIf j = i + 1 Then
+            s = s & nums(i) & "," & nums(j)
+        Else
+            s = s & nums(i)
+        End If
+        i = j + 1
+    Loop
+    CompactNumbers = s
+End Function
+
+' "1,3", "2-4", "2 - 4", "1 3 5", "1;4" -> picked(1..maxN). Renvoie le nombre de
+' fichiers choisis ; 0 = saisie non reconnue (ou hors bornes).
+Private Function ParseChoice(ByVal answer As String, ByVal maxN As Long, _
+                             ByRef picked() As Boolean) As Long
+    ParseChoice = 0
+    Dim s As String, parts As Variant, i As Long, tok As String, p As Long
+    Dim lo As Long, hi As Long, k As Long, cnt As Long
+    s = Replace(answer, ";", ",")
+    Do While InStr(s, " -") > 0
+        s = Replace(s, " -", "-")
+    Loop
+    Do While InStr(s, "- ") > 0
+        s = Replace(s, "- ", "-")
+    Loop
+    s = Replace(s, " ", ",")
+    parts = Split(s, ",")
+    For i = LBound(parts) To UBound(parts)
+        tok = Trim$(CStr(parts(i)))
+        If Len(tok) > 0 Then
+            p = InStr(tok, "-")
+            If p > 0 Then
+                If Not IsSmallNumber(Left$(tok, p - 1)) Then Exit Function
+                If Not IsSmallNumber(Mid$(tok, p + 1)) Then Exit Function
+                lo = CLng(Left$(tok, p - 1))
+                hi = CLng(Mid$(tok, p + 1))
+            Else
+                If Not IsSmallNumber(tok) Then Exit Function
+                lo = CLng(tok)
+                hi = lo
+            End If
+            If lo > hi Then
+                k = lo
+                lo = hi
+                hi = k
+            End If
+            If lo < 1 Or hi > maxN Then Exit Function
+            For k = lo To hi
+                picked(k) = True
+            Next k
+        End If
+    Next i
+    For k = 1 To maxN
+        If picked(k) Then cnt = cnt + 1
+    Next k
+    ParseChoice = cnt
+End Function
+
+' Alerte avant ajout si le poids total des pieces jointes du message
+' (existantes + choisies) depasse ThreadAttachWarnMB. True = on continue.
+Private Function ConfirmWeight(ByVal draft As Object, ByRef sel() As Long, _
+                               ByVal nSel As Long) As Boolean
+    ConfirmWeight = True
+    Dim warnMB As Long
+    warnMB = modConfig.CfgL("ThreadAttachWarnMB", 20)
+    If warnMB <= 0 Then Exit Function
+
+    Dim total As Double, i As Long
+    For i = 1 To nSel
+        total = total + CDbl(mCand(sel(i)).SizeB)
+    Next i
+    total = total + DraftAttachBytes(draft)
+    If total <= CDbl(warnMB) * 1048576# Then Exit Function
+
+    Dim mbTxt As String, answer As VbMsgBoxResult
+    mbTxt = Replace(Replace(Format$(total / 1048576#, "0.0"), ",", "."), ".", T(",", "."))
+    modDebugLog.DInfo MOD_NAME, "Alerte de poids : " & mbTxt & " Mo pour un seuil de " & warnMB & " Mo"
+    answer = modMsgBoxCustom.MsgBoxC( _
+        T("Avec ces fichiers, les pi~fces jointes du message p~fseront environ ", _
+          "With these files, the message attachments will weigh about ") & mbTxt & _
+        T(" Mo, au-del~a du seuil r~egl~e (", " MB, above the configured threshold (") & warnMB & _
+        T(" Mo)." & vbCrLf & vbCrLf & "L'envoi risque d'~xtre refus~e par le serveur.", _
+          " MB)." & vbCrLf & vbCrLf & "The server may refuse to send it."), _
+        vbOKCancel + vbExclamation + vbDefaultButton2, UiTitle(), _
+        T("&Ajouter quand m~xme", "&Add anyway"), T("Annuler", "Cancel"))
+    ConfirmWeight = (answer = vbOK)
+End Function
+
+Private Function DraftAttachBytes(ByVal draft As Object) As Double
+    On Error Resume Next
+    Dim atts As Object, n As Long, j As Long, att As Object, total As Double
+    Set atts = Nothing
+    Set atts = draft.Attachments
+    If atts Is Nothing Then Exit Function
+    n = 0
+    n = atts.Count
+    For j = 1 To n
+        Set att = Nothing
+        Set att = atts.Item(j)
+        If Not att Is Nothing Then
+            If Not IsHiddenAtt(att) Then total = total + CDbl(AttSize(att))
+        End If
+    Next j
+    DraftAttachBytes = total
+End Function
+
+'=============================================================================
+' === COPIE DANS LE BROUILLON ================================================
+'=============================================================================
+
+Private Sub AddSelected(ByVal draft As Object, ByRef sel() As Long, ByVal nSel As Long)
+    Dim errNo As Long, errDesc As String
+    On Error GoTo ErrH
+
+    Dim fso As Object, runDir As String
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    runDir = MakeRunDir(fso)
+    If Len(runDir) = 0 Then
+        modDebugLog.DError MOD_NAME, "Dossier temporaire inaccessible"
+        modUi.Fail T("Dossier temporaire inaccessible : ajout impossible.", _
+                     "Temporary folder unavailable: files cannot be added."), UiTitle()
+        Exit Sub
+    End If
+
+    Dim ns As Object
+    Set ns = Application.GetNamespace("MAPI")
+
+    Dim i As Long, nOk As Long, nFail As Long, failed As String
+    For i = 1 To nSel
+        If AddOne(draft, ns, fso, runDir, i, sel(i)) Then
+            nOk = nOk + 1
+        Else
+            nFail = nFail + 1
+            If nFail <= 6 Then failed = failed & vbCrLf & "- " & mCand(sel(i)).FileName
+        End If
+    Next i
+
+    On Error Resume Next
+    fso.DeleteFolder runDir, True
+    On Error GoTo ErrH
+
+    modDebugLog.DInfo MOD_NAME, "Ajout : " & nOk & " fichier(s) joint(s), " & nFail & " echec(s)"
+    If nFail > 0 Then
+        If nFail > 6 Then failed = failed & vbCrLf & "..."
+        modUi.Inform T("Certains fichiers n'ont pas pu ~xtre ajout~es :", _
+                       "Some files could not be added:") & failed, _
+                     UiTitle(), vbExclamation, False
+    End If
+    Exit Sub
+
+ErrH:
+    errNo = Err.Number
+    errDesc = Err.Description
+    modDebugLog.DError MOD_NAME, "AddSelected err " & errNo & " - " & errDesc
+    modUi.Fail T("Erreur pendant l'ajout : ", "Error while adding files: ") & errNo & " - " & errDesc, _
+               UiTitle()
+End Sub
+
+' Un fichier : relecture du mail source, SaveAsFile dans un sous-dossier
+' propre (deux fichiers de meme nom ne se marchent pas dessus), Add.
+Private Function AddOne(ByVal draft As Object, ByVal ns As Object, ByVal fso As Object, _
+                        ByVal runDir As String, ByVal slot As Long, ByVal k As Long) As Boolean
+    AddOne = False
+    On Error GoTo AddFailed
+
+    Dim src As Object, att As Object
+    Set src = GetItemSafe(ns, mCand(k).MailEID, mCand(k).StoreID)
+    If src Is Nothing Then GoTo AddFailed
+    Set att = SourceAttachment(src, k)
+    If att Is Nothing Then GoTo AddFailed
+
+    Dim subDir As String, target As String
+    subDir = runDir & "\" & slot
+    If Not fso.FolderExists(subDir) Then fso.CreateFolder subDir
+    target = subDir & "\" & DiskName(mCand(k).FileName, Len(subDir) + 1, slot)
+    att.SaveAsFile target
+    If Not fso.FileExists(target) Then GoTo AddFailed
+    draft.Attachments.Add target
+    AddOne = True
+    modDebugLog.DDebug MOD_NAME, "Joint : " & mCand(k).FileName
+    Exit Function
+
+AddFailed:
+    modDebugLog.DError MOD_NAME, "Echec sur '" & mCand(k).FileName & "' : " & _
+        Err.Number & " - " & Err.Description
+End Function
+
+' Piece jointe source : rang memorise, nom verifie ; sinon recherche par nom
+' et taille (mail modifie entre l'analyse et l'ajout).
+Private Function SourceAttachment(ByVal src As Object, ByVal k As Long) As Object
+    Set SourceAttachment = Nothing
+    On Error Resume Next
+    Dim atts As Object, n As Long, j As Long, att As Object
+    Set atts = Nothing
+    Set atts = src.Attachments
+    If atts Is Nothing Then Exit Function
+    n = 0
+    n = atts.Count
+    j = mCand(k).AttIndex
+    If j >= 1 And j <= n Then
+        Set att = Nothing
+        Set att = atts.Item(j)
+        If Not att Is Nothing Then
+            If StrComp(AttName(att), mCand(k).FileName, vbTextCompare) = 0 Then
+                Set SourceAttachment = att
+                Exit Function
+            End If
+        End If
+    End If
+    For j = 1 To n
+        Set att = Nothing
+        Set att = atts.Item(j)
+        If Not att Is Nothing Then
+            If SameFile(AttName(att), AttSize(att), mCand(k).FileName, mCand(k).SizeB) Then
+                Set SourceAttachment = att
+                Exit Function
+            End If
+        End If
+    Next j
+End Function
+
+' Nom sur disque = nom affiche, caracteres interdits retires, point final
+' retire, longueur de chemin bornee (extension conservee).
+Private Function DiskName(ByVal nm As String, ByVal prefixLen As Long, _
+                          ByVal slot As Long) As String
+    Dim s As String, ext As String, p As Long, room As Long
+    s = modCommon.SanitizeFileName(nm)
+    Do While Len(s) > 0
+        If Right$(s, 1) <> "." Then Exit Do
+        s = Left$(s, Len(s) - 1)
+    Loop
+    If Len(s) = 0 Then s = T("piece-jointe-", "attachment-") & slot
+    room = MAX_PATH_SAFE - prefixLen
+    If room < 20 Then room = 20
+    If Len(s) > room Then
+        p = InStrRev(s, ".")
+        If p > 1 And Len(s) - p <= 10 Then ext = Mid$(s, p)
+        s = Left$(s, room - Len(ext)) & ext
+    End If
+    DiskName = s
+End Function
+
+' %TEMP%\COTK-ThreadAtt\<aaaammjj-hhnnss>[-n] ; "" si impossible.
+Private Function MakeRunDir(ByVal fso As Object) As String
+    MakeRunDir = ""
+    On Error Resume Next
+    Dim root As String, stamp As String, cand As String, n As Long, ok As Boolean
+    root = Environ$("TEMP")
+    If Len(root) = 0 Then root = Environ$("TMP")
+    If Len(root) = 0 Then Exit Function
+    root = root & "\" & TEMP_SUBDIR
+    ok = False
+    ok = fso.FolderExists(root)
+    If Not ok Then fso.CreateFolder root
+    ok = False
+    ok = fso.FolderExists(root)
+    If Not ok Then Exit Function
+    PurgeOldRuns fso, root
+
+    stamp = Format$(Now, "yyyymmdd-hhnnss")
+    cand = root & "\" & stamp
+    n = 1
+    Do
+        ok = True
+        ok = fso.FolderExists(cand)
+        If Not ok Then Exit Do
+        n = n + 1
+        If n > 50 Then Exit Function
+        cand = root & "\" & stamp & "-" & n
+    Loop
+    fso.CreateFolder cand
+    ok = False
+    ok = fso.FolderExists(cand)
+    If ok Then MakeRunDir = cand
+End Function
+
+' Restes d'executions interrompues (plus d'un jour) : suppression best-effort.
+Private Sub PurgeOldRuns(ByVal fso As Object, ByVal root As String)
+    On Error Resume Next
+    Dim sf As Object, olds As Collection, i As Long, created As Date
+    Set olds = New Collection
+    For Each sf In fso.GetFolder(root).SubFolders
+        created = Now
+        created = sf.DateCreated
+        If created < Now - 1 Then olds.Add CStr(sf.Path)
+    Next sf
+    For i = 1 To olds.Count
+        fso.DeleteFolder olds.Item(i), True
+    Next i
+End Sub
+
+'=============================================================================
+' === JOURNAL ET DIAGNOSTIC ==================================================
+'=============================================================================
+
+Private Sub LogSummary()
+    modDebugLog.DInfo MOD_NAME, "Analyse : ancrage=" & HowCode() & _
+        ", index=" & IIf(mConvOK, "OK", "KO") & _
+        ", mails=" & mThreadMails & ", avec fichiers=" & mMailsWithFiles & _
+        ", retenus=" & mCount & ", deja joints=" & AttachedCount() & _
+        ", ecartes inline=" & mSkipInline & " lien=" & mSkipLink & _
+        " bloque=" & mSkipBlocked & " tech=" & mSkipTech & " autre=" & mSkipOther & _
+        ", doublons=" & mDupes & ", illisibles=" & mUnreadable & _
+        ", parent=" & IIf(Len(mParentEID) > 0, "oui", "non")
+End Sub
+
+Private Function HowCode() As String
+    Select Case mHow
+        Case HOW_SELECTION:   HowCode = "selection"
+        Case HOW_WINDOW:      HowCode = "fenetre"
+        Case HOW_SAME_THREAD: HowCode = "meme fil"
+        Case HOW_TOPIC:       HowCode = "sujet"
+        Case HOW_DRAFT:       HowCode = "brouillon"
+        Case Else:            HowCode = "aucun"
+    End Select
+End Function
+
+Private Function HowLabel() As String
+    Select Case mHow
+        Case HOW_SELECTION:   HowLabel = T("s~election de la liste", "list selection")
+        Case HOW_WINDOW:      HowLabel = T("fen~xtre ouverte", "open window")
+        Case HOW_SAME_THREAD: HowLabel = T("mail du fil s~electionn~e", "selected mail of the thread")
+        Case HOW_TOPIC:       HowLabel = T("recherche par sujet du fil", "thread subject search")
+        Case HOW_DRAFT:       HowLabel = T("index du brouillon", "draft index")
+        Case Else:            HowLabel = T("aucun", "none")
+    End Select
+End Function
+
+Private Function ClickLabel() As String
+    If mCount = 0 Then
+        ClickLabel = T("aucune pi~fce jointe ~a proposer", "no attachment to offer")
+    ElseIf RemainingCount() = 0 Then
+        ClickLabel = T("tout est d~ej~a joint", "everything is already attached")
+    ElseIf DistinctMailCount() = 1 Then
+        ClickLabel = T("ajout direct (un seul mail porte des fichiers)", _
+                       "direct add (a single mail carries files)")
+    Else
+        ClickLabel = T("liste de choix (", "choice list (") & DistinctMailCount() & _
+                     T(" mails avec fichiers)", " mails with files)")
+    End If
+End Function
+
+Private Sub ShowDiagnostic()
+    Dim s As String, i As Long, lineTxt As String
+    s = T("Lecture seule : rien n'est ajout~e.", "Read-only: nothing is added.") & vbCrLf & vbCrLf
+    s = s & T("Mail d'origine : ", "Original mail: ") & HowLabel() & vbCrLf
+    s = s & T("Fil : ", "Thread: ") & mThreadMails & T(" mail(s)", " mail(s)")
+    If Not mConvOK Then
+        s = s & T(" - index de conversations indisponible, mail d'ancrage seul", _
+                  " - conversation index unavailable, anchor mail only")
+    End If
+    s = s & vbCrLf
+    If Len(mParentEID) > 0 Then
+        s = s & T("Mail auquel vous r~epondez : rep~er~e dans le fil", _
+                  "Mail you are replying to: found in the thread") & vbCrLf
+    Else
+        s = s & T("Mail auquel vous r~epondez : non rep~er~e", _
+                  "Mail you are replying to: not found") & vbCrLf
+    End If
+    s = s & T("Fichiers retenus : ", "Files kept: ") & mCount & T(" (dont ", " (") & _
+        AttachedCount() & T(" d~ej~a dans le message)", " already in the message)") & vbCrLf
+    s = s & T("~Ecart~es : ", "Skipped: ") & mSkipInline & _
+        T(" image(s) du texte ou de signature, ", " body or signature image(s), ") & _
+        mSkipLink & T(" lien(s) ou objet(s), ", " link(s) or object(s), ") & _
+        mSkipBlocked & T(" bloqu~e(s), ", " blocked, ") & _
+        (mSkipTech + mSkipOther) & T(" technique(s), ", " technical, ") & _
+        mDupes & T(" doublon(s)", " duplicate(s)") & vbCrLf
+    If mUnreadable > 0 Then
+        s = s & T("Mails illisibles : ", "Unreadable mails: ") & mUnreadable & vbCrLf
+    End If
+    s = s & T("Au clic : ", "On click: ") & ClickLabel() & vbCrLf
+
+    If mCount > 0 Then s = s & vbCrLf
+    For i = 1 To mCount
+        lineTxt = CandLine(i, mCand(i), True)
+        If mCand(i).Attached Then lineTxt = lineTxt & T(" [d~ej~a joint]", " [already attached]")
+        modDebugLog.DInfo MOD_NAME, "Diag " & lineTxt
+        If i <= DIAG_LINES Then s = s & lineTxt & vbCrLf
+    Next i
+    If mCount > DIAG_LINES Then s = s & "... (+" & (mCount - DIAG_LINES) & ")" & vbCrLf
+    If Len(s) > 1000 Then s = Left$(s, 990) & " ..."
+
+    modUi.Inform s, T("Diagnostic - PJ du fil", "Diagnostics - thread attachments"), _
+                 vbInformation, False
+End Sub
+
+'=============================================================================
+' === UTILITAIRES ============================================================
+'=============================================================================
+
+Private Function UiTitle() As String
+    UiTitle = T("PJ du fil", "Thread attachments")
+End Function
+
+' Copie de modReplyInPlace.IsDraftChildOf (privee la-bas) : parentCI est un
+' prefixe STRICT de draftCI = le brouillon descend de ce mail.
+Private Function IsDraftChildOf(ByVal draftCI As String, ByVal parentCI As String) As Boolean
+    IsDraftChildOf = False
+    If Len(parentCI) = 0 Or Len(draftCI) = 0 Then Exit Function
+    If Len(parentCI) >= Len(draftCI) Then Exit Function
+    If StrComp(Left$(draftCI, Len(parentCI)), parentCI, vbBinaryCompare) <> 0 Then Exit Function
+    IsDraftChildOf = True
+End Function
+
+' Meme fil : meme en-tete d'index (22 premiers octets).
+Private Function SameHeader(ByVal ci As String, ByVal draftCI As String) As Boolean
+    SameHeader = False
+    If Len(ci) < HEADER_LEN Or Len(draftCI) < HEADER_LEN Then Exit Function
+    SameHeader = (StrComp(Left$(ci, HEADER_LEN), Left$(draftCI, HEADER_LEN), vbBinaryCompare) = 0)
+End Function
+
+Private Function SafeCI(ByVal itm As Object) As String
+    On Error Resume Next
+    SafeCI = ""
+    SafeCI = CStr(itm.ConversationIndex)
+End Function
+
+Private Function SafeConversation(ByVal itm As Object) As Object
+    Set SafeConversation = Nothing
+    On Error Resume Next
+    Set SafeConversation = itm.GetConversation
+End Function
+
+Private Function SafeStoreID(ByVal itm As Object) As String
+    On Error Resume Next
+    SafeStoreID = ""
+    SafeStoreID = CStr(itm.Parent.StoreID)
+End Function
+
+Private Function GetItemSafe(ByVal ns As Object, ByVal eid As String, ByVal sid As String) As Object
+    Set GetItemSafe = Nothing
+    On Error Resume Next
+    Dim itm As Object
+    Set itm = Nothing
+    If Len(sid) > 0 Then Set itm = ns.GetItemFromID(eid, sid)
+    If itm Is Nothing Then Set itm = ns.GetItemFromID(eid)
+    Set GetItemSafe = itm
+End Function
+
+' Date d'un mail : reception, sinon envoi, sinon creation (0 si aucune ;
+' Outlook renvoie 01/01/4501 pour une date vide).
+Private Function SafeMailTime(ByVal itm As Object) As Date
+    On Error Resume Next
+    Dim d As Date
+    d = 0
+    d = itm.ReceivedTime
+    If d <= 0 Or d > MAX_VALID_DATE Then
+        d = 0
+        d = itm.SentOn
+    End If
+    If d <= 0 Or d > MAX_VALID_DATE Then
+        d = 0
+        d = itm.CreationTime
+    End If
+    If d > MAX_VALID_DATE Then d = 0
+    SafeMailTime = d
+End Function
+
+' "moi" pour nos propres envois, sinon nom court de l'expediteur.
+Private Function WhoLabel(ByVal itm As Object) As String
+    On Error Resume Next
+    Dim nm As String, smtp As String, p As Long
+    nm = ""
+    nm = Trim$(CStr(itm.SenderName))
+    If Len(nm) > 0 And StrComp(nm, modSmtp.MyName(), vbTextCompare) = 0 Then
+        WhoLabel = T("moi", "me")
+        Exit Function
+    End If
+    smtp = ""
+    smtp = modSmtp.SenderSmtp(itm)
+    If modSmtp.IsMe(smtp) Then
+        WhoLabel = T("moi", "me")
+        Exit Function
+    End If
+    p = InStr(nm, "@")
+    If p > 1 Then nm = Left$(nm, p - 1)
+    If Len(nm) = 0 Then nm = "?"
+    WhoLabel = Clip(nm, WHO_MAX)
+End Function
+
+Private Function AttName(ByVal att As Object) As String
+    On Error Resume Next
+    Dim nm As String, ty As Long
+    nm = ""
+    nm = Trim$(CStr(att.FileName))
+    If Len(nm) = 0 Then nm = Trim$(CStr(att.DisplayName))
+    ty = 0
+    ty = att.Type
+    If ty = ATT_EMBEDDED Then
+        If Len(nm) = 0 Then nm = T("message", "message")
+        If StrComp(Right$(nm, 4), ".msg", vbTextCompare) <> 0 Then nm = nm & ".msg"
+    End If
+    AttName = nm
+End Function
+
+Private Function AttSize(ByVal att As Object) As Long
+    On Error Resume Next
+    AttSize = 0
+    AttSize = CLng(att.Size)
+End Function
+
+Private Function IsHiddenAtt(ByVal att As Object) As Boolean
+    On Error Resume Next
+    Dim v As Variant
+    v = False
+    v = att.PropertyAccessor.GetProperty(PR_ATTACH_HIDDEN)
+    IsHiddenAtt = False
+    IsHiddenAtt = CBool(v)
+End Function
+
+Private Function LoadHtml(ByVal itm As Object) As String
+    On Error Resume Next
+    LoadHtml = ""
+    Dim bf As Long
+    bf = 0
+    bf = itm.BodyFormat
+    If bf <> BODY_FORMAT_HTML Then Exit Function
+    LoadHtml = CStr(itm.HTMLBody)
+End Function
+
+' Pieces techniques, jamais utiles a un destinataire.
+Private Function IsTechnicalName(ByVal nm As String) As Boolean
+    Dim s As String
+    IsTechnicalName = False
+    s = LCase$(Trim$(nm))
+    Select Case s
+        Case "smime.p7s", "smime.p7m", "winmail.dat"
+            IsTechnicalName = True
+            Exit Function
+    End Select
+    If Right$(s, 4) = ".emz" Or Right$(s, 4) = ".wmz" Then IsTechnicalName = True
+End Function
+
+' Image de signature restee en piece jointe (reponse en texte brut, client
+' mobile...) : nom genere par Outlook (image001.png, Outlook-abc12.png) ET
+' petite taille.
+Private Function IsSignatureImage(ByVal nm As String, ByVal sz As Long) As Boolean
+    IsSignatureImage = False
+    If sz <= 0 Or sz >= SIG_IMAGE_MAX Then Exit Function
+    Dim s As String, p As Long, ext As String, stem As String
+    s = LCase$(Trim$(nm))
+    p = InStrRev(s, ".")
+    If p <= 1 Then Exit Function
+    ext = Mid$(s, p + 1)
+    Select Case ext
+        Case "png", "jpg", "jpeg", "gif", "bmp"
+        Case Else
+            Exit Function
+    End Select
+    stem = Left$(s, p - 1)
+    If Left$(stem, 5) = "image" And Len(stem) > 5 Then
+        IsSignatureImage = IsAllDigits(Mid$(stem, 6))
+    ElseIf Left$(stem, 8) = "outlook-" Then
+        IsSignatureImage = True
+    End If
+End Function
+
+Private Function IsAllDigits(ByVal s As String) As Boolean
+    Dim i As Long, ch As String
+    IsAllDigits = False
+    If Len(s) = 0 Then Exit Function
+    For i = 1 To Len(s)
+        ch = Mid$(s, i, 1)
+        If ch < "0" Or ch > "9" Then Exit Function
+    Next i
+    IsAllDigits = True
+End Function
+
+' Numero de ligne saisi : 1 a 5 chiffres (CLng sans debordement).
+Private Function IsSmallNumber(ByVal s As String) As Boolean
+    IsSmallNumber = False
+    s = Trim$(s)
+    If Len(s) = 0 Or Len(s) > 5 Then Exit Function
+    IsSmallNumber = IsAllDigits(s)
+End Function
+
+Private Function ClipName(ByVal nm As String, ByVal maxLen As Long) As String
+    Dim p As Long, ext As String
+    If Len(nm) <= maxLen Then
+        ClipName = nm
+        Exit Function
+    End If
+    p = InStrRev(nm, ".")
+    If p > 1 And Len(nm) - p <= 6 Then ext = Mid$(nm, p)
+    ClipName = Left$(nm, maxLen - Len(ext) - 3) & "..." & ext
+End Function
+
+Private Function Clip(ByVal s As String, ByVal maxLen As Long) As String
+    If Len(s) <= maxLen Then
+        Clip = s
+    Else
+        Clip = Left$(s, maxLen - 3) & "..."
+    End If
+End Function
+
+' 245 Ko / 1,2 Mo (separateur decimal selon la langue de l'interface).
+Private Function FormatSize(ByVal b As Long) As String
+    Dim kb As Double, s As String
+    If b < 1048576 Then
+        kb = Int((CDbl(b) + 1023#) / 1024#)
+        If kb < 1 Then kb = 1
+        FormatSize = CStr(kb) & T(" Ko", " KB")
+    Else
+        s = Format$(CDbl(b) / 1048576#, "0.0")
+        s = Replace(Replace(s, ",", "."), ".", T(",", "."))
+        FormatSize = s & T(" Mo", " MB")
+    End If
+End Function
+
+' 12/09 (annee ajoutee si ce n'est pas l'annee en cours) ; mm/dd en anglais.
+Private Function ShortDate(ByVal d As Date) As String
+    Dim fmt As String
+    If d <= 0 Then
+        ShortDate = "?"
+        Exit Function
+    End If
+    If modConfig.LangIsEN() Then
+        fmt = "mm/dd"
+    Else
+        fmt = "dd/mm"
+    End If
+    If Year(d) <> Year(Now) Then fmt = fmt & "/yy"
+    ShortDate = Format$(d, fmt)
+End Function

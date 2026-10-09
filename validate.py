@@ -53,6 +53,10 @@ NOT_VBA = {
 # Modules dont le nom de fichier ne porte pas de MOD_NAME (formulaires,
 # fichiers de code de UserForm du projet Excel).
 NO_MOD_NAME_OK = {
+    # 2026-10-05 : code du classeur Suivi des mails.xlsm (projet VBA Excel
+    # distinct, sans modDebugLog ni modMaintenance).
+    "Suivi_des_mails__ThisWorkbook.txt",
+    "Suivi_des_mails__modMailTracker.txt",
     "frmConfig.txt",
     "frmProgress.txt",
     "modMailAnalytics__frmConfig_Code.txt",

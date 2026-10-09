@@ -1,0 +1,1927 @@
+Option Explicit
+
+'=============================================================================
+' modMailTracker v1.2  (2026-10-09) - classeur "Suivi des mails.xlsm"
+'
+' v1.2 (2026-10-09) : ACTUALISER par le canal de commandes. L'appel direct
+'   RefreshMailTracking (procedure de ThisOutlookSession vue d'Excel) reste
+'   tente en premier ; sur ce poste il echoue toujours (438 : raccourci non
+'   documente, non expose). Repli : SendOutlookCommand ecrit la note
+'   "TOOLKIT|REFRESH|horodatage" dans le dossier Notes\ClassicOutlook-Toolkit,
+'   qu'Outlook surveille (ThisOutlookSession v10.16). Dossier absent = Outlook
+'   pas encore a jour : message explicite.
+'
+' v1.1 (2026-10-08) :
+'   (a) FILTRE SUR TOUTES LES COLONNES. Le filtre automatique ne couvrait
+'       que les colonnes visibles (A:M). Un tri lance depuis une fleche du
+'       filtre deplacait donc les lignes visibles SANS les colonnes
+'       techniques masquees (identifiant, fil, mail, acquittement) : chaque
+'       objet se retrouvait relie au mail d'une autre ligne (dossier, statut,
+'       relance et ouverture faux). Le filtre couvre desormais aussi les
+'       colonnes masquees (EnsureFilterCoversAll, a l'ouverture et apres
+'       chaque actualisation) : un tri deplace la ligne entiere. Reparation
+'       des lignes deja melangees : macro Outlook RepairTrackerRows
+'       (modMailResponseTracker v6.4).
+'   (b) ACTUALISER : si Outlook refuse l'appel avec le classeur en
+'       parametre, nouvel essai sans parametre ; le message d'echec donne
+'       desormais le numero d'erreur (il ne renvoyait qu'a "coller
+'       ThisOutlookSession v10.15", y compris quand c'etait deja fait).
+'
+' MODULE STANDARD DU CLASSEUR (rien a voir avec le projet VBA d'Outlook).
+' A creer une fois : Excel, Alt+F11 -> VBAProject (Suivi des mails.xlsm) ->
+' Insertion > Module -> F4 : nommer le module "modMailTracker" -> coller.
+' Le module de la feuille "Suivi" doit etre VIDE (ses anciens liens
+' cliquables n'existent plus) ; ThisWorkbook v7 branche les evenements.
+'
+' Toute la logique du classeur :
+'   - onglet de ruban "Suivi des mails" (customUI14.xml du fichier) :
+'     Rbn_OnLoad, Rbn_Action, Rbn_GetLabel (compteurs, Archiver/Restaurer),
+'     Rbn_GetImage ;
+'   - colonne A "coche" : un clic coche ou decoche la ligne, un clic sur
+'     l'en-tete decoche tout (OnSelectionChanged, via ThisWorkbook) ;
+'   - actions : Relancer (pieces jointes du mail suivi remises d'office,
+'     texte FR ou EN selon la langue du mail suivi), Ouvrir le mail, Ouvrir
+'     le dossier, Prolonger / Valider la reponse / Archiver (lignes cochees,
+'     sinon ligne active), Restaurer (feuille Archives), Actualiser (demande
+'     le recalcul a Outlook, qui rappelle AfterOutlookRefresh) ;
+'   - ligne active surlignee (mise en forme conditionnelle), echeance par
+'     formule, compteurs du ruban.
+'
+' COLONNES : lues PAR NOM dans la feuille masquee "_Schema", tenue par
+' modMailResponseTracker (Outlook). Relue des que sa version change : une
+' migration faite par Outlook pendant que le classeur est ouvert est prise
+' en compte au clic suivant. Garde-fou : aucune action si l'en-tete Objet
+' n'est pas a l'indice annonce (incident v5.7 : apres un decalage de
+' colonnes, "Valider" SUPPRIMAIT la ligne). Sans _Schema : ancien gabarit
+' (v6 : sans colonne coche ni colonne dossier).
+'
+' TEXTES AFFICHES : marqueurs d'accent ASCII decodes par A(), PRIVEE (meme
+' table que modConfig.A() cote Outlook ; ce classeur est un projet VBA
+' distinct, sans conflit de nom). Jamais de donnee (objet de mail, nom de
+' dossier) a l'interieur d'A() : un "~e" y serait decode a tort.
+'
+' PIECES JOINTES : memes regles de tri que modThreadAttachments.Classify
+' cote Outlook (images de signature, liens cloud, fichiers techniques
+' ecartes).
+' PIEGE VBA : sous On Error Resume Next, une erreur DANS la condition d'un
+' If fait executer la branche Then. Toute lecture COM est donc faite dans
+' une variable AVANT le test.
+'=============================================================================
+
+Private Const MOD_VERSION As String = "v1.2 - 2026-10-09"
+
+Private Const SH_TRACK As String = "Suivi"
+Private Const SH_ARCHIVE As String = "Archives"
+Private Const SH_SCHEMA As String = "_Schema"
+Private Const TAB_ID As String = "tabSuiviMails"
+Private Const APP_TITLE As String = "Suivi des mails"
+Private Const FOLLOWUP_PROP As String = "FollowupConvID"
+Private Const OL_MAIL_CLASS As Long = 43
+Private Const MARK_GLYPH As Long = 10003         ' ChrW : coche
+Private Const MARK_FONT As String = "Segoe UI Symbol"
+Private Const MAX_LISTED As Long = 8             ' objets listes dans une confirmation
+Private Const STATUS_TIMEOUT_SEC As Long = 120   ' barre d'etat effacee au plus tard apres
+Private Const TEMP_SUBDIR As String = "SuiviMails-PJ"
+Private Const SIG_IMAGE_MAX As Long = 30720      ' 30 Ko : plafond d'une image de signature
+Private Const PR_ATTACH_HIDDEN As String = "http://schemas.microsoft.com/mapi/proptag/0x7FFE000B"
+Private Const PR_ATTACH_CONTENT_ID As String = "http://schemas.microsoft.com/mapi/proptag/0x3712001F"
+Private Const PR_ATTACH_METHOD As String = "http://schemas.microsoft.com/mapi/proptag/0x37050003"
+
+' v1.2 : canal de commandes vers Outlook (cf. ThisOutlookSession v10.16).
+Private Const CMD_FOLDER_NAME As String = "ClassicOutlook-Toolkit"
+Private Const OL_FOLDER_NOTES As Long = 12
+Private Const OL_NOTE_ITEM As Long = 5
+
+' Detection de la langue du mail suivi (mots entoures d'espaces).
+Private Const FR_WORDS As String = " bonjour vous nous merci cordialement pour avec dans est une des les votre notre pas sur que qui bien salutations suite concernant veuillez madame monsieur bonne "
+Private Const EN_WORDS As String = " hello hi you we thanks thank regards please the and for with this that have are would could best kind dear attached find following sincerely your our "
+
+' Indices de colonnes (cf. EnsureSchema). 0 = colonne absente.
+Private COL_MARK As Long
+Private COL_STATUS As Long
+Private COL_DEADLINE As Long
+Private COL_FOLDER As Long
+Private COL_SUBJECT As Long
+Private COL_RESPONSE As Long
+Private COL_SENT As Long
+Private COL_DELAY As Long
+Private COL_DUE As Long
+Private COL_LASTFU As Long
+Private COL_NBFU As Long
+Private COL_ID As Long
+Private COL_CONV As Long
+Private COL_ENTRY As Long
+Private COL_ACK As Long
+Private COL_ARCHIVED_AT As Long
+Private mSchemaLoaded As Boolean
+Private mSchemaVer As String
+
+' Ruban (IRibbonUI) recu par Rbn_OnLoad. Perdu si le projet VBA est
+' reinitialise (edition du code, erreur non geree) : l'onglet reste
+' utilisable, compteurs et libelles ne bougent plus jusqu'a la prochaine
+' ouverture du classeur.
+Private mRibbon As Object
+Private mBusy As Boolean            ' selection deplacee par le code (anti-reentree)
+Private mStatusSet As Boolean       ' barre d'etat ecrite par ce module
+
+'=============================================================================
+' ModVersion - version reellement collee dans le classeur.
+'=============================================================================
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+'=============================================================================
+' RUBAN - rappels de l'onglet "Suivi des mails".
+' L'attribut tag="..." de chaque bouton porte le nom de l'action.
+'=============================================================================
+Public Sub Rbn_OnLoad(ribbon As Object)
+    On Error Resume Next
+    Set mRibbon = ribbon
+    ActivateRibbonTab
+End Sub
+
+Public Sub Rbn_Action(control As Object)
+    Dim act As String
+    act = ""
+    On Error Resume Next
+    act = UCase$(CStr(control.Tag))
+    On Error GoTo 0
+    If Len(act) > 0 Then RunAction act
+End Sub
+
+' Libelles dynamiques : compteurs, et Archiver / Restaurer selon la feuille.
+Public Sub Rbn_GetLabel(control As Object, ByRef returnedVal)
+    On Error Resume Next
+    Dim id As String
+    id = ""
+    id = CStr(control.id)
+    EnsureSchema ThisWorkbook
+    Dim n As Long
+    Select Case id
+        Case "lblValidate"
+            n = CountStatus(TrackSheet(), "R" & ChrW$(233) & "pondu ?")
+            returnedVal = n & A(" ~a valider")
+        Case "lblLate"
+            n = CountStatus(TrackSheet(), "En retard")
+            returnedVal = n & " en retard"
+        Case "lblChecked"
+            n = CountMarks(ListSheet())
+            If n > 1 Then
+                returnedVal = n & A(" coch~ees")
+            Else
+                returnedVal = n & A(" coch~ee")
+            End If
+        Case "btnArchiver"
+            If OnArchiveSheet() Then returnedVal = "Restaurer" Else returnedVal = "Archiver"
+        Case Else
+            returnedVal = ""
+    End Select
+End Sub
+
+Public Sub Rbn_GetImage(control As Object, ByRef returnedVal)
+    On Error Resume Next
+    If OnArchiveSheet() Then
+        returnedVal = "SourceControlCheckOut"
+    Else
+        returnedVal = "SourceControlCheckIn"
+    End If
+End Sub
+
+' Re-selectionne l'onglet (ouverture du classeur, retour sur sa fenetre).
+Public Sub ActivateRibbonTab()
+    On Error Resume Next
+    If mRibbon Is Nothing Then Exit Sub
+    mRibbon.ActivateTab TAB_ID
+End Sub
+
+' Compteurs et libelles recalcules (apres une action, un cochage, un
+' changement de feuille, une actualisation).
+Public Sub RefreshRibbon()
+    On Error Resume Next
+    If mRibbon Is Nothing Then Exit Sub
+    mRibbon.Invalidate
+End Sub
+
+'=============================================================================
+' EVENEMENTS (appeles par ThisWorkbook)
+'=============================================================================
+Public Sub OnWorkbookOpen()
+    On Error Resume Next
+    EnsureSchema ThisWorkbook
+    EnsureSetup TrackSheet()
+    EnsureSetup ArchiveSheet()
+    RefreshRibbon
+End Sub
+
+Public Sub OnSheetActivated(ByVal sh As Object)
+    On Error Resume Next
+    RefreshRibbon
+    If TypeName(sh) = "Worksheet" Then sh.Calculate
+End Sub
+
+' Colonne coche : un clic coche/decoche la ligne (la cellule active passe
+' sur l'objet), un clic sur l'en-tete decoche tout. Puis recalcul de la
+' feuille : le surlignage de la ligne active (CELL("row")) suit la selection.
+Public Sub OnSelectionChanged(ByVal sh As Object, ByVal Target As Range)
+    If mBusy Then Exit Sub
+    On Error GoTo Fin
+    If TypeName(sh) <> "Worksheet" Then Exit Sub
+    Dim ws As Worksheet
+    Set ws = sh
+    If ws.Name <> SH_TRACK And ws.Name <> SH_ARCHIVE Then Exit Sub
+    EnsureSchema ws.Parent
+
+    If COL_MARK >= 1 And COL_SUBJECT >= 1 Then
+        If Target.CountLarge = 1 Then
+            If Target.Column = COL_MARK Then
+                Dim r As Long
+                r = Target.Row
+                mBusy = True
+                Application.EnableEvents = False
+                If r = 1 Then
+                    ClearAllMarks ws
+                ElseIf HasId(ws, r) Then
+                    ToggleMark ws, r
+                End If
+                Dim tr As Long
+                tr = r
+                If tr < 2 Then tr = 2
+                ws.Cells(tr, COL_SUBJECT).Select
+                Application.EnableEvents = True
+                mBusy = False
+                RefreshRibbon
+            End If
+        End If
+    End If
+    ws.Calculate
+    Exit Sub
+Fin:
+    Application.EnableEvents = True
+    mBusy = False
+End Sub
+
+' Edition du delai (feuille Suivi) -> recalcul instantane de la date limite
+' et du statut, sans rouvrir le tableau de bord.
+Public Sub OnSheetChanged(ByVal sh As Object, ByVal Target As Range)
+    On Error GoTo Fin
+    If TypeName(sh) <> "Worksheet" Then Exit Sub
+    If sh.Name <> SH_TRACK Then Exit Sub
+    Dim ws As Worksheet
+    Set ws = sh
+    EnsureSchema ws.Parent
+    If COL_DELAY < 1 Or COL_ID < 1 Then Exit Sub
+    Dim isect As Range
+    Set isect = Application.Intersect(Target, ws.Columns(COL_DELAY))
+    If isect Is Nothing Then Exit Sub
+    Dim lastRow As Long
+    lastRow = LastDataRow(ws)
+    If lastRow < 2 Then Exit Sub
+    Set isect = Application.Intersect(isect, ws.Range(ws.Cells(2, COL_DELAY), ws.Cells(lastRow, COL_DELAY)))
+    If isect Is Nothing Then Exit Sub
+    Application.EnableEvents = False
+    Dim cell As Range
+    For Each cell In isect.Cells
+        If HasId(ws, cell.Row) Then RecomputeRow ws, cell.Row
+    Next cell
+Fin:
+    Application.EnableEvents = True
+End Sub
+
+' Appele par Outlook (Application.Run) a la fin d'une actualisation
+' demandee par le bouton Actualiser.
+Public Sub AfterOutlookRefresh()
+    On Error Resume Next
+    mSchemaLoaded = False
+    EnsureSchema ThisWorkbook
+    EnsureSetup TrackSheet()
+    EnsureSetup ArchiveSheet()
+    RefreshRibbon
+    SetStatus A("Suivi actualis~e ~a ") & Format$(Now, "hh:nn") & "."
+    ScheduleStatusClear 20
+End Sub
+
+Public Sub ClearStatusBarSafe()
+    On Error Resume Next
+    If mStatusSet Then
+        Application.StatusBar = False
+        mStatusSet = False
+    End If
+End Sub
+
+'=============================================================================
+' AIGUILLAGE DES ACTIONS
+'=============================================================================
+Private Sub RunAction(ByVal act As String)
+    On Error GoTo Fin
+    If act = "REFRESH" Then
+        DoRefresh
+        Exit Sub
+    End If
+
+    Dim sh As Object
+    Set sh = Nothing
+    On Error Resume Next
+    Set sh = ActiveSheet
+    On Error GoTo Fin
+    If sh Is Nothing Then Exit Sub
+    If TypeName(sh) <> "Worksheet" Then
+        ShowInfo A("S~electionnez une ligne de la feuille ") & SH_TRACK & "."
+        Exit Sub
+    End If
+    If Not sh.Parent Is ThisWorkbook Then Exit Sub
+    Dim ws As Worksheet
+    Set ws = sh
+    EnsureSchema ws.Parent
+
+    Dim onArchive As Boolean
+    If ws.Name = SH_TRACK Then
+        onArchive = False
+    ElseIf ws.Name = SH_ARCHIVE Then
+        onArchive = True
+    Else
+        ShowInfo A("Les actions du suivi portent sur les feuilles ") & SH_TRACK & " et " & SH_ARCHIVE & "."
+        Exit Sub
+    End If
+
+    ' Garde-fou : les indices lus dans _Schema doivent correspondre a la
+    ' feuille. Sinon relecture forcee, puis refus si l'ecart persiste.
+    If Not LayoutMatches(ws) Then
+        mSchemaLoaded = False
+        EnsureSchema ws.Parent
+        If Not LayoutMatches(ws) Then
+            MsgBox A("Les colonnes de la feuille ne correspondent pas ~a la feuille _Schema : ") & _
+                   A("aucune action n'a ~et~e faite.") & vbCrLf & vbCrLf & _
+                   A("Ouvrez le tableau de bord depuis Outlook, puis recommencez."), _
+                   vbExclamation, APP_TITLE
+            Exit Sub
+        End If
+    End If
+
+    Dim rowList As Collection
+    Select Case act
+        Case "FOLLOWUP", "OPEN", "OPEN_FOLDER"
+            If onArchive And act = "FOLLOWUP" Then
+                ShowInfo A("Ligne archiv~ee : restaurez-la d'abord pour la relancer.")
+                Exit Sub
+            End If
+            Dim r As Long
+            r = ActiveCell.Row
+            If r < 2 Or Not HasId(ws, r) Then
+                ShowInfo A("S~electionnez d'abord une ligne de suivi (une cellule de la ligne suffit).")
+                Exit Sub
+            End If
+            If act = "FOLLOWUP" Then DoFollowUp ws, r
+            If act = "OPEN" Then DoOpen ws, r
+            If act = "OPEN_FOLDER" Then DoOpenFolder ws, r
+        Case "EXTEND", "VALIDATE", "ARCHIVE"
+            If onArchive And act <> "ARCHIVE" Then
+                ShowInfo A("Ligne archiv~ee : seuls Ouvrir le mail, Ouvrir le dossier et Restaurer sont disponibles ici.")
+                Exit Sub
+            End If
+            Set rowList = TargetRows(ws)
+            If rowList.Count = 0 Then Exit Sub
+            If act = "EXTEND" Then DoExtend ws, rowList
+            If act = "VALIDATE" Then DoValidate ws, rowList
+            If act = "ARCHIVE" Then
+                If onArchive Then DoRestore ws, rowList Else DoArchive ws, rowList
+            End If
+    End Select
+    Exit Sub
+Fin:
+    MsgBox A("Action impossible : ") & Err.Number & " - " & Err.Description, vbExclamation, APP_TITLE
+End Sub
+
+' Lignes visees : les lignes cochees s'il y en a, sinon la ligne active.
+' Vide (avec message) si rien d'exploitable.
+Private Function TargetRows(ByVal ws As Worksheet) As Collection
+    Dim res As Collection
+    Set res = CheckedRows(ws)
+    If res.Count = 0 Then
+        Dim r As Long
+        r = ActiveCell.Row
+        If r >= 2 Then
+            If HasId(ws, r) Then res.Add r
+        End If
+    End If
+    If res.Count = 0 Then
+        ShowInfo A("Cochez une ou plusieurs lignes (colonne A), ou s~electionnez une ligne de suivi.")
+    End If
+    Set TargetRows = res
+End Function
+
+'=============================================================================
+' COLONNES (_Schema), FEUILLES, GARDE-FOU
+'=============================================================================
+Private Sub EnsureSchema(ByVal wb As Workbook)
+    Dim wsS As Worksheet
+    Set wsS = Nothing
+    On Error Resume Next
+    Set wsS = wb.Worksheets(SH_SCHEMA)
+    On Error GoTo 0
+
+    Dim ver As String
+    ver = ""
+    If Not wsS Is Nothing Then ver = CStr(wsS.Cells(1, 2).Value)
+    If mSchemaLoaded And StrComp(ver, mSchemaVer, vbBinaryCompare) = 0 Then Exit Sub
+
+    ' Repli = gabarit v6 : un classeur sans _Schema n'a jamais ete rouvert
+    ' par Outlook depuis le pack v3, donc sans colonne coche ni dossier.
+    COL_MARK = 0: COL_STATUS = 1: COL_DEADLINE = 2: COL_FOLDER = 0
+    COL_SUBJECT = 3: COL_RESPONSE = 5: COL_SENT = 7: COL_DELAY = 8
+    COL_DUE = 9: COL_LASTFU = 10: COL_NBFU = 11: COL_ID = 17
+    COL_CONV = 18: COL_ENTRY = 19: COL_ACK = 20: COL_ARCHIVED_AT = 21
+
+    If Not wsS Is Nothing Then
+        Dim blk As Variant
+        blk = wsS.Range("A1:B80").Value
+        COL_MARK = SchemaCol(blk, "MARK", 0)
+        COL_STATUS = SchemaCol(blk, "STATUS", COL_STATUS)
+        COL_DEADLINE = SchemaCol(blk, "DEADLINE", COL_DEADLINE)
+        COL_FOLDER = SchemaCol(blk, "FOLDER", 0)
+        COL_SUBJECT = SchemaCol(blk, "SUBJECT", COL_SUBJECT)
+        COL_RESPONSE = SchemaCol(blk, "RESPONSE_COUNT", COL_RESPONSE)
+        COL_SENT = SchemaCol(blk, "SENT_DATE", COL_SENT)
+        COL_DELAY = SchemaCol(blk, "DELAY_DAYS", COL_DELAY)
+        COL_DUE = SchemaCol(blk, "DUE_DATE", COL_DUE)
+        COL_LASTFU = SchemaCol(blk, "LAST_FOLLOWUP", COL_LASTFU)
+        COL_NBFU = SchemaCol(blk, "FOLLOWUP_COUNT", COL_NBFU)
+        COL_ID = SchemaCol(blk, "ID", COL_ID)
+        COL_CONV = SchemaCol(blk, "CONV_ID", COL_CONV)
+        COL_ENTRY = SchemaCol(blk, "ENTRY_ID", COL_ENTRY)
+        COL_ACK = SchemaCol(blk, "ACK_COUNT", COL_ACK)
+        COL_ARCHIVED_AT = SchemaCol(blk, "ARCHIVED_AT", SchemaCol(blk, "ARCHIVE", COL_ARCHIVED_AT))
+    End If
+    mSchemaVer = ver
+    mSchemaLoaded = True
+End Sub
+
+Private Function SchemaCol(ByRef blk As Variant, ByVal keyName As String, ByVal fallback As Long) As Long
+    On Error Resume Next
+    SchemaCol = fallback
+    Dim i As Long, v As Variant
+    For i = LBound(blk, 1) To UBound(blk, 1)
+        If StrComp(Trim$(CStr(blk(i, 1))), keyName, vbTextCompare) = 0 Then
+            v = blk(i, 2)
+            If IsNumeric(v) Then
+                If CLng(v) >= 1 Then SchemaCol = CLng(v)
+            End If
+            Exit Function
+        End If
+    Next i
+End Function
+
+' L'en-tete Objet est-il bien a l'indice lu dans _Schema ?
+Private Function LayoutMatches(ByVal ws As Worksheet) As Boolean
+    On Error Resume Next
+    LayoutMatches = False
+    If COL_SUBJECT < 1 Then Exit Function
+    Dim s As String
+    s = ""
+    s = LCase$(Trim$(CStr(ws.Cells(1, COL_SUBJECT).Value)))
+    LayoutMatches = (s = "objet" Or s = "subject")
+End Function
+
+Private Function TrackSheet() As Worksheet
+    On Error Resume Next
+    Set TrackSheet = Nothing
+    Set TrackSheet = ThisWorkbook.Worksheets(SH_TRACK)
+End Function
+
+Private Function ArchiveSheet() As Worksheet
+    On Error Resume Next
+    Set ArchiveSheet = Nothing
+    Set ArchiveSheet = ThisWorkbook.Worksheets(SH_ARCHIVE)
+End Function
+
+' Feuille dont on compte les coches : la feuille active si c'est Suivi ou
+' Archives, sinon Suivi.
+Private Function ListSheet() As Worksheet
+    On Error Resume Next
+    Set ListSheet = TrackSheet()
+    Dim sh As Object
+    Set sh = Nothing
+    Set sh = ActiveSheet
+    If sh Is Nothing Then Exit Function
+    If TypeName(sh) <> "Worksheet" Then Exit Function
+    If sh.Parent Is ThisWorkbook Then
+        If sh.Name = SH_ARCHIVE Then Set ListSheet = sh
+    End If
+End Function
+
+Private Function OnArchiveSheet() As Boolean
+    On Error Resume Next
+    OnArchiveSheet = False
+    Dim sh As Object
+    Set sh = Nothing
+    Set sh = ActiveSheet
+    If sh Is Nothing Then Exit Function
+    If TypeName(sh) <> "Worksheet" Then Exit Function
+    If sh.Parent Is ThisWorkbook Then OnArchiveSheet = (sh.Name = SH_ARCHIVE)
+End Function
+
+Private Function LastDataRow(ByVal ws As Worksheet) As Long
+    On Error Resume Next
+    LastDataRow = 1
+    If COL_ID < 1 Then Exit Function
+    LastDataRow = ws.Cells(ws.Rows.Count, COL_ID).End(xlUp).Row
+End Function
+
+Private Function HasId(ByVal ws As Worksheet, ByVal r As Long) As Boolean
+    On Error Resume Next
+    HasId = False
+    If r < 2 Or COL_ID < 1 Then Exit Function
+    Dim v As String
+    v = ""
+    v = CStr(ws.Cells(r, COL_ID).Value)
+    HasId = (Len(v) > 0)
+End Function
+
+'=============================================================================
+' MISE EN PLACE DE LA FEUILLE (idempotente) : colonne coche, colonnes
+' techniques masquees, surlignage de la ligne active.
+'=============================================================================
+Private Sub EnsureSetup(ByVal ws As Worksheet)
+    On Error Resume Next
+    If ws Is Nothing Then Exit Sub
+    FormatMarkColumn ws
+    HideTechColumns ws
+    EnsureFilterCoversAll ws
+    EnsureHighlightRule ws
+End Sub
+
+Private Sub FormatMarkColumn(ByVal ws As Worksheet)
+    On Error Resume Next
+    If COL_MARK < 1 Then Exit Sub
+    With ws.Columns(COL_MARK)
+        .ColumnWidth = 3.2
+        .HorizontalAlignment = xlCenter
+        .Font.Name = MARK_FONT
+        .Font.Color = RGB(0, 112, 192)
+    End With
+    Dim hdr As String
+    hdr = "?"
+    hdr = CStr(ws.Cells(1, COL_MARK).Value)
+    If hdr <> ChrW$(MARK_GLYPH) Then ws.Cells(1, COL_MARK).Value = ChrW$(MARK_GLYPH)
+End Sub
+
+Private Sub HideTechColumns(ByVal ws As Worksheet)
+    On Error Resume Next
+    If COL_ID > 0 Then ws.Columns(COL_ID).Hidden = True
+    If COL_CONV > 0 Then ws.Columns(COL_CONV).Hidden = True
+    If COL_ENTRY > 0 Then ws.Columns(COL_ENTRY).Hidden = True
+    If COL_ACK > 0 Then ws.Columns(COL_ACK).Hidden = True
+End Sub
+
+' v1.1 : le filtre automatique doit couvrir AUSSI les colonnes techniques
+' masquees. Sinon un tri lance depuis une fleche du filtre ne deplace que
+' les colonnes visibles : chaque objet se retrouve relie au mail d'une autre
+' ligne. Meme plage que modMailResponseTracker.EnsureAutoFilter (Outlook,
+' v6.4) : colonne 1 a la derniere colonne technique, en-tete compris.
+' Sans filtre pose, rien n'est fait.
+Private Sub EnsureFilterCoversAll(ByVal ws As Worksheet)
+    On Error Resume Next
+    Dim mode As Boolean
+    mode = False
+    mode = CBool(ws.AutoFilterMode)
+    If Not mode Then Exit Sub
+
+    Dim lastCol As Long
+    lastCol = COL_ID
+    If COL_CONV > lastCol Then lastCol = COL_CONV
+    If COL_ENTRY > lastCol Then lastCol = COL_ENTRY
+    If COL_ACK > lastCol Then lastCol = COL_ACK
+    If lastCol < 1 Then Exit Sub
+
+    Dim c1 As Long, nc As Long
+    c1 = 0
+    nc = 0
+    c1 = ws.AutoFilter.Range.Column
+    nc = ws.AutoFilter.Range.Columns.Count
+    If c1 = 1 And nc >= lastCol Then Exit Sub
+
+    Dim lastRow As Long
+    lastRow = LastDataRow(ws)
+    If lastRow < 2 Then Exit Sub
+    Dim evOn As Boolean
+    evOn = Application.EnableEvents
+    Application.EnableEvents = False
+    ws.AutoFilterMode = False
+    ws.Range(ws.Cells(1, 1), ws.Cells(lastRow, lastCol)).AutoFilter
+    Application.EnableEvents = evOn
+End Sub
+
+' Surlignage jaune de la ligne active (sauf la cellule Statut, qui garde sa
+' couleur). Mise en forme conditionnelle sur =ROW()=CELL("row") : rien n'est
+' ecrit dans le fichier ; OnSelectionChanged recalcule la feuille a chaque
+' changement de selection. Les anciennes regles de ce module sont retirees
+' avant pose (les indices de colonnes ont pu changer).
+Private Sub EnsureHighlightRule(ByVal ws As Worksheet)
+    On Error Resume Next
+    If COL_ID < 1 Or COL_STATUS < 1 Then Exit Sub
+    Dim lastVis As Long
+    lastVis = COL_NBFU
+    If lastVis < COL_SUBJECT Then lastVis = COL_SUBJECT
+
+    Dim i As Long, f As String
+    For i = ws.Cells.FormatConditions.Count To 1 Step -1
+        f = ""
+        f = CStr(ws.Cells.FormatConditions(i).Formula1)
+        If InStr(1, f, "CELL(", vbTextCompare) > 0 Then ws.Cells.FormatConditions(i).Delete
+    Next i
+
+    Dim formula As String
+    formula = "=AND(ROW()=CELL(""row""),$" & ColLetter(ws, COL_ID) & "2<>"""")"
+    If COL_STATUS > 1 Then
+        AddHighlight ws.Range(ws.Cells(2, 1), ws.Cells(ws.Rows.Count, COL_STATUS - 1)), formula
+    End If
+    If lastVis > COL_STATUS Then
+        AddHighlight ws.Range(ws.Cells(2, COL_STATUS + 1), ws.Cells(ws.Rows.Count, lastVis)), formula
+    End If
+End Sub
+
+Private Sub AddHighlight(ByVal rng As Range, ByVal formula As String)
+    On Error Resume Next
+    Dim fc As Object
+    Set fc = rng.FormatConditions.Add(Type:=xlExpression, Formula1:=formula)
+    If fc Is Nothing Then Exit Sub
+    fc.Interior.Color = RGB(255, 244, 171)
+    fc.StopIfTrue = False
+End Sub
+
+Private Function ColLetter(ByVal ws As Worksheet, ByVal col As Long) As String
+    ColLetter = Split(ws.Cells(1, col).Address(True, False), "$")(0)
+End Function
+
+'=============================================================================
+' COCHES (colonne A)
+'=============================================================================
+Private Sub ToggleMark(ByVal ws As Worksheet, ByVal r As Long)
+    On Error Resume Next
+    Dim v As String
+    v = ""
+    v = CStr(ws.Cells(r, COL_MARK).Value)
+    If Len(v) > 0 Then
+        ws.Cells(r, COL_MARK).ClearContents
+    Else
+        ws.Cells(r, COL_MARK).Value = ChrW$(MARK_GLYPH)
+    End If
+End Sub
+
+Private Sub ClearAllMarks(ByVal ws As Worksheet)
+    On Error Resume Next
+    If COL_MARK < 1 Then Exit Sub
+    Dim lastRow As Long
+    lastRow = LastDataRow(ws)
+    If lastRow < 2 Then Exit Sub
+    ws.Range(ws.Cells(2, COL_MARK), ws.Cells(lastRow, COL_MARK)).ClearContents
+End Sub
+
+Private Sub ClearMarks(ByVal ws As Worksheet, ByVal rowList As Collection)
+    On Error Resume Next
+    If COL_MARK < 1 Then Exit Sub
+    Dim v As Variant
+    For Each v In rowList
+        ws.Cells(CLng(v), COL_MARK).ClearContents
+    Next v
+End Sub
+
+' Lignes cochees (ordre croissant), limitees aux lignes de suivi.
+Private Function CheckedRows(ByVal ws As Worksheet) As Collection
+    Dim res As Collection
+    Set res = New Collection
+    Set CheckedRows = res
+    On Error Resume Next
+    If COL_MARK < 1 Or COL_ID < 1 Then Exit Function
+    Dim lastRow As Long
+    lastRow = LastDataRow(ws)
+    If lastRow < 2 Then Exit Function
+    Dim marks As Variant, ids As Variant
+    marks = ws.Range(ws.Cells(2, COL_MARK), ws.Cells(lastRow, COL_MARK)).Value
+    ids = ws.Range(ws.Cells(2, COL_ID), ws.Cells(lastRow, COL_ID)).Value
+    Dim i As Long
+    If lastRow = 2 Then
+        If Len(CStr(ws.Cells(2, COL_MARK).Value)) > 0 And Len(CStr(ws.Cells(2, COL_ID).Value)) > 0 Then res.Add 2
+        Exit Function
+    End If
+    For i = 1 To UBound(marks, 1)
+        If Len(CStr(marks(i, 1))) > 0 And Len(CStr(ids(i, 1))) > 0 Then res.Add i + 1
+    Next i
+End Function
+
+Private Function CountMarks(ByVal ws As Worksheet) As Long
+    On Error Resume Next
+    CountMarks = 0
+    If ws Is Nothing Then Exit Function
+    CountMarks = CheckedRows(ws).Count
+End Function
+
+Private Function CountStatus(ByVal ws As Worksheet, ByVal st As String) As Long
+    On Error Resume Next
+    CountStatus = 0
+    If ws Is Nothing Or COL_STATUS < 1 Then Exit Function
+    Dim lastRow As Long
+    lastRow = LastDataRow(ws)
+    If lastRow < 2 Then Exit Function
+    Dim n As Long, r As Long, v As String
+    If lastRow = 2 Then
+        v = Trim$(CStr(ws.Cells(2, COL_STATUS).Value))
+        If StrComp(v, st, vbTextCompare) = 0 Then n = 1
+    Else
+        Dim vals As Variant
+        vals = ws.Range(ws.Cells(2, COL_STATUS), ws.Cells(lastRow, COL_STATUS)).Value
+        For r = 1 To UBound(vals, 1)
+            v = Trim$(CStr(vals(r, 1)))
+            If StrComp(v, st, vbTextCompare) = 0 Then n = n + 1
+        Next r
+    End If
+    CountStatus = n
+End Function
+
+'=============================================================================
+' OUVRIR LE MAIL
+'=============================================================================
+Private Sub DoOpen(ByVal ws As Worksheet, ByVal r As Long)
+    On Error GoTo Fin
+    Dim ol As Object
+    Set ol = GetOutlook()
+    If ol Is Nothing Then Exit Sub
+
+    Dim itm As Object
+    Set itm = ResolveMail(ol, ws, r)
+    If itm Is Nothing Then Exit Sub
+    SyncFolderCell ws, r, itm
+
+    itm.Display
+    On Error Resume Next
+    ol.ActiveWindow.Activate
+    Exit Sub
+Fin:
+    MsgBox A("Ouverture impossible : ") & Err.Number & " - " & Err.Description, _
+           vbExclamation, A("Ouvrir le mail")
+End Sub
+
+'=============================================================================
+' OUVRIR LE DOSSIER : la fenetre principale d'Outlook navigue vers le
+' dossier qui contient le mail suivi, mail selectionne s'il est visible dans
+' la vue. Sans fenetre principale ouverte, nouvelle fenetre.
+'=============================================================================
+Private Sub DoOpenFolder(ByVal ws As Worksheet, ByVal r As Long)
+    On Error GoTo Fin
+    Dim ol As Object
+    Set ol = GetOutlook()
+    If ol Is Nothing Then Exit Sub
+
+    Dim itm As Object
+    Set itm = ResolveMail(ol, ws, r)
+    If itm Is Nothing Then Exit Sub
+
+    Dim fld As Object
+    Set fld = itm.Parent
+    SyncFolderCell ws, r, itm
+
+    Dim olExp As Object
+    Set olExp = Nothing
+    On Error Resume Next
+    Set olExp = ol.ActiveExplorer
+    On Error GoTo Fin
+    If olExp Is Nothing Then
+        fld.Display
+        On Error Resume Next
+        Set olExp = ol.ActiveExplorer
+        On Error GoTo Fin
+    Else
+        Set olExp.CurrentFolder = fld
+    End If
+    If olExp Is Nothing Then Exit Sub
+
+    On Error Resume Next
+    Dim selectable As Boolean, winState As Long
+    selectable = False
+    selectable = olExp.IsItemSelectableInView(itm)
+    If selectable Then
+        olExp.ClearSelection
+        olExp.AddToSelection itm
+    End If
+    winState = -1
+    winState = olExp.WindowState
+    If winState = 1 Then olExp.WindowState = 0             ' reduite -> agrandie
+    olExp.Activate
+    AppActivate CStr(olExp.Caption)
+    Exit Sub
+Fin:
+    MsgBox A("Ouverture du dossier impossible : ") & Err.Number & " - " & Err.Description, _
+           vbExclamation, A("Ouvrir le dossier")
+End Sub
+
+'=============================================================================
+' RELANCER : brouillon "Repondre a tous" pre-rempli, affiche pour relecture.
+' Les pieces jointes du mail suivi (le mail envoye par soi dont la date est
+' la plus proche de la ligne) sont remises d'office : une reponse a tous les
+' retire. Texte en francais ou en anglais selon la langue de ce mail. La
+' ligne n'est mise a jour qu'a l'ENVOI reel (Outlook : Application_ItemSend
+' -> RegisterFollowupSent, grace a la propriete FollowupConvID).
+'=============================================================================
+Private Sub DoFollowUp(ByVal ws As Worksheet, ByVal r As Long)
+    Dim tmpDir As String
+    tmpDir = ""
+    On Error GoTo Fin
+
+    Dim ol As Object
+    Set ol = GetOutlook()
+    If ol Is Nothing Then Exit Sub
+
+    Dim src As Object
+    Set src = ResolveMail(ol, ws, r)
+    If src Is Nothing Then Exit Sub
+    SyncFolderCell ws, r, src
+
+    Dim orig As Object
+    Set orig = FindTrackedSentMail(ol, src, RowSentDate(ws, r))
+
+    Dim lang As String
+    If orig Is Nothing Then lang = DetectLanguage(src) Else lang = DetectLanguage(orig)
+
+    Dim attPaths As Collection
+    Set attPaths = New Collection
+    If Not orig Is Nothing Then
+        tmpDir = NewTempDir()
+        If Len(tmpDir) > 0 Then CopyRealAttachments orig, tmpDir, attPaths
+    End If
+
+    Dim fu As Object
+    Set fu = src.ReplyAll
+    fu.htmlBody = InsertAfterBody(fu.htmlBody, BuildRelanceHtml(attPaths.Count, lang))
+    Dim v As Variant
+    For Each v In attPaths
+        fu.Attachments.Add CStr(v)
+    Next v
+
+    On Error Resume Next
+    Dim up As Object
+    Set up = fu.UserProperties.Find(FOLLOWUP_PROP)
+    If up Is Nothing Then Set up = fu.UserProperties.Add(FOLLOWUP_PROP, 1)   ' olText
+    up.Value = CStr(ws.Cells(r, COL_CONV).Value)
+    On Error GoTo Fin
+
+    fu.Display
+    On Error Resume Next
+    ol.ActiveWindow.Activate
+    RemoveTempDir tmpDir
+    Exit Sub
+Fin:
+    Dim errNo As Long, errDesc As String
+    errNo = Err.Number
+    errDesc = Err.Description
+    On Error Resume Next
+    RemoveTempDir tmpDir
+    MsgBox A("Relance impossible : ") & errNo & " - " & errDesc, vbExclamation, "Relancer"
+End Sub
+
+'=============================================================================
+' PROLONGER (une ou plusieurs lignes) : la nouvelle date limite se compte a
+' partir d'AUJOURD'HUI (pas de la date d'envoi). La date limite etant
+' DERIVEE du delai (t0 + delai, t0 = derniere relance sinon date d'envoi),
+' on ajuste le DELAI pour que la prolongation survive au recalcul d'Outlook.
+' Une date peut etre saisie directement. Prolonger acquitte les reponses
+' deja recues (comme ExtendRow cote Outlook).
+'=============================================================================
+Private Sub DoExtend(ByVal ws As Worksheet, ByVal rowList As Collection)
+    On Error GoTo Fin
+    Dim head As String
+    If rowList.Count = 1 Then
+        Dim curDue As Date
+        curDue = 0
+        On Error Resume Next
+        curDue = CDate(ws.Cells(CLng(rowList(1)), COL_DUE).Value)
+        On Error GoTo Fin
+        head = A("Date limite actuelle : ") & DueText(curDue)
+    Else
+        head = rowList.Count & A(" lignes s~electionn~ees.")
+    End If
+
+    Dim prompt As String
+    prompt = head & vbCrLf & vbCrLf & _
+             A("La nouvelle date limite se compte ~a partir d'AUJOURD'HUI (") & _
+             Format$(Date, "dd/mm/yyyy") & ")," & vbCrLf & _
+             A("pas ~a partir de la date d'envoi du mail.") & vbCrLf & _
+             A("Exemple : 7 -> ") & Format$(Date + 7, "dd/mm/yyyy") & vbCrLf & vbCrLf & _
+             A("Nombre de jours, ou une date (jj/mm/aaaa) :")
+
+    Dim s As String
+    s = InputBox(prompt, A("Prolonger le d~elai de r~eponse"), "7")
+    If Len(Trim$(s)) = 0 Then Exit Sub
+
+    Dim newDue As Date
+    If Not ParseExtendInput(s, newDue) Then
+        MsgBox A("Saisie non reconnue : indiquez un nombre de jours (ex. 7) ou une date future (ex. ") & _
+               Format$(Date + 7, "dd/mm/yyyy") & ").", vbExclamation, A("Prolonger le d~elai de r~eponse")
+        Exit Sub
+    End If
+
+    Application.EnableEvents = False
+    Dim v As Variant, r As Long, t0 As Date
+    For Each v In rowList
+        r = CLng(v)
+        t0 = RowFloor(ws, r)
+        ws.Cells(r, COL_DELAY).Value = DateDiff("d", Int(t0), newDue)
+        If COL_ACK > 0 And COL_RESPONSE > 0 Then
+            ws.Cells(r, COL_ACK).Value = ws.Cells(r, COL_RESPONSE).Value
+        End If
+        RecomputeRow ws, r
+    Next v
+    ClearMarks ws, rowList
+    Application.EnableEvents = True
+    RefreshRibbon
+    Exit Sub
+Fin:
+    Application.EnableEvents = True
+    MsgBox A("Prolongation impossible : ") & Err.Number & " - " & Err.Description, _
+           vbExclamation, "Prolonger"
+End Sub
+
+'=============================================================================
+' VALIDER LA REPONSE (une ou plusieurs lignes) : lignes "Repondu ?" (reponse
+' recue, pas encore confirmee) -> acquittement (AckCount = nb de reponses)
+' et statut "Repondu". Cote Outlook, une reponse SUPPLEMENTAIRE re-signalera
+' la ligne. Comparaison sur le statut ACCENTUE (la feuille v6 cherchait
+' "Repondu ?" sans accent : la validation etait toujours refusee).
+'=============================================================================
+Private Sub DoValidate(ByVal ws As Worksheet, ByVal rowList As Collection)
+    On Error GoTo Fin
+    Dim pending As String
+    pending = "R" & ChrW$(233) & "pondu ?"
+
+    Dim v As Variant, r As Long, st As String
+    Dim nDone As Long, nSkipped As Long, firstSkipped As String
+    Application.EnableEvents = False
+    For Each v In rowList
+        r = CLng(v)
+        st = Trim$(CStr(ws.Cells(r, COL_STATUS).Value))
+        If StrComp(st, pending, vbTextCompare) = 0 Then
+            ws.Cells(r, COL_ACK).Value = ws.Cells(r, COL_RESPONSE).Value
+            ws.Cells(r, COL_STATUS).Value = "R" & ChrW$(233) & "pondu"
+            StyleStatus ws, r, "R" & ChrW$(233) & "pondu"
+            EnsureDeadlineFormula ws, r
+            nDone = nDone + 1
+        Else
+            nSkipped = nSkipped + 1
+            If Len(firstSkipped) = 0 Then firstSkipped = st
+        End If
+    Next v
+    ClearMarks ws, rowList
+    Application.EnableEvents = True
+    RefreshRibbon
+
+    If nDone = 0 Then
+        MsgBox A("Rien ~a valider : le statut est ") & firstSkipped & "." & vbCrLf & vbCrLf & _
+               A("Valider la r~eponse ne concerne que les lignes au statut R~epondu ? : ") & _
+               A("une r~eponse re~cue, pas encore confirm~ee."), vbInformation, A("Valider la r~eponse")
+    ElseIf nSkipped > 0 Then
+        SetStatus nDone & A(" r~eponse(s) valid~ee(s), ") & nSkipped & A(" ligne(s) ignor~ee(s) (statut diff~erent de R~epondu ?).")
+        ScheduleStatusClear 15
+    End If
+    Exit Sub
+Fin:
+    Application.EnableEvents = True
+    MsgBox A("Validation impossible : ") & Err.Description, vbExclamation, A("Valider la r~eponse")
+End Sub
+
+'=============================================================================
+' ARCHIVER (une ou plusieurs lignes) : les lignes quittent le suivi courant
+' pour la feuille "Archives" (creee a la premiere utilisation). Colonnes
+' techniques conservees : Ouvrir le mail / Ouvrir le dossier / Restaurer
+' restent possibles depuis les archives. Cote Outlook, FindRowByConv ne
+' cherche que dans Suivi : un nouveau mail sur une conversation archivee
+' cree une ligne NEUVE (voulu).
+'=============================================================================
+Private Sub DoArchive(ByVal ws As Worksheet, ByVal rowList As Collection)
+    On Error GoTo Fin
+    Dim question As String
+    If rowList.Count = 1 Then
+        question = A("Archiver ce suivi ?")
+    Else
+        question = A("Archiver ces ") & rowList.Count & A(" suivis ?")
+    End If
+    If MsgBox(question & vbCrLf & vbCrLf & SubjectList(ws, rowList) & vbCrLf & _
+              A("Les lignes quittent le suivi courant et rejoignent la feuille ") & SH_ARCHIVE & ".", _
+              vbQuestion + vbYesNo, "Archiver") <> vbYes Then Exit Sub
+
+    Dim wsA As Worksheet
+    Set wsA = EnsureArchiveSheet(ws)
+    If wsA Is Nothing Then Exit Sub
+
+    Application.EnableEvents = False
+    Application.ScreenUpdating = False
+    Dim i As Long, r As Long, destRow As Long
+    For i = rowList.Count To 1 Step -1
+        r = CLng(rowList(i))
+        destRow = LastDataRow(wsA) + 1
+        If destRow < 2 Then destRow = 2
+        CopyRowTo ws, r, wsA, destRow
+        If COL_ARCHIVED_AT > 0 Then wsA.Cells(destRow, COL_ARCHIVED_AT).Value = Format$(Now, "dd/mm/yyyy hh:nn")
+        ws.Rows(r).Delete
+    Next i
+    Application.ScreenUpdating = True
+    Application.EnableEvents = True
+    RefreshRibbon
+    Exit Sub
+Fin:
+    Application.CutCopyMode = False
+    Application.ScreenUpdating = True
+    Application.EnableEvents = True
+    MsgBox A("Archivage impossible : ") & Err.Description, vbExclamation, "Archiver"
+End Sub
+
+'=============================================================================
+' RESTAURER (feuille Archives, une ou plusieurs lignes) : la ligne revient
+' dans Suivi ; son statut est recalcule a l'actualisation suivante.
+'=============================================================================
+Private Sub DoRestore(ByVal wsA As Worksheet, ByVal rowList As Collection)
+    On Error GoTo Fin
+    Dim question As String
+    If rowList.Count = 1 Then
+        question = A("Restaurer ce suivi dans ") & SH_TRACK & " ?"
+    Else
+        question = A("Restaurer ces ") & rowList.Count & A(" suivis dans ") & SH_TRACK & " ?"
+    End If
+    If MsgBox(question & vbCrLf & vbCrLf & SubjectList(wsA, rowList), vbQuestion + vbYesNo, "Restaurer") <> vbYes Then Exit Sub
+
+    Dim wsT As Worksheet
+    Set wsT = TrackSheet()
+    If wsT Is Nothing Then Exit Sub
+
+    Application.EnableEvents = False
+    Application.ScreenUpdating = False
+    Dim i As Long, r As Long, destRow As Long
+    For i = rowList.Count To 1 Step -1
+        r = CLng(rowList(i))
+        destRow = LastDataRow(wsT) + 1
+        If destRow < 2 Then destRow = 2
+        CopyRowTo wsA, r, wsT, destRow
+        If COL_ARCHIVED_AT > 0 Then wsT.Cells(destRow, COL_ARCHIVED_AT).ClearContents
+        EnsureDeadlineFormula wsT, destRow
+        wsA.Rows(r).Delete
+    Next i
+    Application.ScreenUpdating = True
+    Application.EnableEvents = True
+    RefreshRibbon
+    Exit Sub
+Fin:
+    Application.CutCopyMode = False
+    Application.ScreenUpdating = True
+    Application.EnableEvents = True
+    MsgBox A("Restauration impossible : ") & Err.Description, vbExclamation, "Restaurer"
+End Sub
+
+' Copie une ligne (valeurs + formats de nombre, couleur du statut), coche
+' effacee. Pas de copie des mises en forme conditionnelles.
+Private Sub CopyRowTo(ByVal src As Worksheet, ByVal r As Long, ByVal dst As Worksheet, ByVal destRow As Long)
+    On Error Resume Next
+    src.Rows(r).Copy
+    dst.Rows(destRow).PasteSpecial Paste:=xlPasteValuesAndNumberFormats
+    Application.CutCopyMode = False
+    If COL_MARK > 0 Then dst.Cells(destRow, COL_MARK).ClearContents
+    StyleStatus dst, destRow, Trim$(CStr(dst.Cells(destRow, COL_STATUS).Value))
+End Sub
+
+'=============================================================================
+' EnsureArchiveSheet - cree la feuille "Archives" a la premiere utilisation,
+' avec la meme ligne d'en-tete que le suivi et les memes colonnes masquees.
+'=============================================================================
+Private Function EnsureArchiveSheet(ByVal ws As Worksheet) As Worksheet
+    On Error Resume Next
+    Dim wb As Workbook
+    Set wb = ws.Parent
+    Dim wsA As Worksheet
+    Set wsA = Nothing
+    Set wsA = wb.Worksheets(SH_ARCHIVE)
+    If Not wsA Is Nothing Then
+        Set EnsureArchiveSheet = wsA
+        Exit Function
+    End If
+
+    Err.Clear
+    Set wsA = wb.Worksheets.Add(After:=ws)
+    If wsA Is Nothing Then Exit Function
+    wsA.Name = SH_ARCHIVE
+
+    ws.Rows(1).Copy
+    wsA.Rows(1).PasteSpecial Paste:=xlPasteValues
+    wsA.Rows(1).PasteSpecial Paste:=xlPasteFormats
+    Application.CutCopyMode = False
+    If COL_ARCHIVED_AT > 0 Then
+        wsA.Cells(1, COL_ARCHIVED_AT).Value = A("Archiv~e le")
+        wsA.Columns(COL_ARCHIVED_AT).ColumnWidth = 16
+    End If
+
+    Dim c As Long
+    For c = 1 To COL_ARCHIVED_AT
+        wsA.Columns(c).ColumnWidth = ws.Columns(c).ColumnWidth
+        wsA.Columns(c).Hidden = ws.Columns(c).Hidden
+        wsA.Columns(c).WrapText = ws.Columns(c).WrapText
+    Next c
+    EnsureSetup wsA
+
+    wsA.Rows(1).Font.Bold = True
+    wsA.Activate
+    wsA.Cells(2, 1).Select
+    ActiveWindow.FreezePanes = True
+    ws.Activate
+
+    Set EnsureArchiveSheet = wsA
+End Function
+
+'=============================================================================
+' ACTUALISER : Excel demande le recalcul a Outlook, qui travaille en
+' differe puis rappelle AfterOutlookRefresh.
+' v1.2 : 1) appel direct RefreshMailTracking (ThisOutlookSession) ;
+' 2) s'il echoue, quelle que soit l'erreur : canal de commandes
+' (SendOutlookCommand). Message seulement si les deux echouent.
+'=============================================================================
+Private Sub DoRefresh()
+    Dim ol As Object
+    Set ol = GetOutlook()
+    If ol Is Nothing Then Exit Sub
+
+    Dim errNo As Long
+    On Error Resume Next
+    Err.Clear
+    ol.RefreshMailTracking ThisWorkbook
+    errNo = Err.Number
+    Err.Clear
+    On Error GoTo 0
+
+    If errNo <> 0 Then
+        Dim why As String
+        If Not SendOutlookCommand(ol, "REFRESH", why) Then
+            MsgBox A("Outlook n'a pas re~cu la demande d'actualisation : ") & why & vbCrLf & vbCrLf & _
+                   A("En attendant : bouton Suivi Mails du ruban Outlook."), vbExclamation, "Actualiser"
+            Exit Sub
+        End If
+    End If
+
+    SetStatus A("Actualisation en cours dans Outlook...")
+    ScheduleStatusClear STATUS_TIMEOUT_SEC
+End Sub
+
+' v1.2 - Ecrit une commande pour Outlook dans la note unique du dossier
+' Notes\ClassicOutlook-Toolkit (creee si le dossier est vide). Outlook
+' (ThisOutlookSession v10.16) surveille ce dossier et execute la commande.
+' False + raison dans why si impossible.
+Private Function SendOutlookCommand(ByVal ol As Object, ByVal cmd As String, ByRef why As String) As Boolean
+    SendOutlookCommand = False
+    why = ""
+    On Error Resume Next
+
+    Dim notesFld As Object
+    Set notesFld = Nothing
+    Set notesFld = ol.Session.GetDefaultFolder(OL_FOLDER_NOTES)
+    If notesFld Is Nothing Then
+        why = A("dossier Notes d'Outlook inaccessible.")
+        Exit Function
+    End If
+
+    Dim fld As Object
+    Set fld = Nothing
+    Set fld = notesFld.Folders(CMD_FOLDER_NAME)
+    If fld Is Nothing Then
+        why = A("le dossier de commandes n'existe pas encore. Collez ThisOutlookSession v10.16 dans Outlook, ") & _
+              A("puis fermez et rouvrez Outlook.")
+        Exit Function
+    End If
+
+    Dim itm As Object
+    Set itm = Nothing
+    Set itm = fld.Items.GetFirst
+    If itm Is Nothing Then
+        Err.Clear
+        Set itm = fld.Items.Add(OL_NOTE_ITEM)
+    End If
+    If itm Is Nothing Then
+        why = A("cr~eation de la note de commande impossible.")
+        Exit Function
+    End If
+
+    Err.Clear
+    itm.Body = "TOOLKIT|" & cmd & "|" & Format$(Now, "yyyymmddhhnnss") & "-" & _
+               Format$(Int(Timer * 1000) Mod 1000, "000")
+    itm.Save
+    If Err.Number <> 0 Then
+        why = A("~ecriture de la note de commande impossible (erreur ") & Err.Number & ")."
+        Err.Clear
+        Exit Function
+    End If
+    SendOutlookCommand = True
+End Function
+
+Private Sub SetStatus(ByVal msg As String)
+    On Error Resume Next
+    Application.StatusBar = msg
+    mStatusSet = True
+End Sub
+
+Private Sub ScheduleStatusClear(ByVal seconds As Long)
+    On Error Resume Next
+    Application.OnTime Now + TimeSerial(0, 0, seconds), "'" & ThisWorkbook.Name & "'!ClearStatusBarSafe"
+End Sub
+
+'=============================================================================
+' RECALCUL (date limite derivee du delai + statut binaire ; echeance par
+' formule)
+'=============================================================================
+Private Sub RecomputeRow(ByVal ws As Worksheet, ByVal r As Long)
+    On Error Resume Next
+    Dim delayDays As Long
+    delayDays = 0
+    delayDays = CLng(ws.Cells(r, COL_DELAY).Value)
+
+    Dim t0 As Date
+    t0 = RowFloor(ws, r)
+    Dim due As Date
+    due = DateAdd("d", delayDays, t0)
+    ws.Cells(r, COL_DUE).Value = due
+    ws.Cells(r, COL_DUE).NumberFormat = "dd/mm/yyyy"
+    EnsureDeadlineFormula ws, r
+
+    ' Statuts terminaux : on ne touche pas (Outlook gere "Repondu"/"Traite").
+    Dim st As String
+    st = CStr(ws.Cells(r, COL_STATUS).Value)
+    If st = "R" & ChrW$(233) & "pondu" Then Exit Sub
+    If st = "Trait" & ChrW$(233) Then Exit Sub
+
+    Dim fc As Long
+    fc = 0
+    fc = CLng(ws.Cells(r, COL_NBFU).Value)
+
+    Dim ns As String
+    If Now > due Then
+        ns = "En retard"
+    ElseIf fc > 0 Then
+        ns = "Relanc" & ChrW$(233)
+    Else
+        ns = "En attente"
+    End If
+    ws.Cells(r, COL_STATUS).Value = ns
+    StyleStatus ws, r, ns
+End Sub
+
+' t0 d'une ligne : derniere relance si presente, sinon date d'envoi.
+Private Function RowFloor(ByVal ws As Worksheet, ByVal r As Long) As Date
+    On Error Resume Next
+    Dim lf As Date, sd As Date
+    lf = 0: sd = 0
+    sd = CDate(ws.Cells(r, COL_SENT).Value)
+    If Len(CStr(ws.Cells(r, COL_LASTFU).Value)) > 0 Then lf = CDate(ws.Cells(r, COL_LASTFU).Value)
+    If lf > sd Then RowFloor = lf Else RowFloor = sd
+End Function
+
+Private Function RowSentDate(ByVal ws As Worksheet, ByVal r As Long) As Date
+    On Error Resume Next
+    RowSentDate = 0
+    RowSentDate = CDate(ws.Cells(r, COL_SENT).Value)
+End Function
+
+' Echeance = formule (J-x / Aujourd'hui / Retard x j, vide pour Repondu,
+' Repondu ? et Traite), ecrite si la cellule n'en a pas. Meme formule que
+' modMailResponseTracker.DeadlineFormulaR1C1 (Outlook).
+Private Sub EnsureDeadlineFormula(ByVal ws As Worksheet, ByVal r As Long)
+    On Error Resume Next
+    If COL_DEADLINE < 1 Or COL_STATUS < 1 Or COL_DUE < 1 Then Exit Sub
+    Dim c As Range
+    Set c = ws.Cells(r, COL_DEADLINE)
+    Dim hasF As Boolean
+    hasF = False
+    hasF = CBool(c.HasFormula)
+    If hasF Then Exit Sub
+    Dim st As String, du As String
+    st = "RC" & COL_STATUS
+    du = "RC" & COL_DUE
+    c.FormulaR1C1 = "=IF(OR(" & st & "=""R" & ChrW$(233) & "pondu""," & st & "=""R" & ChrW$(233) & "pondu ?""," & _
+        st & "=""Trait" & ChrW$(233) & """," & du & "=""""),""""," & _
+        "IFERROR(IF(INT(" & du & ")-TODAY()>0,""J-""&(INT(" & du & ")-TODAY())," & _
+        "IF(INT(" & du & ")-TODAY()=0,""Aujourd'hui"",""Retard ""&(TODAY()-INT(" & du & "))&"" j"")),""""))"
+End Sub
+
+Private Sub StyleStatus(ByVal ws As Worksheet, ByVal r As Long, ByVal status As String)
+    On Error Resume Next
+    If COL_STATUS < 1 Then Exit Sub
+    Dim c As Range
+    Set c = ws.Cells(r, COL_STATUS)
+    c.Font.Bold = True
+    Select Case status
+        Case "R" & ChrW$(233) & "pondu"
+            c.Interior.Color = RGB(198, 239, 206): c.Font.Color = RGB(0, 97, 0)
+        Case "R" & ChrW$(233) & "pondu ?"
+            c.Interior.Color = RGB(255, 217, 179): c.Font.Color = RGB(197, 90, 17)
+        Case "En retard"
+            c.Interior.Color = RGB(255, 174, 174): c.Font.Color = RGB(156, 0, 0)
+        Case "Relanc" & ChrW$(233)
+            c.Interior.Color = RGB(197, 217, 241): c.Font.Color = RGB(31, 73, 125)
+        Case "Trait" & ChrW$(233)
+            c.Interior.Color = RGB(217, 217, 217): c.Font.Color = RGB(64, 64, 64)
+        Case Else
+            c.Interior.Color = RGB(230, 230, 230): c.Font.Color = RGB(89, 89, 89)
+    End Select
+End Sub
+
+'=============================================================================
+' OUTILS OUTLOOK
+'=============================================================================
+Private Function GetOutlook() As Object
+    On Error Resume Next
+    Set GetOutlook = GetObject(, "Outlook.Application")
+    On Error GoTo 0
+    If GetOutlook Is Nothing Then
+        MsgBox A("Outlook n'est pas ouvert. Ouvrez Outlook, puis recommencez."), vbExclamation, APP_TITLE
+    End If
+End Function
+
+' Mail de reference de la ligne (EntryID). Nothing + message si introuvable.
+Private Function ResolveMail(ByVal ol As Object, ByVal ws As Worksheet, ByVal r As Long) As Object
+    On Error Resume Next
+    Set ResolveMail = Nothing
+    Dim entryID As String
+    entryID = ""
+    entryID = CStr(ws.Cells(r, COL_ENTRY).Value)
+    If Len(entryID) > 0 Then Set ResolveMail = ol.Session.GetItemFromID(entryID)
+    On Error GoTo 0
+    If ResolveMail Is Nothing Then
+        MsgBox A("Mail introuvable : son identifiant n'est plus valable (mail d~eplac~e ou supprim~e).") & _
+               vbCrLf & A("Cliquez Actualiser (ou ouvrez le tableau de bord depuis Outlook), ") & _
+               A("puis recommencez."), vbExclamation, APP_TITLE
+    End If
+End Function
+
+' Colonne "Nom du dossier" mise a jour depuis le mail resolu (si changee).
+Private Sub SyncFolderCell(ByVal ws As Worksheet, ByVal r As Long, ByVal itm As Object)
+    On Error Resume Next
+    If COL_FOLDER < 1 Then Exit Sub
+    Dim nm As String
+    nm = ""
+    nm = CStr(itm.Parent.Name)
+    If Len(nm) = 0 Then Exit Sub
+    Dim cur As String
+    cur = ""
+    cur = CStr(ws.Cells(r, COL_FOLDER).Value)
+    If StrComp(cur, nm, vbBinaryCompare) <> 0 Then
+        Application.EnableEvents = False
+        ws.Cells(r, COL_FOLDER).Value = nm
+        Application.EnableEvents = True
+    End If
+End Sub
+
+'=============================================================================
+' Retrouve, dans le fil du mail de reference, LE mail suivi : envoye par
+' soi, date d'envoi la plus proche de la "Date envoi" de la ligne. La
+' reference d'une ligne peut etre n'importe quel mail du fil (apres une
+' reparation d'ancrage cote Outlook) : sans ce tri, on risquerait de joindre
+' les pieces jointes d'une REPONSE recue. Nothing si rien d'envoye par soi.
+'=============================================================================
+Private Function FindTrackedSentMail(ByVal ol As Object, ByVal src As Object, _
+                                     ByVal sentDate As Date) As Object
+    On Error Resume Next
+    Set FindTrackedSentMail = Nothing
+
+    Dim myAddr As String, myName As String
+    myAddr = ""
+    myName = ""
+    myAddr = LCase$(CStr(ol.Session.CurrentUser.AddressEntry.Address))
+    myName = CStr(ol.Session.CurrentUser.Name)
+
+    Dim best As Object
+    Set best = Nothing
+    Dim bestGap As Double
+    bestGap = 1E+30
+
+    Dim conv As Object
+    Set conv = Nothing
+    Set conv = src.GetConversation
+    If Not conv Is Nothing Then
+        Dim storeID As String
+        storeID = ""
+        storeID = CStr(src.Parent.storeID)
+        Dim tbl As Object
+        Set tbl = conv.GetTable
+        Dim guard As Long, rw As Object, itm As Object, gap As Double, cls As Long
+        guard = 0
+        Do Until tbl.EndOfTable
+            guard = guard + 1
+            If guard > 500 Then Exit Do
+            Set rw = Nothing
+            Set rw = tbl.GetNextRow
+            If rw Is Nothing Then Exit Do
+            Set itm = Nothing
+            Set itm = ol.Session.GetItemFromID(CStr(rw.Item("EntryID")), storeID)
+            If Not itm Is Nothing Then
+                cls = 0
+                cls = itm.Class
+                If cls = OL_MAIL_CLASS Then
+                    If IsFromMe(itm, myAddr, myName) Then
+                        gap = 1E+30
+                        gap = Abs(CDbl(itm.SentOn) - CDbl(sentDate))
+                        If gap < bestGap Then
+                            bestGap = gap
+                            Set best = itm
+                        End If
+                    End If
+                End If
+            End If
+        Loop
+    End If
+
+    If best Is Nothing Then
+        If IsFromMe(src, myAddr, myName) Then Set best = src
+    End If
+    Set FindTrackedSentMail = best
+End Function
+
+Private Function IsFromMe(ByVal itm As Object, ByVal myAddr As String, ByVal myName As String) As Boolean
+    On Error Resume Next
+    IsFromMe = False
+    Dim senderAddr As String
+    senderAddr = ""
+    senderAddr = LCase$(CStr(itm.SenderEmailAddress))
+    If Len(myAddr) > 0 And Len(senderAddr) > 0 Then
+        If senderAddr = myAddr Then
+            IsFromMe = True
+            Exit Function
+        End If
+    End If
+    Dim senderNm As String
+    senderNm = ""
+    senderNm = CStr(itm.SenderName)
+    If Len(myName) > 0 And Len(senderNm) > 0 Then
+        If StrComp(senderNm, myName, vbTextCompare) = 0 Then IsFromMe = True
+    End If
+End Function
+
+'=============================================================================
+' Langue du mail suivi ("FR" ou "EN") : mots typiques comptes dans le texte
+' propre du mail (avant l'historique cite). Francais en cas de doute.
+'=============================================================================
+Private Function DetectLanguage(ByVal itm As Object) As String
+    On Error Resume Next
+    DetectLanguage = "FR"
+    Dim txt As String
+    txt = ""
+    txt = CStr(itm.Body)
+    If Len(txt) = 0 Then Exit Function
+    txt = OwnTextPart(txt)
+
+    ' Lettres gardees (accents compris), tout le reste devient un espace.
+    Dim out As String, i As Long, ch As String, code As Long
+    out = Space$(Len(txt))
+    For i = 1 To Len(txt)
+        ch = LCase$(Mid$(txt, i, 1))
+        code = AscW(ch)
+        If (code >= 97 And code <= 122) Or code > 127 Then
+            Mid$(out, i, 1) = ch
+        End If
+    Next i
+
+    Dim words() As String, w As Variant, nFr As Long, nEn As Long
+    words = Split(out, " ")
+    For Each w In words
+        If Len(w) > 0 Then
+            If InStr(1, FR_WORDS, " " & w & " ", vbBinaryCompare) > 0 Then nFr = nFr + 1
+            If InStr(1, EN_WORDS, " " & w & " ", vbBinaryCompare) > 0 Then nEn = nEn + 1
+        End If
+    Next w
+    If nEn > nFr Then DetectLanguage = "EN"
+End Function
+
+' Texte du mail avant l'historique cite (reponse en haut), 3000 caracteres max.
+Private Function OwnTextPart(ByVal txt As String) As String
+    Dim marks As Variant, i As Long, p As Long, cut As Long
+    marks = Array(vbLf & "De :", vbLf & "From:", "-----Message", "-----Original", " a " & ChrW$(233) & "crit :", " wrote:")
+    cut = Len(txt) + 1
+    For i = LBound(marks) To UBound(marks)
+        p = InStr(1, txt, CStr(marks(i)), vbTextCompare)
+        If p > 0 And p < cut Then cut = p
+    Next i
+    If cut > 3000 Then cut = 3000
+    OwnTextPart = Left$(txt, cut - 1)
+End Function
+
+'=============================================================================
+' Copie dans runDir les VRAIES pieces jointes d'un mail. Regles identiques a
+' modThreadAttachments.Classify (Outlook) : fichiers et mails joints
+' seulement ; ecartes : pieces masquees, images referencees dans le corps
+' (cid:), images de signature (imageNNN / Outlook-xxx, < 30 Ko), liens
+' cloud, fichiers bloques par Outlook, smime.p7s / smime.p7m, winmail.dat,
+' .emz / .wmz. Un sous-dossier par fichier : le nom d'origine est garde.
+'=============================================================================
+Private Sub CopyRealAttachments(ByVal itm As Object, ByVal runDir As String, ByVal attPaths As Collection)
+    On Error Resume Next
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    If fso Is Nothing Then Exit Sub
+    Dim atts As Object, n As Long
+    Set atts = Nothing
+    Set atts = itm.Attachments
+    If atts Is Nothing Then Exit Sub
+    n = 0
+    n = atts.Count
+
+    Dim html As String, htmlLoaded As Boolean
+    Dim j As Long, k As Long, att As Object, nm As String, subDir As String, p As String
+    For j = 1 To n
+        Set att = Nothing
+        Set att = atts.Item(j)
+        If Not att Is Nothing Then
+            If IsRealAttachment(att, itm, html, htmlLoaded) Then
+                nm = SafeFileName(AttFileName(att))
+                If Len(nm) > 0 Then
+                    k = k + 1
+                    subDir = runDir & "\" & k
+                    fso.CreateFolder subDir
+                    p = subDir & "\" & nm
+                    Err.Clear
+                    att.SaveAsFile p
+                    If Err.Number = 0 Then attPaths.Add p
+                    Err.Clear
+                End If
+            End If
+        End If
+    Next j
+End Sub
+
+Private Function IsRealAttachment(ByVal att As Object, ByVal itm As Object, _
+                                  ByRef html As String, ByRef htmlLoaded As Boolean) As Boolean
+    IsRealAttachment = False
+    On Error Resume Next
+
+    Dim ty As Long
+    ty = -1
+    ty = CLng(att.Type)
+    If ty <> 1 And ty <> 5 Then Exit Function              ' olByValue, olEmbeddeditem
+
+    Dim pa As Object
+    Set pa = Nothing
+    Set pa = att.PropertyAccessor
+
+    Dim meth As Long
+    meth = 0
+    If Not pa Is Nothing Then meth = CLng(pa.GetProperty(PR_ATTACH_METHOD))
+    If meth = 7 Then Exit Function                         ' lien cloud
+
+    Dim hiddenFlag As Boolean
+    hiddenFlag = False
+    If Not pa Is Nothing Then hiddenFlag = CBool(pa.GetProperty(PR_ATTACH_HIDDEN))
+    If hiddenFlag Then Exit Function
+
+    Dim bl As Long
+    bl = 0
+    bl = CLng(att.BlockLevel)
+    If bl <> 0 Then Exit Function                          ' bloque par Outlook
+
+    Dim nm As String
+    nm = AttFileName(att)
+    If Len(nm) = 0 Then Exit Function
+    If IsTechnicalName(nm) Then Exit Function
+
+    Dim cid As String
+    cid = ""
+    If Not pa Is Nothing Then cid = Trim$(CStr(pa.GetProperty(PR_ATTACH_CONTENT_ID)))
+    cid = Replace(Replace(cid, "<", ""), ">", "")
+    If Len(cid) > 0 Then
+        If Not htmlLoaded Then
+            html = ""
+            html = CStr(itm.htmlBody)
+            htmlLoaded = True
+        End If
+        If Len(html) > 0 Then
+            If InStr(1, html, "cid:" & cid, vbTextCompare) > 0 Then Exit Function
+        End If
+    End If
+
+    Dim sz As Long
+    sz = 0
+    sz = CLng(att.Size)
+    If IsSignatureImage(nm, sz) Then Exit Function
+
+    IsRealAttachment = True
+End Function
+
+Private Function AttFileName(ByVal att As Object) As String
+    On Error Resume Next
+    Dim nm As String, ty As Long
+    nm = ""
+    nm = Trim$(CStr(att.Filename))
+    If Len(nm) = 0 Then nm = Trim$(CStr(att.DisplayName))
+    ty = 0
+    ty = CLng(att.Type)
+    If ty = 5 Then                                         ' mail joint
+        If Len(nm) = 0 Then nm = "message"
+        If StrComp(Right$(nm, 4), ".msg", vbTextCompare) <> 0 Then nm = nm & ".msg"
+    End If
+    AttFileName = nm
+End Function
+
+Private Function IsTechnicalName(ByVal nm As String) As Boolean
+    Dim s As String
+    IsTechnicalName = False
+    s = LCase$(Trim$(nm))
+    Select Case s
+        Case "smime.p7s", "smime.p7m", "winmail.dat"
+            IsTechnicalName = True
+            Exit Function
+    End Select
+    If Right$(s, 4) = ".emz" Or Right$(s, 4) = ".wmz" Then IsTechnicalName = True
+End Function
+
+Private Function IsSignatureImage(ByVal nm As String, ByVal sz As Long) As Boolean
+    IsSignatureImage = False
+    If sz <= 0 Or sz >= SIG_IMAGE_MAX Then Exit Function
+    Dim s As String, p As Long, ext As String, stem As String
+    s = LCase$(Trim$(nm))
+    p = InStrRev(s, ".")
+    If p <= 1 Then Exit Function
+    ext = Mid$(s, p + 1)
+    Select Case ext
+        Case "png", "jpg", "jpeg", "gif", "bmp"
+        Case Else
+            Exit Function
+    End Select
+    stem = Left$(s, p - 1)
+    If Left$(stem, 5) = "image" And Len(stem) > 5 Then
+        IsSignatureImage = IsAllDigits(Mid$(stem, 6))
+    ElseIf Left$(stem, 8) = "outlook-" Then
+        IsSignatureImage = True
+    End If
+End Function
+
+Private Function IsAllDigits(ByVal s As String) As Boolean
+    IsAllDigits = False
+    If Len(s) = 0 Then Exit Function
+    Dim i As Long, ch As String
+    For i = 1 To Len(s)
+        ch = Mid$(s, i, 1)
+        If ch < "0" Or ch > "9" Then Exit Function
+    Next i
+    IsAllDigits = True
+End Function
+
+' Dossier temporaire de la relance : %TEMP%\SuiviMails-PJ\<horodatage>. Les
+' restes de plus d'un jour (session interrompue) sont purges au passage.
+Private Function NewTempDir() As String
+    On Error Resume Next
+    NewTempDir = ""
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    If fso Is Nothing Then Exit Function
+    Dim tmpRoot As String
+    tmpRoot = Environ$("TEMP")
+    If Len(tmpRoot) = 0 Then tmpRoot = Environ$("TMP")
+    If Len(tmpRoot) = 0 Then Exit Function
+    tmpRoot = tmpRoot & "\" & TEMP_SUBDIR
+
+    Dim ok As Boolean
+    ok = False
+    ok = fso.FolderExists(tmpRoot)
+    If Not ok Then fso.CreateFolder tmpRoot
+
+    Dim old As Collection, sf As Object, age As Double, v As Variant
+    Set old = New Collection
+    For Each sf In fso.GetFolder(tmpRoot).SubFolders
+        age = 0
+        age = Now - sf.DateCreated
+        If age > 1 Then old.Add CStr(sf.Path)
+    Next sf
+    For Each v In old
+        fso.DeleteFolder CStr(v), True
+    Next v
+
+    Dim d As String
+    d = tmpRoot & "\" & Format$(Now, "yyyymmdd-hhnnss")
+    fso.CreateFolder d
+    ok = False
+    ok = fso.FolderExists(d)
+    If ok Then NewTempDir = d
+End Function
+
+' Supprime le dossier temporaire d'une relance (seulement sous TEMP_SUBDIR).
+Private Sub RemoveTempDir(ByVal d As String)
+    On Error Resume Next
+    If Len(d) = 0 Then Exit Sub
+    If InStr(1, d, "\" & TEMP_SUBDIR & "\", vbTextCompare) = 0 Then Exit Sub
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    fso.DeleteFolder d, True
+End Sub
+
+Private Function SafeFileName(ByVal s As String) As String
+    Dim Bad As Variant, i As Long
+    Bad = Array("\", "/", ":", "*", "?", """", "<", ">", "|")
+    For i = LBound(Bad) To UBound(Bad)
+        s = Replace(s, CStr(Bad(i)), "_")
+    Next i
+    s = Trim$(s)
+    If Len(s) > 150 Then s = Right$(s, 150)
+    SafeFileName = s
+End Function
+
+'=============================================================================
+' CORPS DE RELANCE (FR ou EN) + mention "generee automatiquement" (le
+' brouillon est envoye a la main, d'ou "generee" et non "envoyee"). Avec des
+' pieces jointes, une phrase les annonce.
+'=============================================================================
+Private Function BuildRelanceHtml(ByVal nAttach As Long, ByVal lang As String) As String
+    Dim s As String, mention As String
+    If lang = "EN" Then
+        s = "Hello," & vbCrLf & _
+            "I am following up on the message below, which is still awaiting a reply."
+        If nAttach = 1 Then
+            s = s & " Please find attached the document concerned."
+        ElseIf nAttach > 1 Then
+            s = s & " Please find attached the documents concerned."
+        End If
+        s = s & " Have you had a chance to review it, or would you need any further information from me?" & vbCrLf & _
+            "I remain at your disposal and thank you in advance." & vbCrLf & _
+            "Best regards,"
+        mention = "Follow-up generated automatically."
+    Else
+        s = A("Bonjour,") & vbCrLf & _
+            A("Je me permets de revenir vers vous au sujet de ce message, rest~e sans retour ~a ce jour.")
+        If nAttach = 1 Then
+            s = s & A(" Vous trouverez ci-joint le document concern~e.")
+        ElseIf nAttach > 1 Then
+            s = s & A(" Vous trouverez ci-joint les documents concern~es.")
+        End If
+        s = s & A(" Auriez-vous pu en prendre connaissance, ou avez-vous besoin d'un compl~ement de ma part ?") & _
+            vbCrLf & A("Je reste ~a votre disposition et vous remercie par avance.") & vbCrLf & _
+            A("Bien cordialement,")
+        mention = A("Relance g~en~er~ee automatiquement.")
+    End If
+
+    Dim html As String
+    html = "<div>" & Replace(EncodeHtml(s), vbCrLf, "<br>") & "</div>"
+    html = html & "<div style=""color:#888888;font-size:9pt;font-style:italic;margin-top:2px"">" & _
+                  EncodeHtml(mention) & "</div>"
+    BuildRelanceHtml = html
+End Function
+
+Private Function InsertAfterBody(ByVal htmlBody As String, ByVal fragment As String) As String
+    Dim posBody As Long, posEnd As Long
+    posBody = InStr(1, htmlBody, "<body", vbTextCompare)
+    If posBody > 0 Then
+        posEnd = InStr(posBody, htmlBody, ">")
+        If posEnd > 0 Then
+            InsertAfterBody = Left$(htmlBody, posEnd) & fragment & _
+                              StripLeadingBlanks(Mid$(htmlBody, posEnd + 1))
+            Exit Function
+        End If
+    End If
+    InsertAfterBody = fragment & StripLeadingBlanks(htmlBody)
+End Function
+
+Private Function StripLeadingBlanks(ByVal s As String) As String
+    Dim pats() As String
+    pats = Split("<p class=MsoNormal><o:p>&nbsp;</o:p></p>|" & _
+                 "<p class=MsoNormal><o:p></o:p></p>|" & _
+                 "<p class=MsoNormal>&nbsp;</p>|<p class=MsoNormal></p>|" & _
+                 "<o:p>&nbsp;</o:p>|<o:p></o:p>|" & _
+                 "<div>&nbsp;</div>|<div><br></div>|<div><br/></div>|<div></div>|" & _
+                 "<p>&nbsp;</p>|<p></p>|&nbsp;|<br>|<br/>|<br />", "|")
+    Dim changed As Boolean
+    Do
+        changed = False
+        s = LTrimWS(s)
+        Dim i As Long
+        For i = LBound(pats) To UBound(pats)
+            Do While Len(s) >= Len(pats(i)) And _
+                     StrComp(Left$(s, Len(pats(i))), pats(i), vbTextCompare) = 0
+                s = Mid$(s, Len(pats(i)) + 1)
+                s = LTrimWS(s)
+                changed = True
+            Loop
+        Next i
+    Loop While changed
+    StripLeadingBlanks = s
+End Function
+
+Private Function LTrimWS(ByVal s As String) As String
+    Do While Len(s) > 0
+        Dim ch As String
+        ch = Left$(s, 1)
+        If ch = " " Or ch = vbCr Or ch = vbLf Or ch = vbTab Then
+            s = Mid$(s, 2)
+        Else
+            Exit Do
+        End If
+    Loop
+    LTrimWS = s
+End Function
+
+Private Function EncodeHtml(ByVal s As String) As String
+    s = Replace(s, "&", "&amp;")
+    s = Replace(s, "<", "&lt;")
+    s = Replace(s, ">", "&gt;")
+    EncodeHtml = s
+End Function
+
+'=============================================================================
+' OUTILS DIVERS
+'=============================================================================
+' Saisie "Prolonger" : nombre de jours a compter d'aujourd'hui, ou date
+' (jj/mm/aaaa, jj/mm). False si illisible ou pas dans le futur.
+Private Function ParseExtendInput(ByVal s As String, ByRef newDue As Date) As Boolean
+    On Error GoTo Bad
+    ParseExtendInput = False
+    s = Trim$(s)
+    If Len(s) = 0 Then Exit Function
+    If InStr(1, s, "/") > 0 Or InStr(1, s, ".") > 0 Or InStr(1, s, "-") > 0 Then
+        If Not IsDate(s) Then Exit Function
+        newDue = DateValue(s)
+    Else
+        If Not IsNumeric(s) Then Exit Function
+        Dim n As Long
+        n = CLng(Val(s))
+        If n <= 0 Then Exit Function
+        newDue = Date + n
+    End If
+    If newDue <= Date Then Exit Function
+    ParseExtendInput = True
+    Exit Function
+Bad:
+    ParseExtendInput = False
+End Function
+
+' "29/07/2026 (depassee de 68 j)" / "(dans 12 j)" / "(aujourd'hui)".
+Private Function DueText(ByVal d As Date) As String
+    If d = 0 Then
+        DueText = "-"
+        Exit Function
+    End If
+    Dim n As Long
+    n = DateDiff("d", Date, Int(d))
+    DueText = Format$(d, "dd/mm/yyyy")
+    If n > 0 Then
+        DueText = DueText & " (dans " & n & " j)"
+    ElseIf n = 0 Then
+        DueText = DueText & " (aujourd'hui)"
+    Else
+        DueText = DueText & A(" (d~epass~ee de ") & (-n) & " j)"
+    End If
+End Function
+
+' Objets des lignes visees, pour une confirmation (MAX_LISTED premiers).
+Private Function SubjectList(ByVal ws As Worksheet, ByVal rowList As Collection) As String
+    On Error Resume Next
+    Dim s As String, i As Long, subj As String
+    For i = 1 To rowList.Count
+        If i > MAX_LISTED Then
+            s = s & "  ... et " & (rowList.Count - MAX_LISTED) & " autre(s)" & vbCrLf
+            Exit For
+        End If
+        subj = ""
+        subj = CStr(ws.Cells(CLng(rowList(i)), COL_SUBJECT).Value)
+        If Len(subj) > 70 Then subj = Left$(subj, 70) & "..."
+        s = s & "  - " & subj & vbCrLf
+    Next i
+    SubjectList = s
+End Function
+
+Private Sub ShowInfo(ByVal msg As String)
+    MsgBox msg, vbInformation, APP_TITLE
+End Sub
+
+'=============================================================================
+' A : decode les marqueurs d'accent ASCII (table de modConfig.A() cote
+' Outlook) : ~e e aigu, ~f e grave, ~a a grave, ~E E aigu, ~i i circ,
+' ~o o circ, ~x e circ, ~c c cedille, ~u u circ, ~U u grave, ~A a circ,
+' ~y i trema, ~I I circ. Marqueur inconnu : "~" conserve tel quel.
+'=============================================================================
+Private Function A(ByVal s As String) As String
+    Dim out As String, i As Long, n As Long, ch As String
+    n = Len(s)
+    i = 1
+    Do While i <= n
+        ch = Mid$(s, i, 1)
+        If ch = "~" And i < n Then
+            Select Case Mid$(s, i + 1, 1)
+                Case "e": out = out & ChrW$(233): i = i + 2
+                Case "f": out = out & ChrW$(232): i = i + 2
+                Case "a": out = out & ChrW$(224): i = i + 2
+                Case "E": out = out & ChrW$(201): i = i + 2
+                Case "i": out = out & ChrW$(238): i = i + 2
+                Case "o": out = out & ChrW$(244): i = i + 2
+                Case "x": out = out & ChrW$(234): i = i + 2
+                Case "c": out = out & ChrW$(231): i = i + 2
+                Case "u": out = out & ChrW$(251): i = i + 2
+                Case "U": out = out & ChrW$(249): i = i + 2
+                Case "A": out = out & ChrW$(226): i = i + 2
+                Case "y": out = out & ChrW$(239): i = i + 2
+                Case "I": out = out & ChrW$(206): i = i + 2
+                Case Else
+                    out = out & ch
+                    i = i + 1
+            End Select
+        Else
+            out = out & ch
+            i = i + 1
+        End If
+    Loop
+    A = out
+End Function

@@ -1,3 +1,217 @@
+[2026-10-09] modViewGuard v1.0 (nouveau) - commande manuelle "Standardiser
+             l'affichage" (onglet Affichage, Sub StandardizeView) : colonne
+             "De" dans tous les dossiers de courrier de la boite affichee,
+             "A" seulement dans Elements envoyes, Brouillons et Boite
+             d'envoi. Controle de la vue courante de chaque dossier
+             (View.XML, vues tableau) et correction immediate (propriete +
+             en-tete, tri et regroupement compris), View.Save, Apply si
+             affiche. Vue partagee "tous les dossiers" utilisee aussi par un
+             dossier "A" : jamais modifiee, listee avec la marche a suivre.
+             Toast si tout est regle, fenetre seulement s'il reste a faire.
+             Aucun automatisme au demarrage.
+
+[2026-10-09] Accueil_Tous_les_onglets_principaux.exportedUI - onglet
+             Affichage : groupe "Toolkit", bouton "Standardiser l'affichage"
+             (imageMso FormatPainter, onAction Projet.StandardizeView).
+
+[2026-10-09] ThisOutlookSession v10.16 - canal de commandes Excel -> Outlook.
+             Le bouton Actualiser du classeur appelait RefreshMailTracking a
+             travers l'objet Application d'Outlook : raccourci non documente,
+             non expose sur le poste (erreur 438 a chaque clic). Remplace par
+             un mecanisme documente : dossier Notes\ClassicOutlook-Toolkit
+             (cree au demarrage et par RebindEvents), dont les ajouts et
+             modifications sont surveilles (mCmdItems). Note
+             "TOOLKIT|REFRESH|horodatage" -> RequestDashboardRefresh.
+             Commande deja traitee ou de plus de 120 s (echo de
+             synchronisation) ignoree. RefreshMailTracking conserve.
+
+[2026-10-09] modMailTracker v1.2 (classeur Suivi des mails.xlsm) - Actualiser :
+             appel direct tente d'abord, puis repli sur le canal de commandes
+             (SendOutlookCommand : note unique reutilisee). Dossier absent =
+             message "collez ThisOutlookSession v10.16 puis redemarrez
+             Outlook". Remplace le second essai sans parametre de la v1.1.
+
+[2026-10-08] modMailResponseTracker v6.4 - LIGNES DESALIGNEES dans le
+             tableau de bord (objet sans rapport avec le dossier, le statut
+             ou le mail ouvert). Cause : le filtre automatique ne couvrait
+             que les colonnes VISIBLES ; un tri lance depuis une fleche du
+             filtre deplacait les lignes visibles sans leurs colonnes
+             techniques masquees (ID, ConversationID, EntryID, AckCount).
+             Chaque objet se retrouvait relie au mail d'une autre ligne ;
+             RefreshFolderNames ecrivait alors le dossier de ce mail-la.
+             Constat sur le classeur : identifiants de suivi crees jusqu'a
+             3 mois AVANT l'envoi du mail de leur ligne.
+  * EnsureAutoFilter : filtre sur toutes les colonnes (1 a LAST_COL), plage
+    remplacee aussi si le nombre de lignes a change.
+  * RefreshFolderNames : le mail relu doit porter l'objet de la ligne
+    (SameSubjectFamily) ; sinon aucun dossier ecrit, journal ERROR + toast
+    "lancez RepairTrackerRows".
+  * RepairTrackerRows (nouvelle macro, a lancer une fois) : copie de
+    sauvegarde du classeur, puis chaque bloc technique est remis en face de
+    sa ligne (mail de l'EntryID relu : objet + date d'envoi). Blocs sans mail
+    retrouve : fil et mail effaces, re-identification par RepairOrphans.
+    Statuts "Repondu ?" des lignes modifiees remis a "En attente" (le
+    recalcul les repose si besoin). Feuilles Suivi et Archives. Ouvre
+    ensuite le tableau de bord.
+  * RefreshDashboard : sans classeur transmis par Excel, le classeur deja
+    ouvert chez l'utilisateur est rappele (compteurs du ruban).
+
+[2026-10-08] modMailTracker v1.1 (classeur Suivi des mails.xlsm)
+  * EnsureFilterCoversAll : a l'ouverture et apres chaque actualisation, le
+    filtre automatique est etendu aux colonnes techniques masquees (meme
+    plage que modMailResponseTracker v6.4).
+  * Actualiser : nouvel essai sans parametre si Outlook refuse l'appel avec
+    le classeur (erreurs 438 / 450 / 13) ; message d'echec avec le numero
+    d'erreur. (Remplace par le canal de commandes en v1.2.)
+
+[2026-10-05] SUIVI DES MAILS - onglet de ruban Excel, nouveau gabarit du
+             classeur, actualisation depuis Excel. Fichiers :
+             modMailResponseTracker v6.3, modDefer v1.16, ThisOutlookSession
+             v10.15 ; Suivi des mails.xlsm (onglet de ruban integre au
+             fichier) ; code du classeur v7 : ThisWorkbook, feuille Suivi
+             (videe), NOUVEAU module standard modMailTracker v1.0.
+  * ONGLET DE RUBAN "Suivi des mails", stocke DANS le classeur : visible
+    seulement quand ce fichier est actif, en premier, selectionne a
+    l'ouverture. Boutons : Relancer, Ouvrir le mail, Ouvrir le dossier,
+    Prolonger, Valider la reponse, Archiver (devient Restaurer sur la
+    feuille Archives), Actualiser ; compteurs vivants (a valider, en retard,
+    cochees). Chaque groupe porte une icone (repli correct sur ecran etroit).
+  * NOUVEAU GABARIT (17 colonnes) : coche (A), statut, echeance, nom du
+    dossier, objet, destinataires, nb reponses, repondants, date envoi,
+    delai, date limite, derniere relance, nb relances, puis ID /
+    ConversationID / EntryID / AckCount masquees ; "Archive le" en 18 sur
+    la feuille Archives. Les 5 colonnes de liens cliquables et la colonne
+    Archiver DISPARAISSENT (plus aucun lien pose, ni cote Outlook ni cote
+    classeur). Migration AUTOMATIQUE par modMailResponseTracker
+    (EnsureLayout, a chaque acquisition, avant toute ecriture, en-tetes
+    verifies avant suppression ; feuille Archives comprise) ; _Schema
+    2026-10-05/17 (cles MARK, FOLDER, ARCHIVED_AT). Le code du classeur
+    relit _Schema des que sa version change. Garde-fou d'ecriture
+    (LayoutReady) : gabarit non reconnu -> AUCUNE ecriture, toast +
+    journal ; FollowUpSelected verifie aussi le gabarit. Le classeur livre
+    a le ruban mais PAS le nouveau gabarit : il arrive a la premiere
+    ouverture du tableau de bord (ou au premier Actualiser).
+  * COLONNE COCHE : un clic coche/decoche la ligne (la cellule active passe
+    sur l'objet), un clic sur l'en-tete decoche tout. Prolonger, Valider et
+    Archiver/Restaurer traitent les lignes cochees (sinon la ligne
+    active), une seule confirmation listant les objets. Le filtre
+    automatique couvre toute la ligne : un tri deplace les coches avec.
+  * RELANCER : brouillon "Repondre a tous" avec les pieces jointes du mail
+    suivi remises d'office (une reponse a tous les retire) ; le mail suivi
+    est cherche dans le fil (envoye par soi, date la plus proche de la
+    ligne) ; tri des PJ aligne sur modThreadAttachments.Classify. Texte en
+    FRANCAIS ou en ANGLAIS selon la langue du mail suivi (mots typiques
+    comptes dans le texte propre, avant l'historique cite ; FR en cas de
+    doute). Phrase "ci-joint" ajoutee quand des PJ sont remises. Pas de
+    bouton Relancer simple ni Supprimer (archiver ; supprimer a la main
+    dans Archives, Outlook n'y lit rien).
+  * OUVRIR LE DOSSIER : la fenetre principale d'Outlook navigue vers le
+    dossier du mail suivi, mail selectionne s'il est visible dans la vue.
+  * ACTUALISER (depuis Excel) : Excel appelle
+    Outlook.RefreshMailTracking(ThisWorkbook) (procedure publique de
+    ThisOutlookSession) ; Outlook differe le travail (modDefer
+    "DashRefresh", lourde) pour rendre la main a Excel, recalcule le
+    classeur transmis (statuts, dossiers, orphelins, tri, coherence, mise
+    en page) puis rappelle Application.Run "AfterOutlookRefresh" :
+    compteurs et barre d'etat a jour. A VALIDER SUR LE POSTE au premier
+    clic (exposition des procedures de ThisOutlookSession) ; secours :
+    message renvoyant au bouton Suivi Mails d'Outlook.
+  * ECHEANCE PAR FORMULE (R1C1 relatif, survit au tri) : J-x / Aujourd'hui /
+    Retard x j, vide pour Repondu, Repondu ? et Traite ; juste a chaque
+    ouverture, meme a la main. Posee par Outlook (UpdateDeadlineCell) et par
+    le classeur (recalcul d'une ligne, restauration).
+  * COLONNE "Nom du dossier" : ecrite a la creation (mail deja envoye),
+    relue a chaque recalcul (RefreshFolderNames, budget 15 s) : renommage
+    et deplacement suivis ; aussi rafraichie par Ouvrir / Ouvrir le
+    dossier / Relancer. Largeur plafonnee a 40.
+  * CONTROLE DE COHERENCE (CheckConsistency, apres le tri) : lignes sans
+    identifiant de mail et doublons (meme fil, ou meme objet + meme date
+    d'envoi) : objet surligne orange + commentaire, toast recapitulatif.
+    Les lignes sans ConversationID sont d'abord re-identifiees par objet +
+    date d'envoi (RepairOrphans : Elements envoyes puis parcours borne ;
+    echec memorise 7 jours, cle "orphan:" du registre RepairFail).
+  * MISE EN PAGE (ApplyDashboardLayout) : largeurs ajustees puis plafonnees
+    (objet 70 avec retour a la ligne, destinataires / repondants 45,
+    dossier 40), lignes centrees verticalement, colonnes techniques
+    masquees, filtre sur les 13 colonnes visibles. Ligne active surlignee
+    en jaune (mise en forme conditionnelle, sauf la cellule Statut).
+  * PROLONGER (classeur ET ExtendRow cote Outlook) : la saisie affiche la
+    date limite actuelle, la regle "a partir d'AUJOURD'HUI, pas de la date
+    d'envoi" et un exemple chiffre ; une date peut etre saisie. Cote
+    classeur, prolonger acquitte les reponses recues (comme Outlook v5.7).
+  * BUGS CORRIGES : "Valider reponse" toujours refuse (la feuille v6
+    cherchait "Repondu ?" sans accent) ; "Archiver" jamais visible (sa
+    colonne etait aussi la colonne de tri temporaire) - sans objet
+    desormais, l'action est dans le ruban.
+  * A COLLER, classeur d'abord : ThisWorkbook, feuille Suivi (module
+    VIDE), Insertion > Module renomme modMailTracker ; Debogage >
+    Compiler. Ensuite Outlook : modMailResponseTracker, modDefer,
+    ThisOutlookSession (regle d'edition VBE habituelle), puis ouvrir une
+    fois le tableau de bord depuis Outlook (migration du classeur).
+  * validate.py : les deux fichiers de code du classeur sont exemptes des
+    controles MOD_NAME / MOD_VERSION (projet VBA Excel distinct).
+
+[2026-10-05] modThreadAttachments v1.0 (NOUVEAU module) - pieces jointes du
+             fil dans une reponse ou un transfert. 5 fichiers :
+             modThreadAttachments v1.0, modMaintenance v4.3, config.ini,
+             config_ini.example (cle ThreadAttachWarnMB), CHANGELOG.
+  * BESOIN : repondre a son propre envoi (avec pieces jointes) en changeant
+    de destinataire. Repondre retire les pieces jointes ; Transferer les
+    garde mais change l'objet (TR:) et l'en-tete.
+  * COMMANDE RUBAN AddThreadAttachments (onAction
+    "Projet.AddThreadAttachments", API stable) : fenetre de redaction
+    (onglet Message) et reponse dans le volet de lecture (Outils de
+    composition > Message). Nouveau message refuse (index sans descendance
+    ET objet = sujet du fil) ; une reponse a un mail venu d'un client tiers
+    (index non derive par Outlook) passe et s'accroche par le sujet.
+  * MAIL D'ORIGINE : mail selectionne ou ouvert dont l'index de conversation
+    prefixe celui du brouillon (test de modReplyInPlace) ; sinon mail du
+    meme fil selectionne ou ouvert ; sinon recherche par sujet de fil dans
+    le dossier affiche, la Reception et les Envoyes, en-tete d'index
+    identique exige (pas de fil homonyme). Rien : message "selectionnez un
+    mail de ce fil, puis cliquez a nouveau sur le bouton".
+  * FIL COMPLET via l'index de conversations Exchange (GetConversation ->
+    GetTable, pattern de modMailResponseTracker v4.5 / modReplyInPlace
+    v10) : les mails deja ranges par QuickMove ou modReplyInPlace dans les
+    dossiers projet sont vus. Garde 500 lignes. Repli : mail d'ancrage seul.
+  * TRI : vrais fichiers seulement. Ecartes : pieces masquees, images du
+    corps (cid:), images de signature (imageNNN / Outlook-xxx < 30 Ko),
+    liens cloud (PR_ATTACH_METHOD = 7) et objets OLE, fichiers bloques par
+    Outlook, smime.p7s / p7m, winmail.dat, .emz / .wmz. Doublons ENTRE
+    mails (meme nom, taille a 4 Ko pres) fusionnes : priorite au mail
+    auquel on repond, puis au plus recent. Fichiers deja joints au
+    brouillon non reproposes.
+  * CHOIX : tous les fichiers du fil viennent d'un seul mail -> ajout
+    direct, sans fenetre (decision du 2026-10-05). Sinon liste numerotee
+    (modUi.AskText) pre-remplie avec les fichiers du mail auquel on repond
+    (sinon du mail le plus recent), marque ChrW(187) sur ces lignes ;
+    12 lignes max par page (InputBox ~1 024 caracteres), "+" page
+    suivante, "*" tout, "1,3", "2-4" ou "2 - 4".
+  * POIDS : alerte avant ajout si les pieces jointes du message depassent
+    ThreadAttachWarnMB (defaut 20 Mo, 0 = jamais) ; boutons [Ajouter quand
+    meme] / [Annuler], Annuler par defaut.
+  * COPIE : SaveAsFile dans %TEMP%\COTK-ThreadAtt\<horodatage>\<n>\ ->
+    Attachments.Add -> dossier temporaire supprime (restes de plus d'un
+    jour purges au passage). Aucun mail existant modifie ; brouillon non
+    enregistre par le module. SaveAsFile / Attachments.Add deja en service
+    (modContactExport, modMailCampaign) : rien de nouveau pour l'EDR.
+  * DIAGNOSTIC ThreadAttachDiagnose (lecture seule) : meme analyse sur le
+    brouillon courant, synthese a l'ecran (origine, taille du fil, fichiers
+    retenus / ecartes par motif, comportement au clic) + detail par fichier
+    dans debug.log (INFO).
+  * modMaintenance v4.3 : ThreadAtt ajoute a MODULES_DEFAULT et a
+    ModuleVersionOf (table identique a validate.py --gen-versions).
+  * VALIDATION : validate.py sans anomalie sur les deux modules ; projet
+    complet inchange (5 erreurs preexistantes dans Excel_modSuiviTemps,
+    hors perimetre) ; --config : ThreadAttachWarnMB reconnue.
+  * A COLLER : modThreadAttachments = NOUVEAU module standard (Insertion >
+    Module, renommer modThreadAttachments) ; modMaintenance a remplacer en
+    entier. Regle d'edition VBE : PrepareForEdit avant toute edition dans
+    les 6 premieres minutes. Puis Debogage > Compiler, puis redemarrer
+    Outlook VBE ferme (modDevTools.Reinit en depannage). config.ini :
+    Maintenance > Configuration > Recharger (sans rechargement, le defaut
+    20 s'applique).
+
 [2026-09-24] PACK v4 - demarrage sans gel + liste QuickMove a jour en direct
              11 fichiers : modMailResponseTracker v6.2, modQuickMove v12.0,
              clsFolderWatcher v1.0 (NOUVELLE classe), modDefer v1.15,
