@@ -16,7 +16,7 @@ Attribute VB_Exposed = False
 ' ============================================================================
 ' frmProgress - CODE V23
 ' Formulaire de progression de l'analyse
-' ADAPTï¿½ aux noms de contrï¿½les existants
+' ADAPTÉ aux noms de contrôles existants
 ' ============================================================================
 Option Explicit
 
@@ -39,7 +39,7 @@ Private Sub UserForm_Initialize()
     End If
     If m_ProgressBarWidth = 0 Then m_ProgressBarWidth = 480
     
-    ' Initialiser les labels (sans emojis pour compatibilitï¿½)
+    ' Initialiser les labels (sans emojis pour compatibilité)
     lblTitre.caption = "Analyzing emails..."
     lblStatus.caption = "Initializing..."
     lblBoite.caption = "Mailbox : -"
@@ -76,11 +76,11 @@ Private Sub UserForm_Initialize()
     Me.controls("btnFermer").Visible = False
     On Error GoTo 0
     
-    Debug.Print "[frmProgress] Initialize terminï¿½"
+    Debug.Print "[frmProgress] Initialize terminé"
 End Sub
 
 ' ============================================================================
-' MISE ï¿½ JOUR DE LA PROGRESSION
+' MISE À JOUR DE LA PROGRESSION
 ' ============================================================================
 Public Sub UpdateProgress(current As Long, total As Long, storeName As String, _
                           storeIndex As Long, storeCount As Long)
@@ -101,17 +101,17 @@ Public Sub UpdateProgress(current As Long, total As Long, storeName As String, _
         pct = 0
     End If
     
-    ' Mise ï¿½ jour des labels (sans emojis)
+    ' Mise à jour des labels (sans emojis)
     lblBoite.caption = "Mailbox : " & storeName & " (" & storeIndex & "/" & storeCount & ")"
     lblEmails.caption = "Emails processed: " & Format(current, "#,##0") & " / " & Format(total, "#,##0")
     lblStatus.caption = "Analyzing... " & Format(pct, "0") & "%"
     
-    ' Pourcentage (si contrï¿½le existe)
+    ' Pourcentage (si contrôle existe)
     On Error Resume Next
     Me.controls("lblPercent").caption = Format(pct, "0") & "%"
     On Error GoTo 0
     
-    ' Barre de progression (si contrï¿½le lblProgressBar existe)
+    ' Barre de progression (si contrôle lblProgressBar existe)
     On Error Resume Next
     Me.controls("lblProgressBar").Width = (pct / 100) * m_ProgressBarWidth
     On Error GoTo 0
@@ -122,7 +122,7 @@ End Sub
 Public Sub SetTimeInfo(elapsedSeconds As Long, remainingSeconds As Long)
     On Error Resume Next
     
-    ' Temps ï¿½coulï¿½
+    ' Temps écoulé
     Dim elapsedMin As Long, elapsedSec As Long
     elapsedMin = elapsedSeconds \ 60
     elapsedSec = elapsedSeconds Mod 60
@@ -150,7 +150,7 @@ Public Sub SetComplete(message As String)
     lblStatus.caption = message
     lblStatus.ForeColor = RGB(0, 128, 0)  ' Vert
     
-    ' Barre ï¿½ 100%
+    ' Barre à 100%
     Me.controls("lblPercent").caption = "100%"
     Me.controls("lblProgressBar").Width = m_ProgressBarWidth
     Me.controls("lblProgressBar").BackColor = RGB(112, 173, 71)  ' Vert
@@ -184,7 +184,7 @@ Public Sub SetError(message As String)
 End Sub
 
 ' ============================================================================
-' PROPRIï¿½Tï¿½S
+' PROPRIÉTÉS
 ' ============================================================================
 Public Property Get Cancelled() As Boolean
     Cancelled = m_Cancelled

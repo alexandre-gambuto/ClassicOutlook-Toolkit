@@ -1,7 +1,11 @@
 Option Explicit
 
 '=============================================================================
-' ThisOutlookSession v10.16  (2026-10-09)
+' ThisOutlookSession v10.18  (2026-10-09)
+'
+' v10.18 (2026-10-09) : canal de commandes - commande REPAIR (bouton
+'   Reparer du classeur Suivi des mails) -> modMailResponseTracker.
+'   RequestTrackerRepair. (Numero v10.17 saute : version d'essai abandonnee.)
 '
 ' v10.16 (2026-10-09) : CANAL DE COMMANDES Excel -> Outlook. Le bouton
 '   Actualiser du classeur appelait RefreshMailTracking a travers l'objet
@@ -288,7 +292,7 @@ Private Const SWITCH_GUARD_MS As Long = 1500   ' v10.2 : duree (ms) de la garde 
 Private Const BIRTHDAY_VIEW_DELAY_MS As Long = 1200   ' v10.13 : attente construction fenetre calendrier
 Private Const BIRTHDAY_VIEW_RETRY_MS As Long = 1500   ' v10.13 : espacement des tentatives suivantes
 Private Const MOD_NAME As String = "ThisOutlook"
-Private Const MOD_VERSION As String = "v10.16 - 2026-10-09"
+Private Const MOD_VERSION As String = "v10.18 - 2026-10-09"
 
 ' === QUICKMOVE ENVOYES - prompt asynchrone ===
 ' Garde de reentrance : un seul prompt ouvert a la fois.
@@ -1977,6 +1981,9 @@ Private Sub HandleToolkitCommand(ByVal Item As Object)
         Case "REFRESH"
             modDebugLog.DInfo MOD_NAME, "Canal de commandes : actualisation du suivi demandee par Excel"
             modMailResponseTracker.RequestDashboardRefresh Nothing
+        Case "REPAIR"
+            modDebugLog.DInfo MOD_NAME, "Canal de commandes : reparation du suivi demandee par Excel"
+            modMailResponseTracker.RequestTrackerRepair
         Case Else
             modDebugLog.DInfo MOD_NAME, "Canal de commandes : commande inconnue '" & parts(1) & "'"
     End Select

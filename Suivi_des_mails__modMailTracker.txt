@@ -1,7 +1,14 @@
 Option Explicit
 
 '=============================================================================
-' modMailTracker v1.2  (2026-10-09) - classeur "Suivi des mails.xlsm"
+' modMailTracker v1.3  (2026-10-09) - classeur "Suivi des mails.xlsm"
+'
+' v1.3 (2026-10-09) : bouton REPARER du ruban (tag REPAIR). Apres
+'   confirmation, demande a Outlook (canal de commandes, commande REPAIR,
+'   ThisOutlookSession v10.18 + modMailResponseTracker v6.5) de remettre
+'   chaque ligne en face de son mail (copie de sauvegarde du classeur
+'   d'abord), puis de tout recalculer. Compte rendu par toast Outlook,
+'   compteurs du ruban rafraichis a la fin (AfterOutlookRefresh).
 '
 ' v1.2 (2026-10-09) : ACTUALISER par le canal de commandes. L'appel direct
 '   RefreshMailTracking (procedure de ThisOutlookSession vue d'Excel) reste
@@ -68,7 +75,7 @@ Option Explicit
 ' une variable AVANT le test.
 '=============================================================================
 
-Private Const MOD_VERSION As String = "v1.2 - 2026-10-09"
+Private Const MOD_VERSION As String = "v1.3 - 2026-10-09"
 
 Private Const SH_TRACK As String = "Suivi"
 Private Const SH_ARCHIVE As String = "Archives"
@@ -316,6 +323,10 @@ Private Sub RunAction(ByVal act As String)
     On Error GoTo Fin
     If act = "REFRESH" Then
         DoRefresh
+        Exit Sub
+    End If
+    If act = "REPAIR" Then
+        DoRepair
         Exit Sub
     End If
 
@@ -1214,6 +1225,33 @@ Private Function SendOutlookCommand(ByVal ol As Object, ByVal cmd As String, ByR
     End If
     SendOutlookCommand = True
 End Function
+
+'=============================================================================
+' REPARER (v1.3) : lignes dont l'objet ne correspond plus au mail ouvert, au
+' dossier ou au statut (colonnes techniques decalees par un tri). Outlook
+' remet chaque ligne en face de son mail (objet + date d'envoi), apres une
+' copie de sauvegarde du classeur, puis recalcule tout et rappelle
+' AfterOutlookRefresh. Confirmation : l'action reecrit des colonnes.
+'=============================================================================
+Private Sub DoRepair()
+    If MsgBox(A("R~eparer le suivi : chaque ligne est remise en face de son mail (m~xme objet, m~xme date d'envoi), ") & _
+              A("puis tout est recalcul~e.") & vbCrLf & vbCrLf & _
+              A("Une copie de sauvegarde du classeur est faite avant. Continuer ?"), _
+              vbQuestion + vbYesNo, A("R~eparer")) <> vbYes Then Exit Sub
+
+    Dim ol As Object
+    Set ol = GetOutlook()
+    If ol Is Nothing Then Exit Sub
+
+    Dim why As String
+    If Not SendOutlookCommand(ol, "REPAIR", why) Then
+        MsgBox A("Outlook n'a pas re~cu la demande de r~eparation : ") & why & vbCrLf & vbCrLf & _
+               A("En attendant : macro RepairTrackerRows dans Outlook (Alt+F8)."), vbExclamation, A("R~eparer")
+        Exit Sub
+    End If
+    SetStatus A("R~eparation en cours dans Outlook...")
+    ScheduleStatusClear STATUS_TIMEOUT_SEC
+End Sub
 
 Private Sub SetStatus(ByVal msg As String)
     On Error Resume Next

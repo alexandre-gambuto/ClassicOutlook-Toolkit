@@ -1,7 +1,27 @@
 Option Explicit
 
 '=============================================================================
-' modMailResponseTracker v6.4  (2026-10-08)
+' modMailResponseTracker v6.6  (2026-10-09)
+'
+' v6.6 (2026-10-09) : RE-IDENTIFICATION SOLIDE des lignes sans mail joignable
+'   (colonne dossier vide, "Ouvrir le mail" qui ne trouve rien). RelinkRows
+'   remplace RepairOrphans : lignes visees quel que soit le statut (fil vide,
+'   mail introuvable, ou mail dont l'objet ne correspond pas), recherche en
+'   UN passage sur tous les dossiers par tables Outlook filtrees sur la date
+'   d'envoi (plus de lecture mail par mail), correspondance objet normalise +
+'   envoye par soi + date d'envoi la plus proche, un mail par ligne. Reparer :
+'   feuilles Suivi ET Archives, budget 90 s, memoire des echecs ignoree,
+'   "(mail introuvable)" pour les lignes non retrouvees. Actualiser : budget
+'   20 s, ligne non retrouvee re-cherchee apres 7 jours.
+'
+' v6.5 (2026-10-09) : REPARATION DEPUIS LE CLASSEUR (bouton Reparer du ruban
+'   Excel, modMailTracker v1.3, via le canal de commandes de
+'   ThisOutlookSession v10.18). RequestTrackerRepair arme la meme
+'   actualisation differee (cle modDefer "DashRefresh") avec un drapeau :
+'   RefreshDashboard lance alors la reparation, puis le recalcul complet du
+'   classeur ouvert. Depuis Excel : AUCUNE fenetre Outlook (elle s'ouvrirait
+'   derriere Excel) - compte rendu et erreurs par toast, compteurs du ruban
+'   rafraichis. La macro RepairTrackerRows (Alt+F8) garde son comportement.
 '
 ' v6.4 (2026-10-08) : LIGNES DESALIGNEES (objet sans rapport avec le dossier,
 '   le statut ou le mail ouvert).
@@ -284,7 +304,7 @@ Option Explicit
 '=============================================================================
 
 Private Const MOD_NAME As String = "MailTrack"
-Private Const MOD_VERSION As String = "v6.4 - 2026-10-08"
+Private Const MOD_VERSION As String = "v6.6 - 2026-10-09"
 
 ' v5.7 (2026-07-13) [PARTIE 2b] : tableau de bord. (a) Nouvelle colonne
 '   d'action "Valider reponse" (entre Prolonger et Supprimer) -> colonnes
@@ -376,6 +396,11 @@ Private Const REG_KEY_LASTPOP As String = "LastPopupDate"
 Private Const REG_REPAIR_SECTION As String = "RepairFail"
 Private Const REPAIR_BUDGET_SEC As Long = 20
 Private Const REPAIR_RETRY_DAYS As Long = 7
+' v6.6 : re-identification des lignes (RelinkRows).
+Private Const RELINK_AUTO_BUDGET_SEC As Long = 20
+Private Const RELINK_REPAIR_BUDGET_SEC As Long = 90
+Private Const PR_SENDER_SMTP As String = "http://schemas.microsoft.com/mapi/proptag/0x5D01001F"
+Private Const PR_SENT_REP_SMTP As String = "http://schemas.microsoft.com/mapi/proptag/0x5D02001F"
 
 ' Variable module pour garder Excel en cache
 Private mXlApp As Object
@@ -395,6 +420,8 @@ Private mRepairT0 As Double
 Private mRepairAborted As Boolean
 ' v6.3 : classeur transmis par Excel (bouton Actualiser), consomme par RefreshDashboard.
 Private mRefreshWb As Object
+' v6.5 : reparation demandee par le classeur (bouton Reparer), consommee par RefreshDashboard.
+Private mRepairRequested As Boolean
 
 ' Mise au premier plan de la fenetre Excel (best effort).
 ' Pack v3 (D1) : 64-bit seul, branche #Else supprimee.
@@ -2131,217 +2158,432 @@ Private Function DateKey(ByVal v As Variant) As String
 End Function
 
 '=============================================================================
-' v6.3 - RepairOrphans : lignes sans ConversationID (lignes anciennes, suivi
-' urgent dont le brouillon a change d'identifiant...). Le mail envoye par
-' soi est recherche par OBJET normalise + DATE D'ENVOI (un jour de
-' tolerance, le plus proche gagne) : d'abord dans les Elements envoyes
-' (Restrict sur la date, rapide), puis par un parcours BORNE de la boite
-' (meme budget que la reparation). Trouve : ConversationID, EntryID et
-' dossier reecrits (la ligne redevient ouvrable et relancable, et entre dans
-' le recalcul qui suit). Echec : memorise REPAIR_RETRY_DAYS jours (registre
-' RepairFail, cle "orphan:" & ID de suivi).
+' v6.6 - RelinkRows : RE-IDENTIFICATION des lignes dont le mail n'est plus
+' joignable. Remplace RepairOrphans (v6.3), qui ne traitait que les lignes
+' sans ConversationID, cherchait d'abord dans les Elements envoyes (or les
+' mails suivis sont ranges ailleurs par QuickMove / ReplyInPlace), puis
+' parcourait la boite MAIL PAR MAIL en 20 s maximum, et bloquait tout nouvel
+' essai pendant 7 jours apres un echec.
+'
+' Lignes visees (feuilles transmises : Suivi, et Archives pour Reparer) :
+' identifiant de fil vide, OU mail de reference introuvable (un mail deplace
+' change d'identifiant), OU mail de reference dont l'objet ne correspond pas
+' a la ligne - quel que soit le statut (Repondu ? et Repondu compris : c'est
+' la que "Ouvrir le mail" echouait).
+'
+' Recherche : UN passage sur tous les dossiers de courrier de la boite par
+' defaut, par tables Outlook filtrees sur la date d'envoi (fenetres de
+' +/- 1 jour autour des dates des lignes visees, fusionnees) : seules les
+' lignes de la table sont lues (objet, date d'envoi, expediteur), aucun mail
+' n'est ouvert pendant le parcours. Correspondance : mail ENVOYE PAR SOI,
+' meme objet normalise (RE:/TR:... retires, casse ignoree), date d'envoi a un
+' jour pres ; le plus proche gagne (la date d'une ligne est en general la
+' date d'envoi exacte : ecart de quelques secondes). Un meme mail ne sert
+' qu'a une ligne. Trouve : ConversationID, EntryID et nom du dossier
+' reecrits.
+'
+' force = True (bouton Reparer) : memoire des echecs ignoree, budget long,
+' "(mail introuvable)" ecrit dans la colonne dossier des lignes non
+' retrouvees. force = False (Actualiser) : budget court, une ligne non
+' retrouvee n'est recherchee de nouveau qu'apres REPAIR_RETRY_DAYS jours.
 '=============================================================================
-Private Sub RepairOrphans(ws As Object, ByVal lastRow As Long)
+Private Sub RelinkRows(ByVal sheets As Collection, ByVal force As Boolean, ByVal budgetSec As Long, _
+                       ByRef nFound As Long, ByRef nLost As Long, ByRef relinkAborted As Boolean)
     On Error GoTo ErrH
-    Dim blk As Variant
-    blk = modExcelBridge.ReadBlock(ws, 2, 1, lastRow, LAST_COL)
-
-    Dim dBySubj As Object, dRowDate As Object, dFound As Object
-    Set dBySubj = CreateObject("Scripting.Dictionary")   ' objet normalise -> "r1;r2"
-    Set dRowDate = CreateObject("Scripting.Dictionary")  ' ligne -> date d'envoi
-    Set dFound = CreateObject("Scripting.Dictionary")    ' ligne -> EntryID retrouve
-
-    Dim r As Long, trackID As String, convID As String, key As String, sd As Variant, v As String
-    For r = 1 To lastRow - 1
-        trackID = CStr(SafeVal(blk, r, COL_ID))
-        If Len(trackID) = 0 Then GoTo NextOrphan
-        convID = CStr(SafeVal(blk, r, COL_CONV_ID))
-        If Len(convID) > 0 Then GoTo NextOrphan
-        key = NormalizeSubject(CStr(SafeVal(blk, r, COL_SUBJECT)))
-        If Len(key) = 0 Then GoTo NextOrphan
-        sd = SafeVal(blk, r, COL_SENT_DATE)
-        If Not IsDate(sd) Then GoTo NextOrphan
-        v = GetSetting(REG_TRACK_APP, REG_REPAIR_SECTION, "orphan:" & trackID, "")
-        If Len(v) > 0 Then
-            If CDbl(Date) - val(v) < REPAIR_RETRY_DAYS Then GoTo NextOrphan
-        End If
-        If dBySubj.Exists(key) Then
-            dBySubj(key) = dBySubj(key) & ";" & (r + 1)
-        Else
-            dBySubj.Add key, CStr(r + 1)
-        End If
-        dRowDate.Add r + 1, CDate(sd)
-NextOrphan:
-    Next r
-    If dRowDate.count = 0 Then Exit Sub
-
-    modDebugLog.DInfo MOD_NAME, "Orphelins : " & dRowDate.count & " ligne(s) sans ConversationID, recherche par objet + date"
+    nFound = 0
+    nLost = 0
+    relinkAborted = False
+    Dim heavyOn As Boolean
+    heavyOn = False
     Dim olNS As Outlook.NameSpace
     Set olNS = Application.GetNamespace("MAPI")
-    Dim ownerSMTP As String
-    ownerSMTP = GetOwnerSMTP(olNS)
 
-    ' Etape A : Elements envoyes, filtre sur la date (rapide).
-    OrphanLookupSent olNS, ownerSMTP, dBySubj, dRowDate, dFound
-
-    ' Etape B : parcours borne de la boite (meme mecanique que la reparation).
-    If dFound.count < dRowDate.count Then
-        Dim rootFolder As Outlook.MAPIFolder
-        Set rootFolder = Nothing
-        On Error Resume Next
-        Set rootFolder = olNS.GetDefaultFolder(olFolderInbox).Store.GetRootFolder
-        On Error GoTo ErrH
-        If rootFolder Is Nothing Then Set rootFolder = olNS.GetDefaultFolder(olFolderInbox)
-        mRepairT0 = Timer
-        mRepairAborted = False
-        modDefer.BeginHeavy
-        OrphanScanTree rootFolder, olNS, ownerSMTP, dBySubj, dRowDate, dFound
-        modDefer.EndHeavy
+    ' --- 1. Lignes a re-identifier : Array(feuille, ligne, objet normalise, date, ID)
+    Dim cand As Collection
+    Set cand = New Collection
+    Dim healthy As Object                    ' EntryID des mails deja rattaches a une ligne saine
+    Set healthy = CreateObject("Scripting.Dictionary")
+    Dim t0 As Double
+    t0 = Timer
+    Dim sh As Variant, ws As Object, lastRow As Long, blk As Variant, r As Long
+    Dim trackID As String, eid As String, subjRaw As String, subjN As String
+    Dim sd As Variant, v As String, itm As Object, needs As Boolean
+    For Each sh In sheets
+        Set ws = sh
+        lastRow = ws.Cells(ws.Rows.count, COL_ID).End(-4162).row
+        If lastRow >= 2 Then
+            blk = modExcelBridge.ReadBlock(ws, 2, 1, lastRow, LAST_COL)
+            For r = 1 To lastRow - 1
+                trackID = CStr(SafeVal(blk, r, COL_ID))
+                subjRaw = CStr(SafeVal(blk, r, COL_SUBJECT))
+                subjN = NormalizeSubject(subjRaw)
+                sd = SafeVal(blk, r, COL_SENT_DATE)
+                If Len(trackID) > 0 And Len(subjN) > 0 And IsDate(sd) Then
+                    ' Actualiser : une ligne deja cherchee sans succes recemment
+                    ' est sautee AVANT tout acces Outlook.
+                    Dim skipLine As Boolean
+                    skipLine = False
+                    If Not force Then
+                        v = GetSetting(REG_TRACK_APP, REG_REPAIR_SECTION, "orphan:" & trackID, "")
+                        If Len(v) > 0 Then
+                            If CDbl(Date) - val(v) < REPAIR_RETRY_DAYS Then skipLine = True
+                        End If
+                    End If
+                    If Not skipLine Then
+                        needs = (Len(CStr(SafeVal(blk, r, COL_CONV_ID))) = 0)
+                        If Not needs Then
+                            eid = CStr(SafeVal(blk, r, COL_ENTRY_ID))
+                            Set itm = Nothing
+                            If Len(eid) > 0 Then
+                                On Error Resume Next
+                                Set itm = olNS.GetItemFromID(eid)
+                                Err.Clear
+                                On Error GoTo ErrH
+                            End If
+                            If itm Is Nothing Then
+                                needs = True
+                            ElseIf Not SameSubjectFamily(subjRaw, ItemSubject(itm)) Then
+                                needs = True
+                            Else
+                                healthy(CStr(itm.entryID)) = True
+                            End If
+                        End If
+                        If needs Then cand.Add Array(ws, r + 1, subjN, CDate(sd), trackID)
+                    End If
+                End If
+            Next r
+        End If
+    Next sh
+    If cand.count = 0 Then Exit Sub
+    If ElapsedSec(t0) > budgetSec Then
+        modDebugLog.DInfo MOD_NAME, "Re-identification : budget epuise avant la recherche (" & cand.count & " ligne(s) en attente)"
+        Exit Sub
     End If
+    modDebugLog.DInfo MOD_NAME, "Re-identification : " & cand.count & " ligne(s) a rechercher" & _
+        IIf(force, " (reparation)", "")
 
-    ' Ecriture des identifiants retrouves ; memoire des echecs.
-    Dim rowKey As Variant, nFound As Long, itm As Object
-    For Each rowKey In dRowDate.keys
-        r = CLng(rowKey)
-        trackID = CStr(ws.Cells(r, COL_ID).Value)
-        If dFound.Exists(r) Then
-            Set itm = Nothing
-            On Error Resume Next
-            Set itm = olNS.GetItemFromID(CStr(dFound(r)))
-            On Error GoTo ErrH
-            If Not itm Is Nothing Then
-                ws.Cells(r, COL_CONV_ID).Value = CStr(itm.ConversationID)
-                ws.Cells(r, COL_ENTRY_ID).Value = CStr(itm.entryID)
-                ws.Cells(r, COL_FOLDER).Value = ItemFolderName(itm)
-                DeleteSetting REG_TRACK_APP, REG_REPAIR_SECTION, "orphan:" & trackID
-                nFound = nFound + 1
-            End If
+    ' --- 2. Index objet normalise -> "i1;i2" et filtre par dates
+    Dim dSubj As Object
+    Set dSubj = CreateObject("Scripting.Dictionary")
+    Dim i As Long, c As Variant, key As String
+    For i = 1 To cand.count
+        c = cand(i)
+        key = CStr(c(2))
+        If dSubj.Exists(key) Then
+            dSubj(key) = dSubj(key) & ";" & i
         Else
-            SaveSetting REG_TRACK_APP, REG_REPAIR_SECTION, "orphan:" & trackID, Str$(CLng(Date))
-        End If
-    Next rowKey
-    modDebugLog.DInfo MOD_NAME, "Orphelins : " & nFound & "/" & dRowDate.count & " ligne(s) re-identifiee(s)"
-    Exit Sub
-ErrH:
-    modDebugLog.DError MOD_NAME, "RepairOrphans err " & Err.Number & " - " & Err.Description
-    On Error Resume Next
-    modDefer.EndHeavy
-End Sub
-
-' Elements envoyes : un Restrict par ligne orpheline (date +/- 1 jour).
-Private Sub OrphanLookupSent(ByVal olNS As Outlook.NameSpace, ByVal ownerSMTP As String, _
-                             ByVal dBySubj As Object, ByVal dRowDate As Object, ByVal dFound As Object)
-    On Error Resume Next
-    Dim sentFolder As Outlook.MAPIFolder
-    Set sentFolder = olNS.GetDefaultFolder(olFolderSentMail)
-    If sentFolder Is Nothing Then Exit Sub
-    Dim items As Outlook.items
-    Set items = sentFolder.items
-
-    Dim rowKey As Variant, d As Date, flt As String, found As Outlook.items, itm As Object
-    For Each rowKey In dRowDate.keys
-        If Not dFound.Exists(rowKey) Then
-            d = CDate(dRowDate(rowKey))
-            flt = "[SentOn] >= '" & modCommon.FormatDaslDate(d - 1) & "' AND [SentOn] <= '" & _
-                  modCommon.FormatDaslDate(d + 1) & "'"
-            Set found = Nothing
-            Set found = items.Restrict(flt)
-            If Not found Is Nothing Then
-                Set itm = found.GetFirst
-                Do While Not itm Is Nothing
-                    OrphanMatch itm, ownerSMTP, dBySubj, dRowDate, dFound
-                    Set itm = found.GetNext
-                Loop
-            End If
-        End If
-    Next rowKey
-End Sub
-
-Private Sub OrphanScanTree(folder As Outlook.MAPIFolder, ByVal olNS As Outlook.NameSpace, _
-                           ByVal ownerSMTP As String, ByVal dBySubj As Object, _
-                           ByVal dRowDate As Object, ByVal dFound As Object)
-    On Error Resume Next
-    If dFound.count >= dRowDate.count Then Exit Sub
-    If RepairOverBudget() Then Exit Sub
-    If folder.DefaultItemType <> olMailItem Then Exit Sub
-
-    Dim items As Outlook.items
-    Set items = folder.items
-    Dim cnt As Long
-    cnt = items.count
-    Dim i As Long, Item As Object
-    For i = 1 To cnt
-        If (i Mod 200) = 0 Then
-            DoEvents
-            If RepairOverBudget() Then Exit Sub
-        End If
-        Set Item = Nothing
-        Set Item = items.Item(i)
-        If Not Item Is Nothing Then
-            OrphanMatch Item, ownerSMTP, dBySubj, dRowDate, dFound
-            If dFound.count >= dRowDate.count Then Exit Sub
+            dSubj.Add key, CStr(i)
         End If
     Next i
+    Dim flt As String
+    flt = RelinkDateFilter(cand)
 
-    Dim subs As Outlook.Folders
-    Set subs = folder.Folders
-    Dim sub_ As Outlook.MAPIFolder
-    For Each sub_ In subs
-        DoEvents
-        If RepairOverBudget() Then Exit Sub
-        OrphanScanTree sub_, olNS, ownerSMTP, dBySubj, dRowDate, dFound
-        If dFound.count >= dRowDate.count Then Exit Sub
-    Next sub_
-End Sub
-
-' Un mail croise correspond-il a une ligne orpheline ? Envoye par soi, meme
-' objet normalise, date d'envoi a un jour pres (la plus proche gagne).
-Private Sub OrphanMatch(ByVal itm As Object, ByVal ownerSMTP As String, ByVal dBySubj As Object, _
-                        ByVal dRowDate As Object, ByVal dFound As Object)
+    ' --- 3. Parcours unique des dossiers de courrier (tables filtrees)
+    Dim ownerSMTP As String, myName As String, deletedId As String
+    ownerSMTP = GetOwnerSMTP(olNS)
+    If InStr(1, ownerSMTP, "@") = 0 Then ownerSMTP = ""   ' adresse interne Exchange : inutilisable ici
+    myName = ""
+    deletedId = ""
     On Error Resume Next
-    Dim cls As Long
-    cls = 0
-    cls = itm.Class
-    If cls <> OL_MAIL_CLASS Then Exit Sub
-    Dim key As String
-    key = ""
-    key = NormalizeSubject(CStr(itm.subject))
-    If Len(key) = 0 Then Exit Sub
-    If Not dBySubj.Exists(key) Then Exit Sub
+    myName = CStr(olNS.CurrentUser.Name)
+    deletedId = CStr(olNS.GetDefaultFolder(olFolderDeletedItems).entryID)
+    Err.Clear
+    On Error GoTo ErrH
 
-    Dim oMail As Outlook.mailItem
-    Set oMail = itm
-    Dim senderAddr As String
-    senderAddr = ""
-    senderAddr = LCase(GetMailSenderSMTP(oMail))
-    If Len(ownerSMTP) > 0 And Len(senderAddr) > 0 Then
-        If StrComp(senderAddr, ownerSMTP, vbTextCompare) <> 0 Then Exit Sub
+    Dim pairs As Collection                  ' Array(indice ligne, EntryID, ecart)
+    Set pairs = New Collection
+    Dim nFolders As Long, aborted As Boolean, nTables As Long, nTableErr As Long
+    aborted = False
+    modDefer.BeginHeavy
+    heavyOn = True
+    Dim root As Object
+    Set root = Nothing
+    On Error Resume Next
+    Set root = olNS.DefaultStore.GetRootFolder
+    On Error GoTo ErrH
+    If Not root Is Nothing Then
+        RelinkScanFolder root, True, deletedId, flt, dSubj, cand, ownerSMTP, myName, pairs, t0, budgetSec, _
+                         nFolders, nTables, nTableErr, aborted
     End If
-    Dim sentOn As Date
-    sentOn = 0
-    sentOn = oMail.SentOn
-    If sentOn = 0 Then Exit Sub
+    ' Aucune table lisible : recherche impossible (filtre refuse...), pas un
+    ' "introuvable".
+    If nTables = 0 Then aborted = True
+    modDefer.EndHeavy
+    heavyOn = False
 
-    Dim parts() As String, k As Long, r As Long, gap As Double, best As Long, bestGap As Double
-    parts = Split(CStr(dBySubj(key)), ";")
-    best = 0
-    bestGap = 1.5
-    For k = LBound(parts) To UBound(parts)
-        r = CLng(val(parts(k)))
-        If r > 0 Then
-            If Not dFound.Exists(r) Then
-                gap = Abs(CDbl(sentOn) - CDbl(dRowDate(r)))
-                If gap < bestGap Then
-                    bestGap = gap
-                    best = r
+    ' --- 4. Attribution : ecart le plus faible d'abord, un mail par ligne
+    Dim n As Long, ordIdx() As Long, gaps() As Double, j As Long, tmpL As Long
+    n = pairs.count
+    Dim usedRow As Object, usedMail As Object
+    Set usedRow = CreateObject("Scripting.Dictionary")
+    Set usedMail = CreateObject("Scripting.Dictionary")
+    Dim hk As Variant
+    For Each hk In healthy.keys
+        usedMail(CStr(hk)) = True                ' jamais pris a une ligne saine
+    Next hk
+    If n > 0 Then
+        ReDim ordIdx(1 To n)
+        ReDim gaps(1 To n)
+        For i = 1 To n
+            ordIdx(i) = i
+            c = pairs(i)
+            gaps(i) = CDbl(c(2))
+        Next i
+        For i = 2 To n
+            tmpL = ordIdx(i)
+            j = i - 1
+            Do While j >= 1
+                If gaps(ordIdx(j)) <= gaps(tmpL) Then Exit Do
+                ordIdx(j + 1) = ordIdx(j)
+                j = j - 1
+            Loop
+            ordIdx(j + 1) = tmpL
+        Next i
+        For i = 1 To n
+            c = pairs(ordIdx(i))
+            If Not usedRow.Exists(CStr(c(0))) And Not usedMail.Exists(CStr(c(1))) Then
+                usedRow.Add CStr(c(0)), CStr(c(1))
+                usedMail(CStr(c(1))) = True
+            End If
+        Next i
+    End If
+
+    ' --- 5. Ecriture
+    Dim rowRef As Variant, wsT As Object, rr As Long, found As Object
+    For i = 1 To cand.count
+        rowRef = cand(i)
+        Set wsT = rowRef(0)
+        rr = CLng(rowRef(1))
+        trackID = CStr(rowRef(4))
+        Set found = Nothing
+        If usedRow.Exists(CStr(i)) Then
+            On Error Resume Next
+            Set found = olNS.GetItemFromID(CStr(usedRow(CStr(i))))
+            Err.Clear
+            On Error GoTo ErrH
+        End If
+        If Not found Is Nothing Then
+            wsT.Cells(rr, COL_CONV_ID).Value = CStr(found.ConversationID)
+            wsT.Cells(rr, COL_ENTRY_ID).Value = CStr(found.entryID)
+            wsT.Cells(rr, COL_FOLDER).Value = ItemFolderName(found)
+            DeleteOrphanMemory trackID
+            nFound = nFound + 1
+        Else
+            nLost = nLost + 1
+            ' Recherche interrompue (budget, tables illisibles) : la ligne n'est
+            ' pas declaree introuvable, elle sera recherchee de nouveau.
+            If Not aborted Then
+                SaveSetting REG_TRACK_APP, REG_REPAIR_SECTION, "orphan:" & trackID, Str$(CLng(Date))
+                If force Then
+                    If Len(Trim$(CStr(wsT.Cells(rr, COL_FOLDER).Value))) = 0 Then
+                        wsT.Cells(rr, COL_FOLDER).Value = T("(mail introuvable)", "(mail not found)")
+                    End If
                 End If
             End If
         End If
-    Next k
-    If best > 0 Then
-        If bestGap <= 1# Then dFound.Add best, CStr(oMail.entryID)
-    End If
+    Next i
+
+    modDebugLog.DInfo MOD_NAME, "Re-identification : " & nFound & " retrouvee(s), " & nLost & _
+        " introuvable(s), " & nFolders & " dossier(s) parcouru(s) (" & nTableErr & " table(s) illisible(s)) en " & _
+        Format$(ElapsedSec(t0), "0.0") & " s" & IIf(aborted, " - RECHERCHE INCOMPLETE (budget " & budgetSec & " s)", "")
+    relinkAborted = aborted
+    Exit Sub
+ErrH:
+    modDebugLog.DError MOD_NAME, "RelinkRows err " & Err.Number & " - " & Err.Description
+    relinkAborted = True
+    On Error Resume Next
+    If heavyOn Then modDefer.EndHeavy
 End Sub
+
+' v6.6 - Filtre Jet sur la date d'envoi : fenetres de +/- 1 jour autour des
+' dates des lignes visees, triees et fusionnees ; au-dela de 30 fenetres,
+' une seule plage du plus ancien au plus recent.
+Private Function RelinkDateFilter(ByVal cand As Collection) As String
+    Dim n As Long, i As Long, j As Long, tmp As Double, c As Variant
+    n = cand.count
+    Dim ds() As Double
+    ReDim ds(1 To n)
+    For i = 1 To n
+        c = cand(i)
+        ds(i) = CDbl(CDate(c(3)))
+    Next i
+    For i = 2 To n
+        tmp = ds(i)
+        j = i - 1
+        Do While j >= 1
+            If ds(j) <= tmp Then Exit Do
+            ds(j + 1) = ds(j)
+            j = j - 1
+        Loop
+        ds(j + 1) = tmp
+    Next i
+
+    Dim parts As Collection, lo As Double, hi As Double
+    Set parts = New Collection
+    lo = ds(1) - 1#
+    hi = ds(1) + 1#
+    For i = 2 To n
+        If ds(i) - 1# <= hi Then
+            If ds(i) + 1# > hi Then hi = ds(i) + 1#
+        Else
+            parts.Add Array(lo, hi)
+            lo = ds(i) - 1#
+            hi = ds(i) + 1#
+        End If
+    Next i
+    parts.Add Array(lo, hi)
+
+    Dim s As String, p As Variant
+    If parts.count > 30 Then
+        RelinkDateFilter = "[SentOn] >= '" & modCommon.FormatDaslDate(CDate(ds(1) - 1#)) & _
+                           "' AND [SentOn] <= '" & modCommon.FormatDaslDate(CDate(ds(n) + 1#)) & "'"
+        Exit Function
+    End If
+    For Each p In parts
+        If Len(s) > 0 Then s = s & " OR "
+        s = s & "([SentOn] >= '" & modCommon.FormatDaslDate(CDate(p(0))) & _
+                "' AND [SentOn] <= '" & modCommon.FormatDaslDate(CDate(p(1))) & "')"
+    Next p
+    RelinkDateFilter = s
+End Function
+
+' v6.6 - Un dossier : table filtree sur les dates, puis sous-dossiers. Les
+' dossiers qui ne sont pas du courrier sont elagues avec leur descendance
+' (la racine de la boite est toujours parcourue).
+Private Sub RelinkScanFolder(ByVal fld As Object, ByVal isRoot As Boolean, ByVal deletedId As String, _
+                             ByVal flt As String, ByVal dSubj As Object, _
+                             ByVal cand As Collection, ByVal ownerSMTP As String, ByVal myName As String, _
+                             ByVal pairs As Collection, ByVal t0 As Double, ByVal budgetSec As Long, _
+                             ByRef nFolders As Long, ByRef nTables As Long, ByRef nTableErr As Long, _
+                             ByRef aborted As Boolean)
+    On Error Resume Next
+    If aborted Then Exit Sub
+    Dim itemType As Long
+    itemType = -1
+    itemType = CLng(fld.DefaultItemType)
+    If itemType <> olMailItem And Not isRoot Then Exit Sub
+    ' Elements supprimes (et sa descendance) : une copie y disparait a la
+    ' prochaine purge.
+    If Len(deletedId) > 0 Then
+        If CStr(fld.entryID) = deletedId Then Exit Sub
+    End If
+    Err.Clear
+
+    nFolders = nFolders + 1
+    If (nFolders Mod 20) = 0 Then
+        DoEvents
+        If ElapsedSec(t0) > budgetSec Then
+            aborted = True
+            Exit Sub
+        End If
+    End If
+
+    Dim tbl As Object
+    Set tbl = Nothing
+    Err.Clear
+    Set tbl = fld.GetTable(flt)
+    If Err.Number <> 0 Or tbl Is Nothing Then
+        nTableErr = nTableErr + 1
+        If nTableErr = 1 Then
+            modDebugLog.DError MOD_NAME, "Re-identification : table refusee (" & Err.Number & " - " & _
+                Err.Description & ") dossier " & CStr(fld.FolderPath) & " filtre " & Left$(flt, 200)
+        End If
+        Err.Clear
+        Set tbl = Nothing
+    Else
+        nTables = nTables + 1
+    End If
+    If Not tbl Is Nothing Then
+        Err.Clear
+        tbl.Columns.Add "SentOn"
+        tbl.Columns.Add "SenderName"
+        tbl.Columns.Add PR_SENDER_SMTP
+        tbl.Columns.Add PR_SENT_REP_SMTP
+        Err.Clear
+        Dim rw As Object, key As String, sent As Date, idxs() As String, k As Long
+        Dim ci As Long, c As Variant, gap As Double, guard As Long
+        guard = 0
+        Do Until tbl.EndOfTable
+            guard = guard + 1
+            If (guard Mod 500) = 0 Then
+                DoEvents
+                If ElapsedSec(t0) > budgetSec Then
+                    aborted = True
+                    Exit Sub
+                End If
+            End If
+            If guard > 50000 Then
+                modDebugLog.DError MOD_NAME, "Re-identification : dossier trop volumineux, lecture arretee : " & _
+                    CStr(fld.FolderPath)
+                aborted = True
+                Exit Do
+            End If
+            Set rw = Nothing
+            Set rw = tbl.GetNextRow
+            If rw Is Nothing Then Exit Do
+            key = ""
+            key = NormalizeSubject(CStr(rw("Subject")))
+            If Len(key) > 0 Then
+                If dSubj.Exists(key) Then
+                    If IsPlainMail(rw) And RowIsFromMe(rw, ownerSMTP, myName) Then
+                        sent = 0
+                        sent = CDate(rw("SentOn"))
+                        If sent > 0 Then
+                            idxs = Split(CStr(dSubj(key)), ";")
+                            For k = LBound(idxs) To UBound(idxs)
+                                ci = CLng(val(idxs(k)))
+                                c = cand(ci)
+                                gap = Abs(CDbl(sent) - CDbl(CDate(c(3))))
+                                If gap <= 1# Then pairs.Add Array(ci, CStr(rw("EntryID")), gap)
+                            Next k
+                        End If
+                    End If
+                End If
+            End If
+            Err.Clear
+        Loop
+    End If
+    Err.Clear
+
+    Dim sub_ As Object
+    For Each sub_ In fld.Folders
+        If aborted Then Exit Sub
+        RelinkScanFolder sub_, False, deletedId, flt, dSubj, cand, ownerSMTP, myName, pairs, t0, budgetSec, _
+                         nFolders, nTables, nTableErr, aborted
+    Next sub_
+End Sub
+
+' v6.6 - Ligne de table = un mail (pas une invitation, un accuse...).
+Private Function IsPlainMail(ByVal rw As Object) As Boolean
+    On Error Resume Next
+    Dim mc As String
+    mc = ""
+    mc = UCase$(CStr(rw("MessageClass")))
+    IsPlainMail = (Len(mc) = 0 Or Left$(mc, 8) = "IPM.NOTE")
+End Function
+
+' v6.6 - Ligne de table envoyee par soi ? Adresse SMTP de l'expediteur (ou
+' du "de la part de") egale a la sienne ; a defaut d'adresse, le nom.
+Private Function RowIsFromMe(ByVal rw As Object, ByVal ownerSMTP As String, ByVal myName As String) As Boolean
+    On Error Resume Next
+    RowIsFromMe = False
+    Dim a1 As String, a2 As String, nm As String
+    a1 = ""
+    a2 = ""
+    a1 = LCase$(Trim$(CStr(rw(PR_SENDER_SMTP))))
+    a2 = LCase$(Trim$(CStr(rw(PR_SENT_REP_SMTP))))
+    If Len(ownerSMTP) > 0 Then
+        If a1 = ownerSMTP Or a2 = ownerSMTP Then
+            RowIsFromMe = True
+            Exit Function
+        End If
+    End If
+    If (Len(ownerSMTP) = 0 Or (Len(a1) = 0 And Len(a2) = 0)) And Len(myName) > 0 Then
+        nm = ""
+        nm = CStr(rw("SenderName"))
+        RowIsFromMe = (StrComp(nm, myName, vbTextCompare) = 0)
+    End If
+End Function
 
 '=============================================================================
 ' v6.3 - ACTUALISATION DEMANDEE PAR LE CLASSEUR (bouton Actualiser du ruban
@@ -2365,7 +2607,25 @@ Public Sub RequestDashboardRefresh(ByVal wb As Object)
     modDebugLog.DInfo MOD_NAME, "Actualisation demandee par le classeur"
 End Sub
 
+' v6.5 - Reparation demandee par le classeur (bouton Reparer, canal de
+' commandes). Meme differe que l'actualisation ; RefreshDashboard voit le
+' drapeau et lance la reparation avant le recalcul.
+Public Sub RequestTrackerRepair()
+    On Error Resume Next
+    mRepairRequested = True
+    Set mRefreshWb = Nothing
+    modDefer.ArmUnique "DashRefresh", 1
+    modDebugLog.DInfo MOD_NAME, "Reparation demandee par le classeur"
+End Sub
+
 Public Sub RefreshDashboard()
+    ' v6.5 : reparation demandee par le classeur -> elle passe d'abord ; elle
+    ' rappelle RefreshDashboard une fois les lignes remises en place.
+    If mRepairRequested Then
+        mRepairRequested = False
+        RunTrackerRepair True
+        Exit Sub
+    End If
     On Error GoTo ErrH
     Dim xlApp As Object, wb As Object, ws As Object
     Dim viaExcel As Boolean, userWb As Boolean
@@ -2447,7 +2707,7 @@ End Sub
 '      identifiant de suivi a ete cree au plus un jour avant l'envoi de la
 '      ligne (plausible), sinon traite comme les autres restes ;
 '   4. restes : appaires dans l'ordre, ConversationID et EntryID EFFACES ->
-'      RepairOrphans (tableau de bord) re-identifie la ligne par objet + date
+'      RelinkRows re-identifie la ligne par objet + date
 '      d'envoi, comme une ligne ancienne ;
 '   5. lignes modifiees : nom de dossier efface (relu au recalcul), statut
 '      "Repondu ?" remis a "En attente" (calcule sur le mauvais mail ; le
@@ -2458,6 +2718,14 @@ End Sub
 ' touchee.
 '=============================================================================
 Public Sub RepairTrackerRows()
+    RunTrackerRepair False
+End Sub
+
+' v6.5 - corps de la reparation. fromExcel = demande du bouton Reparer du
+' classeur : pas de fenetre Outlook (elle s'ouvrirait derriere Excel),
+' toasts, puis recalcul du classeur ouvert (RefreshDashboard). Sinon
+' (macro) : fenetre de compte rendu puis tableau de bord, comme en v6.4.
+Private Sub RunTrackerRepair(ByVal fromExcel As Boolean)
     On Error GoTo ErrH
     Dim xlApp As Object, wb As Object, ws As Object, wsA As Object
     Dim evSaved As Boolean, evOff As Boolean
@@ -2467,8 +2735,7 @@ Public Sub RepairTrackerRows()
     backupPath = ""
 
     If Dir(GetTrackerFilePath()) = "" Then
-        modUi.Fail T("Fichier de suivi introuvable.", "Tracking file not found."), _
-                   T("Suivi Mails", "Mail Tracking")
+        RepairNotice T("Fichier de suivi introuvable.", "Tracking file not found."), fromExcel
         Exit Sub
     End If
 
@@ -2484,8 +2751,8 @@ Public Sub RepairTrackerRows()
     backupPath = BackupTrackerCopy(xlApp, wb)
     If Len(backupPath) = 0 Then
         ReleaseBackground xlApp, wb
-        modUi.Fail T("Copie de sauvegarde impossible : rien n'a ~et~e modifi~e.", _
-                     "Backup copy failed: nothing was changed."), T("Suivi Mails", "Mail Tracking")
+        RepairNotice T("R~eparation annul~ee : copie de sauvegarde impossible, rien n'a ~et~e modifi~e.", _
+                       "Repair cancelled: backup copy failed, nothing was changed."), fromExcel
         Exit Sub
     End If
 
@@ -2508,6 +2775,17 @@ Public Sub RepairTrackerRows()
     On Error GoTo ErrH
     If Not wsA Is Nothing Then okArch = RealignSheet(wsA, False, aRows, aMoved, aCleared)
 
+    ' v6.6 : lignes sans mail joignable -> re-identification par objet + date
+    ' d'envoi, Suivi et Archives, sans tenir compte des echecs passes.
+    Dim relinkShs As Collection
+    Set relinkShs = New Collection
+    If okTrack Then relinkShs.Add ws
+    If okArch And Not wsA Is Nothing Then relinkShs.Add wsA
+    Dim nRelinked As Long, nRelinkLost As Long, relinkCut As Boolean
+    modCommon.SetStatus MOD_NAME, T("R~eparation : recherche des mails dans tous les dossiers...", _
+                                    "Repair: searching all folders for the mails...")
+    RelinkRows relinkShs, True, RELINK_REPAIR_BUDGET_SEC, nRelinked, nRelinkLost, relinkCut
+
     xlApp.EnableEvents = evSaved
     evOff = False
 
@@ -2517,12 +2795,40 @@ Public Sub RepairTrackerRows()
 
     modDebugLog.DInfo MOD_NAME, "RepairTrackerRows : suivi " & nMoved & " retablie(s), " & _
         nCleared & " a re-identifier sur " & nRows & " ; archives " & aMoved & " retablie(s), " & _
-        aCleared & " effacee(s) sur " & aRows & " ; copie " & backupPath
+        aCleared & " effacee(s) sur " & aRows & " ; re-identifiees " & nRelinked & ", introuvables " & _
+        nRelinkLost & " ; copie " & backupPath
+
+    If fromExcel Then
+        Dim note As String
+        note = T("R~eparation : ", "Repair: ") & nMoved & T(" ligne(s) r~etablie(s), ", " row(s) realigned, ") & _
+               nRelinked & T(" mail(s) retrouv~e(s)", " mail(s) found again")
+        If nRelinkLost > 0 Then
+            If relinkCut Then
+                note = note & ", " & nRelinkLost & T(" non trouv~e(s) - recherche incompl~fte, relancez R~eparer", _
+                                                     " not found - search incomplete, run Repair again")
+            Else
+                note = note & ", " & nRelinkLost & T(" introuvable(s)", " not found")
+            End If
+        End If
+        If aMoved + aCleared > 0 Then
+            note = note & T(" (archives : ", " (archives: ") & (aMoved + aCleared) & ")"
+        End If
+        If Not (okTrack And okArch) Then
+            note = note & T(" - une feuille non trait~ee, voir debug.log", " - a sheet was not processed, see debug.log")
+        End If
+        note = note & vbLf & T("Copie : ", "Backup: ") & Mid$(backupPath, InStrRev(backupPath, "\") + 1)
+        modNotify.Notify note
+        RefreshDashboard
+        Exit Sub
+    End If
 
     Dim msg As String
     msg = T("Suivi : ", "Tracking: ") & nRows & T(" ligne(s), ", " row(s), ") & _
           nMoved & T(" r~etablie(s), ", " realigned, ") & _
-          nCleared & T(" ~a re-identifier (mail introuvable).", " to re-identify (mail not found).") & vbCrLf
+          nCleared & T(" ~a re-identifier.", " to re-identify.") & vbCrLf & _
+          T("Mails retrouv~es dans les dossiers : ", "Mails found again in the folders: ") & nRelinked & _
+          T(", introuvables : ", ", not found: ") & nRelinkLost & _
+          IIf(relinkCut, T(" (recherche incompl~fte : relancez)", " (search incomplete: run again)"), "") & vbCrLf
     If aRows > 0 Then
         msg = msg & T("Archives : ", "Archives: ") & aRows & T(" ligne(s), ", " row(s), ") & _
               aMoved & T(" r~etablie(s), ", " realigned, ") & _
@@ -2548,13 +2854,27 @@ ErrH:
     If evOff Then xlApp.EnableEvents = evSaved
     If Not wb Is Nothing Then ReleaseBackground xlApp, wb
     modDebugLog.DError MOD_NAME, "RepairTrackerRows err " & errNum & " - " & errDesc
-    If Len(backupPath) > 0 Then
+    If fromExcel Then
+        modNotify.Notify T("R~eparation du suivi impossible (erreur ", "Tracking repair failed (error ") & errNum & _
+                         T(") - voir debug.log", ") - see debug.log")
+    ElseIf Len(backupPath) > 0 Then
         MsgBox T("Erreur ", "Error ") & errNum & " : " & errDesc & vbCrLf & vbCrLf & _
                T("Copie de sauvegarde :", "Backup copy:") & vbCrLf & backupPath, _
                vbCritical, T("R~eparation du suivi", "Tracking repair")
     Else
         MsgBox T("Erreur ", "Error ") & errNum & " : " & errDesc, _
                vbCritical, T("R~eparation du suivi", "Tracking repair")
+    End If
+End Sub
+
+' v6.5 - message de la reparation : toast si la demande vient du classeur
+' (une fenetre Outlook s'ouvrirait derriere Excel), fenetre sinon.
+Private Sub RepairNotice(ByVal msg As String, ByVal fromExcel As Boolean)
+    On Error Resume Next
+    If fromExcel Then
+        modNotify.Notify msg
+    Else
+        modUi.Fail msg, T("Suivi Mails", "Mail Tracking")
     End If
 End Sub
 
@@ -2750,7 +3070,7 @@ Private Function RealignSheet(ByVal ws As Object, ByVal isTrack As Boolean, _
     Next j
 
     ' Reste 2 : blocs libres -> lignes libres, dans l'ordre ; fil et mail
-    ' effaces (re-identification par RepairOrphans).
+    ' effaces (re-identification par RelinkRows).
     k = 1
     For j = 1 To n
         If tupOf(j) = 0 Then
@@ -2860,7 +3180,7 @@ Bad:
 End Function
 
 ' v6.4 - Oublie l'echec de re-identification memorise pour un ID de suivi
-' (RepairOrphans le recherchera au prochain recalcul).
+' (RelinkRows le recherchera au prochain recalcul).
 Private Sub DeleteOrphanMemory(ByVal trackID As String)
     On Error Resume Next
     If Len(trackID) = 0 Then Exit Sub
@@ -2902,10 +3222,17 @@ Private Sub UpdateAllTrackingStatuses(ws As Object, _
 
     If lastRow < 2 Then Exit Sub
 
-    ' --- Phase 0 (v6.3) : lignes sans ConversationID re-identifiees par
-    ' objet + date d'envoi (mail envoye par soi). Seul le tableau de bord
-    ' complet s'en charge (pas le mode "candidates retard").
-    If Not onlyOverdueCandidates Then RepairOrphans ws, lastRow
+    ' --- Phase 0 (v6.6) : lignes sans mail joignable (fil vide, mail
+    ' introuvable ou d'un autre objet) re-identifiees par objet + date
+    ' d'envoi (RelinkRows). Seul le tableau de bord complet s'en charge (pas
+    ' le mode "candidates retard").
+    If Not onlyOverdueCandidates Then
+        Dim relinkShs As Collection
+        Set relinkShs = New Collection
+        relinkShs.Add ws
+        Dim nRelinked As Long, nRelinkLost As Long, relinkCut As Boolean
+        RelinkRows relinkShs, False, RELINK_AUTO_BUDGET_SEC, nRelinked, nRelinkLost, relinkCut
+    End If
 
     ' --- Phase 1 : collecter les convID actifs (status != Complete) ---
     ' Dictionary PARALLELES indexes par convID (un Dictionary imbrique via

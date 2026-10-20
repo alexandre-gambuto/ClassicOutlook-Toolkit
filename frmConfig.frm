@@ -31,7 +31,7 @@ Private m_LastSelectedStore As String
 Private Sub UserForm_Initialize()
     On Error GoTo ErrInit
     
-    Debug.Print "[frmConfig] Initialize dï¿½but..."
+    Debug.Print "[frmConfig] Initialize début..."
     
     Set m_MailboxConfigs = CreateObject("Scripting.Dictionary")
     m_Cancelled = True
@@ -60,11 +60,11 @@ Private Sub UserForm_Initialize()
     End With
     
     Debug.Print "[frmConfig] LoadMailboxes..."
-    ' Charger les boï¿½tes aux lettres
+    ' Charger les boîtes aux lettres
     Call LoadMailboxes
     
-    Debug.Print "[frmConfig] Initialisation pï¿½riode..."
-    ' Initialiser pï¿½riode
+    Debug.Print "[frmConfig] Initialisation période..."
+    ' Initialiser période
     optTout.Value = True
     cboDepuis.Enabled = False
     txtDateDebut.Enabled = False
@@ -80,7 +80,7 @@ Private Sub UserForm_Initialize()
     
     m_Cancelled = True
     
-    Debug.Print "[frmConfig] Initialize terminï¿½ OK"
+    Debug.Print "[frmConfig] Initialize terminé OK"
     Exit Sub
     
 ErrInit:
@@ -89,7 +89,7 @@ ErrInit:
 End Sub
 
 ' ============================================================================
-' CHARGEMENT DES BOï¿½TES
+' CHARGEMENT DES BOÎTES
 ' ============================================================================
 Private Sub LoadMailboxes()
     Dim olNS As Object
@@ -113,7 +113,7 @@ Private Sub LoadMailboxes()
             
             Set cfg = CreateObject("Scripting.Dictionary")
             
-            ' Appliquer prï¿½-configuration si disponible, sinon extraction auto
+            ' Appliquer pré-configuration si disponible, sinon extraction auto
             Call ApplyPresetConfig(storeName, cfg, colorIndex)
             
             m_MailboxConfigs.Add storeName, cfg
@@ -146,7 +146,7 @@ Private Sub ApplyPresetConfig(storeName As String, ByRef cfg As Object, colorInd
             cfg("ColorRGB") = GetColorByIndex(0)
             
         Case Else
-            ' Configuration par dï¿½faut (extraction automatique)
+            ' Configuration par défaut (extraction automatique)
             Dim emailUser As String
             emailUser = ExtractEmailFromStore(storeName)
             cfg("EmailUser") = emailUser
@@ -159,7 +159,7 @@ Private Sub ApplyPresetConfig(storeName As String, ByRef cfg As Object, colorInd
 End Sub
 
 Private Function ExtractEmailFromStore(storeName As String) As String
-    ' Si le nom de la boï¿½te contient @, c'est l'adresse email
+    ' Si le nom de la boîte contient @, c'est l'adresse email
     If InStr(storeName, "@") > 0 Then
         ExtractEmailFromStore = storeName
     Else
@@ -185,7 +185,7 @@ Private Function ExtractKeywordFromEmail(email As String) As String
     atPos = InStr(email, "@")
     If atPos > 1 Then
         localPart = LCase(Left(email, atPos - 1))
-        ' Prendre le dernier segment aprï¿½s le point (gï¿½nï¿½ralement le prï¿½nom ou nom)
+        ' Prendre le dernier segment après le point (généralement le prénom ou nom)
         dotPos = InStrRev(localPart, ".")
         If dotPos > 0 Then
             ExtractKeywordFromEmail = mid(localPart, dotPos + 1)
@@ -220,7 +220,7 @@ Private Function GetColorByIndex(idx As Long) As Long
         Case 6: GetColorByIndex = RGB(215, 45, 124)   ' Rose
         Case 7: GetColorByIndex = RGB(255, 192, 0)    ' Jaune
         Case 8: GetColorByIndex = RGB(0, 43, 89)      ' Bleu marine
-        Case 9: GetColorByIndex = RGB(34, 139, 34)    ' Vert forï¿½t
+        Case 9: GetColorByIndex = RGB(34, 139, 34)    ' Vert forêt
         Case 10: GetColorByIndex = RGB(139, 69, 19)   ' Marron
         Case 11: GetColorByIndex = RGB(128, 128, 128) ' Gris
         Case 12: GetColorByIndex = RGB(64, 224, 208)  ' Turquoise
@@ -231,7 +231,7 @@ Private Function GetColorByIndex(idx As Long) As Long
 End Function
 
 ' ============================================================================
-' ï¿½Vï¿½NEMENTS LISTE DES BOï¿½TES
+' ÉVÉNEMENTS LISTE DES BOÎTES
 ' ============================================================================
 Private Sub lstBoites_Change()
     Dim selectedCount As Long
@@ -240,7 +240,7 @@ Private Sub lstBoites_Change()
     Dim cfg As Object
     Dim i As Long
     
-    ' Compter les sï¿½lections et trouver le dernier index sï¿½lectionnï¿½
+    ' Compter les sélections et trouver le dernier index sélectionné
     selectedCount = 0
     lastSelectedIndex = -1
     
@@ -251,7 +251,7 @@ Private Sub lstBoites_Change()
         End If
     Next i
     
-    ' Aucune sï¿½lection : dï¿½sactiver le panneau config
+    ' Aucune sélection : désactiver le panneau config
     If selectedCount = 0 Then
         fraConfigBoite.Enabled = False
         fraConfigBoite.caption = "Selected mailbox configuration"
@@ -260,20 +260,20 @@ Private Sub lstBoites_Change()
         Exit Sub
     End If
     
-    ' Si l'ï¿½lï¿½ment actuellement cliquï¿½ est sï¿½lectionnï¿½, l'utiliser
+    ' Si l'élément actuellement cliqué est sélectionné, l'utiliser
     If lstBoites.ListIndex >= 0 And lstBoites.Selected(lstBoites.ListIndex) Then
         lastSelectedIndex = lstBoites.ListIndex
     End If
     
     storeName = lstBoites.list(lastSelectedIndex)
     
-    ' Sauvegarder la config prï¿½cï¿½dente si on change de boï¿½te
+    ' Sauvegarder la config précédente si on change de boîte
     If storeName <> m_LastSelectedStore Then
         If Len(m_LastSelectedStore) > 0 And m_MailboxConfigs.Exists(m_LastSelectedStore) Then
             Call SaveCurrentConfig(m_LastSelectedStore)
         End If
     Else
-        ' Mï¿½me boï¿½te, pas besoin de recharger
+        ' Même boîte, pas besoin de recharger
         Exit Sub
     End If
     
@@ -281,7 +281,7 @@ Private Sub lstBoites_Change()
     
     If Not m_MailboxConfigs.Exists(storeName) Then Exit Sub
     
-    ' Activer le panneau et mettre ï¿½ jour le titre
+    ' Activer le panneau et mettre à jour le titre
     fraConfigBoite.Enabled = True
     If Len(storeName) > 30 Then
         fraConfigBoite.caption = "Config: " & Left(storeName, 27) & "..."
@@ -289,7 +289,7 @@ Private Sub lstBoites_Change()
         fraConfigBoite.caption = "Config: " & storeName
     End If
     
-    ' Charger la config de la boï¿½te sï¿½lectionnï¿½e
+    ' Charger la config de la boîte sélectionnée
     Set cfg = m_MailboxConfigs(storeName)
     
     txtEmailUser.text = cfg("EmailUser")
@@ -306,19 +306,19 @@ Private Sub lstBoites_Change()
     lblCouleurApercu.BackColor = cfg("ColorRGB")
     lblResultatTest.caption = ""
     
-    ' Charger DateMin si les contrï¿½les existent
+    ' Charger DateMin si les contrôles existent
     On Error Resume Next
     Dim dateMinEnabled As Boolean
     dateMinEnabled = False
     If cfg.Exists("DateMinEnabled") Then dateMinEnabled = cfg("DateMinEnabled")
     
-    ' Checkbox : cochï¿½ ou non (pas grisï¿½)
+    ' Checkbox : coché ou non (pas grisé)
     Me.controls("chkDateMin").Value = dateMinEnabled
     
-    ' TextBox : activï¿½/dï¿½sactivï¿½ avec couleur appropriï¿½e
+    ' TextBox : activé/désactivé avec couleur appropriée
     Me.controls("txtDateMin").Enabled = dateMinEnabled
     If dateMinEnabled Then
-        Me.controls("txtDateMin").BackColor = &H80000005  ' Blanc (couleur fenï¿½tre)
+        Me.controls("txtDateMin").BackColor = &H80000005  ' Blanc (couleur fenêtre)
         If cfg.Exists("DateMin") Then
             If IsDate(cfg("DateMin")) Then
                 Me.controls("txtDateMin").text = Format(cfg("DateMin"), "DD/MM/YYYY")
@@ -358,7 +358,7 @@ Private Sub SaveCurrentConfig(storeName As String)
     cfg("ColorIndex") = cboCouleur.ListIndex
     cfg("ColorRGB") = GetColorByIndex(cboCouleur.ListIndex)
     
-    ' Sauvegarder DateMin si les contrï¿½les existent
+    ' Sauvegarder DateMin si les contrôles existent
     On Error Resume Next
     cfg("DateMinEnabled") = Me.controls("chkDateMin").Value
     If Me.controls("chkDateMin").Value Then
@@ -372,10 +372,10 @@ Private Sub SaveCurrentConfig(storeName As String)
 End Sub
 
 ' ============================================================================
-' ï¿½Vï¿½NEMENTS CONFIGURATION BOï¿½TE
+' ÉVÉNEMENTS CONFIGURATION BOÎTE
 ' ============================================================================
 Private Sub txtEmailUser_Change()
-    ' Auto-remplir domaine et mot-clï¿½
+    ' Auto-remplir domaine et mot-clé
     Dim email As String
     email = txtEmailUser.text
     
@@ -466,8 +466,8 @@ Private Function GetInboxOrFirst(rootFolder As Outlook.folder) As Outlook.folder
     Dim subFolder As Outlook.folder
     On Error Resume Next
     For Each subFolder In rootFolder.Folders
-        If LCase(subFolder.name) Like "*inbox*" Or LCase(subFolder.name) Like "*rï¿½ception*" Or _
-           LCase(subFolder.name) Like "*boï¿½te de rï¿½ception*" Then
+        If LCase(subFolder.name) Like "*inbox*" Or LCase(subFolder.name) Like "*réception*" Or _
+           LCase(subFolder.name) Like "*boîte de réception*" Then
             Set GetInboxOrFirst = subFolder
             Exit Function
         End If
@@ -503,7 +503,7 @@ Private Function TryResolveAddress(Sender As Object) As String
 End Function
 
 ' ============================================================================
-' BOUTONS Sï¿½LECTION
+' BOUTONS SÉLECTION
 ' ============================================================================
 Private Sub btnToutSel_Click()
     Dim i As Long
@@ -520,7 +520,7 @@ Private Sub btnToutDesel_Click()
 End Sub
 
 ' ============================================================================
-' ï¿½Vï¿½NEMENTS Pï¿½RIODE
+' ÉVÉNEMENTS PÉRIODE
 ' ============================================================================
 Private Sub optTout_Click()
     cboDepuis.Enabled = False
@@ -544,9 +544,9 @@ End Sub
 ' BOUTONS PRINCIPAUX
 ' ============================================================================
 Private Sub btnLancer_Click()
-    Debug.Print "[frmConfig] btnLancer_Click dï¿½but..."
+    Debug.Print "[frmConfig] btnLancer_Click début..."
     
-    ' Vï¿½rifier qu'au moins une boï¿½te est sï¿½lectionnï¿½e
+    ' Vérifier qu'au moins une boîte est sélectionnée
     Dim i As Long, hasSelection As Boolean
     hasSelection = False
     For i = 0 To lstBoites.ListCount - 1
@@ -560,7 +560,7 @@ Private Sub btnLancer_Click()
         Exit Sub
     End If
     
-    ' Sauvegarder la derniï¿½re config
+    ' Sauvegarder la dernière config
     If Len(m_LastSelectedStore) > 0 Then
         Debug.Print "[frmConfig] Sauvegarde config: " & m_LastSelectedStore
         Call SaveCurrentConfig(m_LastSelectedStore)
@@ -572,7 +572,7 @@ Private Sub btnLancer_Click()
     Debug.Print "[frmConfig] Appel Hide..."
     On Error Resume Next
     Me.Hide
-    Debug.Print "[frmConfig] Hide terminï¿½, err=" & Err.Number
+    Debug.Print "[frmConfig] Hide terminé, err=" & Err.Number
     On Error GoTo 0
 End Sub
 
@@ -583,14 +583,14 @@ End Sub
 
 Private Sub UserForm_QueryClose(Cancel As Integer, CloseMode As Integer)
     If CloseMode = 0 Then ' Clic sur X
-        Cancel = True  ' Empï¿½cher la fermeture automatique qui dï¿½truit l'objet
+        Cancel = True  ' Empêcher la fermeture automatique qui détruit l'objet
         m_Cancelled = True
-        Me.Hide  ' Cacher le formulaire au lieu de le dï¿½truire
+        Me.Hide  ' Cacher le formulaire au lieu de le détruire
     End If
 End Sub
 
 ' ============================================================================
-' PROPRIï¿½Tï¿½S PUBLIQUES
+' PROPRIÉTÉS PUBLIQUES
 ' ============================================================================
 Public Property Get Cancelled() As Boolean
     Cancelled = m_Cancelled
@@ -692,7 +692,7 @@ Public Function GetStoreAddressMode(storeName As String) As Boolean
 End Function
 
 Public Function GetStoreDateMin(storeName As String) As Date
-    ' Retourne la date minimum pour cette boï¿½te (ou 1/1/1900 si pas activï¿½)
+    ' Retourne la date minimum pour cette boîte (ou 1/1/1900 si pas activé)
     On Error Resume Next
     If m_MailboxConfigs.Exists(storeName) Then
         If m_MailboxConfigs(storeName)("DateMinEnabled") Then
@@ -709,7 +709,7 @@ Public Function GetStoreDateMin(storeName As String) As Date
     On Error GoTo 0
 End Function
 
-' ï¿½vï¿½nement pour le checkbox DateMin
+' Événement pour le checkbox DateMin
 Private Sub chkDateMin_Click()
     On Error Resume Next
     Dim isEnabled As Boolean

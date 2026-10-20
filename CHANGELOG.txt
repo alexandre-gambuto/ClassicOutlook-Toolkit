@@ -1,3 +1,23 @@
+[2026-10-09] Suivi des mails - bouton REPARER dans le ruban du classeur.
+             Fichiers : modMailResponseTracker v6.5, ThisOutlookSession
+             v10.18, modMailTracker v1.3 (classeur), customUI14.xml
+             (ruban integre au classeur).
+  * Ruban "Suivi des mails", groupe Suivi : bouton "Reparer" (tag REPAIR,
+    imageMso RecordsRefreshMenu) a cote d'Actualiser.
+  * modMailTracker v1.3 : DoRepair - confirmation (l'action reecrit des
+    colonnes), puis commande REPAIR par le canal de commandes
+    (SendOutlookCommand). Echec = message + repli macro RepairTrackerRows.
+  * ThisOutlookSession v10.18 : canal de commandes, Case "REPAIR" ->
+    modMailResponseTracker.RequestTrackerRepair. Numero v10.17 saute
+    (version d'essai abandonnee, jamais livree au changelog).
+  * modMailResponseTracker v6.5 : RequestTrackerRepair arme le differe
+    "DashRefresh" avec un drapeau ; RefreshDashboard lance alors la
+    reparation (RunTrackerRepair, corps de l'ancienne RepairTrackerRows)
+    puis le recalcul complet du classeur ouvert. Depuis Excel : aucune
+    fenetre Outlook (elle s'ouvrirait derriere Excel), compte rendu et
+    erreurs par toast. La macro RepairTrackerRows garde son comportement
+    (fenetre de compte rendu puis tableau de bord).
+
 [2026-10-09] modViewGuard v1.0 (nouveau) - commande manuelle "Standardiser
              l'affichage" (onglet Affichage, Sub StandardizeView) : colonne
              "De" dans tous les dossiers de courrier de la boite affichee,
