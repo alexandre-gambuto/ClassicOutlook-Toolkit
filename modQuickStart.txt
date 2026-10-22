@@ -1,7 +1,8 @@
 Option Explicit
 
 '=============================================================================
-' modQuickStart  (v1.0 - 2026-09-15)
+' modQuickStart  (v1.1 - 2026-10-22)
+' v1.1 (2026-10-22) : exemples de codes remplaces par des valeurs fictives (relecture de confidentialite du depot public). Aucun changement de comportement.
 ' Purpose (EN): first-run quick start guide. When no config.ini exists, offers
 '   (8 s after startup, through modDefer) to check the environment, ask five
 '   questions and write a minimal config.ini in the working folder. Can be run
@@ -33,7 +34,7 @@ Option Explicit
 '=============================================================================
 
 Private Const MOD_NAME As String = "QuickStart"
-Private Const MOD_VERSION As String = "v1.0 - 2026-09-15"
+Private Const MOD_VERSION As String = "v1.1 - 2026-10-22"
 
 ' Declenchement automatique (une ligne a passer a False pour le couper).
 Private Const AUTO_ENABLED As Boolean = True
@@ -517,9 +518,9 @@ NextQ1:
         ans = modUi.AskText( _
             T("2/5 - Pr~efixe des codes projet", "2/5 - Project code prefix") & vbCrLf & vbCrLf & _
             T("Le toolkit reconna~yt vos projets par un pr~efixe suivi de chiffres " & _
-              "(exemple : DV2485). Indiquez le pr~efixe seul, lettres uniquement.", _
+              "(exemple : DV1234). Indiquez le pr~efixe seul, lettres uniquement.", _
               "The toolkit recognises your projects by a prefix followed by digits " & _
-              "(example: DV2485). Enter the prefix only, letters only.") & vbCrLf & _
+              "(example: DV1234). Enter the prefix only, letters only.") & vbCrLf & _
             T("Laissez DV si vous n'en avez pas.", "Leave DV if you do not have one."), _
             QTitle(2), mPrefix)
         If Len(Trim$(ans)) = 0 Then
@@ -724,7 +725,7 @@ Private Function BuildIniText() As String
     s = s & "[ClassicOutlookToolkit]" & vbCrLf
     s = s & "; Language of every dialog: FR or EN" & vbCrLf
     s = s & "Language=" & mLang & vbCrLf
-    s = s & "; Project codes = prefix + digits (e.g. DV2485); digits: ProjectCodeLength (4)" & vbCrLf
+    s = s & "; Project codes = prefix + digits (e.g. DV1234); digits: ProjectCodeLength (4)" & vbCrLf
     s = s & "ProjectPrefix=" & mPrefix & vbCrLf
     s = s & "; Internal mail domains, pipe-separated" & vbCrLf
     s = s & "InternalDomains=" & mDomains & vbCrLf

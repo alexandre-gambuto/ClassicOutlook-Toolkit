@@ -1,7 +1,9 @@
 Option Explicit
 
 '=============================================================================
-' modContactFromMail v1.5  (2026-09-01)
+' modContactFromMail v1.6  (2026-10-22)
+' v1.6 (2026-10-22) : signature d'exemple des commentaires (societe, domaine, ORIAS,
+'   telephone) remplacee par des valeurs fictives. Aucun changement de comportement.
 ' Purpose (EN): create a contact card from the signature of the selected or
 '   open e-mail (or from the highlighted text of an open e-mail): sender
 '   SMTP address, name, job title, company, phones (E.164), postal address,
@@ -92,8 +94,8 @@ Option Explicit
 '   - TOI EXCLU : tes adresses (comptes du profil + utilisateur courant) et
 '     tes noms d'affichage (ordre des mots indifferent) ne sont jamais
 '     retenus ; ta propre signature (mail envoye par toi) est ignoree.
-'   - Telephone "06.76. 52.67.33" (double separateur) reconnu ; tiret
-'     typographique en fin de rue retire ; lignes "ORIAS : 25006085",
+'   - Telephone "06.12. 34.56.78" (double separateur) reconnu ; tiret
+'     typographique en fin de rue retire ; lignes "ORIAS : 12345678",
 '     "SIRET ...", "TVA ..." ecartees de la fonction / societe ; mots de
 '     fonction ajoutes (courtier, conseiller, agent, doctorant...) ;
 '     "Nom | Fonction" et "Nom (Societe)" : le reste de la ligne nom
@@ -120,7 +122,7 @@ Option Explicit
 '=============================================================================
 
 Private Const MOD_NAME As String = "ContMail"
-Private Const MOD_VERSION As String = "v1.5 - 2026-09-01"
+Private Const MOD_VERSION As String = "v1.6 - 2026-10-22"
 
 Private Const PROPTAG_HIDDEN As String = "http://schemas.microsoft.com/mapi/proptag/0x10F4000B"
 Private Const PROPTAG_SENDER_SMTP As String = "http://schemas.microsoft.com/mapi/proptag/0x5D02001F"
@@ -1335,7 +1337,7 @@ Private Function LettersOnly(ByVal wl As String) As Boolean
     LettersOnly = True
 End Function
 
-' "Ouest Courtage" = domaine ouestcourtage.fr : c'est la societe, pas la personne.
+' "Exemple Courtage" = domaine exemple-courtage.fr : c'est la societe, pas la personne.
 Private Function DomainKeyMatches(ByVal s As String) As Boolean
     Dim k As String
     k = Replace(NormKey(s), " ", "")
@@ -1363,7 +1365,7 @@ Private Function IsNameSuffix(ByVal rest As String) As Boolean
     End If
 End Function
 
-' Ligne "numero d'immatriculation" : "ORIAS : 25006085", "SIRET 830 123 456
+' Ligne "numero d'immatriculation" : "ORIAS : 12345678", "SIRET 830 123 456
 ' 00017", "TVA : FR12..." - beaucoup de chiffres et peu de lettres, ou
 ' libelle connu + chiffres.
 Private Function IsCodeLine(ByVal s As String, ByVal low As String) As Boolean

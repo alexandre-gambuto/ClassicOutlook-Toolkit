@@ -1,3 +1,20 @@
+[2026-10-22] Relecture de confidentialite du depot public - exemples remplaces
+             par des valeurs fictives. Fichiers : modProjectTag v9.2,
+             modQuickMove v12.1, modMailCampaign v11.2, modContactFromMail
+             v1.6, modQuickStart v1.1, README.md, Time-tracking-template
+             (.xlsm remplace par .xlsx).
+  * Codes de contrat, d'opportunite et de projet cites en exemple (messages a
+    l'ecran et commentaires) remplaces par des codes fictifs. Aucun
+    changement de comportement.
+  * modContactFromMail : signature d'exemple des commentaires (societe,
+    domaine, numero ORIAS, telephone) remplacee par des valeurs fictives.
+  * Time-tracking-template : publie sans macros (.xlsx). Les macros internes
+    du classeur Suivi de temps ne font pas partie du toolkit ; seule la
+    structure (feuilles, colonnes, lignes d'exemple) sert de modele.
+  * README : badges, section Auteur, chiffres du projet a jour (5 classes,
+    57 modules, environ 47 000 lignes), fichiers du suivi des mails et
+    formulaires de l'outil de statistiques dans la liste du depot.
+
 [2026-10-09] Suivi des mails - bouton REPARER dans le ruban du classeur.
              Fichiers : modMailResponseTracker v6.5, ThisOutlookSession
              v10.18, modMailTracker v1.3 (classeur), customUI14.xml
@@ -690,7 +707,7 @@
     ou 1er destinataire si expediteur interne), jamais de la signature. Sur
     un mail transfere par un collegue ("TR:"), la fiche portait le collegue
     ("IC" <ic@...>) ; la 1re ligne de la signature, non reconnue comme nom,
-    tombait en Fonction, "ORIAS : 25006085" en Societe, l'e-mail de la
+    tombait en Fonction, "ORIAS : 12345678" en Societe, l'e-mail de la
     signature etait ignore et le site web deduit du mauvais domaine.
   * PERSONNE VISEE, ordre de resolution : 1) zone surlignee (1er e-mail +
     1re ligne "Prenom NOM" de la zone, en-tete en repli seulement) ;
@@ -711,7 +728,7 @@
     IsSelf, IsOwnName, WordsSorted, IsOwnSignature.
   * SMTP des destinataires durci (PR_SMTP_ADDRESS, sinon AddressEntry
     Exchange -> PrimarySmtpAddress) ; expediteur : repli GetExchangeUser.
-  * EXTRACTION : telephone "06.76. 52.67.33" (double separateur) reconnu ;
+  * EXTRACTION : telephone "06.12. 34.56.78" (double separateur) reconnu ;
     tiret typographique en fin de rue retire ("12 rue des Landelles -") ;
     lignes ORIAS / SIRET / TVA / RCS... (libelle + chiffres, ou >= 5 chiffres
     et <= 12 lettres) ecartees de Fonction / Societe ; ligne nom : civilites
@@ -1521,8 +1538,8 @@ modMaintenance.ModuleVersionOf - 4 lignes a ajouter (ordre alphabetique) :
 
 [2026-08-17] modFolderRename v1.1 - corrections apres premier export reel (189
              dossiers sous DV).
-  * Separateurs de blocs acceptes en entree : ajout de "," et "/" ("0957, 3302,
-    4019_SICPA", "3624/4547/5290_...").
+  * Separateurs de blocs acceptes en entree : ajout de "," et "/" ("1111, 2222,
+    3333_CLIENT", "4444/5555/6666_...").
   * Garde-fou contrat 20XX_XXXXX corrige : il exigeait 5 chiffres mais en
     acceptait 4, donc rejetait des noms multi-codes valides ("4314_4501").
   * FolderPath : Outlook echappe "/" en %2F ; decodage avant
@@ -3188,7 +3205,7 @@ modMaintenance.ModuleVersionOf - 4 lignes a ajouter (ordre alphabetique) :
 [2026-06-03] modQuickMove v13 - Scan des noms de pieces jointes (DV / contrat)
   AJOUT : ExtractPrefill et ExtractPrefillSilent scannent desormais les noms
   des pieces jointes, entre l'etape SUJET et l'etape CORPS (nouvelle etape
-  1bis). Un nom comme "DV2485 - Devis signe.pdf" ou "2024_00157_rapport.docx"
+  1bis). Un nom comme "DV1234 - Devis signe.pdf" ou "2024_00001_rapport.docx"
   est un signal aussi fiable que le sujet, et plus propre que le corps (souvent
   bruyant en numeros parasites).
   IMPLEMENTATION :
@@ -3390,7 +3407,7 @@ Format       : [YYYY-MM-DD] modXxx vN - description courte
                ContientTokenOpportunite.
  
              PORTEE : DETECTION uniquement. La CONSTRUCTION et le PARSING des
-             tags poses sur les RDV (modTagProjet : "DV" & dvNum, [DV906/...],
+             tags poses sur les RDV (modTagProjet : "DV" & dvNum, [DV1234/...],
              InStr(UCase, "DV") lignes ~1743/1760, ExtraireTagTempoDuTitre)
              utilisent ENCORE le prefixe "DV" en dur. Changer PrefixeProjet
              adapte la detection mais pas le texte des tags stockes. Coherence
@@ -3913,7 +3930,7 @@ NOTES D'INTEGRATION (ruban)
              Symptome : apres avoir lance PurgerCategoriesRDVPasses,
              les categories "Reunion interne" / "Reunion externe"
              reapparaissaient instantanement sur les RDV traites.
-             Seules les autres categories (FrameXG, Commercial, Interne,
+             Seules les autres categories (Programme, Commercial, Interne,
              etc., hors Personnel preservee) etaient effectivement retirees.
  
              Cause racine :
@@ -4208,7 +4225,7 @@ NOTES D'INTEGRATION (ruban)
              Symptome : apres avoir lance PurgerCategoriesRDVPasses,
              les categories "Reunion interne" / "Reunion externe"
              reapparaissaient instantanement sur les RDV traites.
-             Seules les autres categories (FrameXG, Commercial, Interne,
+             Seules les autres categories (Programme, Commercial, Interne,
              etc., hors Personnel preservee) etaient effectivement retirees.
  
              Cause racine :

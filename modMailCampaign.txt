@@ -1,7 +1,9 @@
 Option Explicit
 
 '=============================================================================
-' modMailCampaign  (v11.1 - 2026-08-22)  [COTE OUTLOOK]
+' modMailCampaign  (v11.2 - 2026-10-22)  [COTE OUTLOOK]
+'
+' v11.2 (2026-10-22) : exemples de codes remplaces par des valeurs fictives (relecture de confidentialite du depot public). Aucun changement de comportement.
 '
 ' v11.1 (2026-08-22) : revue traduction + UX pop-ups.
 '   (a) TRADUCTION des zones restees francaises hors T() : le menu de
@@ -50,7 +52,7 @@ Option Explicit
 ' v10.5 (2026-07-15) : (a) CHEMINS RELATIFS pour les PJ et la colonne
 '   Modele : un chemin sans lettre de lecteur ni prefixe UNC est resolu
 '   par rapport au DOSSIER DU CLASSEUR d'emailing (ResoudreCheminRel).
-'   "DV4370.pdf" ou "PJ\\fiche.pdf" a cote du .xlsx suffit desormais.
+'   "DV1234.pdf" ou "PJ\\fiche.pdf" a cote du .xlsx suffit desormais.
 '   Limite : classeur ouvert depuis le DISQUE (un classeur ouvert depuis
 '   SharePoint/URL n'a pas de dossier local -> chemin laisse tel quel).
 '   (b) SEPARATEUR PJ : les retours a la ligne DANS la cellule (Alt+Entree)
@@ -159,7 +161,7 @@ Option Explicit
 '=============================================================================
 
 Private Const MOD_NAME As String = "Campaign"
-Private Const MOD_VERSION As String = "v11.1 - 2026-08-22"
+Private Const MOD_VERSION As String = "v11.2 - 2026-10-22"
 
 ' --- Roles de colonnes -------------------------------------------------------
 Private Const R_TO As String = "TO"

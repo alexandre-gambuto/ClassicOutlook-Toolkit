@@ -1,14 +1,20 @@
 # ClassicOutlook-Toolkit
 
-A productivity automation suite for **Outlook Classic (desktop)**, written entirely in
-VBA, plus a standalone **Excel email-analytics** tool. It grew out of daily
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
+[![Platform: Outlook Classic](https://img.shields.io/badge/platform-Outlook%20Classic%20(Windows)-0078D4.svg)](#requirements)
+[![Language: VBA](https://img.shields.io/badge/language-VBA-867DB1.svg)](#whats-inside)
+[![Release](https://img.shields.io/github/v/release/alexandre-gambuto/ClassicOutlook-Toolkit)](https://github.com/alexandre-gambuto/ClassicOutlook-Toolkit/releases)
+[![Last commit](https://img.shields.io/github/last-commit/alexandre-gambuto/ClassicOutlook-Toolkit)](https://github.com/alexandre-gambuto/ClassicOutlook-Toolkit/commits/main)
+
+A productivity automation suite for **Outlook Classic (desktop)** by **Alexandre Gambuto**,
+written entirely in VBA, plus a standalone **Excel email-analytics** tool. It grew out of daily
 knowledge-work needs: filing mail in two keystrokes, tagging appointments by project,
 filing replies automatically, colouring meetings by attendee type, running small mail
 campaigns, tracking which sent mails are still awaiting a reply, keeping the address
 book clean, and more.
 
-Everything runs inside a single Outlook VBA project (`ThisOutlookSession`, four
-`WithEvents` classes and about 56 standard modules, roughly 41,000 lines), with all
+Everything runs inside a single Outlook VBA project (`ThisOutlookSession`, five
+`WithEvents` classes and 57 standard modules, roughly 47,000 lines), with all
 business configuration externalized to a `config.ini` file. The UI is **bilingual**
 (French / English), switchable from one config key.
 
@@ -193,7 +199,7 @@ Because the VBA Project Object Model is assumed blocked, modules are pasted in b
    `modUi`, `modDefer`, `modSmtp`, `modExcelBridge`, `modContactCommon`,
    `modInspectorQueue`, `modNotify`, `modMsgBoxCustom`, `modStoreContext`), then the
    others. Class modules (`clsAppEvents`, `clsApptWatcher`, `clsInboxWatcher`,
-   `clsExplorerWatcher`) go into class modules; `ThisOutlookSession` into the existing
+   `clsExplorerWatcher`, `clsFolderWatcher`) go into class modules; `ThisOutlookSession` into the existing
    object of that name.
 3. Copy `config.ini.example` to `config.ini`, edit it for your environment.
    `python validate.py --config config.ini` lists keys unknown to the code.
@@ -217,11 +223,14 @@ environment-specific values); only `config.ini.example` is tracked.
 ```
 *.txt                      Outlook VBA modules / classes (paste into the VBE)
 modMailAnalytics*          Excel email-analytics project (+ its own README)
-Suivi_des_mails__Feuille_Suivi.txt   VBA of the mail-tracking workbook sheet
+Suivi_des_mails__*.txt     VBA of the mail-tracking workbook (module, ThisWorkbook, sheet)
+frmConfig.frm/.frx, frmProgress.frm/.frx   UserForms of the Excel email-analytics project
 *.exportedUI               Outlook ribbon customizations
 config.ini.example         Commented configuration template
 validate.py                Source validator and generators
-*-template.xlsm            Empty copies of the two companion workbooks (sample rows only)
+Mail-tracker-template.xlsm   Empty copy of the mail-tracking workbook (sample rows only)
+Time-tracking-template.xlsx   Structure of the time-tracking workbook (sheets, columns,
+                             sample rows), published without its internal macros
 docs/                      Features, installation, configuration, troubleshooting
 LICENSE                    GNU General Public License v3.0
 ARCHITECTURE.md            Module topology, event routing, conventions
@@ -229,6 +238,18 @@ CONTRIBUTING.md            Conventions for contributors
 RELEASE-NOTES-v3.md        Version 3 summary
 CHANGELOG.txt              Change history
 ```
+
+---
+
+## Author
+
+**Alexandre Gambuto**, Licensing & Business Development Manager in technology transfer
+and intellectual property, based in Rennes, France. I built this toolkit on my own time
+for my daily work, and maintain it.
+
+- Website and project pages: [alexandre-gambuto.com](https://alexandre-gambuto.com/classicoutlook-toolkit-en/)
+- LinkedIn: [linkedin.com/in/alexandregambuto](https://www.linkedin.com/in/alexandregambuto)
+- GitHub: [@alexandre-gambuto](https://github.com/alexandre-gambuto)
 
 ---
 

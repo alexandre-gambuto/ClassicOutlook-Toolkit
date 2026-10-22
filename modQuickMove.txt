@@ -18,6 +18,8 @@ Option Explicit
 '   organises par DOSS (4 chiffres), contrat (202X_XXXXX) et nom de dossier
 '   client/partenaire.
 '
+' v12.1 (2026-10-22) : exemples de codes remplaces par des valeurs fictives (relecture de confidentialite du depot public). Aucun changement de comportement.
+'
 ' v12.0 (2026-09-24) : PACK v4 - CHARGEMENT INSTANTANE ET LISTE A JOUR.
 '   (a) LIAISON A LA DEMANDE. SmartLoad lit le cache et c'est tout : plus de
 '       reconnexion des 1248 dossiers un par un a chaque session (4 a 28 s
@@ -268,7 +270,7 @@ Public mRecentFolders(1 To 5) As Long
 Public mRecentCount As Long
 
 Private Const MOD_NAME As String = "QuickMove"
-Private Const MOD_VERSION As String = "v12.0 - 2026-09-24"
+Private Const MOD_VERSION As String = "v12.1 - 2026-10-22"
 
 Private Const CACHE_FILE = "QuickMoveCache.txt"
 Private Const RECENT_FILE = "QuickMoveRecents.txt"
@@ -2513,7 +2515,7 @@ End Function
 ' ----------------------------------------------------------------------------
 ' ClassifyCode : classe un texte en code contrat (True / isContract=True),
 ' code DV (True / isContract=False) ou ni l'un ni l'autre (False). Le
-' contrat est teste AVANT le DV : "2026_00277" contient "2026", soit 4
+' contrat est teste AVANT le DV : "2026_00123" contient "2026", soit 4
 ' chiffres valides pour le motif DV. Motifs config : ContractPattern /
 ' DigitsPattern (modConfig), ancres ^$ ajoutees ici (le code doit etre
 ' la TOTALITE de la saisie).

@@ -2,7 +2,9 @@ Option Explicit
 
 '=============================================================================
 ' MODULE : modProjectTag
-' modProjectTag v9.1  (2026-09-24)
+' modProjectTag v9.2  (2026-10-22)
+'
+' v9.2 (2026-10-22) : exemples de codes remplaces par des valeurs fictives (relecture de confidentialite du depot public). Aucun changement de comportement.
 '
 ' v9.1 (2026-09-24) : COPIE LOCALE DE LA LISTE DES PROJETS (pack v4).
 '   LoadProjects relit d'abord ProjectTagCache.txt (dossier
@@ -156,7 +158,7 @@ Private Const MAX_RECENTS As Long = 5
 
 ' v8.4 : nom court pour le logger
 Private Const MOD_NAME As String = "ProjectTag"
-Private Const MOD_VERSION As String = "v9.1 - 2026-09-24"
+Private Const MOD_VERSION As String = "v9.2 - 2026-10-22"
 
 ' v8.5 -> pack v3 : le retry/backoff COM vit dans modExcelBridge.
 
@@ -272,11 +274,11 @@ End Sub
 '=============================================================================
 Public Sub TagProject()
     Dim oItem As Object
-
+    
     On Error Resume Next
     Set oItem = Application.ActiveInspector.CurrentItem
     On Error GoTo 0
-
+    
     If oItem Is Nothing Then
         Dim rep As VbMsgBoxResult
         rep = MsgBox(T("Aucun evenement en cours d'edition." & vbCrLf & vbCrLf & _
@@ -288,17 +290,17 @@ Public Sub TagProject()
         Set oItem = Application.CreateItem(olAppointmentItem)
         oItem.Display
     End If
-
+    
     If Not TypeOf oItem Is Outlook.AppointmentItem Then
         MsgBox T("Cet ~el~ement n'est pas un rendez-vous ou une r~eunion.", "This item is not an appointment or a meeting."), _
                vbExclamation, T("Projet", "Project")
         Exit Sub
     End If
-
+    
     Dim appt As Outlook.AppointmentItem
     Set appt = oItem
-
-
+    
+    
     ' FORCER la synchronisation de l'Inspector ouvert avec l'AppointmentItem.
     ' Quand un Inspector est ouvert, les modifications saisies par l'utilisateur
     ' ne sont pas toujours propagees a AppointmentItem.Subject tant qu'il n'a pas
@@ -316,7 +318,7 @@ Public Sub TagProject()
         End If
         On Error GoTo 0
     End If
-
+    
     ' Si le sujet est toujours vide, demander a l'utilisateur de confirmer
     If Len(Trim(CStr(appt.subject))) = 0 Then
         Dim emptyReply As VbMsgBoxResult
@@ -331,14 +333,14 @@ Public Sub TagProject()
                          vbYesNo + vbQuestion, T("Projet - Sujet vide", "Project - Empty subject"))
         If emptyReply = vbNo Then Exit Sub
     End If
-
+    
     Dim projects() As TProject
     Dim projectCount As Long
     If Not LoadProjects(projects, projectCount) Then Exit Sub
-
+    
     Dim prefill As String
     prefill = ExtractPrefill(CStr(appt.subject))
-
+    
     Dim idx As Long
     idx = SelectProject(projects, projectCount, prefill, appt)
     If idx < 0 Then Exit Sub
@@ -352,13 +354,13 @@ End Sub
 Public Sub TagSelection()
     Dim oSel As Outlook.Selection
     Set oSel = Application.ActiveExplorer.Selection
-
+    
     If oSel.count = 0 Then
         MsgBox T("S~electionnez un evenement dans le calendrier.", "Select an event in the calendar."), _
                vbExclamation, T("Projet", "Project")
         Exit Sub
     End If
-
+    
     ' Verifier que tous les elements sont des RDV
     Dim i As Long
     For i = 1 To oSel.count
@@ -371,11 +373,11 @@ Public Sub TagSelection()
             Exit Sub
         End If
     Next i
-
+    
     Dim projects() As TProject
     Dim projectCount As Long
     If Not LoadProjects(projects, projectCount) Then Exit Sub
-
+    
     ' Si selection unique, pre-remplir
     Dim prefill As String
     prefill = ""
@@ -384,15 +386,15 @@ Public Sub TagSelection()
         Set apptSingle = oSel.Item(1)
         prefill = ExtractPrefill(apptSingle.subject)
     End If
-
+    
     ' Pour la creation d'un nouveau dossier, on utilise le 1er element de la selection comme reference
     Dim apptRef As Outlook.AppointmentItem
     Set apptRef = oSel.Item(1)
-
+    
     Dim idx As Long
     idx = SelectProject(projects, projectCount, prefill, apptRef)
     If idx < 0 Then Exit Sub
-
+    
     ' Appliquer a tous les elements selectionnes
     Dim appt As Outlook.AppointmentItem
     Dim tagCount As Long
@@ -403,7 +405,7 @@ Public Sub TagSelection()
         appt.Save
         tagCount = tagCount + 1
     Next i
-
+    
     SaveRecent projects(idx).displayText
 End Sub
 
@@ -412,21 +414,21 @@ End Sub
 '=============================================================================
 Public Function CheckAssignment(ByVal appt As Outlook.AppointmentItem) As Boolean
     CheckAssignment = False
-
+    
     If Not PROJECT_AUTO_ASK Then Exit Function
-
+    
     ' Exclure journee entiere (rappels, feries, etc.)
     If appt.AllDayEvent Then Exit Function
-
+    
     ' Exclure evenements prives
     If appt.Sensitivity = olPrivate Or appt.Sensitivity = olConfidential Then Exit Function
-
+    
     ' Exclure categorie Personnel (nom configurable : PersonalCategory)
     If modConfig.ContainsPersonalCategory(appt.Categories) Then Exit Function
-
+    
     ' Si deja tague => rien a faire
     If ContainsTag(appt.subject) Then Exit Function
-
+    
     ' v8.5 : via modUi.Ask. Appelee depuis CalendarItems_ItemAdd et depuis
     ' Application_ItemSend : dans les deux cas la fenetre du RDV vient de se
     ' fermer et le premier plan est instable - c'est exactement le contexte
@@ -440,20 +442,20 @@ Public Function CheckAssignment(ByVal appt As Outlook.AppointmentItem) As Boolea
         T("Affecter un projet ?", "Assign a project?"), _
         T("Projet", "Project"), _
         vbYesNo + vbQuestion)
-
+    
     If rep = vbNo Then Exit Function
-
+    
     Dim projects() As TProject
     Dim projectCount As Long
     If Not LoadProjects(projects, projectCount) Then Exit Function
-
+    
     Dim prefill As String
     prefill = ExtractPrefill(appt.subject)
-
+    
     Dim idx As Long
     idx = SelectProject(projects, projectCount, prefill, appt)
     If idx < 0 Then Exit Function
-
+    
     ApplyTag appt, projects(idx)
     appt.Save
     SaveRecent projects(idx).displayText
@@ -482,16 +484,16 @@ End Function
 '=============================================================================
 Public Sub CheckReTag(ByVal appt As Outlook.AppointmentItem)
     If Not PROJECT_AUTO_ASK Then Exit Sub
-
+    
     Dim savedTag As String
     savedTag = ReadUserProperty(appt)
-
+    
     ' (1) Aucun tag memorise : rien a faire
     If savedTag = "" Then Exit Sub
-
+    
     ' (2) Tag memorise toujours present dans le titre : rien n'a change
     If InStr(1, appt.subject, savedTag) > 0 Then Exit Sub
-
+    
     ' (3) Le titre contient un AUTRE tag Projet valide -> resync silencieuse
     Dim currentTag As String
     currentTag = ExtractProjectTagFromTitle(appt.subject)
@@ -500,7 +502,7 @@ Public Sub CheckReTag(ByVal appt As Outlook.AppointmentItem)
         appt.Save
         Exit Sub
     End If
-
+    
     ' (4) Plus aucun tag Projet dans le titre -> vrai cas tag perdu
     ' v8.5 : le TAG et le SUJET sont concatenes A L'EXTERIEUR de T(). T()
     ' applique A() a ses deux branches : un tag ou un sujet contenant "~e",
@@ -526,18 +528,18 @@ Public Sub CheckReTag(ByVal appt As Outlook.AppointmentItem)
           "  No   -> keeps the current title without tag"), _
         T("Projet - Tag projet supprime", "Project - Project tag removed"), _
         vbYesNo + vbQuestion)
-
+    
     If rep = vbNo Then Exit Sub
-
+    
     Dim subjectText As String
     subjectText = Trim(appt.subject)
-
+    
     If InStr(savedTag, "[" & modConfig.CrossPrefix() & "/") = 1 Then
         appt.subject = subjectText & " " & savedTag
     Else
         appt.subject = savedTag & " " & subjectText
     End If
-
+    
     appt.Save
     ' v8.5 : toast au lieu d'une modale. L'utilisateur vient de repondre Oui
     ' a la question precedente : lui redemander un clic pour confirmer que
@@ -556,28 +558,28 @@ End Sub
 '=============================================================================
 Private Function ExtractProjectTagFromTitle(ByVal subjectText As String) As String
     ExtractProjectTagFromTitle = ""
-
+    
     Dim posO As Long, posF As Long
     Dim pos As Long: pos = 1
     Dim iter As Long
-
+    
     Do
         iter = iter + 1
         If iter > 20 Then Exit Do
-
+        
         posO = InStr(pos, subjectText, "[")
         If posO = 0 Then Exit Do
         posF = InStr(posO, subjectText, "]")
         If posF = 0 Then Exit Do
-
+        
         Dim inner As String
         inner = Mid(subjectText, posO + 1, posF - posO - 1)
-
+        
         If IsValidProjectTag(inner) Then
             ExtractProjectTagFromTitle = "[" & inner & "]"
             Exit Function
         End If
-
+        
         pos = posF + 1
         If pos > Len(subjectText) Then Exit Do
     Loop
@@ -603,21 +605,21 @@ Public Sub CreateFolderFromAppointment()
                vbExclamation, T("Projet - Cr~eer dossier", "Project - Create folder")
         Exit Sub
     End If
-
+    
     ' --- Pre-analyse : scan du titre + corps pour extraire des patterns ---
     Dim txtAll As String
     txtAll = CStr(rdv.subject) & " " & CStr(rdv.body)
-
+    
     Dim preProjCode As String, preContract As String, preOpp As String
     preProjCode = ScanProject(txtAll)
     preContract = ScanContract(txtAll)
     preOpp = ScanOpportunity(txtAll)
-
+    
     ' --- Dossiers similaires : depuis le cache de session (pack v3 : Excel
     '     n'est plus ouvert AVANT la saisie ; il ne l'est que pour ecrire) ---
     Dim similar As String
     similar = FindSimilarFoldersCached(CStr(rdv.subject))
-
+    
     ' --- Apercu + confirmation ---
     Dim preview As String
     preview = T("RDV : ", "Appt: ") & Left(CStr(rdv.subject), 100) & vbCrLf & vbCrLf & _
@@ -625,7 +627,7 @@ Public Sub CreateFolderFromAppointment()
              T("  Code      : ", "  Code:     ") & IIf(Len(preProjCode) > 0, preProjCode, T("(aucun)", "(none)")) & vbCrLf & _
              T("  Contrat   : ", "  Contract: ") & IIf(Len(preContract) > 0, preContract, T("(aucun)", "(none)")) & vbCrLf & _
              T("  Opport.   : ", "  Opport.:  ") & IIf(Len(preOpp) > 0, preOpp, T("(aucune)", "(none)")) & vbCrLf & vbCrLf
-
+    
     If Len(similar) > 0 Then
         preview = preview & T("Dossiers similaires existants :", "Existing similar folders:") & vbCrLf & similar & vbCrLf & _
                  T("Si l'un correspond, clique NON et utilise plutot TagProject.", "If one matches, click NO and use TagProject instead.") & vbCrLf & vbCrLf
@@ -633,9 +635,9 @@ Public Sub CreateFolderFromAppointment()
         preview = preview & T("Aucun dossier similaire detecte.", "No similar folder detected.") & vbCrLf & vbCrLf
     End If
     preview = preview & T("Creer un NOUVEAU dossier ?", "Create a NEW folder?")
-
+    
     If MsgBox(preview, vbYesNo + vbQuestion, T("Projet - Cr~eation dossier", "Project - Folder creation")) = vbNo Then Exit Sub
-
+    
     ' --- Saisie des 5 champs (assistant partage) ---
     Dim nFolder As String, nProjCode As String, nContract As String, nOpp As String, nPartner As String
     Dim defFolder As String
@@ -643,12 +645,12 @@ Public Sub CreateFolderFromAppointment()
     If Len(defFolder) > 50 Then defFolder = Left(defFolder, 50)
     If Not AskNewFolderFields(defFolder, preProjCode, preContract, preOpp, _
                               nFolder, nProjCode, nContract, nOpp, nPartner) Then Exit Sub
-
+    
     ' --- Recap + confirmation ---
     If MsgBox(NewFolderRecap(nFolder, nProjCode, nContract, nOpp, nPartner) & _
               T("Creer ce dossier dans 'Temps par mois' ?", "Create this folder in 'Temps par mois'?"), _
               vbYesNo + vbQuestion, T("Projet - Confirmer", "Project - Confirm")) = vbNo Then Exit Sub
-
+    
     ' --- Ouvrir Excel (invisible) et ecrire ---
     Dim xlApp As Object, wb As Object, closeExcel As Boolean, wasOpen As Boolean
     If Not OpenTimeTracking(xlApp, wb, closeExcel, wasOpen) Then
@@ -657,19 +659,19 @@ Public Sub CreateFolderFromAppointment()
                "Path: ") & modConfig.TimeTrackingPath(), vbCritical, T("Projet", "Project")
         Exit Sub
     End If
-
+    
     Dim ok As Boolean
     ok = WriteNewFolder(wb, nOpp, nContract, nProjCode, nFolder, nPartner)
-
+    
     If Not ok Then
         MsgBox T("~Echec : dossier non cr~e~e (doublon ou erreur).", "Failed: folder not created (duplicate or error)."), vbExclamation, T("Projet", "Project")
         CloseTimeTracking xlApp, wb, closeExcel, wasOpen, False
         Exit Sub
     End If
-
+    
     ' Sauvegarde (fenetre re-affichee AVANT le Save : modExcelBridge)
     CloseTimeTracking xlApp, wb, closeExcel, wasOpen, True
-
+    
     ' v8.4 : la liste a change, invalider le cache. Le prochain tag
     ' rechargera depuis le fichier.
     InvalidateProjectsCache
@@ -690,7 +692,7 @@ Public Sub CreateFolderFromAppointment()
         Else
             tag = "[" & nFolder & "]"
         End If
-
+        
         Dim subjectText As String
         subjectText = Trim(CStr(rdv.subject))
         If Not ContainsTag(subjectText) Then
@@ -711,7 +713,7 @@ End Sub
 Private Function CreateFolderInline(ByVal searchTerm As String, ByVal appt As Object, _
                                      ByRef createdProj As TProject) As Boolean
     CreateFolderInline = False
-
+    
     ' --- Pre-remplissage base sur le RDV (si dispo) ---
     Dim preProjCode As String, preContract As String, preOpp As String
     Dim txtScan As String
@@ -720,7 +722,7 @@ Private Function CreateFolderInline(ByVal searchTerm As String, ByVal appt As Ob
         txtScan = CStr(appt.subject) & " " & CStr(appt.body)
         On Error GoTo 0
     End If
-
+    
     ' Si le terme est un DOSS/contrat/opp, pre-remplir directement depuis le terme
     ' Pack v3 (A3) : longueur du code projet lue dans la config.
     Dim digitsPat As String
@@ -732,12 +734,12 @@ Private Function CreateFolderInline(ByVal searchTerm As String, ByVal appt As Ob
     ElseIf searchTerm Like ("20##_" & String(modConfig.ContractNumberLength(), "#")) Then
         preContract = searchTerm
     End If
-
+    
     ' Completer par scan du RDV
     If Len(preProjCode) = 0 Then preProjCode = ScanProject(txtScan)
     If Len(preContract) = 0 Then preContract = ScanContract(txtScan)
     If Len(preOpp) = 0 Then preOpp = ScanOpportunity(txtScan)
-
+    
     ' --- Pre-remplir le nom de dossier : si le terme recherche n'est pas un code, c'est lui ---
     Dim defFolder As String
     If Not (searchTerm Like digitsPat Or searchTerm Like "20##_*") Then
@@ -751,24 +753,24 @@ Private Function CreateFolderInline(ByVal searchTerm As String, ByVal appt As Ob
         defFolder = CleanAllTags(defFolder)
         If Len(defFolder) > 50 Then defFolder = Left(defFolder, 50)
     End If
-
+    
     ' --- Saisie des 5 champs (assistant partage) ---
     Dim nFolder As String, nProjCode As String, nContract As String, nOpp As String, nPartner As String
     If Not AskNewFolderFields(defFolder, preProjCode, preContract, preOpp, _
                               nFolder, nProjCode, nContract, nOpp, nPartner) Then Exit Function
-
+    
     ' --- Recap + confirmation ---
     If MsgBox(NewFolderRecap(nFolder, nProjCode, nContract, nOpp, nPartner) & _
               T("Creer ce dossier dans 'Temps par mois' et l'utiliser pour tagger le RDV ?", "Create this folder in 'Temps par mois' and use it to tag the appointment?"), _
               vbYesNo + vbQuestion, T("Projet - Confirmer", "Project - Confirm")) = vbNo Then Exit Function
-
+    
     ' --- Ecriture dans Excel ---
     Dim xlApp As Object, wb As Object, closeExcel As Boolean, wasOpen As Boolean
     If Not OpenTimeTracking(xlApp, wb, closeExcel, wasOpen) Then
         MsgBox T("Impossible d'ouvrir Suivi de temps.xlsm.", "Cannot open the time-tracking workbook."), vbCritical, T("Projet", "Project")
         Exit Function
     End If
-
+    
     Dim ok As Boolean
     ok = WriteNewFolder(wb, nOpp, nContract, nProjCode, nFolder, nPartner)
     If Not ok Then
@@ -776,19 +778,19 @@ Private Function CreateFolderInline(ByVal searchTerm As String, ByVal appt As Ob
         CloseTimeTracking xlApp, wb, closeExcel, wasOpen, False
         Exit Function
     End If
-
+    
     ' Sauvegarde (fenetre re-affichee AVANT le Save : modExcelBridge)
     CloseTimeTracking xlApp, wb, closeExcel, wasOpen, True
-
+    
     ' --- Construire le TProject en memoire (constructeur partage) ---
     Dim projCodeNum As Long
     If IsNumeric(nProjCode) Then projCodeNum = CLng(nProjCode) Else projCodeNum = 0
     BuildProject createdProj, nOpp, nContract, projCodeNum, nFolder, nPartner
-
+    
     ' v8.4 : push direct dans le cache pour eviter un reload juste apres
     ' la creation. Sans effet si le cache n'est pas charge.
     PushProjectCache createdProj
-
+    
     CreateFolderInline = True
 End Function
 
@@ -836,15 +838,15 @@ Private Function AskNewFolderFields(ByVal defFolder As String, ByVal preProjCode
         defContract = modConfig.ContractLabelOpportunity()
     End If
     nContract = Trim(modUi.AskText(T("3/5 - Contrat (optionnel) :" & vbCrLf & _
-                             "Ex: 2025_00679, Opportunite CRM, Op~erations commerciales et support", _
+                             "Ex: 2025_00001, Opportunite CRM, Op~erations commerciales et support", _
                              "3/5 - Contract (optional):" & vbCrLf & _
-                             "E.g. 2025_00679, CRM opportunity, Commercial operations and support"), _
+                             "E.g. 2025_00001, CRM opportunity, Commercial operations and support"), _
                              T("Projet - Nouveau dossier", "Project - New folder"), defContract))
 
     nOpp = Trim(modUi.AskText(T("4/5 - Code opportunite (optionnel) :" & vbCrLf & _
-                         "Ex: 2025_OT_0103, 2026_DT_0026", _
+                         "Ex: 2025_OT_0001, 2026_DT_0001", _
                          "4/5 - Opportunity code (optional):" & vbCrLf & _
-                         "E.g. 2025_OT_0103, 2026_DT_0026"), _
+                         "E.g. 2025_OT_0001, 2026_DT_0001"), _
                          T("Projet - Nouveau dossier", "Project - New folder"), preOpp))
 
     nPartner = Trim(modUi.AskText(T("5/5 - Partenaire (optionnel) :" & vbCrLf & _
@@ -967,14 +969,14 @@ Private Function SelectProject(ByRef projects() As TProject, ByVal projectCount 
                                      ByVal prefill As String, _
                                      Optional ByVal appt As Object = Nothing) As Long
     SelectProject = -1
-
+    
     Dim recents As String
     recents = LoadRecents()
     Dim choice As String
     Dim prompt As String
     Dim firstPass As Boolean
     firstPass = True
-
+    
     ' v8.3 : header dynamique base sur le sujet du RDV ("Affecter la reunion <sujet>")
     Dim subjectAppt As String
     subjectAppt = ""
@@ -986,7 +988,7 @@ Private Function SelectProject(ByRef projects() As TProject, ByVal projectCount 
         subjectAppt = CleanAllTags(subjectAppt)
         subjectAppt = Trim(subjectAppt)
     End If
-
+    
     Dim headerTitle As String
     If Len(subjectAppt) > 0 Then
         ' Chr(233) = e accent aigu (eviter les accents en dur dans les chaines VBA)
@@ -994,14 +996,14 @@ Private Function SelectProject(ByRef projects() As TProject, ByVal projectCount 
     Else
         headerTitle = T("Affecter la r" & Chr(233) & "union", "Assign the meeting")
     End If
-
+    
     Do
         prompt = "=== " & headerTitle & " ===" & vbCrLf & vbCrLf
-
+        
         If recents <> "" Then
             prompt = prompt & T("--- RECENTS ---", "--- RECENT ---") & vbCrLf & recents & vbCrLf
         End If
-
+        
         prompt = prompt & _
                  T("Tapez :" & vbCrLf & _
                  "  - Un numero ", _
@@ -1009,19 +1011,19 @@ Private Function SelectProject(ByRef projects() As TProject, ByVal projectCount 
                  "  - A ") & modConfig.ProjectPrefixUC() & _
                  T(" (ex: 2485)" & vbCrLf & _
                  "  - Un nom de dossier ou partenaire" & vbCrLf & _
-                 "  - Un code contrat (ex: 2025_00364)" & vbCrLf & _
+                 "  - Un code contrat (ex: 2025_00002)" & vbCrLf & _
                  "  - Un code transversal (ex: A01)" & vbCrLf & _
                  "  - # suivi du numero de recent (ex: #1)" & vbCrLf & _
                  "  - * pour les taches internes" & vbCrLf & vbCrLf & _
                  "Recherche :", _
                  " code (e.g. 2485)" & vbCrLf & _
                  "  - A folder or partner name" & vbCrLf & _
-                 "  - A contract code (e.g. 2025_00364)" & vbCrLf & _
+                 "  - A contract code (e.g. 2025_00002)" & vbCrLf & _
                  "  - A cross code (e.g. A01)" & vbCrLf & _
                  "  - # then a recent number (e.g. #1)" & vbCrLf & _
                  "  - * for internal tasks" & vbCrLf & vbCrLf & _
                  "Search:")
-
+        
         Dim defaultVal As String
         If firstPass And prefill <> "" Then
             defaultVal = prefill
@@ -1029,11 +1031,11 @@ Private Function SelectProject(ByRef projects() As TProject, ByVal projectCount 
             defaultVal = ""
         End If
         firstPass = False
-
+        
         choice = modUi.AskText(prompt, T("Projet - Affectation dans le calendrier", "Project - Assign in calendar"), defaultVal)
         If choice = "" Then Exit Function
         choice = Trim(choice)
-
+        
         If Left(choice, 1) = "#" Then
             Dim numR As Long
             numR = val(Mid(choice, 2))
@@ -1045,7 +1047,7 @@ Private Function SelectProject(ByRef projects() As TProject, ByVal projectCount 
             Else
                 MsgBox T("R~ecent #", "Recent #") & numR & T(" non trouve.", " not found."), vbExclamation, T("Projet", "Project")
             End If
-
+            
         ElseIf choice = "*" Then
             Dim idxL As Long
             idxL = ShowInternalList(projects, projectCount)
@@ -1053,12 +1055,12 @@ Private Function SelectProject(ByRef projects() As TProject, ByVal projectCount 
                 SelectProject = idxL
                 Exit Function
             End If
-
+            
         Else
             Dim results() As Long
             Dim resCount As Long
             SearchProjects projects, projectCount, choice, results, resCount
-
+            
             If resCount = 0 Then
                 ' --- NOUVEAU v6.1 : proposer de creer le dossier et l'integrer directement ---
                 Dim createReply As VbMsgBoxResult
@@ -1079,7 +1081,7 @@ Private Function SelectProject(ByRef projects() As TProject, ByVal projectCount 
                     End If
                     ' Si la creation a echoue ou ete annulee, reboucler sur l'InputBox
                 End If
-
+                
             ElseIf resCount = 1 Then
                 Dim conf As VbMsgBoxResult
                 conf = MsgBox(T("Projet trouve :", "Project found:") & vbCrLf & vbCrLf & _
@@ -1091,7 +1093,7 @@ Private Function SelectProject(ByRef projects() As TProject, ByVal projectCount 
                     SelectProject = results(1)
                     Exit Function
                 End If
-
+                
             Else
                 Dim idxMulti As Long
                 idxMulti = ShowResults(projects, results, resCount)
@@ -1113,24 +1115,24 @@ Private Sub SearchProjects(ByRef projects() As TProject, ByVal projectCount As L
                        ByVal term As String, ByRef results() As Long, ByRef resCount As Long)
     ReDim results(1 To projectCount)
     resCount = 0
-
+    
     Dim termUp As String
     termUp = UCase(term)
-
+    
     Dim termNum As Long
     Dim termIsNum As Boolean
     termIsNum = IsNumeric(term)
     If termIsNum Then termNum = CLng(term)
-
+    
     Dim i As Long
     For i = 1 To projectCount
         Dim match As Boolean
         match = False
-
+        
         If termIsNum Then
             If projects(i).projCode = termNum Then match = True
         End If
-
+        
         If Not match Then
             With projects(i)
                 If InStr(1, .UpFolder, termUp, vbBinaryCompare) > 0 Then
@@ -1148,13 +1150,13 @@ Private Sub SearchProjects(ByRef projects() As TProject, ByVal projectCount As L
                 End If
             End With
         End If
-
+        
         If match Then
             resCount = resCount + 1
             results(resCount) = i
         End If
     Next i
-
+    
     If resCount > 0 Then ReDim Preserve results(1 To resCount)
 End Sub
 
@@ -1194,25 +1196,25 @@ Private Function ShowResults(ByRef projects() As TProject, ByRef indices() As Lo
 
     Dim txt As String
     txt = nb & T(" resultats trouves :", " results found:") & vbCrLf & vbCrLf
-
+    
     Dim maxA As Long
     maxA = nb
     If maxA > modConfig.TagPageSize() Then maxA = modConfig.TagPageSize()
-
+    
     Dim i As Long
     For i = 1 To maxA
         txt = txt & i & ") " & projects(ord(i)).displayText & vbCrLf
     Next i
-
+    
     If nb > modConfig.TagPageSize() Then
         txt = txt & vbCrLf & T("... et ", "... and ") & (nb - modConfig.TagPageSize()) & T(" autres. Affinez.", " more. Refine.")
     End If
     txt = txt & vbCrLf & T("NUMERO pour choisir, ou TEXTE pour affiner :", "NUMBER to choose, or TEXT to refine:")
-
+    
     Dim rep As String
     rep = modUi.AskText(txt, T("Projet - ", "Project - ") & nb & T(" resultats", " results"))
     If rep = "" Then Exit Function
-
+    
     If IsNumeric(Trim(rep)) Then
         Dim num As Long
         num = CLng(Trim(rep))
@@ -1227,7 +1229,7 @@ End Function
 '=============================================================================
 Private Function ShowInternalList(ByRef projects() As TProject, ByVal projectCount As Long) As Long
     ShowInternalList = -1
-
+    
     Dim mapping() As Long
     ReDim mapping(1 To projectCount)
     Dim count As Long
@@ -1257,12 +1259,12 @@ Private Function ShowInternalList(ByRef projects() As TProject, ByVal projectCou
     Next i
 
     txt = txt & vbCrLf & T("Entrez le numero (1-", "Enter the number (1-") & count & T(") :", "):")
-
+    
     Dim rep As String
     rep = modUi.AskText(txt, T("Projet - Taches internes", "Project - Internal tasks"))
     If rep = "" Then Exit Function
     If Not IsNumeric(rep) Then Exit Function
-
+    
     Dim num As Long
     num = CLng(rep)
     If num >= 1 And num <= count Then
@@ -1469,14 +1471,14 @@ End Function
 '=============================================================================
 Private Function LoadProjectsFromFile(ByRef projects() As TProject, ByRef projectCount As Long) As Boolean
     LoadProjectsFromFile = False
-
+    
     Dim xlApp As Object, xlWb As Object, closeExcel As Boolean, wasOpen As Boolean
     ' v7 : ouvrir en lecture seule pour ne pas verrouiller le fichier
     If Not OpenTimeTrackingReadOnly(xlApp, xlWb, closeExcel, wasOpen) Then
         MsgBox T("Fichier introuvable : ", "File not found: ") & modConfig.TimeTrackingPath(), vbCritical, T("Projet", "Project")
         Exit Function
     End If
-
+    
     Dim xlWs As Object
     On Error Resume Next
     Set xlWs = xlWb.Worksheets(modConfig.TimeTrackingSheet())
@@ -1487,19 +1489,19 @@ Private Function LoadProjectsFromFile(ByRef projects() As TProject, ByRef projec
         CloseTimeTracking xlApp, xlWb, closeExcel, wasOpen, False
         Exit Function
     End If
-
+    
     ' Lire les lignes de donnees (a partir de la ligne 2, entetes en ligne 1)
     ' Pack v3 (A2) : meme borne que WriteNewFolder v9.0 (max des colonnes
     ' B..E) - la colonne D seule ratait les lignes sans acronyme.
     Dim lastRow As Long
     lastRow = modExcelBridge.DataLastRow(xlWs, 2, 5)
-
+    
     If lastRow < 2 Then
         MsgBox T("Aucune ligne de donn~ees dans '", "No data row in '") & modConfig.TimeTrackingSheet() & "'.", vbExclamation, T("Projet", "Project")
         CloseTimeTracking xlApp, xlWb, closeExcel, wasOpen, False
         Exit Function
     End If
-
+    
     ' ---------------------------------------------------------------------
     ' v7 PERF : lecture en bloc des colonnes A..E en une seule operation COM.
     ' L'ancienne version faisait 5 appels .Cells(r, c).Value par ligne,
@@ -1507,7 +1509,7 @@ Private Function LoadProjectsFromFile(ByRef projects() As TProject, ByRef projec
     ' ---------------------------------------------------------------------
     Dim data As Variant
     data = xlWs.Range(xlWs.Cells(2, 1), xlWs.Cells(lastRow, 5)).Value
-
+    
     ' Cas special : une seule ligne de donnees -> data n'est pas un tableau
     ' mais un Variant simple. On normalise.
     If Not IsArray(data) Then
@@ -1515,13 +1517,13 @@ Private Function LoadProjectsFromFile(ByRef projects() As TProject, ByRef projec
         one(1, 1) = data
         data = one
     End If
-
+    
     Dim nbRows As Long
     nbRows = UBound(data, 1)
-
+    
     ReDim projects(1 To nbRows)
     projectCount = 0
-
+    
     Dim r As Long
     For r = 1 To nbRows
         Dim opp As String, contract As String, projCodeNum As Long, folder As String, partner As String
@@ -1536,27 +1538,27 @@ Private Function LoadProjectsFromFile(ByRef projects() As TProject, ByRef projec
         End If
         folder = Nz(data(r, 4))
         partner = Nz(data(r, 5))
-
+        
         ' Sauter les lignes totalement vides
         If opp = "" And contract = "" And projCodeNum = 0 And folder = "" And partner = "" Then
             GoTo SuivantLigne
         End If
-
+        
         projectCount = projectCount + 1
         ' Pack v3 (C5) : construction par BuildProject (une seule version).
         BuildProject projects(projectCount), opp, contract, projCodeNum, folder, partner
 SuivantLigne:
     Next r
-
+    
     If projectCount > 0 Then ReDim Preserve projects(1 To projectCount)
-
+    
     CloseTimeTracking xlApp, xlWb, closeExcel, wasOpen, False
-
+    
     If projectCount = 0 Then
         MsgBox T("Aucun projet trouve dans '", "No project found in '") & modConfig.TimeTrackingSheet() & "'.", vbExclamation, T("Projet", "Project")
         Exit Function
     End If
-
+    
     LoadProjectsFromFile = True
 End Function
 
@@ -1625,13 +1627,13 @@ Private Function WriteNewFolder(ByVal wb As Object, ByVal opp As String, _
                                        ByVal contract As String, ByVal projCode As String, _
                                        ByVal folder As String, ByVal partner As String) As Boolean
     WriteNewFolder = False
-
+    
     Dim ws As Object
     On Error Resume Next
     Set ws = wb.Worksheets(modConfig.TimeTrackingSheet())
     On Error GoTo 0
     If ws Is Nothing Then Exit Function
-
+    
     ' Deduplication : DOSS + Dossier + Contrat + Opp
     ' On considere qu'un doublon existe si :
     '   - Meme DOSS + meme Dossier (si DOSS renseigne)
@@ -1656,7 +1658,7 @@ Private Function WriteNewFolder(ByVal wb As Object, ByVal opp As String, _
         ctrCell = Nz(blk(r - 1, 2))
         dvCell = Nz(blk(r - 1, 3))
         dosCell = Nz(blk(r - 1, 4))
-
+        
         If Len(projCode) > 0 And Len(dvCell) > 0 And Len(folder) > 0 Then
             If StrComp(dvCell, projCode, vbTextCompare) = 0 And _
                StrComp(dosCell, folder, vbTextCompare) = 0 Then
@@ -1680,7 +1682,7 @@ Private Function WriteNewFolder(ByVal wb As Object, ByVal opp As String, _
             End If
         End If
     Next r
-
+    
     ' --- Application des regles metier sur Contrat (B) et DOSS (C) ---
     ' La colonne B ne doit JAMAIS etre vide. Regles (par ordre de priorite) :
     '   1. Opportunite saisie  -> B = "Opportunite CRM" (ecrase la saisie)
@@ -1689,10 +1691,10 @@ Private Function WriteNewFolder(ByVal wb As Object, ByVal opp As String, _
     ' Pour la colonne C (DOSS) : si vide ou 0, on force 9999 (convention "pas de DOSS").
     Dim contratFinal As String
     Dim dvFinal As String
-
+    
     contratFinal = contract
     dvFinal = projCode
-
+    
     ' Normalisation DOSS : vide ou "0" -> 9999
     Dim projCodeNum As Long
     projCodeNum = 0
@@ -1701,7 +1703,7 @@ Private Function WriteNewFolder(ByVal wb As Object, ByVal opp As String, _
         dvFinal = "9999"
         projCodeNum = 9999
     End If
-
+    
     ' Regle 1 : opportunite -> libelle config ContractLabelOpportunity (ecrase)
     ' Pack v3 (C10) : libelles externalises (config.ini), plus de FR en dur.
     If Len(opp) > 0 Then
@@ -1710,7 +1712,7 @@ Private Function WriteNewFolder(ByVal wb As Object, ByVal opp As String, _
         ' Regle 2 : DOSS vrai sans contrat -> libelle config ContractLabelDefault
         contratFinal = modConfig.ContractLabelDefault()
     End If
-
+    
     ' v9.0 : INSERTION dans la plage de donnees, pas apres (cf. en-tete).
     ' Rows(lastRow).Insert etend les formules du bloc de synthese
     ' ($2:$lastRow -> $2:$lastRow+1) et herite du format de la ligne du
@@ -1731,7 +1733,7 @@ Private Function WriteNewFolder(ByVal wb As Object, ByVal opp As String, _
     End If
     ws.Cells(newRow, 4).Value = folder
     ws.Cells(newRow, 5).Value = partner
-
+    
     WriteNewFolder = True
 End Function
 
@@ -1807,7 +1809,7 @@ End Function
 
 Private Function ExtractPrefill(ByVal subjectText As String) As String
     ExtractPrefill = ""
-
+    
     ' Priorite 1 : DOSS
     Dim projCode As String
     projCode = ScanProject(subjectText)
@@ -1815,7 +1817,7 @@ Private Function ExtractPrefill(ByVal subjectText As String) As String
         ExtractPrefill = projCode
         Exit Function
     End If
-
+    
     ' Priorite 2 : Opportunite
     Dim opp As String
     opp = ScanOpportunity(subjectText)
@@ -1823,7 +1825,7 @@ Private Function ExtractPrefill(ByVal subjectText As String) As String
         ExtractPrefill = opp
         Exit Function
     End If
-
+    
     ' Priorite 3 : Contrat
     Dim c As String
     c = ScanContract(subjectText)
@@ -1839,18 +1841,18 @@ End Function
 Private Sub ApplyTag(ByRef appt As Outlook.AppointmentItem, ByRef proj As TProject)
     Dim originalSubject As String
     originalSubject = Trim(CStr(appt.subject))
-
-
+    
+    
     Dim subjectText As String
     subjectText = CleanAllTags(originalSubject)
-
-
+    
+    
     ' Garde-fou : si le nettoyage a TOUT mange alors que le sujet original
     ' n'etait pas vide, on garde le sujet original tel quel (sans ses crochets).
     If subjectText = "" And originalSubject <> "" Then
         subjectText = originalSubject
     End If
-
+    
     Dim nouveauSujet As String
     Select Case proj.Category
         Case "TRANSVERSAL"
@@ -1866,8 +1868,8 @@ Private Sub ApplyTag(ByRef appt As Outlook.AppointmentItem, ByRef proj As TProje
                 nouveauSujet = proj.tagText & " " & subjectText & proj.SuffixOpp
             End If
     End Select
-
-
+    
+    
     ' SECURITE ABSOLUE : si le nouveau sujet est plus court que le tag + original,
     ' on refuse l'ecriture et on alerte
     If Len(nouveauSujet) = 0 Then
@@ -1877,9 +1879,9 @@ Private Sub ApplyTag(ByRef appt As Outlook.AppointmentItem, ByRef proj As TProje
                    T("Projet", "Project"), vbCritical
         Exit Sub
     End If
-
+    
     appt.subject = nouveauSujet
-
+    
     ' Appliquer la categorie Outlook (couleur) si definie
     ' NB : pour les RDV recurrents, .Categories doit etre modifie sur le Master,
     ' pas sur l'occurrence. L'occurrence retournee par la selection calendrier
@@ -1888,7 +1890,7 @@ Private Sub ApplyTag(ByRef appt As Outlook.AppointmentItem, ByRef proj As TProje
     If proj.OutlookCategory <> "" Then
         Dim catTarget As Outlook.AppointmentItem
         Set catTarget = AppointmentForCategory(appt)
-
+        
         If Not catTarget Is Nothing Then
             On Error Resume Next
             Dim currentCats As String
@@ -1909,7 +1911,7 @@ Private Sub ApplyTag(ByRef appt As Outlook.AppointmentItem, ByRef proj As TProje
         End If
         Set catTarget = Nothing
     End If
-
+    
     On Error Resume Next
     WriteUserProperty appt, proj.tagText
     On Error GoTo 0
@@ -1923,13 +1925,13 @@ End Sub
 '=============================================================================
 Private Function AppointmentForCategory(ByVal appt As Outlook.AppointmentItem) As Outlook.AppointmentItem
     On Error Resume Next
-
+    
     ' Cas 1 : pas recurrent -> retourner tel quel
     If Not appt.IsRecurring Then
         Set AppointmentForCategory = appt
         Exit Function
     End If
-
+    
     ' Cas 2 : recurrent. Est-ce le Master ou une occurrence ?
     '   RecurrenceState :
     '     0 = olApptNotRecurring
@@ -1938,13 +1940,13 @@ Private Function AppointmentForCategory(ByVal appt As Outlook.AppointmentItem) A
     '     3 = olApptException       (une occurrence modifiee)
     Dim etat As Integer
     etat = appt.RecurrenceState
-
+    
     If etat = 1 Then
         ' Deja le Master
         Set AppointmentForCategory = appt
         Exit Function
     End If
-
+    
     ' Cas 3 : occurrence (simple ou exception) -> remonter au Master via .Parent
     Dim parent As Outlook.AppointmentItem
     Set parent = appt.parent
@@ -1952,7 +1954,7 @@ Private Function AppointmentForCategory(ByVal appt As Outlook.AppointmentItem) A
         Set AppointmentForCategory = parent
         Exit Function
     End If
-
+    
     ' Fallback : retourner l'appt original (la tentative de modif plantera proprement)
     Set AppointmentForCategory = appt
 End Function
@@ -1963,23 +1965,23 @@ End Function
 Private Function AssembleTag(ByVal p1 As String, ByVal p2 As String, ByVal p3 As String) As String
     Dim parts(1 To 3) As String
     Dim n As Long: n = 0
-
+    
     If p1 <> "" Then n = n + 1: parts(n) = p1
     If p2 <> "" Then n = n + 1: parts(n) = p2
     If p3 <> "" Then n = n + 1: parts(n) = p3
-
+    
     If n = 0 Then
         AssembleTag = "[]"
         Exit Function
     End If
-
+    
     Dim result As String
     result = parts(1)
     Dim i As Long
     For i = 2 To n
         result = result & "/" & parts(i)
     Next i
-
+    
     AssembleTag = "[" & result & "]"
 End Function
 
@@ -2028,31 +2030,31 @@ Private Function CleanAllTags(ByVal subjectText As String) As String
     ' Un tag Projet reconnu contient au moins un de ces patterns :
     '   - DOSS suivi de 4 chiffres        (ex: [DOSS2485/Acme])
     '   - 20XX_XXXXX (code contrat)     (ex: [2024_00123/Project name])
-    '   - 20XX_OT_XXXX / 20XX_DT_XXXX   (ex: [2025_DT_0169/DOSS906/Partner])
+    '   - 20XX_OT_XXXX / 20XX_DT_XXXX   (ex: [2025_DT_0002/DOSS1234/Partner])
     '   - A/A## (code transversal)      (ex: [A/A01])
-
+    
     Dim result As String: result = subjectText
     Dim posO As Long, posF As Long
     Dim pos As Long: pos = 1
     Dim iter As Long: iter = 0
-
+    
     Do
         iter = iter + 1
         If iter > 20 Then
             Exit Do
         End If
-
+        
         posO = InStr(pos, result, "[")
         If posO = 0 Then Exit Do
         posF = InStr(posO, result, "]")
         If posF = 0 Then Exit Do
-
+        
         Dim inner As String
         inner = Mid(result, posO + 1, posF - posO - 1)
-
+        
         Dim isTag As Boolean
         isTag = IsValidProjectTag(inner)
-
+        
         If isTag Then
             ' Retirer ce tag et l'espace adjacent
             Dim before As String, after As String
@@ -2066,7 +2068,7 @@ Private Function CleanAllTags(ByVal subjectText As String) As String
             If pos > Len(result) Then Exit Do
         End If
     Loop
-
+    
     CleanAllTags = Trim(result)
 End Function
 
@@ -2077,24 +2079,24 @@ End Function
 Private Function IsValidProjectTag(ByVal content As String) As Boolean
     IsValidProjectTag = False
     If Len(content) = 0 Then Exit Function
-
+    
     Dim c As String: c = UCase(content)
-
+    
     ' Pattern 1 : DOSS suivi de 4 chiffres
     If modConfig.ContainsProjectCode(content) Then
         IsValidProjectTag = True: Exit Function
     End If
-
+    
     ' Pattern 2 : code contrat 20XX_XXXXX (10 chars, 5 chiffres apres _)
     If modConfig.ContainsContractCode(content) Then
         IsValidProjectTag = True: Exit Function
     End If
-
+    
     ' Pattern 3 : opportunite 20XX_<type>_#### (largeur pilotee par config)
     If Len(modConfig.ScanOpportunityCode(c)) > 0 Then
         IsValidProjectTag = True: Exit Function
     End If
-
+    
     ' Pattern 4 : code transversal A/A## (ex: A/A01, A/A02)
     If modConfig.ContainsCrossCode(content) Then
         IsValidProjectTag = True: Exit Function
@@ -2125,7 +2127,7 @@ End Function
 '=============================================================================
 Private Function GetSelectedAppointment() As Object
     On Error Resume Next
-
+    
     ' Inspector ouvert ?
     Dim insp As Object
     Set insp = Application.ActiveInspector
@@ -2135,7 +2137,7 @@ Private Function GetSelectedAppointment() As Object
             Exit Function
         End If
     End If
-
+    
     ' Selection calendrier ?
     Dim expl As Object
     Set expl = Application.ActiveExplorer
@@ -2147,7 +2149,7 @@ Private Function GetSelectedAppointment() As Object
             End If
         End If
     End If
-
+    
     Set GetSelectedAppointment = Nothing
 End Function
 
@@ -2160,13 +2162,13 @@ Private Sub SaveRecent(ByVal displayText As String)
     For i = 1 To MAX_RECENTS
         recents(i) = GetSetting(APP_NAME, "Recents", "R" & i, "")
     Next i
-
+    
     ' Si deja present : remonter en tete
     Dim posExist As Long: posExist = 0
     For i = 1 To MAX_RECENTS
         If recents(i) = displayText Then posExist = i: Exit For
     Next i
-
+    
     If posExist > 0 Then
         For i = posExist To 2 Step -1
             recents(i) = recents(i - 1)
@@ -2177,7 +2179,7 @@ Private Sub SaveRecent(ByVal displayText As String)
         Next i
     End If
     recents(1) = displayText
-
+    
     For i = 1 To MAX_RECENTS
         SaveSetting APP_NAME, "Recents", "R" & i, recents(i)
     Next i
