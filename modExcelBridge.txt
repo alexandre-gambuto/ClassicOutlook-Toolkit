@@ -1,7 +1,19 @@
 Option Explicit
 
 '=============================================================================
-' modExcelBridge  (v1.0 - 2026-09-02)  [PACK v3 - C1]
+' modExcelBridge  (v1.1 - 2026-11-16)  [PACK v3 - C1]
+' v1.1 (2026-11-16) : audit 11/2026 - F2-04, F4-01, F5-04, F8-01 :
+'   (a) classeur deja ouvert reconnu aussi par son NOM quand son FullName est
+'   une adresse web OneDrive (FindOpenWorkbookByRef, utilise par
+'   OpenWorkbook) : "Suivi de temps" ouvert a l'ecran n'est plus rouvert,
+'   masque puis referme ; un AUTRE fichier du meme nom ouvert depuis un
+'   autre dossier est refuse (jamais d'ecriture dans la mauvaise copie) ;
+'   (b) DataLastRow insensible aux filtres (lit les cellules, lignes
+'   masquees comprises, au lieu de End(xlUp) qui saute les lignes
+'   filtrees et faisait ecrire par-dessus une ligne cachee) ;
+'   (c) ClearSheetFilter : reaffiche les lignes filtrees avant une ecriture ;
+'   (d) PauseMs : vraie attente (modCommon.SleepMs) au lieu d'une boucle
+'   DoEvents a vide.
 ' Purpose (EN): shared Excel COM lifecycle for every module that reads or
 '   writes a workbook from Outlook: get-or-create an Excel instance (ghost
 '   detection, adoption of an invisible automation leftover), open a workbook
@@ -29,10 +41,12 @@ Option Explicit
 ' API :
 '   GetExcelApp(createdByUs)                      -> Excel.Application ou Nothing
 '   OpenWorkbook(path, readOnly, xlApp, wb, wasOpen, createdByUs) -> Boolean
+'   FindOpenWorkbookByRef(xlApp, wbRef)           -> Workbook ouvert ou Nothing (v1.1)
 '   CloseWorkbook(xlApp, wb, wasOpen, createdByUs, saveChanges)
 '   SaveWorkbookVisible(xlApp, wb)
 '   ReadBlock(ws, r1, c1, r2, c2)                 -> Variant 2D (toujours)
-'   DataLastRow(ws, firstCol, lastCol)            -> Long (max des End(xlUp))
+'   DataLastRow(ws, firstCol, lastCol)            -> Long (v1.1 : filtres ignores)
+'   ClearSheetFilter(ws)                          -> Boolean (v1.1)
 '   IsRetryableCOMError(errNum), PauseMs(ms)
 '
 ' NON COUVERT (volontairement) : la gestion d'imbrication du tracker
@@ -43,10 +57,15 @@ Option Explicit
 '=============================================================================
 
 Private Const MOD_NAME As String = "ExcelBridge"
-Private Const MOD_VERSION As String = "v1.0 - 2026-09-02"
+Private Const MOD_VERSION As String = "v1.1 - 2026-11-16"
 
 Private Const COM_MAX_RETRIES As Long = 5
 Private Const COM_BACKOFF_MS As Long = 200    ' delai de base, croissant
+
+' v1.1 : DataLastRow lit les lignes situees sous la derniere ligne visible
+' par paquets, en partant du bas de la zone utilisee (aucun ou un seul
+' paquet dans le cas courant).
+Private Const LAST_ROW_CHUNK As Long = 5000
 
 Public Function ModVersion() As String
     ModVersion = MOD_VERSION
@@ -68,15 +87,12 @@ Public Function IsRetryableCOMError(ByVal errNum As Long) As Boolean
     End Select
 End Function
 
-' Pause active courte (ms) sans dependance API : laisse Excel finir son
-' operation en cours avant de reessayer.
+' Pause courte (ms) : laisse Excel finir son operation en cours avant de
+' reessayer. v1.1 (audit 11/2026) : vraie attente (Sleep par tranches +
+' DoEvents, modCommon.SleepMs) au lieu d'une boucle DoEvents a vide qui
+' occupait un coeur du processeur pendant toute l'attente.
 Public Sub PauseMs(ByVal ms As Long)
-    Dim t0 As Double
-    t0 = Timer
-    Do While (Timer - t0) * 1000 < ms
-        DoEvents
-        If Timer < t0 Then Exit Do   ' passage de minuit
-    Loop
+    modCommon.SleepMs ms
 End Sub
 
 '=============================================================================
@@ -139,6 +155,11 @@ End Function
 ' OpenWorkbook : retrouve le classeur s'il est deja ouvert (wasOpen=True),
 ' sinon l'ouvre en mode furtif (lecture seule si demande).
 ' Renvoie False si le fichier n'existe pas ou si Excel/l'ouverture echoue.
+' v1.1 (F2-04) : deja ouvert = meme chemin complet, OU meme nom de fichier
+' quand Excel le presente par son adresse web (OneDrive Entreprise). Un
+' autre fichier du meme nom ouvert depuis un autre dossier local -> False
+' (Excel refuserait de toute facon d'ouvrir le notre, et ecrire dans la
+' copie ouverte serait une erreur silencieuse).
 '=============================================================================
 Public Function OpenWorkbook(ByVal path As String, ByVal readOnlyMode As Boolean, _
                              ByRef xlApp As Object, ByRef wb As Object, _
@@ -155,39 +176,27 @@ Public Function OpenWorkbook(ByVal path As String, ByVal readOnlyMode As Boolean
     If xlApp Is Nothing Then Set xlApp = GetExcelApp(createdByUs)
     If xlApp Is Nothing Then Exit Function
 
-    ' --- Deja ouvert ? Iteration PAR INDEX + retry sur le comptage ---
-    Dim nbWb As Long, tentative As Long, e As Long
-    nbWb = -1
-    For tentative = 1 To COM_MAX_RETRIES
-        Err.Clear
-        On Error Resume Next
-        nbWb = xlApp.Workbooks.Count
-        e = Err.Number
-        On Error GoTo 0
-        If e = 0 Then Exit For
-        modDebugLog.DDebug MOD_NAME, "Workbooks.Count err " & e & ", retry " & tentative
-        PauseMs COM_BACKOFF_MS * tentative
-    Next tentative
-
-    Dim lowPath As String
+    ' --- Deja ouvert ? (chemin complet, ou nom si adresse web OneDrive) ---
+    Dim tentative As Long, e As Long
+    Dim lowPath As String, fullN As String
     lowPath = LCase$(path)
-    If nbWb > 0 Then
-        Dim idx As Long, wbN As Object, fullN As String
-        For idx = 1 To nbWb
-            Set wbN = Nothing
-            fullN = ""
-            On Error Resume Next
-            Set wbN = xlApp.Workbooks.Item(idx)
-            If Not wbN Is Nothing Then fullN = wbN.FullName
-            On Error GoTo 0
-            If Len(fullN) > 0 Then
-                If LCase$(fullN) = lowPath Then
-                    Set wb = wbN
-                    wasOpen = True
-                    Exit For
-                End If
+    Set wb = FindOpenWorkbookByRef(xlApp, path)
+    If Not wb Is Nothing Then
+        fullN = ""
+        On Error Resume Next
+        fullN = LCase$(CStr(wb.FullName))
+        On Error GoTo 0
+        If fullN = lowPath Or Left$(fullN, 4) = "http" Or Len(fullN) = 0 Then
+            wasOpen = True
+            If fullN <> lowPath Then
+                modDebugLog.DDebug MOD_NAME, "Classeur deja ouvert reconnu par son nom (adresse web) : " & path
             End If
-        Next idx
+        Else
+            modDebugLog.DError MOD_NAME, "Un autre classeur du meme nom est deja ouvert dans Excel (" & _
+                fullN & ") : impossible d'ouvrir " & path
+            Set wb = Nothing
+            Exit Function
+        End If
     End If
 
     ' --- Ouverture furtive avec retry/backoff ---
@@ -220,6 +229,68 @@ Public Function OpenWorkbook(ByVal path As String, ByVal readOnlyMode As Boolean
         Exit Function
     End If
     OpenWorkbook = True
+End Function
+
+'=============================================================================
+' FindOpenWorkbookByRef (v1.1 - audit 11/2026, F2-04)
+' Classeur deja ouvert dans xlApp dont le CHEMIN COMPLET correspond a wbRef
+' (sans casse) ; a defaut, celui dont le NOM DE FICHIER correspond. wbRef :
+' chemin complet (C:\...\x.xlsm), adresse web, ou simple nom de fichier.
+' Pourquoi le nom : sous OneDrive Entreprise, le FullName d'un classeur
+' ouvert depuis le dossier synchronise est son adresse web (https://...),
+' jamais egale au chemin local de config.ini. Excel n'ouvre jamais deux
+' classeurs de meme nom dans une instance : le nom designe un seul classeur.
+' L'appelant qui ECRIT doit verifier qu'un classeur trouve par son seul nom
+' est bien le sien (voir OpenWorkbook). Nothing si aucun ou Excel muet.
+' Parcours PAR INDEX, comptage avec essais repetes (Excel occupe).
+'=============================================================================
+Public Function FindOpenWorkbookByRef(ByVal xlApp As Object, ByVal wbRef As String) As Object
+    Set FindOpenWorkbookByRef = Nothing
+    If xlApp Is Nothing Then Exit Function
+
+    Dim refL As String, nameOnly As String
+    refL = LCase$(Trim$(wbRef))
+    If Len(refL) = 0 Then Exit Function
+    nameOnly = refL
+    If InStrRev(nameOnly, "\") > 0 Then nameOnly = Mid$(nameOnly, InStrRev(nameOnly, "\") + 1)
+    If InStrRev(nameOnly, "/") > 0 Then nameOnly = Mid$(nameOnly, InStrRev(nameOnly, "/") + 1)
+
+    Dim nbWb As Long, tentative As Long, e As Long
+    nbWb = -1
+    For tentative = 1 To COM_MAX_RETRIES
+        Err.Clear
+        On Error Resume Next
+        nbWb = xlApp.Workbooks.Count
+        e = Err.Number
+        On Error GoTo 0
+        If e = 0 Then Exit For
+        modDebugLog.DDebug MOD_NAME, "Workbooks.Count err " & e & ", retry " & tentative
+        PauseMs COM_BACKOFF_MS * tentative
+    Next tentative
+    If nbWb <= 0 Then Exit Function
+
+    Dim idx As Long, wbN As Object, fullN As String, nm As String
+    Dim byName As Object
+    For idx = 1 To nbWb
+        Set wbN = Nothing
+        fullN = ""
+        nm = ""
+        On Error Resume Next
+        Set wbN = xlApp.Workbooks.Item(idx)
+        If Not wbN Is Nothing Then
+            fullN = LCase$(CStr(wbN.FullName))
+            nm = LCase$(CStr(wbN.Name))
+        End If
+        On Error GoTo 0
+        If Not wbN Is Nothing Then
+            If Len(fullN) > 0 And fullN = refL Then
+                Set FindOpenWorkbookByRef = wbN
+                Exit Function
+            End If
+            If byName Is Nothing And Len(nm) > 0 And nm = nameOnly Then Set byName = wbN
+        End If
+    Next idx
+    If Not byName Is Nothing Then Set FindOpenWorkbookByRef = byName
 End Function
 
 '=============================================================================
@@ -309,17 +380,149 @@ Public Function ReadBlock(ByVal ws As Object, ByVal r1 As Long, ByVal c1 As Long
 End Function
 
 '=============================================================================
-' DataLastRow : derniere ligne de DONNEES = max des End(xlUp) sur les
-' colonnes firstCol..lastCol. Renvoie 1 pour une feuille sans donnees.
+' DataLastRow : derniere ligne non vide sur les colonnes firstCol..lastCol.
+' Renvoie 1 pour une feuille sans donnees.
+' v1.1 (audit 11/2026, F4-01 / F5-04 / F8-01) : INSENSIBLE AUX FILTRES.
+' Avant : max des End(xlUp), qui s'arrete sur la derniere ligne VISIBLE ;
+' avec un filtre actif qui masquait le bas du tableau, l'appelant ecrivait
+' "a la suite" par-dessus une ligne cachee. Maintenant : le resultat
+' End(xlUp) sert de plancher (c'est une ligne non vide), puis les lignes
+' situees entre ce plancher et le bas de la zone utilisee sont lues
+' (formules, lignes masquees comprises ; une cellule contenant une formule
+' compte comme non vide, comme pour End(xlUp)), par paquets en remontant.
+' Sans ligne masquee, le resultat est identique a l'ancien. Repli sur l'ancienne
+' methode si la lecture echoue.
 '=============================================================================
 Public Function DataLastRow(ByVal ws As Object, ByVal firstCol As Long, ByVal lastCol As Long) As Long
+    DataLastRow = 1
+    If ws Is Nothing Then Exit Function
+    If lastCol < firstCol Or firstCol < 1 Then Exit Function
+
+    Dim floorRow As Long, usedLast As Long, r1 As Long, r2 As Long, nCols As Long
+    Dim blk As Variant, r As Long, c As Long, e As Long
+    nCols = lastCol - firstCol + 1
+
+    ' Plancher : derniere ligne non vide VISIBLE (ancienne methode).
+    floorRow = VisibleLastRow(ws, firstCol, lastCol)
+    DataLastRow = floorRow
+
+    On Error Resume Next
+    usedLast = 0
+    usedLast = ws.UsedRange.Row + ws.UsedRange.Rows.Count - 1
+    e = Err.Number
+    Err.Clear
+    On Error GoTo 0
+    If e <> 0 Then
+        modDebugLog.DDebug MOD_NAME, "DataLastRow : zone utilisee illisible (err " & e & "), repli End(xlUp)"
+        Exit Function
+    End If
+    If usedLast <= floorRow Then Exit Function
+
+    ' Lignes sous le plancher (masquees par un filtre ?), du bas vers le haut.
+    r2 = usedLast
+    Do While r2 > floorRow
+        r1 = r2 - LAST_ROW_CHUNK + 1
+        If r1 <= floorRow Then r1 = floorRow + 1
+        blk = Empty
+        On Error Resume Next
+        blk = ws.Range(ws.Cells(r1, firstCol), ws.Cells(r2, lastCol)).Formula
+        e = Err.Number
+        Err.Clear
+        On Error GoTo 0
+        If e <> 0 Then
+            modDebugLog.DDebug MOD_NAME, "DataLastRow : lecture des cellules impossible (err " & _
+                e & "), repli End(xlUp)"
+            Exit Function
+        End If
+        If IsArray(blk) Then
+            For r = r2 - r1 + 1 To 1 Step -1
+                For c = 1 To nCols
+                    If Len(CStr(blk(r, c))) > 0 Then
+                        DataLastRow = r1 + r - 1
+                        Exit Function
+                    End If
+                Next c
+            Next r
+        Else
+            If Len(CStr(blk)) > 0 Then
+                DataLastRow = r1
+                Exit Function
+            End If
+        End If
+        r2 = r1 - 1
+    Loop
+End Function
+
+' Plancher de DataLastRow (ancienne methode) : max des End(xlUp) sur les
+' colonnes. Juste sans filtre ; avec un filtre, derniere ligne VISIBLE.
+' 1 si rien (ou erreur).
+Private Function VisibleLastRow(ByVal ws As Object, ByVal firstCol As Long, _
+                                ByVal lastCol As Long) As Long
+    On Error Resume Next
     Dim c As Long, lr As Long, best As Long
     best = 1
-    On Error Resume Next
     For c = firstCol To lastCol
         lr = 0
         lr = ws.Cells(ws.Rows.Count, c).End(-4162).Row   ' -4162 = xlUp
         If lr > best Then best = lr
     Next c
-    DataLastRow = best
+    VisibleLastRow = best
+End Function
+
+'=============================================================================
+' ClearSheetFilter (v1.1 - audit 11/2026, F4-01 / F5-04 / F8-01)
+' A appeler avant d'ECRIRE dans une feuille que l'utilisateur a pu filtrer :
+' reaffiche toutes les lignes (filtre automatique de la feuille et filtres
+' des tableaux). Les fleches de filtre restent en place ; seules les lignes
+' masquees reapparaissent, pour que l'utilisateur voie ce qui est ecrit.
+' Renvoie True si au moins un filtre a ete retire. Feuille protegee ou
+' Excel occupe : rien n'est retire, l'echec est journalise, False.
+' DataLastRow (v1.1) est deja juste sous filtre : cet appel sert a la
+' visibilite et aux appelants qui calculent encore leur ligne eux-memes.
+'=============================================================================
+Public Function ClearSheetFilter(ByVal ws As Object) As Boolean
+    ClearSheetFilter = False
+    If ws Is Nothing Then Exit Function
+    On Error Resume Next
+
+    Dim fm As Boolean, wsName As String
+    wsName = ""
+    wsName = CStr(ws.Name)
+
+    fm = False
+    fm = CBool(ws.FilterMode)
+    If fm Then
+        Err.Clear
+        ws.ShowAllData
+        If Err.Number = 0 Then
+            ClearSheetFilter = True
+        Else
+            modDebugLog.DError MOD_NAME, "ShowAllData refuse sur '" & wsName & "' (err " & Err.Number & ")"
+            Err.Clear
+        End If
+    End If
+
+    Dim los As Object, lo As Object, i As Long, n As Long
+    Set los = Nothing
+    Set los = ws.ListObjects
+    n = 0
+    If Not los Is Nothing Then n = los.Count
+    For i = 1 To n
+        Set lo = Nothing
+        Set lo = los.Item(i)
+        fm = False
+        If Not lo Is Nothing Then fm = CBool(lo.AutoFilter.FilterMode)
+        If fm Then
+            Err.Clear
+            lo.AutoFilter.ShowAllData
+            If Err.Number = 0 Then
+                ClearSheetFilter = True
+            Else
+                modDebugLog.DError MOD_NAME, "ShowAllData (tableau) refuse sur '" & wsName & "' (err " & Err.Number & ")"
+                Err.Clear
+            End If
+        End If
+    Next i
+
+    If ClearSheetFilter Then modDebugLog.DInfo MOD_NAME, "Filtre retire sur '" & wsName & "' avant ecriture"
 End Function

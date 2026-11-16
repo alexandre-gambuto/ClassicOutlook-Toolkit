@@ -1,7 +1,15 @@
 Option Explicit
 
 '=============================================================================
-' modContactNormalize v1.5  (2026-08-20)
+' modContactNormalize v1.6  (2026-11-16)
+' v1.6 (2026-11-16) : audit 11/2026 - F7-12, F7-13, F7-14, F7-15, F7-16 :
+'   numero national d'un contact dont l'adresse est a l'etranger laisse tel
+'   quel (plus de faux "+33") ; fichier d'annulation de chaque passe
+'   Appliquer, purge des categories comprise (ContactUndoLastRun) ;
+'   [Appliquer maintenant] apres une simulation ; outils communs.
+'   integration - F7-16 : ligne "(Boutons natifs : ...)" retiree du
+'   choix Simulation / Appliquer : modMsgBoxCustom v2.1 l'ajoute lui-meme
+'   en cas de repli sur des boutons natifs.
 ' Purpose (EN): harmonise contact cards across ALL contact folders of a
 '   chosen store (or the current selection / open card): phone numbers to
 '   E.164 (+33...), names to "Firstname LASTNAME" (particles lower case),
@@ -15,7 +23,13 @@ Option Explicit
 '     00 -> + ; "+33 (0)6" -> +336 ; 9 chiffres sans le 0 -> +CC (signale
 '     "suppose") ; numeros courts (<= 6 chiffres : 112, 3635) conserves ;
 '     toute valeur contenant des lettres (poste, ext.) est laissee intacte
-'     et signalee. Fax volontairement hors perimetre.
+'     et signalee. Fax volontairement hors perimetre. v1.6 (F7-12) : si le
+'     pays d'adresse de la fiche (bureau, sinon domicile, sinon autre) est
+'     renseigne et n'est pas le pays par defaut (AddressDefaultCountry, a
+'     defaut FRANCE ; FR / FRA admis), un numero NATIONAL (sans + ni 00)
+'     est laisse tel quel et signale : "0471 12 34 56" d'un contact belge
+'     ne devient plus "+33471123456". Les numeros internationaux suivent
+'     la regle commune.
 '   - NOMS : Prenom "Jean-Baptiste", Nom "de CHAISEMARTIN" (particules en
 '     minuscules, liste config NameParticles). Une fiche dont le prenom OU
 '     le nom est vide est reputee ENTITE (societe, service) et n'est pas
@@ -46,9 +60,14 @@ Option Explicit
 '     absent de la table = signale au rapport, rien n'est ecrit. Les entites
 '     ne sont pas concernees. Lue ensuite par modContactBirthday.
 '
-' RAPPORT : <Bureau>\Macro VBA\Outlook\ContactNormalize-AAAAMMJJ-HHMMSS.txt
-' (UTF-8) : une ligne par champ modifie (avant -> apres) + avertissements
-' (numeros non normalisables). Ouverture proposee dans Notepad.
+' RAPPORT : <outil>\Sorties\ (modConfig.MacroVBADir)
+' ContactNormalize-AAAAMMJJ-HHMMSS.txt (UTF-8) : une ligne par champ modifie
+' (avant -> apres) + avertissements (numeros non normalisables). Ouverture
+' proposee dans Notepad. v1.6 : en mode Appliquer, a cote,
+' ContactNormalize-...-undo.tsv (F7-13) - modContactCommon.
+' ContactUndoLastRun remet les champs ecrits a leur valeur d'avant. Apres
+' une simulation, le bilan propose [Appliquer maintenant] (meme compte ou
+' meme selection, sans reposer les questions) (F7-16).
 '
 ' FONCTION PUBLIQUE PARTAGEE (v1.5) :
 '   PhoneFormatCanonical(raw) : formate un numero selon la convention du
@@ -67,7 +86,7 @@ Option Explicit
 ' Prenom / NOM tels qu'ils sont dans la fiche).
 '
 ' Dependances : modConfig (Cfg/CfgB, T, A, MacroVBADir), modDebugLog,
-'   modMsgBoxCustom.Confirm3.
+'   modMsgBoxCustom.Confirm3, modContactCommon v1.1+.
 '
 ' Cles config.ini (section CONTACTS - HARMONISATION) : NormalizeNames,
 '   NormalizePhones, NormalizeAddresses, NormalizeEmails, NormalizeNameDay,
@@ -79,10 +98,9 @@ Option Explicit
 '=============================================================================
 
 Private Const MOD_NAME As String = "ContNorm"
-Private Const MOD_VERSION As String = "v1.5 - 2026-08-20"
+Private Const MOD_VERSION As String = "v1.6 - 2026-11-16"
 
-Private Const PROPTAG_HIDDEN As String = "http://schemas.microsoft.com/mapi/proptag/0x10F4000B"
-Private Const DEFAULT_SKIP As String = "{*|Recipient Cache|*sugg*|GAL Contacts|Organizational Contacts|Companies|PeopleCentricConversation Buddies|*Lync*|*Skype*|ExternalContacts"
+' v1.6 (F7-14) : dossiers exclus par defaut = modContactCommon.ContactSkipDefault.
 Private Const DEFAULT_PARTICLES As String = "de|du|des|d|le|la|les|l|van|von|der|den|di|da|del|della|dell|el|al|ben"
 Private Const DEFAULT_LOWER_WORDS As String = "de|du|des|d|la|le|les|l|et|sur|sous|en|au|aux|a|bis|ter|quater"
 Private Const DEFAULT_UPPER_WORDS As String = "BP|CS|CEDEX|TSA|ZA|ZI|ZAC|ZAE|RN|RD|HLM|PA|PAE|CHU|CHR|II|III|IV|VI|VII|VIII|IX|XI|XII|XIII|XIV|XV|XVI|XX"
@@ -97,10 +115,9 @@ Private Const PH_ASSUMED As Long = 2
 Private Const PH_SHORT As Long = 3
 Private Const PH_LETTERS As Long = 4
 Private Const PH_INVALID As Long = 5
+Private Const PH_FOREIGN As Long = 6     ' v1.6 (F7-12) : numero national d'un contact a l'etranger
 ' UserProperty portant la fete du prenom (fonctionnelle, hors T()) : "MM-JJ"
 Private Const UP_NAMEDAY As String = "NameDay"
-
-Private Declare PtrSafe Sub Sleep Lib "kernel32" (ByVal dwMilliseconds As Long)
 
 ' --- Reglages (LoadSettings) ---
 Private mDoNames As Boolean
@@ -127,6 +144,9 @@ Private mClearMode As Boolean     ' passe "purge des categories" en cours
 ' --- Rapport ---
 Private mReport As String
 Private mReportPath As String
+' v1.6 (F7-13) : lignes d'annulation de la passe / de la fiche en cours.
+Private mUndo As String
+Private mCardUndo As String
 
 ' --- Compteurs ---
 Private mFolders As Long
@@ -176,13 +196,20 @@ Public Sub ContactNormalizeAll()
     Dim dryRun As Boolean
     dryRun = (choice = vbYes)
 
-    modDebugLog.DInfo MOD_NAME, "NormalizeAll start store=" & st.DisplayName & " dryRun=" & dryRun
-    ReportHeader dryRun, "Compte : " & st.DisplayName
-    ProcessFolderTree st.GetRootFolder, dryRun
-    WriteReport
-    modDebugLog.DInfo MOD_NAME, "NormalizeAll end scanned=" & mScanned & " changed=" & mChanged & _
-        " fields=" & mFieldChanges & " errors=" & mErrors & " cats=" & mCatFound & " dryRun=" & dryRun
-    ShowSummary dryRun
+    ' v1.6 (F7-16) : [Appliquer maintenant] apres la simulation relance la
+    ' passe sur le meme compte, sans reposer les questions.
+    Do
+        ResetCounters
+        modDebugLog.DInfo MOD_NAME, "NormalizeAll start store=" & st.DisplayName & " dryRun=" & dryRun
+        ReportHeader dryRun, "Compte : " & st.DisplayName
+        ProcessFolderTree st.GetRootFolder, dryRun
+        WriteReport
+        SaveUndo dryRun, "ContactNormalize"
+        modDebugLog.DInfo MOD_NAME, "NormalizeAll end scanned=" & mScanned & " changed=" & mChanged & _
+            " fields=" & mFieldChanges & " errors=" & mErrors & " cats=" & mCatFound & " dryRun=" & dryRun
+        If Not ShowSummary(dryRun) Then Exit Do
+        dryRun = False
+    Loop
     If mClearCatPrompt And mCatFound > 0 Then OfferClearCategories st
     Exit Sub
 ErrH:
@@ -192,6 +219,7 @@ ErrH:
     modDebugLog.DError MOD_NAME, "ContactNormalizeAll err " & errNo & " - " & errDesc
     ReportLine "!! ERREUR " & errNo & " - " & errDesc
     WriteReport
+    SaveUndo dryRun, "ContactNormalize"
     MsgBox T("Erreur : ", "Error: ") & errNo & " - " & errDesc, vbExclamation, UiTitle()
 End Sub
 
@@ -237,14 +265,20 @@ Public Sub ContactNormalizeSelected()
     Dim dryRun As Boolean
     dryRun = (choice = vbYes)
 
-    modDebugLog.DInfo MOD_NAME, "NormalizeSelected start n=" & picked.Count & " dryRun=" & dryRun
-    ReportHeader dryRun, "Selection : " & picked.Count & " fiche(s)"
+    ' v1.6 (F7-16) : [Appliquer maintenant] apres la simulation (meme selection).
     Dim itm As Object
-    For Each itm In picked
-        NormalizeContact itm, "(selection)", dryRun
-    Next itm
-    WriteReport
-    ShowSummary dryRun
+    Do
+        ResetCounters
+        modDebugLog.DInfo MOD_NAME, "NormalizeSelected start n=" & picked.Count & " dryRun=" & dryRun
+        ReportHeader dryRun, "Selection : " & picked.Count & " fiche(s)"
+        For Each itm In picked
+            NormalizeContact itm, "(selection)", dryRun
+        Next itm
+        WriteReport
+        SaveUndo dryRun, "ContactNormalize (selection)"
+        If Not ShowSummary(dryRun) Then Exit Do
+        dryRun = False
+    Loop
     Exit Sub
 ErrH:
     errNo = Err.Number
@@ -253,6 +287,7 @@ ErrH:
     modDebugLog.DError MOD_NAME, "ContactNormalizeSelected err " & errNo & " - " & errDesc
     ReportLine "!! ERREUR " & errNo & " - " & errDesc
     WriteReport
+    SaveUndo dryRun, "ContactNormalize (selection)"
     MsgBox T("Erreur : ", "Error: ") & errNo & " - " & errDesc, vbExclamation, UiTitle()
 End Sub
 
@@ -279,6 +314,7 @@ ErrH:
     modDebugLog.DError MOD_NAME, "ContactClearCategories err " & errNo & " - " & errDesc
     ReportLine "!! ERREUR " & errNo & " - " & errDesc
     WriteReport
+    SaveUndo False, "ContactNormalize (purge des categories)"
     MsgBox T("Erreur : ", "Error: ") & errNo & " - " & errDesc, vbExclamation, UiTitle()
 End Sub
 
@@ -324,6 +360,8 @@ Private Sub RunClearCategories(ByVal st As Outlook.Store)
     ProcessFolderTree st.GetRootFolder, dryRun
     mClearMode = False
     WriteReport
+    ' v1.6 (F7-13) : la purge est annulable (ContactUndoLastRun).
+    SaveUndo dryRun, "ContactNormalize (purge des categories)"
     modDebugLog.DInfo MOD_NAME, "ClearCategories end found=" & mCatFound & " cleared=" & mCatCleared & _
         " errors=" & mErrors & " dryRun=" & dryRun
     MsgBox IIf(dryRun, T("SIMULATION - rien n'a ~et~e ~ecrit.", "DRY RUN - nothing was written."), _
@@ -354,7 +392,7 @@ Private Sub LoadSettings()
     mCountryUpper = modConfig.CfgB("AddressCountryUppercase", True)
     mDefaultCountry = Trim$(modConfig.Cfg("AddressDefaultCountry", ""))
     mFileAsFormat = UCase$(Trim$(modConfig.Cfg("ContactFileAsFormat", "LastFirst")))
-    mSkipFolders = modConfig.Cfg("ContactSkipFolders", DEFAULT_SKIP)
+    mSkipFolders = modConfig.Cfg("ContactSkipFolders", modContactCommon.ContactSkipDefault())
     mDoNameDay = modConfig.CfgB("NormalizeNameDay", True)
     mClearCatPrompt = modConfig.CfgB("ClearCategoriesPrompt", True)
     LoadNameDays modConfig.Cfg("NameDayExtra", "")
@@ -378,6 +416,8 @@ End Sub
 Private Sub ResetCounters()
     mReport = ""
     mReportPath = ""
+    mUndo = ""
+    mCardUndo = ""
     mFolders = 0: mScanned = 0: mChanged = 0: mFieldChanges = 0
     mEntities = 0: mPhoneWarn = 0: mErrors = 0
     mNameDaySet = 0: mNameDayUnknown = 0
@@ -392,11 +432,9 @@ Private Function AskMode(ByVal scopeTxt As String) As VbMsgBoxResult
     AskMode = modMsgBoxCustom.Confirm3( _
         scopeTxt & vbCrLf & vbCrLf & _
         T("Simulation : rien n'est ~ecrit, le rapport liste champ par champ ce qui SERAIT chang~e." & vbCrLf & _
-          "Appliquer : ~ecrit les fiches (t~el~ephones E.164, noms Pr~enom NOM, adresses, e-mails)." & vbCrLf & _
-          "(Boutons natifs : Oui = Simulation, Non = Appliquer.)", _
+          "Appliquer : ~ecrit les fiches (t~el~ephones E.164, noms Pr~enom NOM, adresses, e-mails).", _
           "Dry run: nothing is written, the report lists field by field what WOULD change." & vbCrLf & _
-          "Apply: writes the cards (E.164 phones, Firstname LASTNAME, addresses, e-mails)." & vbCrLf & _
-          "(Native buttons: Yes = Dry run, No = Apply.)"), _
+          "Apply: writes the cards (E.164 phones, Firstname LASTNAME, addresses, e-mails)."), _
         UiTitle(), T("&Simulation", "&Dry run"), T("&Appliquer", "&Apply"), T("A&nnuler", "&Cancel"))
 End Function
 
@@ -475,12 +513,6 @@ Private Function IsSkippedFolder(ByVal fld As Outlook.MAPIFolder) As Boolean
     IsSkippedFolder = modContactCommon.IsSkippedFolder(fld, mSkipFolders)
 End Function
 
-' Dossier situe sous les Elements supprimes de son compte (corbeille) ?
-Private Function IsInDeletedItems(ByVal fld As Outlook.MAPIFolder) As Boolean
-    ' Pack v3 (C3) : delegation modContactCommon (helper partage).
-    IsInDeletedItems = modContactCommon.IsInDeletedItems(fld)
-End Function
-
 
 Private Sub ProcessContacts(ByVal fld As Outlook.MAPIFolder, ByVal dryRun As Boolean)
     On Error GoTo ErrH
@@ -514,6 +546,7 @@ Private Sub NormalizeContact(ByVal ct As Outlook.ContactItem, ByVal fldName As S
     On Error GoTo ErrH
     mScanned = mScanned + 1
     ResetScratch
+    mCardUndo = ""
 
     who = SafeProp(ct, "FullName")
     If Len(who) = 0 Then who = SafeProp(ct, "FileAs")
@@ -531,10 +564,13 @@ Private Sub NormalizeContact(ByVal ct As Outlook.ContactItem, ByVal fldName As S
         mFieldChanges = mFieldChanges + 1
         mCatCleared = mCatCleared + 1
         If Not dryRun Then
+            UndoAdd ct, "Categories", SafeProp(ct, "Categories"), ""
             ct.Categories = ""
             If Not SafeSave(ct) Then
                 mErrors = mErrors + 1
                 ReportLine "   !! Save en echec"
+            Else
+                mUndo = mUndo & mCardUndo
             End If
         End If
         Exit Sub
@@ -559,6 +595,8 @@ Private Sub NormalizeContact(ByVal ct As Outlook.ContactItem, ByVal fldName As S
         ReportLine "   !! Save en echec, fiche non modifiee"
         Exit Sub
     End If
+    ' v1.6 (F7-13) : fiche enregistree -> ses lignes d'annulation comptent.
+    mUndo = mUndo & mCardUndo
     PostSaveChecks ct
     Exit Sub
 ErrH:
@@ -632,6 +670,13 @@ Private Function DoNames(ByVal ct As Outlook.ContactItem, ByRef lines As String,
         Exit Function
     End If
 
+    ' v1.6 (F7-13) : annulation dans l'ordre de l'ecriture (FullName d'abord).
+    UndoAdd ct, "FullName", oldFull, newFull
+    UndoAdd ct, "FirstName", SafeProp(ct, "FirstName"), nFirst
+    UndoAdd ct, "MiddleName", SafeProp(ct, "MiddleName"), nMiddle
+    UndoAdd ct, "LastName", SafeProp(ct, "LastName"), nLast
+    UndoAdd ct, "FileAs", oldFA, newFA
+
     ' FullName d'abord (Outlook le re-decoupe), puis les composantes qui
     ' font foi, puis FileAs. Civilite / suffixe reposes a l'identique.
     ct.FullName = newFull
@@ -648,6 +693,7 @@ Private Function DoNames(ByVal ct As Outlook.ContactItem, ByRef lines As String,
         For idx = 1 To 3
             dn = SafeProp(ct, "Email" & idx & "DisplayName")
             If InStr(1, dn, oldFull, vbBinaryCompare) > 0 Then
+                UndoAdd ct, "Email" & idx & "DisplayName", dn, Replace(dn, oldFull, newFull)
                 CallByName ct, "Email" & idx & "DisplayName", VbLet, Replace(dn, oldFull, newFull)
             End If
         Next idx
@@ -746,22 +792,32 @@ End Function
 Private Function DoPhones(ByVal ct As Outlook.ContactItem, ByRef lines As String, ByVal dryRun As Boolean) As Long
     On Error GoTo ErrH
     Dim props() As String, idx As Long, raw As String, newV As String, status As Long, cnt As Long
+    Dim foreign As String
+    ' v1.6 (F7-12) : pays d'adresse etranger -> numeros nationaux laisses tels quels.
+    foreign = ForeignCountry(ct)
     props = Split(PHONE_PROPS, "|")
     For idx = LBound(props) To UBound(props)
         raw = SafeProp(ct, props(idx))
         If Len(Trim$(raw)) > 0 Then
-            newV = NormalizePhone(raw, status)
+            newV = NormalizePhone(raw, status, (Len(foreign) > 0))
             Select Case status
                 Case PH_CHANGED, PH_ASSUMED
                     cnt = cnt + 1
                     AddLine lines, PhoneLabel(props(idx)), raw, newV & IIf(status = PH_ASSUMED, T("  (0 initial suppos~e)", "  (leading 0 assumed)"), "")
-                    If Not dryRun Then CallByName ct, props(idx), VbLet, newV
+                    If Not dryRun Then
+                        UndoAdd ct, props(idx), raw, newV
+                        CallByName ct, props(idx), VbLet, newV
+                    End If
                 Case PH_LETTERS
                     mPhoneWarn = mPhoneWarn + 1
                     AddNote lines, "!! " & PhoneLabel(props(idx)) & T(" contient du texte, laiss~e tel quel : ", " contains text, left as is: ") & raw
                 Case PH_INVALID
                     mPhoneWarn = mPhoneWarn + 1
                     AddNote lines, "!! " & PhoneLabel(props(idx)) & T(" non reconnu, laiss~e tel quel : ", " not recognised, left as is: ") & raw
+                Case PH_FOREIGN
+                    mPhoneWarn = mPhoneWarn + 1
+                    AddNote lines, "!! " & PhoneLabel(props(idx)) & T(" : num~ero national d'un contact ", ": national number of a contact in ") & _
+                                   foreign & T(", laiss~e tel quel : ", ", left as is: ") & raw
             End Select
         End If
     Next idx
@@ -789,8 +845,32 @@ Private Function PhoneLabel(ByVal propName As String) As String
     End Select
 End Function
 
+' v1.6 (F7-12) : pays d'adresse de la fiche (bureau, domicile, autre) s'il
+' est renseigne et n'est pas le pays par defaut (AddressDefaultCountry, a
+' defaut FRANCE) ; "" sinon.
+Private Function ForeignCountry(ByVal ct As Object) As String
+    Dim cty As String, k As String, home As String
+    cty = Trim$(SafeProp(ct, "BusinessAddressCountry"))
+    If Len(cty) = 0 Then cty = Trim$(SafeProp(ct, "HomeAddressCountry"))
+    If Len(cty) = 0 Then cty = Trim$(SafeProp(ct, "OtherAddressCountry"))
+    If Len(cty) = 0 Then Exit Function
+    k = modContactCommon.NormKey(cty)
+    home = modContactCommon.NormKey(mDefaultCountry)
+    If Len(home) = 0 Then home = "FRANCE"
+    If k = home Then Exit Function
+    If home = "FRANCE" Then
+        Select Case k
+            Case "FR", "FRA", "FRANCE METROPOLITAINE": Exit Function
+        End Select
+    End If
+    ForeignCountry = cty
+End Function
+
 ' E.164 : "+" & indicatif & numero national sans le 0. Statuts en tete.
-Private Function NormalizePhone(ByVal raw As String, ByRef status As Long) As String
+' v1.6 (F7-12) : keepNational = contact a l'etranger -> un numero national
+' (ni + ni 00, plus de 6 chiffres) n'est pas converti (PH_FOREIGN).
+Private Function NormalizePhone(ByVal raw As String, ByRef status As Long, _
+                                Optional ByVal keepNational As Boolean = False) As String
     Dim s As String, idx As Long, ch As String, digits As String
     Dim hasPlus As Boolean, hasLetter As Boolean, cc As String, result As String
     NormalizePhone = raw
@@ -838,6 +918,10 @@ Private Function NormalizePhone(ByVal raw As String, ByRef status As Long) As St
     Else
         If Len(digits) <= 6 Then
             status = PH_SHORT
+            Exit Function
+        End If
+        If keepNational Then
+            status = PH_FOREIGN
             Exit Function
         End If
         If Len(digits) = 10 And Left$(digits, 1) = "0" Then
@@ -1070,6 +1154,7 @@ Private Function DoNameDay(ByVal ct As Outlook.ContactItem, ByRef lines As Strin
     AddLine lines, T("F" & ChrW$(234) & "te", "Name day"), cur, Mid$(mmdd, 4, 2) & "/" & Left$(mmdd, 2)
     mNameDaySet = mNameDaySet + 1
     If Not dryRun Then
+        UndoAdd ct, "UP:" & UP_NAMEDAY, cur, mmdd
         If up Is Nothing Then Set up = ct.UserProperties.Add(UP_NAMEDAY, olText, False)
         up.Value = mmdd
     End If
@@ -1218,9 +1303,29 @@ Private Function ApplyField(ByVal ct As Outlook.ContactItem, ByVal propName As S
                             ByRef lines As String, ByVal dryRun As Boolean) As Long
     If StrComp(oldV, newV, vbBinaryCompare) = 0 Then Exit Function
     AddLine lines, lbl, oldV, newV
-    If Not dryRun Then CallByName ct, propName, VbLet, newV
+    If Not dryRun Then
+        UndoAdd ct, propName, oldV, newV
+        CallByName ct, propName, VbLet, newV
+    End If
     ApplyField = 1
 End Function
+
+' v1.6 (F7-13) : ligne d'annulation d'un champ de la fiche en cours (gardee
+' dans mUndo seulement apres un Save reussi).
+Private Sub UndoAdd(ByVal ct As Object, ByVal propName As String, ByVal oldV As String, ByVal newV As String)
+    If StrComp(oldV, newV, vbBinaryCompare) = 0 Then Exit Sub
+    mCardUndo = mCardUndo & modContactCommon.UndoLine(ct, propName, oldV, newV)
+End Sub
+
+' v1.6 (F7-13) : fichier d'annulation de la passe, a cote du rapport (mode
+' Appliquer seulement ; une seule fois par passe).
+Private Sub SaveUndo(ByVal dryRun As Boolean, ByVal source As String)
+    On Error Resume Next
+    If dryRun Or Len(mUndo) = 0 Or Len(mReportPath) = 0 Then Exit Sub
+    modContactCommon.UndoSave modContactCommon.UndoPathFor(mReportPath), source, mUndo
+    mUndo = ""
+    Err.Clear
+End Sub
 
 Private Function SafeProp(ByVal ct As Object, ByVal propName As String) As String
     On Error Resume Next
@@ -1322,19 +1427,8 @@ End Function
 
 ' Save avec 3 essais (Exchange Online : erreurs transitoires).
 Private Function SafeSave(ByVal itm As Object) As Boolean
-    Dim tries As Long
-    On Error Resume Next
-    For tries = 1 To 3
-        Err.Clear
-        itm.Save
-        If Err.Number = 0 Then
-            SafeSave = True
-            Exit Function
-        End If
-        modDebugLog.DDebug MOD_NAME, "Save essai " & tries & " err " & Err.Number & " - " & Err.Description
-        Sleep 300 * tries
-    Next tries
-    SafeSave = False
+    ' v1.6 (F7-14) : delegation modContactCommon (helper partage).
+    SafeSave = modContactCommon.SafeSave(itm, MOD_NAME)
 End Function
 
 '=============================================================================
@@ -1350,22 +1444,15 @@ Private Sub WriteReport()
     dirPath = modConfig.MacroVBADir()
     If Dir(dirPath, vbDirectory) = "" Then MkDir dirPath
     mReportPath = dirPath & "\ContactNormalize-" & Format$(Now, "yyyymmdd-hhnnss") & ".txt"
-    Dim stm As Object
-    Set stm = CreateObject("ADODB.Stream")
-    stm.Type = 2
-    stm.Charset = "utf-8"
-    stm.Open
-    stm.WriteText mReport
-    stm.SaveToFile mReportPath, 2
-    stm.Close
-    If Err.Number <> 0 Then
-        modDebugLog.DError MOD_NAME, "WriteReport err " & Err.Number & " - " & Err.Description
-        Err.Clear
-    End If
+    ' v1.6 (F7-14) : ecriture UTF-8 partagee (erreur journalisee par elle).
+    modContactCommon.WriteUtf8 mReportPath, mReport
+    Err.Clear
 End Sub
 
-Private Sub ShowSummary(ByVal dryRun As Boolean)
-    Dim msg As String
+' Bilan. v1.6 (F7-16) : apres une simulation qui trouve des changements,
+' [Appliquer maintenant] / [Ouvrir le rapport] / [Fermer] ; True = appliquer.
+Private Function ShowSummary(ByVal dryRun As Boolean) As Boolean
+    Dim msg As String, r As VbMsgBoxResult
     msg = IIf(dryRun, T("SIMULATION - rien n'a ~et~e ~ecrit.", "DRY RUN - nothing was written."), _
                       T("Termin~e.", "Done.")) & vbCrLf & vbCrLf & _
           T("Dossiers de contacts : ", "Contact folders: ") & mFolders & vbCrLf & _
@@ -1378,9 +1465,19 @@ Private Sub ShowSummary(ByVal dryRun As Boolean)
           T("F" & ChrW$(234) & "tes pos~ees : ", "Name days set: ") & mNameDaySet & "   " & _
           T("pr~enoms inconnus : ", "unknown first names: ") & mNameDayUnknown & vbCrLf & _
           T("Erreurs : ", "Errors: ") & mErrors & vbCrLf & vbCrLf & _
-          T("Rapport : ", "Report: ") & mReportPath & vbCrLf & vbCrLf & _
-          T("Ouvrir le rapport ?", "Open the report?")
-    If MsgBox(msg, vbYesNo + vbInformation, UiTitle()) = vbYes Then
-        If Dir(mReportPath) <> "" Then Shell "notepad.exe """ & mReportPath & """", vbNormalFocus
+          T("Rapport : ", "Report: ") & mReportPath
+    If dryRun And mChanged > 0 Then
+        r = modMsgBoxCustom.Confirm3(msg & vbCrLf & vbCrLf & T("Appliquer maintenant ces changements ?", "Apply these changes now?"), _
+                                     UiTitle(), T("&Appliquer maintenant", "&Apply now"), _
+                                     T("&Ouvrir le rapport", "&Open report"), T("&Fermer", "&Close"), vbInformation)
+        If r = vbYes Then
+            ShowSummary = True
+            Exit Function
+        End If
+        If r <> vbNo Then Exit Function
+    ElseIf MsgBox(msg & vbCrLf & vbCrLf & T("Ouvrir le rapport ?", "Open the report?"), _
+                  vbYesNo + vbInformation, UiTitle()) <> vbYes Then
+        Exit Function
     End If
-End Sub
+    If Dir(mReportPath) <> "" Then Shell "notepad.exe """ & mReportPath & """", vbNormalFocus
+End Function

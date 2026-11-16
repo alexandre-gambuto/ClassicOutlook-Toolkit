@@ -1,6 +1,19 @@
 Option Explicit
 
 '=============================================================================
+' ARCHIVE (11/2026) : ne plus coller dans le projet installe.
+'   Audit 11/2026, F9-14 (choix A) : sonde du blocage OneNote, inutile tant
+'   que l'IT n'a pas repare la TypeLib. Sort du projet VBA installe
+'   (Fichier > Supprimer modOneNoteProbe, sans exporter, puis Debogage >
+'   Compiler) avec modOneNote, l'onglet OneNote du ruban et les references
+'   de modMaintenance (ModuleVersionOf "ONProbe", MODULES_DEFAULT). Le
+'   fichier reste dans le depot. AVANT TOUTE REMISE EN SERVICE : revoir les
+'   lancements de regedit.exe et de cmd.exe (reg.exe query, clip) au regard
+'   de la regle EDR du projet.
+' v1.1 (2026-11-16) : audit 11/2026 - F9-14 : en-tete d'archive (code inchange).
+'=============================================================================
+
+'=============================================================================
 ' modOneNoteProbe - Diagnostic avance de la chaine COM OneNote
 ' Purpose (EN): Advanced standalone probe for the OneNote COM chain. Reads the
 '   TypeLib registration in TRIPLE view (HKLM machine / HKCU user override /
@@ -37,7 +50,7 @@ Option Explicit
 '=============================================================================
 
 Private Const MOD_NAME As String = "ONProbe"
-Private Const MOD_VERSION As String = "v1 - 2026-06-07"
+Private Const MOD_VERSION As String = "v1.1 - 2026-11-16"
 
 ' ---- Identite COM OneNote (replis si la resolution registre echoue) ----
 Private Const PROGID_ONENOTE    As String = "OneNote.Application"

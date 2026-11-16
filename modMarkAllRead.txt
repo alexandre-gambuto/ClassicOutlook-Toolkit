@@ -1,16 +1,27 @@
 Option Explicit
 
 '=============================================================================
-' modMarkAllRead v4  (2026-08-22)
-' Purpose (EN): marks every unread mail in the current store (root +
-'   recursive) as read. Uses Restrict("[UnRead] = True") and skips the
-'   per-item .Save (Outlook persists UnRead on its own -> major speedup on
-'   stores with thousands of unread items).
+' modMarkAllRead v4.1  (2026-11-16)
+' Purpose (EN): marks every unread mail in the current store - the mailbox
+'   of the folder shown in the active explorer (root + recursive) - as
+'   read. Mail folders only; folders without unread items are skipped
+'   (Folder.UnReadItemCount, no query). Uses Restrict("[UnRead] = True")
+'   and skips the per-item .Save (Outlook persists UnRead on its own).
 '
-' Marque tous les mails non lus de la boite courante (racine + recursif)
-' comme lus.
+' Marque tous les mails non lus de la boite courante (celle du dossier
+' affiche ; racine + recursif) comme lus.
 '
 ' Point d'entree public : MarkAllRead
+'
+' v4.1 (2026-11-16) : audit 11/2026 - F3-15 (choix A) : (a) la boite
+'   traitee est celle du dossier AFFICHE (modStoreContext.CurrentStore,
+'   repli boite par defaut), comme modSearch / modViewGuard / modSnooze ;
+'   avant, toujours la boite principale, meme lance depuis une autre boite.
+'   (b) Comptage par Folder.UnReadItemCount (aucune requete) et dossiers
+'   sans non-lu sautes au marquage : avant, deux Restrict par dossier sur
+'   les 1 000+ dossiers. (c) DoEvents tous les 200 messages marques.
+'   Dossiers de courrier seulement (DefaultItemType = olMailItem), au
+'   comptage comme au marquage.
 '
 ' v4 (2026-08-22) : revue UX pop-ups.
 '   (a) CONFIRMATION AJOUTEE (manquait) : l'action balaie TOUTE la boite,
@@ -34,7 +45,7 @@ Option Explicit
 '=============================================================================
 
 Private Const MOD_NAME As String = "MarkRead"
-Private Const MOD_VERSION As String = "v4 - 2026-08-22"
+Private Const MOD_VERSION As String = "v4.1 - 2026-11-16"
 
 '=============================================================================
 ' ModVersion - version REELLEMENT chargee dans le VBE.
@@ -61,10 +72,14 @@ Public Sub MarkAllRead()
     On Error GoTo ErrHandler
 
     Set olNS = Application.GetNamespace("MAPI")
-    Set olRootFolder = olNS.defaultStore.GetRootFolder
+    ' v4.1 (F3-15, choix A) : boite du dossier affiche (repli : principale).
+    Dim st As Object
+    Set st = modStoreContext.CurrentStore()
+    If st Is Nothing Then Set st = olNS.defaultStore
+    Set olRootFolder = st.GetRootFolder
 
     ' --- v4 : comptage prealable, puis confirmation -----------------------
-    ' Le comptage est un simple Restrict par dossier (pas d'ecriture) : il
+    ' Le comptage lit Folder.UnReadItemCount (v4.1, pas d'ecriture) : il
     ' coute un balayage, mais il transforme une confirmation abstraite en
     ' chiffre verifiable. Sur une boite deja propre (0 non-lu), on sort
     ' sans rien demander ni rien ecrire.
@@ -127,16 +142,16 @@ End Sub
 '=============================================================================
 ' CountFolder - compte les non-lus, recursif. Lecture seule.
 ' v4 : separe de ProcessFolder pour que la confirmation porte sur un chiffre.
+' v4.1 (F3-15) : Folder.UnReadItemCount (aucune requete), dossiers de
+' courrier seulement.
 '=============================================================================
 Private Sub CountFolder(ByVal objFolder As Outlook.folder, ByRef lngCount As Long)
-    Dim objItems As Outlook.items
     Dim objSubFolder As Outlook.folder
 
     On Error Resume Next
 
-    Set objItems = objFolder.items.Restrict("[UnRead] = True")
-    If Not objItems Is Nothing Then
-        lngCount = lngCount + objItems.count
+    If IsMailFolder(objFolder) Then
+        lngCount = lngCount + objFolder.UnReadItemCount
     End If
 
     If Err.Number <> 0 Then
@@ -151,7 +166,6 @@ Private Sub CountFolder(ByVal objFolder As Outlook.folder, ByRef lngCount As Lon
         CountFolder objSubFolder, lngCount
     Next objSubFolder
 
-    Set objItems = Nothing
     Set objSubFolder = Nothing
 End Sub
 
@@ -166,8 +180,17 @@ Private Sub ProcessFolder(ByVal objFolder As Outlook.folder, ByRef lngCount As L
 
     On Error Resume Next
 
-    ' Filtrer sur non-lus uniquement
-    Set objItems = objFolder.items.Restrict("[UnRead] = True")
+    ' v4.1 (F3-15) : dossier de courrier ET au moins un non-lu, sinon aucune
+    ' requete (avant : un Restrict sur chacun des 1 000+ dossiers).
+    Dim nUnread As Long
+    nUnread = 0
+    If IsMailFolder(objFolder) Then nUnread = objFolder.UnReadItemCount
+    Err.Clear
+
+    If nUnread > 0 Then
+        ' Filtrer sur non-lus uniquement
+        Set objItems = objFolder.items.Restrict("[UnRead] = True")
+    End If
 
     If Not objItems Is Nothing Then
         ' Boucle inverse : si UnRead=False modifie la collection filtree,
@@ -179,6 +202,8 @@ Private Sub ProcessFolder(ByVal objFolder As Outlook.folder, ByRef lngCount As L
                 ' (evite un aller-retour MAPI par item, gain massif).
                 objItem.UnRead = False
                 lngCount = lngCount + 1
+                ' v4.1 : Outlook reste reactif sur les gros volumes.
+                If (lngCount Mod 200) = 0 Then DoEvents
             End If
             Set objItem = Nothing
         Next i
@@ -200,3 +225,15 @@ Private Sub ProcessFolder(ByVal objFolder As Outlook.folder, ByRef lngCount As L
     Set objItems = Nothing
     Set objSubFolder = Nothing
 End Sub
+
+'=============================================================================
+' IsMailFolder (v4.1) : dossier dont le type d'element par defaut est le
+' courrier (olMailItem = 0). False si illisible.
+'=============================================================================
+Private Function IsMailFolder(ByVal objFolder As Outlook.folder) As Boolean
+    On Error Resume Next
+    Dim itemType As Long
+    itemType = -1
+    itemType = objFolder.DefaultItemType
+    IsMailFolder = (itemType = olMailItem)
+End Function

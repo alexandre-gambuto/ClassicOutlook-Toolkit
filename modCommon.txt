@@ -1,11 +1,15 @@
 Option Explicit
 
 '=============================================================================
-' modCommon v1.3
+' modCommon v1.4
+' v1.4 (2026-11-16) : audit 11/2026 - F10-05 : mesure du temps ecoule
+'   insensible a la duree d'allumage du PC (TickMs / ElapsedMs, sur
+'   GetTickCount64) et vraie attente courte (SleepMs : Sleep par tranches
+'   + DoEvents, sans faire tourner un coeur a vide).
 ' Purpose (EN): shared, STATELESS helper functions used by several modules
 '   (file-name sanitizing, HTML escaping, folder resolution by full path,
-'   protected item-property accessors). No module-level state, no UI, no
-'   event handler.
+'   protected item-property accessors, elapsed time). No module-level
+'   state, no UI, no event handler.
 '
 ' Helpers communs SANS ETAT, partages entre modules. Premiere extraction
 ' (revue 2026-06-10) :
@@ -17,6 +21,8 @@ Option Explicit
 '   SetStatus         (v1.1 - fix B5 : progression -> log DEBUG)
 '   ExcelAlive        (v1.2 - instance Excel VRAIMENT vivante, anti-fantome)
 '   FormatDaslDate    (v1.3 - date de filtre au format du poste, pack v4)
+'   TickMs / ElapsedMs (v1.4 - compteur 64 bits, ne reboucle jamais)
+'   SleepMs           (v1.4 - attente courte qui rend la main a Windows)
 '
 ' PERIMETRE VOLONTAIREMENT LIMITE : les helpers SMTP / categories /
 ' IsTechnical restent pour l'instant dans leurs modules consommateurs
@@ -35,7 +41,19 @@ Option Explicit
 '=============================================================================
 
 Private Const MOD_NAME As String = "Common"
-Private Const MOD_VERSION As String = "v1.3 - 2026-09-24"
+Private Const MOD_VERSION As String = "v1.4 - 2026-11-16"
+
+' v1.4 (F10-05) : compteur de millisecondes depuis le demarrage de Windows,
+' sur 64 bits. GetTickCount (32 bits, signe en VBA) devient NEGATIF apres
+' 24,9 jours d'allumage et repasse a zero apres 49,7 jours : toute
+' comparaison de deux valeurs brutes devient fausse (panne des alertes de
+' nouveau mail et de la fenetre calendrier du 09/11/2026). GetTickCount64
+' ne reboucle pas (585 millions d'annees). Projet 64 bits seulement.
+Private Declare PtrSafe Function GetTickCount64 Lib "kernel32" () As LongLong
+Private Declare PtrSafe Sub Sleep Lib "kernel32" (ByVal dwMilliseconds As Long)
+
+' Tranche d'attente de SleepMs : Outlook repond toujours en moins de 50 ms.
+Private Const SLEEP_SLICE_MS As Long = 50
 
 Public Function ModVersion() As String
     ModVersion = MOD_VERSION
@@ -214,3 +232,61 @@ End Function
 Public Function FormatDaslDate(ByVal d As Date) As String
     FormatDaslDate = Format$(d, "ddddd") & " " & Format$(d, "hh:nn")
 End Function
+
+'-----------------------------------------------------------------------------
+' TickMs (v1.4 - audit 11/2026, F10-05)
+' Millisecondes ecoulees depuis le demarrage de Windows, en Double (entier
+' exact). Ne repasse jamais par zero et ne devient jamais negatif, quelle
+' que soit la duree d'allumage du PC. A utiliser A LA PLACE de GetTickCount
+' pour toute echeance ou duree :
+'     t0 = modCommon.TickMs()           ' depart
+'     If modCommon.ElapsedMs(t0) > 1500 Then ...
+'     deadline = modCommon.TickMs() + 5000
+'     If modCommon.TickMs() < deadline Then ...  ' echeance pas encore atteinte
+' Une variable "pas d'echeance" vaut 0 : TickMs() est toujours > 0.
+' Contrairement a Timer, insensible au passage de minuit.
+'-----------------------------------------------------------------------------
+Public Function TickMs() As Double
+    On Error Resume Next
+    TickMs = CDbl(GetTickCount64())
+End Function
+
+'-----------------------------------------------------------------------------
+' ElapsedMs (v1.4) : millisecondes ecoulees depuis startMs (valeur rendue
+' plus tot par TickMs). Jamais negatif.
+'-----------------------------------------------------------------------------
+Public Function ElapsedMs(ByVal startMs As Double) As Double
+    Dim d As Double
+    d = TickMs() - startMs
+    If d < 0 Then d = 0
+    ElapsedMs = d
+End Function
+
+'-----------------------------------------------------------------------------
+' SleepMs (v1.4) : attente de ms millisecondes qui rend VRAIMENT la main a
+' Windows (Sleep par tranches de 50 ms) tout en laissant Outlook traiter
+' ses messages (DoEvents apres chaque tranche). Remplace les boucles
+' "Do While Timer < fin : DoEvents : Loop", qui font tourner un coeur a
+' 100 % et ne sortent jamais si l'attente chevauche minuit.
+' ATTENTION : DoEvents laisse passer les evenements Outlook et les differes
+' modDefer pendant l'attente (comme les anciennes boucles). ms <= 0 : un
+' seul DoEvents.
+'-----------------------------------------------------------------------------
+Public Sub SleepMs(ByVal ms As Long)
+    On Error Resume Next
+    If ms <= 0 Then
+        DoEvents
+        Exit Sub
+    End If
+    Dim t0 As Double, remain As Double, slice As Long
+    t0 = TickMs()
+    Do
+        remain = ms - ElapsedMs(t0)
+        If remain <= 0 Then Exit Do
+        slice = SLEEP_SLICE_MS
+        If remain < slice Then slice = CLng(remain)
+        If slice < 1 Then slice = 1
+        Sleep slice
+        DoEvents
+    Loop
+End Sub

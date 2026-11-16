@@ -1,7 +1,50 @@
 Option Explicit
 
 '=============================================================================
-' modMaintenance v4.3  (2026-10-05)
+' modMaintenance v4.6  (2026-11-16)
+'
+' v4.6 (2026-11-16) : audit 11/2026 - F0-01, F2-01, F2-11, F9-14, F9-12,
+'   F5-19 :
+'   (1) F0-01 : repart de la v4.5 du 25/10 (celle installee dans Outlook),
+'       que la livraison du 02/11, refaite sur la v4.4, avait effacee :
+'       diagnostic des chemins du dossier de l'outil en deux fenetres,
+'       chemins relatifs <outil>\..., libelle "Sorties", MaintOpenVBAFolder
+'       sur <outil>\Code. Garde l'ajout ContEnrich du 02/11.
+'   (2) F2-01 : rapports qui depassaient la limite de 1 024 caracteres
+'       d'une boite : versions des modules ecrites en entier dans
+'       <Sorties>\versions-modules.txt, ouvert dans le Bloc-notes (la boite
+'       ne garde que le total et les modules non instrumentes) ; filtre du
+'       journal en pages de 30 modules sur deux colonnes ("+" = page
+'       suivante).
+'   (3) F2-11 : "Ouvrir config" sans config.ini lance le guide de demarrage
+'       (modQuickStart, qui cree le dossier et le fichier) ; modele
+'       CreateConfigTemplate (perime) supprime. Aide du niveau de journal :
+'       INFO est le defaut, niveau valable jusqu'au prochain demarrage ;
+'       "6 bindings" ; menu Configuration renumerote 1 a 6.
+'   (4) F9-14 (choix A) : modules OneNote sortis du projet installe : Case
+'       "ONProbe" / "OneNote" et noms retires (dependance de compilation).
+'   (5) F9-12 / F5-19 : Case "Analytics" (modMailAnalytics) et "SendLLM"
+'       (modSendToLLM), desormais instrumentes.
+'
+' v4.5 (2026-11-02, livraison refaite sur la v4.4, remplacee par la v4.6) :
+'   nouveau module modContactEnrich (Completer les coordonnees des
+'   contacts) : ContEnrich ajoute a MODULES_DEFAULT et a ModuleVersionOf.
+'
+' v4.5 (2026-10-25) : nouvel emplacement de l'outil (modConfig v3.17).
+'   MaintDiagnosePaths affiche le dossier de l'outil (et s'il s'agit de
+'   l'ancien emplacement), le dossier memorise, Sorties, Classeurs, Code
+'   et le classeur des campagnes ; test d'ecriture sur Sorties. Deux
+'   fenetres (chemins, puis tests) et chemins relatifs au dossier de
+'   l'outil (<outil>\...) : une MsgBox est coupee vers 1 024 caracteres.
+'   Modele de config.ini : commentaire des chemins a jour.
+'   MaintOpenVBAFolder ouvre <outil>\Code (modConfig.VBADir).
+'   PREREQUIS COMPILATION : modConfig v3.17 colle avant ce module
+'   (ToolkitDir, IsLegacyLayout, ToolkitDirRemembered, WorkbooksDir).
+'
+' v4.4 (2026-10-20) : module modViewGuard (Standardiser l'affichage) :
+'   ViewGuard ajoute a MODULES_DEFAULT et a ModuleVersionOf (oubli de la
+'   livraison du 09/10 : le filtre de log par module ne l'atteignait pas,
+'   et MaintModuleVersions n'affichait pas sa version).
 '
 ' v4.3 (2026-10-05) : nouveau module modThreadAttachments (pieces jointes
 '   du fil) : ThreadAtt ajoute a MODULES_DEFAULT et a ModuleVersionOf.
@@ -122,11 +165,12 @@ Option Explicit
 '   MaintenanceQuick      Reinit / Health-check / Voir le log (auto-ferme)
 '   AssertBindings        health-check des bindings WithEvents
 '   MaintCycleLogLevel      cycle OFF/INFO/DEBUG/TRACE
-'   MaintFilterModules       filtre log par module (pseudo-UI)
-'   MaintOpenConfig        ouvrir config.ini (cree un modele si absent)
-'   MaintOpenVBAFolder    ouvrir <Bureau>\Macro VBA\Outlook\VBA
+'   MaintFilterModules       filtre log par module (pseudo-UI, par pages)
+'   MaintOpenConfig        ouvrir config.ini (lance le guide si absent)
+'   MaintOpenVBAFolder    ouvrir le dossier des sources (<outil>\Code)
 '   MaintDiagnosePaths   chemins resolus + test ecriture
 '   MaintModuleVersions     versions REELLEMENT chargees dans le VBE
+'                          (rapport complet dans le Bloc-notes)
 ' Deja publiques ailleurs (epinglables directement) :
 '   modDebugLog.OpenLog / ClearLog
 '   modBackupVBA.BackupVBA
@@ -137,8 +181,13 @@ Option Explicit
 '=============================================================================
 
 Private Const MOD_NAME As String = "Maint"
-Private Const MOD_VERSION As String = "v4.3 - 2026-10-05"
+Private Const MOD_VERSION As String = "v4.6 - 2026-11-16"
 Private Const TITLE As String = "Maintenance VBA"
+
+' v4.6 (F2-01) : filtre du journal par pages (une boite de saisie est
+' coupee vers 1 024 caracteres) et rapport complet des versions.
+Private Const FILTER_PAGE_SIZE As Long = 30
+Private Const VERSIONS_REPORT_FILE As String = "versions-modules.txt"
 
 ' Copie locale du filtre de log courant. modDebugLog n'expose pas son
 ' filtre (champ prive) : on garde donc une copie synchronisee a chaque
@@ -149,17 +198,19 @@ Private mFilterLocal As String
 ' Liste des modules connus pour le filtre de log et les versions.
 ' Surchargeable via config.ini : cle "KnownModules=modA|modB|..."
 ' (sinon la valeur par defaut ci-dessous est utilisee).
+' v4.6 (F9-14) : OneNote et ONProbe retires (modules archives, hors projet).
 Private Const MODULES_DEFAULT As String = _
     "Config|DebugLog|QuickMove|Snooze|Search|ProjectTag|MeetingColor|" & _
     "AntiOverlap|NewMeeting|ShiftAppt|FlashAppt|ReplyInPlace|PurgeCat|" & _
-    "DevTools|FolderScan|BackupVBA|BackupAuto|Maint|OneNote|MailConfid|" & _
+    "DevTools|FolderScan|BackupVBA|BackupAuto|Maint|MailConfid|" & _
     "ApptPrivacy|MaxWindow|MailTrack|Analytics|ApptWatch|Campaign|" & _
     "Common|FolderMerge|MailExport|MigrateTags|MsgBoxC|Mtg2Appt|Notify|" & _
     "ReplySusp|SendLLM|ThisOutlook|" & _
-    "AppEvents|Defer|ExplWatch|MarkRead|ONProbe|ReplyGreet|" & _
+    "AppEvents|Defer|ExplWatch|MarkRead|ReplyGreet|" & _
     "ContBday|ContExp|ContImp|ContMail|ContNorm|ContNote|ContRel|" & _
     "FolderRen|FolderSort|HideBcc|InboxAlert|InboxWatch|StoreCtx|Ui|" & _
-    "Smtp|ExcelBridge|ContCommon|InspQueue|QuickStart|FoldWatch|ThreadAtt"
+    "Smtp|ExcelBridge|ContCommon|InspQueue|QuickStart|FoldWatch|ThreadAtt|ViewGuard|" & _
+    "ContEnrich"
 
 '=============================================================================
 ' Maintenance  (POINT D'ENTREE - a epingler au QAT)
@@ -241,14 +292,18 @@ End Sub
 ' Aide affichee a chaque changement de niveau : rappelle ce que chaque
 ' niveau ecrit dans debug.log (du moins au plus verbeux). Marque le niveau
 ' courant d'une fleche.
+' v4.6 (F2-11) : le defaut est INFO (DefaultLogLevel=1, modConfig), pas OFF ;
+' le niveau choisi ici ne vaut que jusqu'au prochain demarrage.
 Private Function LogLevelHelp() As String
     Dim cur As Long
     cur = modDebugLog.GlobalLevel
     LogLevelHelp = _
-        Marker(cur, modDebugLog.LOG_ERROR) & T("OFF   : erreurs uniquement (defaut)", "OFF   : errors only (default)") & vbCrLf & _
-        Marker(cur, modDebugLog.LOG_INFO) & T("INFO  : + actions reussies (RDV decale, mail range...)", "INFO  : + successful actions (appt shifted, mail filed...)") & vbCrLf & _
-        Marker(cur, modDebugLog.LOG_DEBUG) & T("DEBUG : + decisions et valeurs intermediaires", "DEBUG : + decisions and intermediate values") & vbCrLf & _
-        Marker(cur, modDebugLog.LOG_TRACE) & T("TRACE : + entree/sortie de fonctions (tout, verbeux)", "TRACE : + function entry/exit (everything, verbose)")
+        Marker(cur, modDebugLog.LOG_ERROR) & T("OFF   : erreurs uniquement", "OFF   : errors only") & vbCrLf & _
+        Marker(cur, modDebugLog.LOG_INFO) & T("INFO  : + actions r~eussies (RDV d~ecal~e, mail rang~e...) (d~efaut)", "INFO  : + successful actions (appt shifted, mail filed...) (default)") & vbCrLf & _
+        Marker(cur, modDebugLog.LOG_DEBUG) & T("DEBUG : + d~ecisions et valeurs interm~ediaires", "DEBUG : + decisions and intermediate values") & vbCrLf & _
+        Marker(cur, modDebugLog.LOG_TRACE) & T("TRACE : + entr~ee/sortie de fonctions (tout, verbeux)", "TRACE : + function entry/exit (everything, verbose)") & vbCrLf & vbCrLf & _
+        T("(jusqu'au prochain d~emarrage ; durable : DefaultLogLevel dans config.ini)", _
+          "(until next start; permanent: DefaultLogLevel in config.ini)")
 End Function
 
 Private Function Marker(ByVal cur As Long, ByVal lvl As Long) As String
@@ -272,8 +327,14 @@ End Function
 '=============================================================================
 ' MaintFilterModules  (epinglable au QAT)
 ' Pseudo-UI rechargee : liste numerotee de tous les modules connus avec
-' statut ACTIF/off. Taper un numero -> toggle. 0 / vide -> quitter en
-' gardant la config courante.
+' statut [x] actif / [ ] coupe. Taper un numero -> toggle. 0 / vide ->
+' quitter en gardant la config courante.
+' v4.6 (F2-01) : la liste complete (65 lignes, environ 2 000 caracteres)
+' etait coupee par la boite de saisie vers 1 024 caracteres (modules 33 et
+' suivants et consigne invisibles). Pages de FILTER_PAGE_SIZE modules sur
+' deux colonnes (environ 850 caracteres) ; "+" = page suivante ; le
+' filtre courant est resume (nombre de modules actifs), les [x] disent
+' lesquels. Un numero d'une autre page reste accepte.
 '=============================================================================
 Public Sub MaintFilterModules()
     Dim mods() As String, n As Long
@@ -284,29 +345,48 @@ Public Sub MaintFilterModules()
         Exit Sub
     End If
 
+    Dim nPages As Long, page As Long
+    nPages = (n + FILTER_PAGE_SIZE - 1) \ FILTER_PAGE_SIZE
+    page = 1
+
     Dim choice As String, idx As Long
+    Dim disp As String, i As Long, iFirst As Long, iLast As Long, half As Long
+    Dim filterStr As String, nActive As Long
     Do
-        ' Construire l'affichage avec statut
-        Dim disp As String, i As Long
-        Dim filterStr As String
+        ' Construire l'affichage avec statut (page courante seulement)
         filterStr = CurrentFilter()
-        disp = T("=== FILTRE MODULES ===", "=== MODULE FILTER ===") & vbCrLf & _
-               T("(ACTIF = trace dans le log)", "(ACTIF = traced in the log)") & vbCrLf & vbCrLf
+        nActive = 0
+        For i = 0 To n - 1
+            If IsActive(mods(i), filterStr) Then nActive = nActive + 1
+        Next i
+        disp = T("=== FILTRE MODULES ===", "=== MODULE FILTER ===") & "  " & _
+               T("page ", "page ") & page & "/" & nPages & vbCrLf & _
+               T("[x] = trac~e dans le log", "[x] = traced in the log") & vbCrLf
         If Len(filterStr) = 0 Then
             disp = disp & T("Filtre courant : (tous actifs)", "Current filter: (all active)") & vbCrLf & vbCrLf
         Else
-            disp = disp & T("Filtre courant : ", "Current filter: ") & filterStr & vbCrLf & vbCrLf
+            disp = disp & T("Filtre courant : ", "Current filter: ") & nActive & "/" & n & _
+                   T(" module(s) actif(s)", " module(s) active") & vbCrLf & vbCrLf
         End If
-        For i = 0 To n - 1
-            disp = disp & Format$(i + 1, "00") & " - " & _
-                   Left$(mods(i) & String(14, " "), 14) & " [" & _
-                   IIf(IsActive(mods(i), filterStr), T("ACTIF", "ON   "), "  off") & "]" & vbCrLf
+        iFirst = (page - 1) * FILTER_PAGE_SIZE
+        iLast = iFirst + FILTER_PAGE_SIZE - 1
+        If iLast > n - 1 Then iLast = n - 1
+        half = (iLast - iFirst + 2) \ 2          ' lignes de la page (2 colonnes)
+        For i = iFirst To iFirst + half - 1
+            disp = disp & FilterCell(mods, i, filterStr)
+            If i + half <= iLast Then disp = disp & "   " & FilterCell(mods, i + half, filterStr)
+            disp = disp & vbCrLf
         Next i
-        disp = disp & vbCrLf & T("Numero pour basculer, 0 = quitter (garde la config) :", "Number to toggle, 0 = quit (keep config):")
+        disp = disp & vbCrLf & T("Num~ero pour basculer", "Number to toggle")
+        If nPages > 1 Then disp = disp & T(", + = page suivante", ", + = next page")
+        disp = disp & T(", 0 = quitter (garde la config) :", ", 0 = quit (keep config):")
 
-        choice = modUi.AskText(disp, TITLE)
-        Select Case Trim$(choice)
+        choice = Trim$(modUi.AskText(disp, TITLE))
+        Select Case choice
             Case "", "0": Exit Sub
+            Case "+"
+                page = page + 1
+                If page > nPages Then page = 1
             Case Else
                 If IsNumeric(choice) Then
                     idx = CLng(choice)
@@ -316,11 +396,17 @@ Public Sub MaintFilterModules()
                         MsgBox T("Num~ero hors plage.", "Number out of range."), vbExclamation, TITLE
                     End If
                 Else
-                    MsgBox T("Entree invalide.", "Invalid entry."), vbExclamation, TITLE
+                    MsgBox T("Entr~ee invalide.", "Invalid entry."), vbExclamation, TITLE
                 End If
         End Select
     Loop
 End Sub
+
+' v4.6 (F2-01) : une case du filtre : "07 ReplyInPlace [x]" (18 caracteres).
+Private Function FilterCell(ByRef mods() As String, ByVal i As Long, ByVal filterStr As String) As String
+    FilterCell = Format$(i + 1, "00") & " " & Left$(mods(i) & Space$(12), 12) & " " & _
+                 IIf(IsActive(mods(i), filterStr), "[x]", "[ ]")
+End Function
 
 Private Function LogFilterText() As String
     Dim f As String
@@ -457,20 +543,21 @@ Private Sub MenuConfiguration()
             T("1 - Recharger config", "1 - Reload config") & vbCrLf & _
             T("2 - Ouvrir config (Notepad)", "2 - Open config (Notepad)") & vbCrLf & _
             T("3 - Ouvrir le dossier VBA", "3 - Open the VBA folder") & vbCrLf & _
-            T("5 - Guide de d~emarrage (v~erification + config minimale)", "5 - Quick start guide (check + minimal config)") & vbCrLf & _
-            T("6 - Aper~cu du fichier que le guide ~ecrirait", "6 - Preview of the file the guide would write") & vbCrLf & _
-            T("7 - R~einitialiser le marqueur du guide", "7 - Reset the guide marker") & vbCrLf & vbCrLf & _
+            T("4 - Guide de d~emarrage (v~erification + config minimale)", "4 - Quick start guide (check + minimal config)") & vbCrLf & _
+            T("5 - Aper~cu du fichier que le guide ~ecrirait", "5 - Preview of the file the guide would write") & vbCrLf & _
+            T("6 - R~einitialiser le marqueur du guide", "6 - Reset the guide marker") & vbCrLf & vbCrLf & _
             T("0 - Retour", "0 - Back") & vbCrLf & vbCrLf & _
             T("Num~ero :", "Number:"), TITLE)
 
+        ' v4.6 (F2-11) : renumerotation 1 a 6 (il n'y avait pas de 4).
         Select Case Trim$(choice)
             Case "", "0": Exit Sub
             Case "1": ReloadConfig
             Case "2": MaintOpenConfig
             Case "3": MaintOpenVBAFolder
-            Case "5": modQuickStart.QuickStart
-            Case "6": modQuickStart.QuickStartPreview
-            Case "7": modQuickStart.QuickStartReset
+            Case "4": modQuickStart.QuickStart
+            Case "5": modQuickStart.QuickStartPreview
+            Case "6": modQuickStart.QuickStartReset
             Case Else: MsgBox T("Choix invalide.", "Invalid choice."), vbExclamation, TITLE
         End Select
     Loop
@@ -492,21 +579,20 @@ End Sub
 
 '=============================================================================
 ' MaintOpenConfig  (epinglable au QAT)
-' Ouvre config.ini dans Notepad. Propose de creer un modele si absent.
+' Ouvre config.ini dans Notepad.
+' v4.6 (F2-11) : sans config.ini, lance le guide de demarrage (modQuickStart :
+' il cree le dossier de l'outil et ecrit un fichier a jour), puis ouvre le
+' fichier s'il existe. Avant : modele perime (cles abandonnees, chemins du
+' Bureau), en erreur 76 si le dossier de l'outil n'existait pas encore.
 '=============================================================================
 Public Sub MaintOpenConfig()
     On Error GoTo ErrH
     Dim p As String
     p = modConfig.ConfigPath()
-    If Dir(p) = "" Then
-        ' Creer un fichier modele si absent, pour edition immediate.
-        If MsgBox(T("Aucun config.ini.", "No config.ini.") & vbCrLf & _
-                  T("Cr~eer un mod~fle commente maintenant ?", "Create a commented template now?"), _
-                  vbQuestion + vbYesNo, TITLE) = vbYes Then
-            CreateConfigTemplate p
-        Else
-            Exit Sub
-        End If
+    If Len(Dir(p)) = 0 Then
+        modDebugLog.DInfo MOD_NAME, "MaintOpenConfig : config.ini absent, guide de demarrage lance"
+        modQuickStart.QuickStart
+        If Len(Dir(p)) = 0 Then Exit Sub        ' guide abandonne ou reporte
     End If
     Shell "notepad.exe """ & p & """", vbNormalFocus
     Exit Sub
@@ -517,8 +603,8 @@ End Sub
 
 '=============================================================================
 ' MaintOpenVBAFolder  (epinglable au QAT)
-' Ouvre <Bureau>\Macro VBA\Outlook\VBA dans l'Explorateur. Propose de
-' creer le dossier s'il n'existe pas.
+' Ouvre le dossier des sources (modConfig.VBADir : <outil>\Code) dans
+' l'Explorateur. Propose de creer le dossier s'il n'existe pas.
 '=============================================================================
 Public Sub MaintOpenVBAFolder()
     On Error GoTo ErrH
@@ -572,24 +658,67 @@ Public Sub MaintDiagnosePaths()
     ' v4 : entierement localise. Les CHEMINS restent hors T() (donnees :
     ' A() alterait un chemin contenant "~e" ou "~a").
     r = T("=== CHEMINS RESOLUS ===", "=== RESOLVED PATHS ===") & vbCrLf & vbCrLf
+    ' v4.5 (25/10, restauree en v4.6 - F0-01) : dossier de l'outil (modConfig
+    ' v3.17) en tete. Chemins affiches relatifs a ce dossier (<outil>\...) et
+    ' tests dans une seconde fenetre : une MsgBox est coupee vers 1 024
+    ' caracteres (F2-01).
+    r = r & T("Dossier outil : ", "Toolkit dir   : ") & modConfig.ToolkitDir() & vbCrLf
+    If modConfig.IsLegacyLayout() Then
+        r = r & T("                (ancien emplacement)", "                (former location)") & vbCrLf
+    End If
+    r = r & T("M~emoris~e      : ", "Remembered    : ") & RememberedText() & vbCrLf
+    r = r & T("config.ini    : ", "config.ini    : ") & RelToToolkit(modConfig.ConfigPath()) & vbCrLf
+    r = r & T("Sorties       : ", "Output folder : ") & RelToToolkit(modConfig.MacroVBADir()) & vbCrLf
+    r = r & T("debug.log     : ", "debug.log     : ") & RelToToolkit(modDebugLog.LogFilePath()) & vbCrLf
+    r = r & T("Classeurs     : ", "Workbooks     : ") & RelToToolkit(modConfig.WorkbooksDir()) & vbCrLf
+    r = r & T("Suivi temps   : ", "Time tracking : ") & RelToToolkit(modConfig.TimeTrackingPath()) & vbCrLf
+    r = r & T("Suivi mails   : ", "Mail tracking : ") & RelToToolkit(modConfig.MailTrackingPath()) & vbCrLf
+    r = r & T("Campagnes     : ", "Campaigns     : ") & RelToToolkit(modConfig.CampaignWorkbookPath()) & vbCrLf
+    r = r & T("Code (VBA)    : ", "Code (VBA)    : ") & RelToToolkit(modConfig.VBADir()) & vbCrLf
     r = r & T("Bureau        : ", "Desktop       : ") & modConfig.DesktopPath() & vbCrLf
-    r = r & T("Macro VBA     : ", "Macro VBA     : ") & modConfig.MacroVBADir() & vbCrLf
-    r = r & T("Dossier VBA   : ", "VBA folder    : ") & modConfig.VBADir() & vbCrLf
-    r = r & T("config.ini    : ", "config.ini    : ") & modConfig.ConfigPath() & vbCrLf
-    r = r & T("debug.log     : ", "debug.log     : ") & modDebugLog.LogFilePath() & vbCrLf
-    r = r & T("Suivi temps   : ", "Time tracking : ") & modConfig.TimeTrackingPath() & vbCrLf
-    r = r & T("Suivi mails   : ", "Mail tracking : ") & modConfig.MailTrackingPath() & vbCrLf
     r = r & T("AppData OL    : ", "AppData OL    : ") & modConfig.AppDataOutlookPath() & vbCrLf
-    r = r & vbCrLf & T("=== TESTS ===", "=== TESTS ===") & vbCrLf & vbCrLf
-    r = r & T("Bureau (lecture)      : ", "Desktop (read)        : ") & TestDir(modConfig.DesktopPath()) & vbCrLf
-    r = r & T("Macro VBA (ecriture)  : ", "Macro VBA (write)     : ") & TestWrite(modConfig.MacroVBADir()) & vbCrLf
-    r = r & T("Dossier VBA (lecture) : ", "VBA folder (read)     : ") & TestDir(modConfig.VBADir()) & vbCrLf
-    r = r & T("AppData OL (ecriture) : ", "AppData OL (write)    : ") & TestWrite(modConfig.AppDataOutlookPath()) & vbCrLf
-    r = r & T("Suivi temps (lecture) : ", "Time tracking (read)  : ") & TestFile(modConfig.TimeTrackingPath()) & vbCrLf
-    r = r & T("Suivi mails (lecture) : ", "Mail tracking (read)  : ") & TestFile(modConfig.MailTrackingPath()) & vbCrLf
+    modUi.Inform r, TITLE
+
+    r = T("=== TESTS ===", "=== TESTS ===") & vbCrLf & vbCrLf
+    r = r & T("Dossier outil (lecture) : ", "Toolkit dir (read)      : ") & TestDir(modConfig.ToolkitDir()) & vbCrLf
+    r = r & T("Sorties (~ecriture)      : ", "Output folder (write)   : ") & TestWrite(modConfig.MacroVBADir()) & vbCrLf
+    r = r & T("Code (lecture)          : ", "Code (read)             : ") & TestDir(modConfig.VBADir()) & vbCrLf
+    r = r & T("AppData OL (~ecriture)   : ", "AppData OL (write)      : ") & TestWrite(modConfig.AppDataOutlookPath()) & vbCrLf
+    r = r & T("Suivi temps (lecture)   : ", "Time tracking (read)    : ") & TestFile(modConfig.TimeTrackingPath()) & vbCrLf
+    r = r & T("Suivi mails (lecture)   : ", "Mail tracking (read)    : ") & TestFile(modConfig.MailTrackingPath()) & vbCrLf
+    r = r & T("Campagnes (lecture)     : ", "Campaigns (read)        : ") & TestFile(modConfig.CampaignWorkbookPath()) & vbCrLf
 
     modUi.Inform r, TITLE
 End Sub
+
+' v4.5 (25/10, restauree en v4.6) : chemin affiche relatif au dossier de
+' l'outil ("<outil>\...") pour tenir dans une MsgBox. Chemin hors de ce
+' dossier : affiche en entier.
+Private Function RelToToolkit(ByVal p As String) As String
+    Dim root As String
+    RelToToolkit = p
+    root = modConfig.ToolkitDir()
+    If Len(root) = 0 Or Len(p) < Len(root) Then Exit Function
+    If StrComp(Left$(p, Len(root)), root, vbTextCompare) <> 0 Then Exit Function
+    If Len(p) > Len(root) Then
+        If Mid$(p, Len(root) + 1, 1) <> "\" Then Exit Function
+    End If
+    RelToToolkit = T("<outil>", "<toolkit>") & Mid$(p, Len(root) + 1)
+End Function
+
+' v4.5 (25/10, restauree en v4.6) : dossier memorise (registre), compare
+' au dossier en service.
+Private Function RememberedText() As String
+    Dim m As String
+    m = modConfig.ToolkitDirRemembered()
+    If Len(m) = 0 Then
+        RememberedText = T("(aucun)", "(none)")
+    ElseIf StrComp(m, modConfig.ToolkitDir(), vbTextCompare) = 0 Then
+        RememberedText = T("(identique)", "(same)")
+    Else
+        RememberedText = m
+    End If
+End Function
 
 Private Function TestDir(ByVal p As String) As String
     On Error Resume Next
@@ -657,18 +786,21 @@ End Function
 ' MODULES_DEFAULT. Rien d'autre.
 '
 ' Non interrogeables : les classes (clsAppEvents, clsApptWatcher,
-' clsExplorerWatcher) n'ont pas d'instance publique atteignable depuis ici,
-' et ThisOutlookSession n'expose pas de ModVersion. Elles portent quand
-' meme leur constante MOD_VERSION, lisible dans le source.
+' clsExplorerWatcher...) et les formulaires n'ont pas d'instance publique
+' atteignable depuis ici. Les classes portent quand meme leur constante
+' MOD_VERSION, lisible dans le source.
 '=============================================================================
 Private Function ModuleVersionOf(ByVal shortName As String) As String
     ' Pack v3 (A9) : liste GENEREE par validate.py --gen-versions a partir des
     ' modules qui exposent ModVersion() (avant : 4 modules instrumentes
     ' oublies - MeetingColor, Mtg2Appt, BackupAuto, BackupVBA - et 20 non
     ' instrumentes). Les classes (clsXxx) n'ont pas d'acces statique et
-    ' restent hors liste ; modSendToLLM est volontairement intact (C15).
+    ' restent hors liste.
+    ' v4.6 : + Analytics (F9-12) et SendLLM (F5-19) ; - OneNote et ONProbe
+    ' (F9-14 : modules archives, a supprimer du projet installe).
     On Error Resume Next
     Select Case shortName
+        Case "Analytics":    ModuleVersionOf = modMailAnalytics.ModVersion()
         Case "AntiOverlap":  ModuleVersionOf = modAntiOverlap.ModVersion()
         Case "ApptPrivacy":  ModuleVersionOf = modAppointmentPrivacy.ModVersion()
         Case "BackupAuto":   ModuleVersionOf = modBackupAuto.ModVersion()
@@ -678,6 +810,7 @@ Private Function ModuleVersionOf(ByVal shortName As String) As String
         Case "Config":       ModuleVersionOf = modConfig.ModVersion()
         Case "ContBday":     ModuleVersionOf = modContactBirthday.ModVersion()
         Case "ContCommon":   ModuleVersionOf = modContactCommon.ModVersion()
+        Case "ContEnrich":   ModuleVersionOf = modContactEnrich.ModVersion()
         Case "ContExp":      ModuleVersionOf = modContactExport.ModVersion()
         Case "ContImp":      ModuleVersionOf = modContactImport.ModVersion()
         Case "ContMail":     ModuleVersionOf = modContactFromMail.ModVersion()
@@ -708,8 +841,6 @@ Private Function ModuleVersionOf(ByVal shortName As String) As String
         Case "Mtg2Appt":     ModuleVersionOf = modMeetingToAppointment.ModVersion()
         Case "NewMeeting":   ModuleVersionOf = modNewMeetingDefault.ModVersion()
         Case "Notify":       ModuleVersionOf = modNotify.ModVersion()
-        Case "ONProbe":      ModuleVersionOf = modOneNoteProbe.ModVersion()
-        Case "OneNote":      ModuleVersionOf = modOneNote.ModVersion()
         Case "ProjectTag":   ModuleVersionOf = modProjectTag.ModVersion()
         Case "PurgeCat":     ModuleVersionOf = modPurgeCategories.ModVersion()
         Case "QuickMove":    ModuleVersionOf = modQuickMove.ModVersion()
@@ -718,6 +849,7 @@ Private Function ModuleVersionOf(ByVal shortName As String) As String
         Case "ReplyInPlace": ModuleVersionOf = modReplyInPlace.ModVersion()
         Case "ReplySusp":    ModuleVersionOf = modReplySuspicion.ModVersion()
         Case "Search":       ModuleVersionOf = modSearch.ModVersion()
+        Case "SendLLM":      ModuleVersionOf = modSendToLLM.ModVersion()
         Case "ShiftAppt":    ModuleVersionOf = modShiftAppointment.ModVersion()
         Case "Smtp":         ModuleVersionOf = modSmtp.ModVersion()
         Case "Snooze":       ModuleVersionOf = modSnooze.ModVersion()
@@ -725,6 +857,7 @@ Private Function ModuleVersionOf(ByVal shortName As String) As String
         Case "ThisOutlook":  ModuleVersionOf = ThisOutlookSession.ModVersion()
         Case "ThreadAtt":    ModuleVersionOf = modThreadAttachments.ModVersion()
         Case "Ui":           ModuleVersionOf = modUi.ModVersion()
+        Case "ViewGuard":    ModuleVersionOf = modViewGuard.ModVersion()
         Case Else:        ModuleVersionOf = ""
     End Select
     If Err.Number <> 0 Then
@@ -738,6 +871,12 @@ End Function
 ' Lues dans la constante de chaque module, pas dans config.ini : un module
 ' non recolle apres une livraison affiche donc son ANCIENNE version, ce qui
 ' est exactement le signal recherche.
+' v4.6 (F2-01) : la liste complete (58 lignes, environ 2 400 caracteres)
+' etait coupee par la boite vers 1 024 caracteres (24 modules visibles,
+' total jamais affiche). Rapport complet ecrit dans
+' <Sorties>\versions-modules.txt et ouvert dans le Bloc-notes ; la boite ne
+' garde que le total et les modules non instrumentes. Fichier impossible a
+' ecrire : rapport tronque dans la boite, comme avant.
 '=============================================================================
 Public Sub MaintModuleVersions()
     On Error GoTo ErrH
@@ -773,13 +912,53 @@ Public Sub MaintModuleVersions()
         nbKnown & "/" & n & " " & T("module(s) instrument~e(s).", "module(s) instrumented.")
 
     modDebugLog.DInfo MOD_NAME, "MaintModuleVersions : " & nbKnown & "/" & n & " instrumentes"
-    modUi.Inform r, TITLE
+
+    ' v4.6 (F2-01) : rapport complet dans un fichier, boite resumee.
+    Dim reportPath As String
+    reportPath = WriteVersionsReport(r)
+    If Len(reportPath) = 0 Then
+        modUi.Inform r, TITLE                     ' repli : boite (tronquee)
+        Exit Sub
+    End If
+    Shell "notepad.exe """ & reportPath & """", vbNormalFocus
+    If Len(unknown) > 600 Then unknown = Left$(unknown, 600) & "..."
+    ' MSGLOOP-OK : liste des non instrumentes bornee a 600 caracteres ci-dessus.
+    modUi.Inform nbKnown & "/" & n & " " & T("module(s) instrument~e(s).", "module(s) instrumented.") & vbCrLf & vbCrLf & _
+                 T("Non instrument~es (", "Not instrumented (") & nbUnknown & T(") :", "):") & vbCrLf & _
+                 "  " & unknown & vbCrLf & vbCrLf & _
+                 T("Liste compl~fte ouverte dans le Bloc-notes :", "Full list opened in Notepad:") & vbCrLf & _
+                 RelToToolkit(reportPath), TITLE
     Exit Sub
 ErrH:
     modDebugLog.DError MOD_NAME, "MaintModuleVersions err " & Err.Number & " - " & Err.Description
     MsgBox T("Erreur : ", "Error: ") & Err.Number & " - " & Err.Description, _
            vbExclamation, TITLE
 End Sub
+
+' v4.6 (F2-01) : ecrit le rapport des versions dans <Sorties>\
+' versions-modules.txt (ecrase a chaque appel). Renvoie le chemin, ou "" si
+' l'ecriture a echoue (erreur au journal).
+Private Function WriteVersionsReport(ByVal body As String) As String
+    Dim p As String, f As Integer
+    On Error GoTo ErrH
+    WriteVersionsReport = ""
+    p = modConfig.MacroVBADir()
+    If Len(Dir(p, vbDirectory)) = 0 Then CreateFolderRec p
+    p = p & "\" & VERSIONS_REPORT_FILE
+    f = FreeFile
+    Open p For Output As #f
+    Print #f, Format$(Now, "yyyy-mm-dd hh:nn:ss") & " - " & TITLE
+    Print #f, ""
+    Print #f, body
+    Close #f
+    WriteVersionsReport = p
+    Exit Function
+ErrH:
+    modDebugLog.DError MOD_NAME, "Rapport des versions non ecrit : err " & Err.Number & " - " & Err.Description
+    On Error Resume Next
+    If f > 0 Then Close #f
+    WriteVersionsReport = ""
+End Function
 
 ' =====================================================================
 ' 5 - BINDINGS & CACHE
@@ -832,7 +1011,7 @@ End Sub
 '                     (mode demarrage / fin de Reinit).
 ' silentIfOk:=False : rapport systematique ; OK -> MsgBoxC auto-fermee 5 s,
 '                     KO -> MsgBox persistante + rappel Reinit (mode menu).
-' Retour : True si les 5 bindings sont vivants.
+' Retour : True si les 6 bindings sont vivants (v4.6 : 6, pas 5).
 '
 ' NB : les libelles de bindings sont des chaines FONCTIONNELLES de
 ' diagnostic (noms d'evenements Outlook), volontairement hors T().
@@ -910,7 +1089,7 @@ End Function
 ' Acces direct aux 3 actions de maintenance les plus frequentes, via une
 ' MsgBox Win32 a boutons renommes (modMsgBoxCustom), auto-fermee a 10 s.
 '   Oui (Reinit)        -> rebind des WithEvents (apres Ctrl+S VBE)
-'   Non (Health-check)  -> etat des 5 bindings
+'   Non (Health-check)  -> etat des 6 bindings
 '   Annuler (Voir log)  -> ouvre debug.log (Echap / croix : idem, inoffensif)
 ' Timeout 10 s -> AUCUNE action : le defaut est en position 3 (log) et
 ' LastResultWasTimeout() court-circuite le Select. Menu complet : Maintenance().
@@ -921,7 +1100,7 @@ Public Sub MaintenanceQuick()
     r = modMsgBoxCustom.Confirm3( _
             T("Maintenance rapide :", "Quick maintenance:") & vbCrLf & vbCrLf & _
             T("  Reinit       = rebind des WithEvents (apr~fs Ctrl+S VBE)", "  Reinit       = rebind WithEvents (after VBE Ctrl+S)") & vbCrLf & _
-            T("  Health-check = ~etat des 5 bindings", "  Health-check = state of the 5 bindings") & vbCrLf & _
+            T("  Health-check = ~etat des 6 bindings", "  Health-check = state of the 6 bindings") & vbCrLf & _
             T("  Voir le log  = ouvrir debug.log", "  Show log     = open debug.log") & vbCrLf & vbCrLf & _
             T("(fermeture auto dans 10 s = aucune action)", "(auto-close in 10 s = no action)"), _
             TITLE, _
@@ -952,43 +1131,4 @@ Private Sub CreateFolderRec(ByVal path As String)
     parent = fso.GetParentFolderName(path)
     If Len(parent) > 0 And Not fso.FolderExists(parent) Then CreateFolderRec parent
     If Not fso.FolderExists(path) Then fso.CreateFolder path
-End Sub
-
-' Cree un config.ini modele commente (utilise si l'utilisateur ouvre la
-' config alors qu'aucun fichier n'existe).
-Private Sub CreateConfigTemplate(ByVal path As String)
-    On Error GoTo ErrH
-    Dim f As Integer
-    f = FreeFile
-    Open path For Output As #f
-    Print #f, "; ============================================================"
-    Print #f, T("; config.ini - configuration externe du projet VBA Outlook", "; config.ini - external configuration for the Outlook VBA project")
-    Print #f, T("; Format : cle=valeur (une par ligne). ; ou # = commentaire.", "; Format: key=value (one per line). ; or # starts a comment.")
-    Print #f, T("; Apres edition : Maintenance > Configuration > Recharger.", "; After editing: Maintenance > Configuration > Reload.")
-    Print #f, T("; Toute cle absente retombe sur la valeur par defaut du code.", "; Any missing key falls back to the code default.")
-    Print #f, "; ============================================================"
-    Print #f, ""
-    Print #f, T("; --- Chemins (laisser vide = calcul auto depuis le Bureau) ---", "; --- Paths (leave empty = auto-computed from the Desktop) ---")
-    Print #f, "; VBADir="
-    Print #f, "; TimeTrackingPath="
-    Print #f, "; MailTrackingPath="
-    Print #f, ""
-    Print #f, T("; --- Liste des modules connus (filtre log + versions) ---", "; --- Known modules (log filter + versions) ---")
-    Print #f, "; KnownModules=Config|DebugLog|QuickMove|ProjectTag|..."
-    Print #f, ""
-    Print #f, T("; --- Versions (diagnostic, saisie manuelle) ---", "; --- Versions (diagnostic, manual entry) ---")
-    Print #f, "; Version.ProjectTag=v8.4 / 2026-05-01"
-    Print #f, "; Version.MeetingColor=v9 / 2026-05-01"
-    Print #f, ""
-    Print #f, T("; --- Parametres metier (exemples a activer selon besoin) ---", "; --- Business parameters (examples, enable as needed) ---")
-    Print #f, "; InternalDomains=domaine1.fr|domaine2.fr"
-    Print #f, "; DefaultAppointmentDuration=15"
-    Print #f, "; ShiftMinutes=15"
-    Print #f, "; DefaultLogLevel=0"
-    Print #f, "; BackupRetentionMonths=12"
-    Close #f
-    Exit Sub
-ErrH:
-    MsgBox T("Impossible de cr~eer le mod~fle : ", "Cannot create the template: ") & Err.Number & " - " & _
-           Err.Description, vbExclamation, TITLE
 End Sub

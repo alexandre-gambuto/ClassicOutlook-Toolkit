@@ -1,8 +1,32 @@
 Option Explicit
 
 '=============================================================================
-' modReplySuspicion  (v5 - 2026-08-22)
+' modReplySuspicion  (v5.1 - 2026-11-16)
 '
+' v5.1 (2026-11-16) : audit 11/2026 - F10-06 / F1-04, F4-04 (choix A), F4-20 :
+'   (a) IDENTIFIANT SUIVI AU DEPLACEMENT (F10-06). Sur Exchange, l'EntryID
+'       d'un mail change quand il est deplace : la reponse rangee par
+'       modReplyInPlace (ou classee par QuickMove) avant le differe +2 s
+'       n'etait plus retrouvee et la proposition de suivi n'apparaissait
+'       presque jamais (170 cas sur 177 au journal). NoteMoved (appelee par
+'       modQuickMove.MoveItemTo a chaque deplacement) remplace l'ancien
+'       identifiant par le nouveau dans la file ; si le nouveau est inconnu,
+'       le mail est cherche dans le dossier cible (meme objet, envoye depuis
+'       moins de 30 min). "Item introuvable" passe au niveau INFO.
+'   (b) TEXTE ANALYSE = TEXTE ECRIT PAR L'UTILISATEUR (F4-04, choix A) :
+'       corps coupe au premier marqueur d'historique ("De :", "From:",
+'       "-----Message", " a ecrit :", " wrote:", ligne de soulignes) et a la
+'       signature (SignatureTextMarker si defini), 3 000 caracteres au plus.
+'       Avant, tout l'historique cite comptait : 3 mots-cles s'y trouvaient
+'       presque toujours (215 propositions, 3 acceptees).
+'   (c) SANS ACCENTS (F4-20) : objet, texte et mots-cles sont compares sans
+'       accents (modContactCommon.StripAccents), comme l'annonce config.ini ;
+'       "reponse", "repondre", "vos disponibilites" correspondent enfin a un
+'       texte accentue.
+'   (d) Choix journalise au niveau INFO (Suivre / Non / expiration) pour
+'       mesurer l'effet.
+'   (e) integration - F10-13 : objet du mail raccourci au journal
+'       (modDebugLog.LogClip, 20 caracteres).
 ' v5 (2026-08-22) : revue UX pop-ups + traduction.
 '   (a) BUG CORRIGE : le sujet du mail etait concatene A L'INTERIEUR de T().
 '       T() applique A() a ses deux branches, donc tout sujet contenant
@@ -59,10 +83,13 @@ Option Explicit
 '      candidat, on stocke l'EntryID dans la file differee et on arme un
 '      differe modDefer +2s.
 '   3. +2s plus tard, ProposeDeferredFollowup depile la file, resout chaque
-'      mail via GetItemFromID (suit le mail meme deplace) et affiche un
-'      POP-UP AUTO-FERMANT 8 s (modMsgBoxCustom.MsgBoxC, compte a rebours
-'      visible sur le bouton Non). "Suivre" -> suivi via
-'      modMailResponseTracker.RecordSentMail.
+'      mail via GetItemFromID et affiche un POP-UP AUTO-FERMANT 8 s
+'      (modMsgBoxCustom.MsgBoxC, compte a rebours visible sur le bouton
+'      Non). "Suivre" -> suivi en 1 clic via
+'      modMailResponseTracker.RecordSentMailQuick.
+'      v5.1 : un mail DEPLACE entre-temps change d'EntryID sur Exchange ;
+'      NoteMoved (appelee a chaque deplacement par modQuickMove.MoveItemTo)
+'      tient la file a jour.
 '
 ' v2.1 (2026-06-10) : fix B10 - WScript.Shell.Popup remplace par
 '   modMsgBoxCustom.MsgBoxC. La sonde toasts (cf. modNotify) avait etabli
@@ -79,21 +106,28 @@ Option Explicit
 '
 ' SCORING (seuil >= modConfig.SuspicionThreshold()) :
 '   +2  : "?" dans le sujet
-'   +1  : par mot-cle d'attente (sujet+corps), plafonne (g_KeywordsCap)
+'   +1  : par mot-cle d'attente (sujet + texte propre du corps, v5.1),
+'         plafonne (modConfig.KeywordsCap) ; comparaison sans accents
 '   +1  : au moins un destinataire externe
 '   Exclusions dures (score 0) : mail a soi-meme uniquement / aucun destinataire.
 '
-' DEPENDANCES : modMailResponseTracker, modMsgBoxCustom (v2), modDebugLog.
-' Late binding partout.
+' DEPENDANCES : modMailResponseTracker, modMsgBoxCustom (v2), modDebugLog,
+' modSmtp, modContactCommon (StripAccents), modConfig. Late binding partout.
 '=============================================================================
 
 Private Const MOD_NAME As String = "ReplySusp"
-Private Const MOD_VERSION As String = "v5 - 2026-08-22"
+Private Const MOD_VERSION As String = "v5.1 - 2026-11-16"
 
-' Parametres externalises dans config.ini (lus via modConfig.g_*) :
-'   g_SuspicionThreshold   (SuspicionThreshold, defaut 3) - score declenchant
-'   g_KeywordsCap          (KeywordsCap, defaut 3)        - plafond mots-cles
-'   g_InternalDomains      (InternalDomains)              - partage modMeetingColor
+' Parametres externalises dans config.ini (lus par les getters modConfig,
+' qui appellent EnsureLoaded) :
+'   SuspicionThreshold()  (SuspicionThreshold, defaut 3) - score declenchant
+'   KeywordsCap()         (KeywordsCap, defaut 3)        - plafond mots-cles
+'   SuspicionKeywords()   (SuspicionKeywords)            - liste des mots-cles
+'   SignatureTextMarker() (SignatureTextMarker)          - debut de signature
+'   Domaines internes : modSmtp.IsInternalDomain (InternalDomains)
+
+' v5.1 (F4-04) : longueur maximale du texte propre analyse.
+Private Const OWN_TEXT_MAX As Long = 3000
 
 ' --- Etat module-level (declare AVANT toute procedure) ---
 ' mCandidates  : set des sujets normalises juges suspects a l'ItemSend.
@@ -103,6 +137,9 @@ Private Const MOD_VERSION As String = "v5 - 2026-08-22"
 Private mCandidates As Object             ' Scripting.Dictionary (sujet -> True)
 Private mPending As Object                ' Scripting.Dictionary (EntryID -> sujet)
 Private mTimerArmed As Boolean
+' v5.1 (F10-06) : mail de la file deplace sans nouvel EntryID connu :
+' ancien EntryID -> "EntryID|StoreID" du dossier cible (repli de recherche).
+Private mMovedTo As Object                ' Scripting.Dictionary
 
 ' Mots-cles d'attente de reponse (compares en LCase).
 
@@ -123,7 +160,8 @@ Private Function AwaitKeywords() As Variant
         Dim arr() As String, i As Long
         arr = Split(raw, "|")
         For i = LBound(arr) To UBound(arr)
-            arr(i) = LCase$(Trim$(arr(i)))
+            ' v5.1 (F4-20) : mots-cles sans accents, comme le texte compare.
+            arr(i) = NormText(Trim$(arr(i)))
         Next i
         AwaitKeywords = arr
         Exit Function
@@ -151,7 +189,7 @@ Public Sub EvaluateAndStore(ByVal Item As Object)
     score = ComputeScore(Item)
 
     modDebugLog.DTrace MOD_NAME, "EvaluateAndStore score=" & score & _
-        " '" & Left(CStr(Item.subject), 50) & "'"
+        " '" & modDebugLog.LogClip(CStr(Item.subject)) & "'"
 
     If score < modConfig.SuspicionThreshold() Then Exit Sub
 
@@ -162,7 +200,7 @@ Public Sub EvaluateAndStore(ByVal Item As Object)
     mCandidates(key) = True
 
     modDebugLog.DInfo MOD_NAME, "Suspicion attente reponse (score " & score & _
-        ") : '" & Left(CStr(Item.subject), 60) & "'"
+        ") : '" & modDebugLog.LogClip(CStr(Item.subject)) & "'"
 
     On Error GoTo 0
 End Sub
@@ -170,13 +208,14 @@ End Sub
 '=============================================================================
 ' POINT D'ENTREE 2 : mSentItems_ItemAdd (AVANT le deplacement ReplyInPlace).
 ' Si le sujet de l'item est un candidat memorise a l'ItemSend, on capture son
-' EntryID (stable a ce stade) et on arme le differe +2s. On consomme le
-' candidat (un seul suivi par envoi).
+' EntryID et on arme le differe +2s. On consomme le candidat (un seul suivi
+' par envoi).
 '
 ' IMPORTANT : appeler CaptureSentItem AVANT modReplyInPlace.TryMoveSentItem
-' dans mSentItems_ItemAdd, sinon l'item peut deja avoir change de dossier.
-' GetItemFromID survit au deplacement, mais on prend l'EntryID au plus tot
-' pour robustesse.
+' dans mSentItems_ItemAdd. v5.1 (F10-06) : l'EntryID ne survit PAS au
+' deplacement sur Exchange (constate sur le poste) ; chaque deplacement fait
+' par le toolkit passe par modQuickMove.MoveItemTo, qui appelle NoteMoved
+' pour remplacer l'identifiant dans la file.
 '=============================================================================
 Public Sub CaptureSentItem(ByVal Item As Object)
     On Error Resume Next
@@ -206,7 +245,7 @@ Public Sub CaptureSentItem(ByVal Item As Object)
     If Not mPending.Exists(eid) Then mPending(eid) = CStr(Item.subject)
 
     modDebugLog.DTrace MOD_NAME, "CaptureSentItem : EntryID capture pour '" & _
-        Left(CStr(Item.subject), 50) & "'"
+        modDebugLog.LogClip(CStr(Item.subject)) & "'"
 
     If Not mTimerArmed Then
         mTimerArmed = True
@@ -217,9 +256,42 @@ Public Sub CaptureSentItem(ByVal Item As Object)
 End Sub
 
 '=============================================================================
+' v5.1 (F10-06) : NoteMoved - un mail vient d'etre deplace par le toolkit
+' (appelee par modQuickMove.MoveItemTo, pour TOUT deplacement : sans effet
+' si l'ancien EntryID n'est pas dans la file).
+'   newEID non vide : la file suit le mail sous son nouvel identifiant.
+'   newEID vide (Move n'a rien renvoye) : on note le dossier cible ; le
+'   differe y cherchera le mail (meme objet, envoye depuis moins de 30 min).
+'=============================================================================
+Public Sub NoteMoved(ByVal oldEID As String, ByVal newEID As String, _
+                     Optional ByVal destFolder As Object = Nothing)
+    On Error Resume Next
+    If mPending Is Nothing Then Exit Sub
+    If Len(oldEID) = 0 Then Exit Sub
+    If Not mPending.Exists(oldEID) Then Exit Sub
+
+    Dim subj As String
+    subj = CStr(mPending(oldEID))
+    If Len(newEID) > 0 Then
+        If StrComp(newEID, oldEID, vbBinaryCompare) = 0 Then Exit Sub
+        mPending.Remove oldEID
+        If Not mPending.Exists(newEID) Then mPending.Add newEID, subj
+        modDebugLog.DDebug MOD_NAME, "NoteMoved : file mise a jour (nouvel EntryID)"
+    ElseIf Not destFolder Is Nothing Then
+        If mMovedTo Is Nothing Then
+            Set mMovedTo = CreateObject("Scripting.Dictionary")
+            mMovedTo.CompareMode = 0      ' BinaryCompare (EntryID exact)
+        End If
+        mMovedTo(oldEID) = CStr(destFolder.EntryID) & "|" & CStr(destFolder.StoreID)
+        modDebugLog.DInfo MOD_NAME, "NoteMoved : nouvel EntryID inconnu, recherche prevue dans le dossier cible"
+    End If
+End Sub
+
+'=============================================================================
 ' POINT D'ENTREE 3 : differe (+2s), appele par modDefer (cle ReplySusp).
-' Depile la file d'EntryID, resout chaque mail via GetItemFromID (suit le
-' mail meme s'il a ete deplace hors des Envoyes), et propose le suivi.
+' Depile la file d'EntryID, resout chaque mail via GetItemFromID et propose
+' le suivi. v5.1 : un mail deplace entre-temps est suivi sous son nouvel
+' EntryID (NoteMoved) ; a defaut, recherche dans le dossier cible.
 '=============================================================================
 Public Sub ProposeDeferredFollowup()
     On Error GoTo Done
@@ -240,13 +312,23 @@ Public Sub ProposeDeferredFollowup()
     Dim keyList As Variant
     keyList = mPending.keys
 
+    ' v5.1 : la file peut changer pendant un pop-up (NoteMoved remplace un
+    ' identifiant) : chaque cle est relue avant usage, et ce qui reste a la
+    ' fin est re-arme.
     Dim k As Variant
+    Dim eid As String, subj As String
     For Each k In keyList
-        Dim eid As String
         eid = CStr(k)
-        mPending.Remove k
-        ProposeForEntryID eid
+        If mPending.Exists(eid) Then
+            subj = CStr(mPending(eid))
+            mPending.Remove eid
+            ProposeForEntryID eid, subj
+        End If
     Next k
+    If mPending.count > 0 And Not mTimerArmed Then
+        mTimerArmed = True
+        modDefer.Arm "ReplySusp", 2
+    End If
     Exit Sub
 
 Done:
@@ -261,18 +343,27 @@ End Sub
 ' (recipients TO resolus). v4.1 : RecordSentMailQuick = enregistrement
 ' IMMEDIAT (delai par defaut, toast) - le pop-up est la SEULE fenetre.
 '=============================================================================
-Private Sub ProposeForEntryID(ByVal entryID As String)
+Private Sub ProposeForEntryID(ByVal entryID As String, Optional ByVal subj As String = "")
     On Error Resume Next
 
     If Len(entryID) = 0 Then Exit Sub
 
     Dim itm As Object
+    Set itm = Nothing
     Set itm = Application.Session.GetItemFromID(entryID)
+    Err.Clear
+    ' v5.1 (F10-06) : deplace sans nouvel identifiant connu -> recherche
+    ' dans le dossier cible note par NoteMoved.
+    If itm Is Nothing Then Set itm = FindMovedItem(entryID, subj)
     If itm Is Nothing Then
-        modDebugLog.DDebug MOD_NAME, "ProposeForEntryID : item introuvable (EntryID perime)"
+        ' v5.1 : INFO (avant DEBUG, invisible au niveau du poste).
+        modDebugLog.DInfo MOD_NAME, "ProposeForEntryID : item introuvable (EntryID perime)"
         Exit Sub
     End If
-    If itm.Class <> 43 Then Exit Sub
+    Dim cls As Long
+    cls = 0
+    cls = itm.Class
+    If cls <> 43 Then Exit Sub
 
     Dim subjectText As String
     subjectText = CStr(itm.subject)
@@ -314,16 +405,65 @@ Private Sub ProposeForEntryID(ByVal entryID As String)
             T("&Suivre", "&Track"), T("&Non", "&No"), "", timeoutMs, 2)
 
     If rep = vbYes Then
+        ' v5.1 (F4-04) : choix journalise en INFO pour mesurer l'effet.
+        modDebugLog.DInfo MOD_NAME, "Proposition de suivi : Suivre"
         ' On passe directement l'objet mail resolu : recipients TO intacts.
         ' v4.1 : variante 1 clic (delai par defaut + toast, zero fenetre).
         modMailResponseTracker.RecordSentMailQuick itm
+    ElseIf modMsgBoxCustom.LastResultWasTimeout() Then
+        modDebugLog.DInfo MOD_NAME, "Proposition de suivi : expiration"
     Else
-        modDebugLog.DTrace MOD_NAME, "Pop-up non confirme (rep=" & rep & _
-            ", timeout=" & modMsgBoxCustom.LastResultWasTimeout() & ")"
+        modDebugLog.DInfo MOD_NAME, "Proposition de suivi : Non (rep=" & rep & ")"
     End If
 
     On Error GoTo 0
 End Sub
+
+'=============================================================================
+' v5.1 (F10-06) : FindMovedItem - repli quand le Move n'a pas rendu le nouvel
+' EntryID : dans le dossier cible note par NoteMoved, le mail de meme objet
+' envoye depuis moins de 30 min (30 elements les plus recents examines).
+'=============================================================================
+Private Function FindMovedItem(ByVal oldEID As String, ByVal subj As String) As Object
+    On Error Resume Next
+    Set FindMovedItem = Nothing
+    If mMovedTo Is Nothing Then Exit Function
+    If Not mMovedTo.Exists(oldEID) Then Exit Function
+
+    Dim ref As String, sep As Long
+    ref = CStr(mMovedTo(oldEID))
+    mMovedTo.Remove oldEID
+    sep = InStr(ref, "|")
+    If sep = 0 Or Len(subj) = 0 Then Exit Function
+
+    Dim fld As Object, itms As Object, itm As Object
+    Dim n As Long, cls As Long, s As String, so As Date
+    Set fld = Application.Session.GetFolderFromID(Left$(ref, sep - 1), Mid$(ref, sep + 1))
+    If fld Is Nothing Then Exit Function
+    Set itms = fld.Items
+    If itms Is Nothing Then Exit Function
+    itms.Sort "[SentOn]", True
+    Set itm = itms.GetFirst
+    Do While Not itm Is Nothing
+        n = n + 1
+        If n > 30 Then Exit Do
+        cls = 0
+        cls = itm.Class
+        s = ""
+        s = CStr(itm.Subject)
+        so = 0
+        so = itm.SentOn
+        If cls = 43 And so > 0 Then
+            If StrComp(s, subj, vbBinaryCompare) = 0 And DateDiff("n", so, Now) <= 30 Then
+                Set FindMovedItem = itm
+                modDebugLog.DInfo MOD_NAME, "ProposeForEntryID : mail retrouve dans le dossier cible"
+                Exit Function
+            End If
+        End If
+        Set itm = Nothing
+        Set itm = itms.GetNext
+    Loop
+End Function
 
 '=============================================================================
 ' Normalisation de sujet pour le matching candidat -> capture.
@@ -337,15 +477,52 @@ Private Function NormSubject(ByVal s As String) As String
 End Function
 
 '=============================================================================
+' v5.1 (F4-20) : texte compare au scoring = minuscules SANS accents (meme
+' traitement pour l'objet, le corps et les mots-cles).
+'=============================================================================
+Private Function NormText(ByVal s As String) As String
+    NormText = LCase$(modContactCommon.StripAccents(s))
+End Function
+
+'=============================================================================
+' v5.1 (F4-04, choix A) : texte ECRIT par l'utilisateur = debut du corps,
+' jusqu'au premier marqueur d'historique cite (memes reperes que la fonction
+' OwnTextPart du classeur "Suivi des mails"), ou jusqu'a la signature si
+' SignatureTextMarker est defini ; OWN_TEXT_MAX caracteres au plus.
+'=============================================================================
+Private Function OwnTextPart(ByVal txt As String) As String
+    Dim marks As Variant, i As Long, p As Long, cut As Long, sig As String
+    marks = Array(vbLf & "De :", vbLf & "De" & ChrW$(160) & ":", vbLf & "From:", _
+                  "-----Message", "-----Original", "________________", _
+                  " a " & ChrW$(233) & "crit :", " a " & ChrW$(233) & "crit" & ChrW$(160) & ":", _
+                  " wrote:")
+    cut = Len(txt) + 1
+    For i = LBound(marks) To UBound(marks)
+        p = InStr(1, txt, CStr(marks(i)), vbTextCompare)
+        If p > 0 And p < cut Then cut = p
+    Next i
+    sig = Trim$(modConfig.SignatureTextMarker())
+    If Len(sig) > 0 Then
+        p = InStr(1, txt, sig, vbTextCompare)
+        If p > 1 And p < cut Then cut = p
+    End If
+    If cut > OWN_TEXT_MAX + 1 Then cut = OWN_TEXT_MAX + 1
+    OwnTextPart = Left$(txt, cut - 1)
+End Function
+
+'=============================================================================
 ' Calcul du score de suspicion (lecture seule).
 '=============================================================================
 Private Function ComputeScore(ByVal Item As Object) As Long
     ComputeScore = 0
     On Error Resume Next
 
+    ' v5.1 (F4-04, choix A) : seul le texte ecrit par l'utilisateur compte
+    ' (historique cite et signature exclus) ; (F4-20) comparaison sans
+    ' accents, mots-cles compris (AwaitKeywords).
     Dim subjectText As String, bodyText As String
-    subjectText = LCase$(CStr(Item.subject))
-    bodyText = LCase$(CStr(Item.body))
+    subjectText = NormText(CStr(Item.subject))
+    bodyText = NormText(OwnTextPart(CStr(Item.body)))
 
     Dim nbDest As Long, nbExterne As Long, nbMoi As Long
     CountRecipients Item, nbDest, nbExterne, nbMoi
@@ -366,9 +543,13 @@ Private Function ComputeScore(ByVal Item As Object) As Long
     For j = LBound(mots) To UBound(mots)
         Dim mc As String
         mc = CStr(mots(j))
-        If InStr(subjectText, mc) > 0 Or InStr(bodyText, mc) > 0 Then
-            ptsMots = ptsMots + 1
-            If ptsMots >= modConfig.KeywordsCap() Then Exit For
+        ' v5.1 : un mot-cle vide (separateur "|" en trop dans config.ini)
+        ' correspondrait a tout texte (InStr renvoie 1) : ignore.
+        If Len(mc) > 0 Then
+            If InStr(subjectText, mc) > 0 Or InStr(bodyText, mc) > 0 Then
+                ptsMots = ptsMots + 1
+                If ptsMots >= modConfig.KeywordsCap() Then Exit For
+            End If
         End If
     Next j
     score = score + ptsMots

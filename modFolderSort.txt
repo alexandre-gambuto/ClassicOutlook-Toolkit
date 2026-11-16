@@ -1,34 +1,55 @@
 Option Explicit
 
 '=============================================================================
-' modFolderSort v2  (2026-08-22)
-' Purpose (EN): resets the manual (drag-and-drop) ordering of subfolders in
-'   EVERY store of the profile so that Outlook falls back to alphabetical
-'   (A-Z) ordering, i.e. the same result as right-click > "Sort subfolders
-'   A to Z" applied to every folder of every mailbox at once.
+' modFolderSort v3.2  (2026-11-16)
+' Purpose (EN): puts back into alphabetical (A-Z) order every group of
+'   sibling subfolders that carries a manual (drag-and-drop) order, in EVERY
+'   store of the profile - the same visible result as right-click > "Sort
+'   subfolders A to Z" applied to every folder of every mailbox at once.
 '
 '   Mechanism : Outlook 2013+ stores manual ordering in two MAPI properties
-'   on each subfolder : PR_SORT_POSITION (0x3020, binary) and
-'   PR_SORT_PARENTID (0x3021, binary). Deleting them puts the folder back in
-'   alphabetical position (documented MFCMAPI approach). Nothing else is
-'   modified : no rename, no move, no item touched.
+'   on each subfolder : PR_SORT_POSITION (0x3020, binary, compared byte by
+'   byte between siblings) and PR_SORT_PARENTID (0x3021, binary). Exchange
+'   REFUSES DeleteProperty on folders (E_ACCESSDENIED, field test of
+'   2026-08-18) but accepts SetProperty. So, for each sibling group where at
+'   least one child has a manual order, PR_SORT_POSITION is REWRITTEN on
+'   ALL the children with their alphabetical rank (2 bytes, big-endian,
+'   ranks spread over the range so that a later drag-and-drop still finds
+'   room), and PR_SORT_PARENTID is copied onto the children lacking it.
+'   Sibling groups without any manual order are left untouched. Nothing
+'   else is modified : no rename, no move, no item touched.
 '
-' FR : remet tous les sous-dossiers de toutes les boites en ordre A-Z en
-'   supprimant les proprietes de tri manuel posees par le glisser-deposer.
+' FR : remet en ordre A-Z chaque fratrie de sous-dossiers qui porte un
+'   ordre manuel (glisser-deposer), dans toutes les boites. Exchange refuse
+'   la suppression des proprietes de tri : on REECRIT donc PR_SORT_POSITION
+'   sur tous les enfants de la fratrie, dans l'ordre alphabetique des noms.
 '   Aucun dossier renomme, deplace ni supprime.
 '
 ' Points d'entree publics :
-'   FolderSortProbe : simulation, ne modifie rien. Compte les dossiers
-'                     porteurs d'un ordre manuel, detail dans debug.log.
+'   FolderSortProbe : simulation, ne modifie rien. Compte les fratries et
+'                     les dossiers porteurs d'un ordre manuel (debug.log).
 '   FolderSortAZ    : Simulation / Appliquer / Annuler puis traitement.
 '
 ' Limites connues :
 '   - l'arborescence peut ne se rafraichir qu'apres repli/deploiement du
 '     dossier parent, ou au redemarrage d'Outlook ;
-'   - en mode cache, la suppression est ecrite dans l'OST puis synchronisee
+'   - en mode cache, l'ecriture est faite dans l'OST puis synchronisee
 '     avec Exchange (delai de quelques secondes) ;
 '   - les magasins non accessibles (dossiers publics, boites partagees en
 '     lecture seule) sont ignores et comptes en erreur.
+'
+' v3.2 (2026-11-16) : audit 11/2026 - F3-01 : algorithme v3.1 du 18/08
+'   reconstruit. La livraison v2 du 22/08 avait ete batie sur la v1 et
+'   supprimait les proprietes (DeleteProperty), ce qu'Exchange refuse :
+'   "Appliquer" parcourait tout puis ne triait rien (608 erreurs au journal
+'   du 18/08). Retour a l'ecriture du rang alphabetique, fratrie par
+'   fratrie (lignes "Fratrie remise A-Z" et compteurs parents / reset au
+'   journal, comme le 18/08). Les enfants sont relus par EntryID (aucune
+'   collection Folders gardee pendant l'ecriture). Recapitulatif en toast
+'   et rappel de rafraichissement de la v2 conserves.
+' v3.1 (2026-08-18) : ordre A-Z IMPOSE par ecriture (SetProperty) ; nombre
+'   de fratries compte aussi en simulation. (Perdue le 22/08 ; reconstruite
+'   en v3.2 d'apres le CHANGELOG et le journal.)
 '
 ' v2 (2026-08-22) : revue UX pop-ups.
 '   (a) Le RECAPITULATIF de fin passe en toast (modUi.Toast). Il n'appelle
@@ -50,7 +71,7 @@ Option Explicit
 '=============================================================================
 
 Private Const MOD_NAME As String = "FolderSort"
-Private Const MOD_VERSION As String = "v2 - 2026-08-22"
+Private Const MOD_VERSION As String = "v3.2 - 2026-11-16"
 
 Private Const PR_SORT_POSITION As String = "http://schemas.microsoft.com/mapi/proptag/0x30200102"
 Private Const PR_SORT_PARENTID As String = "http://schemas.microsoft.com/mapi/proptag/0x30210102"
@@ -58,8 +79,9 @@ Private Const PR_SORT_PARENTID As String = "http://schemas.microsoft.com/mapi/pr
 ' Compteurs de la passe en cours
 Private mStores As Long
 Private mFolders As Long
-Private mMarked As Long
-Private mReset As Long
+Private mMarked As Long      ' dossiers portant un ordre manuel
+Private mParents As Long     ' v3.2 : fratries remises (ou a remettre) en A-Z
+Private mReset As Long       ' v3.2 : dossiers repositionnes (ecriture reussie)
 Private mErrors As Long
 Private mDryRun As Boolean
 
@@ -107,7 +129,7 @@ Private Sub RunPass(ByVal dryRun As Boolean)
     Dim errNo As Long, errDesc As String
     On Error GoTo ErrH
     mDryRun = dryRun
-    mStores = 0: mFolders = 0: mMarked = 0: mReset = 0: mErrors = 0
+    mStores = 0: mFolders = 0: mMarked = 0: mParents = 0: mReset = 0: mErrors = 0
 
     modDebugLog.DInfo MOD_NAME, "Pass start dryRun=" & dryRun
 
@@ -131,21 +153,25 @@ Private Sub RunPass(ByVal dryRun As Boolean)
     Next st
 
     modDebugLog.DInfo MOD_NAME, "Pass end stores=" & mStores & " folders=" & mFolders & _
-        " marked=" & mMarked & " reset=" & mReset & " errors=" & mErrors
+        " marked=" & mMarked & " parents=" & mParents & " reset=" & mReset & _
+        " errors=" & mErrors
 
     ' --- v2 : recapitulatif en toast --------------------------------------
     ' Ligne 1 (gras) = le verdict, ligne 2 = le chiffre qui compte.
-    ' Les cinq compteurs detailles sont dans debug.log (cf. DInfo ci-dessus).
+    ' Les compteurs detailles sont dans debug.log (cf. DInfo ci-dessus).
     Dim msg As String
     If dryRun Then
         msg = T("Simulation termin~ee (rien n'a ~et~e ~ecrit).", _
                 "Dry run done (nothing written).") & vbLf & _
+              mParents & T(" fratrie(s) ~a remettre en A-Z (", _
+                           " sibling group(s) to put back in A-Z (") & _
               mMarked & T(" dossier(s) avec ordre manuel sur ", _
-                          " folder(s) with manual order out of ") & mFolders
+                          " folder(s) with manual order out of ") & mFolders & ")"
     Else
         msg = T("Tri A-Z appliqu~e.", "A-Z sort applied.") & vbLf & _
-              mReset & T(" dossier(s) remis en A-Z sur ", _
-                         " folder(s) reset to A-Z out of ") & mFolders
+              mReset & T(" dossier(s) repositionn~e(s) dans ", _
+                         " folder(s) repositioned in ") & _
+              mParents & T(" fratrie(s), sur ", " sibling group(s), out of ") & mFolders
     End If
     If mErrors > 0 Then
         msg = msg & T(" - erreurs : ", " - errors: ") & mErrors
@@ -161,12 +187,12 @@ Private Sub RunPass(ByVal dryRun As Boolean)
             T("L'arborescence ne se rafra~ichit pas toujours imm~ediatement." & vbCrLf & vbCrLf & _
               "Si l'ordre n'a pas chang~e a l'~ecran : replier puis d~eployer " & _
               "le dossier parent, ou red~emarrer Outlook." & vbCrLf & vbCrLf & _
-              "En mode cache, la suppression est aussi synchronis~ee avec " & _
+              "En mode cache, l'~ecriture est aussi synchronis~ee avec " & _
               "Exchange (quelques secondes).", _
               "The folder tree does not always refresh immediately." & vbCrLf & vbCrLf & _
               "If the order has not changed on screen: collapse then expand " & _
               "the parent folder, or restart Outlook." & vbCrLf & vbCrLf & _
-              "In cached mode, the deletion is also synchronised with " & _
+              "In cached mode, the change is also synchronised with " & _
               "Exchange (a few seconds)."), _
             UiTitle()
     End If
@@ -179,77 +205,201 @@ ErrH:
 End Sub
 
 '=============================================================================
-' ProcessTree - recursif. Pour chaque sous-dossier : detecte / supprime les
-' proprietes de tri manuel, puis descend.
+' ProcessTree - recursif, une FRATRIE a la fois (v3.2, F3-01).
+'   1) releve des enfants directs : EntryID, nom, ordre manuel ou non,
+'      valeur PR_SORT_PARENTID (identique pour toute la fratrie) ;
+'   2) si au moins un enfant porte un ordre manuel : reecriture du rang
+'      alphabetique sur TOUS les enfants (ResortSiblings) ; sinon rien ;
+'   3) descente dans chaque enfant, relu par EntryID (aucune collection
+'      Folders gardee pendant les ecritures : son ordre peut changer).
 '=============================================================================
 Private Sub ProcessTree(ByVal parentFolder As Outlook.MAPIFolder)
-    Dim i As Long
+    Dim i As Long, n As Long, cnt As Long, nMarked As Long
     Dim child As Outlook.MAPIFolder
+    Dim sid As String, parentPath As String, eid As String
     On Error Resume Next
     ' Pack v3 (B7) : collection Folders evaluee une fois.
     Dim subs As Outlook.Folders
     Set subs = parentFolder.Folders
-    For i = 1 To subs.count
+    If subs Is Nothing Then Exit Sub
+    n = 0
+    n = subs.count
+    If n = 0 Then Exit Sub
+    sid = ""
+    sid = CStr(parentFolder.StoreID)
+    parentPath = ""
+    parentPath = CStr(parentFolder.FolderPath)
+
+    ' --- 1) Releve de la fratrie ---
+    Dim eids() As String, nms() As String, hasPar() As Boolean
+    Dim parentIdVal As Variant, haveParentId As Boolean
+    ReDim eids(1 To n)
+    ReDim nms(1 To n)
+    ReDim hasPar(1 To n)
+    cnt = 0
+    nMarked = 0
+    haveParentId = False
+    For i = 1 To n
         Set child = Nothing
         Set child = subs.Item(i)
         If Not child Is Nothing Then
-            mFolders = mFolders + 1
-            HandleFolder child
-            ProcessTree child
+            eid = ""
+            eid = CStr(child.EntryID)
+            If Len(eid) > 0 Then
+                cnt = cnt + 1
+                mFolders = mFolders + 1
+                eids(cnt) = eid
+                nms(cnt) = ""
+                nms(cnt) = CStr(child.Name)
+                If ReadSortProps(child, hasPar(cnt), parentIdVal, haveParentId) Then
+                    nMarked = nMarked + 1
+                End If
+            End If
         End If
+    Next i
+    Set child = Nothing
+    Set subs = Nothing
+    Err.Clear
+
+    ' --- 2) Fratrie avec au moins un ordre manuel : remise en A-Z ---
+    If nMarked > 0 Then
+        mMarked = mMarked + nMarked
+        mParents = mParents + 1
+        If mDryRun Then
+            modDebugLog.DDebug MOD_NAME, "Fratrie a remettre A-Z : " & parentPath & _
+                " (" & cnt & " enfants, " & nMarked & " marques)"
+        Else
+            ResortSiblings parentPath, sid, eids, nms, hasPar, cnt, parentIdVal, haveParentId
+            modDebugLog.DInfo MOD_NAME, "Fratrie remise A-Z : " & parentPath & _
+                " (" & cnt & " enfants, " & nMarked & " marques)"
+        End If
+    End If
+
+    ' --- 3) Descente, enfant par enfant (relu par EntryID) ---
+    Dim ns As Object
+    Set ns = Application.Session
+    For i = 1 To cnt
+        Set child = Nothing
+        Err.Clear
+        Set child = ns.GetFolderFromID(eids(i), sid)
+        If Err.Number <> 0 Then Set child = Nothing
+        Err.Clear
+        If Not child Is Nothing Then ProcessTree child
     Next i
 End Sub
 
 '=============================================================================
-' HandleFolder - un dossier : a-t-il un ordre manuel ? si oui et pas dry-run,
-' suppression des deux proprietes.
+' ReadSortProps - un dossier porte-t-il un ordre manuel ? (lecture seule)
+' Renvoie True si PR_SORT_POSITION ou PR_SORT_PARENTID est present.
+' hasPar : PR_SORT_PARENTID present. La premiere valeur PR_SORT_PARENTID
+' rencontree dans la fratrie est gardee dans parentIdVal (haveParentId).
 '=============================================================================
-Private Sub HandleFolder(ByVal f As Outlook.MAPIFolder)
+Private Function ReadSortProps(ByVal f As Outlook.MAPIFolder, ByRef hasPar As Boolean, _
+                               ByRef parentIdVal As Variant, ByRef haveParentId As Boolean) As Boolean
     On Error Resume Next
+    ReadSortProps = False
+    hasPar = False
     Dim pa As Outlook.PropertyAccessor
     Set pa = f.PropertyAccessor
-    If pa Is Nothing Then Exit Sub
+    If pa Is Nothing Then Exit Function
 
-    Dim hasPos As Boolean, hasPar As Boolean
+    Dim hasPos As Boolean
     Dim v As Variant
     Err.Clear
     v = pa.GetProperty(PR_SORT_POSITION)
     hasPos = (Err.Number = 0)
     Err.Clear
+    v = Empty
     v = pa.GetProperty(PR_SORT_PARENTID)
     hasPar = (Err.Number = 0)
     Err.Clear
+    If hasPar And Not haveParentId Then
+        parentIdVal = v
+        haveParentId = True
+    End If
 
-    If Not (hasPos Or hasPar) Then Exit Sub
-
-    mMarked = mMarked + 1
+    If Not (hasPos Or hasPar) Then Exit Function
+    ReadSortProps = True
     modDebugLog.DDebug MOD_NAME, "Manual order : " & f.FolderPath & _
         " (pos=" & hasPos & " parent=" & hasPar & ")"
-    If mDryRun Then Exit Sub
+End Function
 
-    Dim ok As Boolean
-    ok = True
-    If hasPos Then
-        pa.DeleteProperty PR_SORT_POSITION
-        If Err.Number <> 0 Then
-            ok = False
-            modDebugLog.DError MOD_NAME, "DeleteProperty POSITION err " & Err.Number & " on " & f.FolderPath
+'=============================================================================
+' ResortSiblings - ecrit le rang alphabetique des enfants d'une fratrie.
+'   - tri des noms sans casse (StrComp vbTextCompare, ordre du poste) ;
+'   - PR_SORT_POSITION = rang r (1..n) espace sur 2 octets : r * (65535 \
+'     (n + 1)), poids fort en premier (comparaison octet par octet) ;
+'   - PR_SORT_PARENTID recopie sur les enfants qui ne l'avaient pas.
+'   SetProperty sur un dossier est ecrit immediatement (pas de Save).
+'   Erreurs comptees ; une seule ligne de journal par fratrie.
+'=============================================================================
+Private Sub ResortSiblings(ByVal parentPath As String, ByVal sid As String, _
+                           ByRef eids() As String, ByRef nms() As String, _
+                           ByRef hasPar() As Boolean, ByVal cnt As Long, _
+                           ByVal parentIdVal As Variant, ByVal haveParentId As Boolean)
+    Dim order() As Long, i As Long, j As Long, k As Long, r As Long
+    If cnt < 1 Then Exit Sub
+    ReDim order(1 To cnt)
+    For i = 1 To cnt
+        order(i) = i
+    Next i
+    ' Tri par insertion (fratries de quelques dizaines a ~150 dossiers).
+    For i = 2 To cnt
+        k = order(i)
+        j = i - 1
+        Do While j >= 1
+            If StrComp(nms(order(j)), nms(k), vbTextCompare) <= 0 Then Exit Do
+            order(j + 1) = order(j)
+            j = j - 1
+        Loop
+        order(j + 1) = k
+    Next i
+
+    Dim stepVal As Long, posVal As Long
+    stepVal = 65535 \ (cnt + 1)
+    If stepVal < 1 Then stepVal = 1
+
+    Dim ns As Object, f As Object, pa As Object
+    Dim b() As Byte
+    Dim nErr As Long, firstErr As Long
+    Set ns = Application.Session
+    On Error Resume Next
+    For r = 1 To cnt
+        i = order(r)
+        Set f = Nothing
+        Set pa = Nothing
+        Err.Clear
+        Set f = ns.GetFolderFromID(eids(i), sid)
+        If Not f Is Nothing Then Set pa = f.PropertyAccessor
+        If pa Is Nothing Then
+            nErr = nErr + 1
+            If firstErr = 0 Then firstErr = Err.Number
             Err.Clear
-        End If
-    End If
-    If hasPar Then
-        pa.DeleteProperty PR_SORT_PARENTID
-        If Err.Number <> 0 Then
-            ok = False
-            modDebugLog.DError MOD_NAME, "DeleteProperty PARENTID err " & Err.Number & " on " & f.FolderPath
+        Else
+            posVal = r * stepVal
+            ReDim b(0 To 1)
+            b(0) = CByte(posVal \ 256)
+            b(1) = CByte(posVal Mod 256)
             Err.Clear
+            pa.SetProperty PR_SORT_POSITION, b
+            If Err.Number = 0 And haveParentId And Not hasPar(i) Then
+                pa.SetProperty PR_SORT_PARENTID, parentIdVal
+            End If
+            If Err.Number = 0 Then
+                mReset = mReset + 1
+            Else
+                nErr = nErr + 1
+                If firstErr = 0 Then firstErr = Err.Number
+                Err.Clear
+            End If
         End If
-    End If
-    If ok Then
-        mReset = mReset + 1
-        modDebugLog.DInfo MOD_NAME, "Reset A-Z : " & f.FolderPath
-    Else
-        mErrors = mErrors + 1
+    Next r
+    On Error GoTo 0
+
+    If nErr > 0 Then
+        mErrors = mErrors + nErr
+        modDebugLog.DError MOD_NAME, "Fratrie " & parentPath & " : " & nErr & _
+            " ecriture(s) refusee(s) sur " & cnt & ", err " & firstErr
     End If
 End Sub
 

@@ -1,7 +1,7 @@
 Option Explicit
 
 ' =====================================================================
-' modMsgBoxCustom v2
+' modMsgBoxCustom v2.1
 ' MsgBox a boutons renommes, avec auto-fermeture (timer) optionnelle,
 ' pour environnement SANS UserForm (VBA Project Object Model bloque).
 '
@@ -54,10 +54,18 @@ Option Explicit
 '     cas ou les 3 libelles couvrent toutes les issues. Retour 1/2/3.
 '   - Confirm3() etendu (timeoutMs / defaultPos optionnels, defaut = 3
 '     soit Annuler : l'auto-fermeture retombe sur la branche inoffensive).
+'
+' v2.1 (2026-11-16) : audit 11/2026 - F7-16 (point accessoire) : dans les
+'   trois replis sur une MsgBox native (appel imbrique, hook refuse,
+'   erreur), les boutons gardent leur texte natif : une ligne de
+'   correspondance "(Oui = Simulation, Non = Appliquer, Annuler =
+'   Annuler)" construite a partir des libelles demandes est ajoutee a la
+'   fin du texte (NativeMap). Les appelants n'ont plus a l'ecrire eux-memes
+'   (elle s'affichait aussi quand les boutons renommes etaient visibles).
 ' =====================================================================
 
 Private Const MOD_NAME As String = "MsgBoxC"
-Private Const MOD_VERSION As String = "v2 - 2026-06-10"
+Private Const MOD_VERSION As String = "v2.1 - 2026-11-16"
 
 ' --- Hook ---
 Private Declare PtrSafe Function SetWindowsHookEx Lib "user32" _
@@ -168,6 +176,8 @@ Public Function MsgBoxC(ByVal prompt As String, _
     ' Reentrance : un MsgBoxC imbrique retombe sur un MsgBox natif.
     If m_Active Then
         modDebugLog.DDebug MOD_NAME, "Reentrance -> MsgBox natif"
+        ' v2.1 (F7-16) : rappeler quel bouton natif porte quel libelle.
+        If Len(label1 & label2 & label3) > 0 Then prompt = prompt & vbCrLf & vbCrLf & NativeMap(buttons, label1, label2, label3)
         MsgBoxC = MsgBox(prompt, buttons Or vbMsgBoxSetForeground, title)
         Exit Function
     End If
@@ -205,6 +215,7 @@ Public Function MsgBoxC(ByVal prompt As String, _
         ' REPLI SILENCIEUX : hook refuse -> MsgBox natif standard.
         modDebugLog.DError MOD_NAME, "SetWindowsHookEx=0 -> repli MsgBox natif"
         m_Active = False
+        If Len(label1 & label2 & label3) > 0 Then prompt = prompt & vbCrLf & vbCrLf & NativeMap(buttons, label1, label2, label3)
         MsgBoxC = MsgBox(prompt, buttons Or vbMsgBoxSetForeground, title)
         Exit Function
     End If
@@ -220,7 +231,59 @@ ErrH:
     modDebugLog.DError MOD_NAME, "MsgBoxC error " & Err.Number & " - " & Err.Description
     Cleanup
     ' Dernier filet : repli natif.
+    If Len(label1 & label2 & label3) > 0 Then prompt = prompt & vbCrLf & vbCrLf & NativeMap(buttons, label1, label2, label3)
     MsgBoxC = MsgBox(prompt, buttons Or vbMsgBoxSetForeground, title)
+End Function
+
+' ---------------------------------------------------------------------
+' NativeMap (v2.1, F7-16) : en repli sur une MsgBox native, ligne
+' "(Oui = Simulation, Non = Appliquer, Annuler = Annuler)" : texte natif de
+' chaque bouton (langue de l'outil) = libelle demande ("&" retire). Seules
+' les positions qui ont un libelle sont citees ; "" si aucune.
+' ---------------------------------------------------------------------
+Private Function NativeMap(ByVal buttons As VbMsgBoxStyle, ByVal label1 As String, _
+                           ByVal label2 As String, ByVal label3 As String) As String
+    On Error Resume Next
+    Dim nat(1 To 3) As String, lab(1 To 3) As String
+    Dim i As Long, n As Long, s As String
+    Select Case (buttons And 7)
+        Case vbYesNoCancel
+            nat(1) = T("Oui", "Yes")
+            nat(2) = T("Non", "No")
+            nat(3) = T("Annuler", "Cancel")
+            n = 3
+        Case vbYesNo
+            nat(1) = T("Oui", "Yes")
+            nat(2) = T("Non", "No")
+            n = 2
+        Case vbOKCancel
+            nat(1) = "OK"
+            nat(2) = T("Annuler", "Cancel")
+            n = 2
+        Case vbAbortRetryIgnore
+            nat(1) = T("Abandonner", "Abort")
+            nat(2) = T("R~eessayer", "Retry")
+            nat(3) = T("Ignorer", "Ignore")
+            n = 3
+        Case vbRetryCancel
+            nat(1) = T("R~eessayer", "Retry")
+            nat(2) = T("Annuler", "Cancel")
+            n = 2
+        Case Else
+            nat(1) = "OK"
+            n = 1
+    End Select
+    lab(1) = Replace(label1, "&", "")
+    lab(2) = Replace(label2, "&", "")
+    lab(3) = Replace(label3, "&", "")
+    s = ""
+    For i = 1 To n
+        If Len(lab(i)) > 0 Then
+            If Len(s) > 0 Then s = s & ", "
+            s = s & nat(i) & " = " & lab(i)
+        End If
+    Next i
+    If Len(s) > 0 Then NativeMap = "(" & s & ")" Else NativeMap = ""
 End Function
 
 ' ---------------------------------------------------------------------

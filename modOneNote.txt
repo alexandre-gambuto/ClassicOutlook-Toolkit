@@ -1,6 +1,22 @@
 Option Explicit
 
 '=============================================================================
+' ARCHIVE (11/2026) : ne plus coller dans le projet installe.
+'   Audit 11/2026, F9-14 (choix A) : OneNote est bloque sur le poste (TypeLib
+'   inchargeable), ce module ne peut pas fonctionner. Il sort du projet VBA
+'   installe (Fichier > Supprimer modOneNote, sans exporter, puis Debogage >
+'   Compiler) en meme temps que modOneNoteProbe, l'onglet OneNote du ruban
+'   et les references de modMaintenance (ModuleVersionOf, MODULES_DEFAULT).
+'   Le fichier reste dans le depot pour le jour ou l'IT repare OneNote.
+'   AVANT TOUTE REMISE EN SERVICE : RunReorganization appelle
+'   modUi.Inform avec vbInformation en 2e argument (place du TITRE) - mettre
+'   UiTitle() en 2e argument et vbInformation en 3e ; et revoir les
+'   lancements de regedit.exe (FixTypeLibWin64_HKCU, CleanHKCUKey) au regard
+'   de la regle EDR du projet.
+' v1.1 (2026-11-16) : audit 11/2026 - F9-14 : en-tete d'archive (code inchange).
+'=============================================================================
+
+'=============================================================================
 ' modOneNote - Moteur de reorganisation OneNote pilote par l'API Claude
 ' Purpose (EN): OneNote reorganization engine. RunReorganization exports a JSON
 '   inventory of the three target notebooks (+ the time-tracking referential) to
@@ -31,7 +47,7 @@ Option Explicit
 ' ---- Constantes ----
 ' modConfig.TimeTrackingFilename() externalise : modConfig.TimeTrackingFilename()
 Private Const MOD_NAME As String = "OneNote"
-Private Const MOD_VERSION As String = "v1 - 2026-06-07"
+Private Const MOD_VERSION As String = "v1.1 - 2026-11-16"
 Private Const BACKUP_FOLDER       As String = "OneNote_Backups"
 Private Const JSON_INVENTORY_FILE As String = "onenote_exchange.json"
 Private Const JSON_PLAN_FILE      As String = "onenote_plan.json"

@@ -1,0 +1,2739 @@
+Option Explicit
+
+'=============================================================================
+' modCampaignBook v1.1  (2026-11-16) - classeur "Suivi des Campagnes.xlsm"
+'
+' v1.1 (2026-11-16) : audit 11/2026 - F5-03, F5-04, F5-07, F5-11, F5-15,
+'   F5-23, charte des classeurs (F8-20 a F8-22) :
+'   (a) relance des lignes selectionnees : les lignes masquees par un filtre
+'       ne sont plus prises ; la question dit combien de lignes choisies ne
+'       sont pas "Sans reponse" (F5-03) ;
+'   (b) derniere ligne de la table calculee lignes masquees comprises
+'       (filtre actif) ; "Importer un fichier" reaffiche toutes les lignes
+'       avant d'ecrire a la suite : plus d'ecrasement de contacts caches
+'       (F5-04) ;
+'   (c) colonnes reconnues par nom EXACT (copie de modMailCampaign v12.1) :
+'       une colonne importee "Statut", "Objet", "Modele" ne prend plus la
+'       place d'une colonne de pilotage (F5-07) ;
+'   (d) effacement differe de la barre d'etat memorise et annule a la
+'       fermeture du classeur (ThisWorkbook.Workbook_BeforeClose) : Excel ne
+'       rouvre plus le classeur ferme pour l'executer (F5-11) ;
+'   (e) nom du classeur et de l'onglet ("Campagnes"), message "Mail
+'       introuvable" (F5-15, F5-23) ;
+'   (f) charte : feuille de campagne creee avec en-tete 1F4E79 blanc gras
+'       centre, hauteur 24, police Arial (11 en-tete, 10 corps), volets
+'       figes sous l'en-tete ; macro FormatCampaignSheet (Alt+F8) pour une
+'       feuille existante.
+'
+' MODULE STANDARD DU CLASSEUR (projet VBA d'Excel, distinct du projet VBA
+' d'Outlook). A creer une fois : Excel, Alt+F11 -> VBAProject (Suivi des
+' Campagnes.xlsm) -> Insertion > Module -> F4 : nommer le module
+' "modCampaignBook" -> coller. ThisWorkbook (code fourni a part) branche les
+' evenements.
+'
+' Toute la logique du classeur :
+'   - onglet de ruban "Campagnes" (customUI14.xml du fichier ; identifiant
+'     tabCampagne inchange) : Rbn_OnLoad, Rbn_Action, Rbn_GetLabel
+'     (compteurs), Rbn_GetEnabled ;
+'   - une feuille par campagne, copiee de la feuille masquee "_Modele" :
+'     bloc de parametres (lignes 1 a 9 : libelle en A, valeur en B) puis
+'     table des contacts (en-tete ligne 11, donnees a partir de la 12) ;
+'   - feuille "Campagnes" : index des campagnes (double-clic = ouvrir) ;
+'   - actions locales : nouvelle campagne, dupliquer, importer un fichier de
+'     contacts (Excel / CSV du marketing), nettoyer, compte d'envoi, modele,
+'     pieces jointes, generer les messages, reinitialiser les statuts,
+'     ouvrir le mail envoye / la derniere reponse / les Brouillons Outlook ;
+'   - actions Outlook (canal de commandes : note Notes\ClassicOutlook-Toolkit,
+'     ThisOutlookSession v10.19 + modMailCampaign v12) : verifier, tester une
+'     ligne, brouillons, envoyer, arreter, actualiser les reponses, relancer,
+'     nettoyer les brouillons. Outlook ecrit ses resultats dans la feuille
+'     puis rappelle AfterOutlookCampaign (compteurs, index, enregistrement).
+'
+' CONTRAT DE DONNEES avec modMailCampaign (jamais traduit) :
+'   colonnes reconnues par leur EN-TETE (normalise : minuscules, sans accents,
+'   lettres et chiffres) : Email (ou Destinataires / Courriel / Adresse), Cc,
+'   Cci, Objet, Message (HTML), Relance (HTML), Pieces jointes, Modele,
+'   Controle, Statut, Suivi, Reponses, Derniere reponse, Relances, Derniere
+'   relance, _ConvID, _EntryID, _SentOn, _ReplyID. Toute autre colonne est un
+'   champ de fusion {{...}} (ex. {{Prenom}}, {{Societe}}).
+'   Statut (ecrit par Outlook, ASCII) : "Brouillon cree le ...", "Envoye le
+'   ...", "Envoye manuellement le ...", "ECHEC ...". Non vide = ligne
+'   protegee contre tout (re)envoi. Controle : "OK" ou l'anomalie.
+'   Suivi (accents, ChrW) : Repondu / Sans reponse / Relance / Non remis /
+'   Relance en brouillon / Mail introuvable.
+'   v1.1 : Outlook (modMailCampaign v12.1) pose "Envoye (en cours) le ..."
+'   juste avant le depart d'un mail ; commencant par "Envoye", ce statut
+'   compte partout comme une ligne envoyee (protegee, jamais reinitialisee
+'   par "Oui = lignes non envoyees").
+'   Parametres (colonne A, libelle reconnu par prefixe) : Campagne, Creee le,
+'   Compte d'envoi, Modele, Objet, Pieces jointes, Dossier de classement,
+'   Message, Message de relance.
+'
+' TEXTES AFFICHES : marqueurs d'accent ASCII decodes par A() (meme table que
+' modConfig.A() cote Outlook). Jamais de donnee a l'interieur d'A().
+' PIEGE VBA : sous On Error Resume Next, une erreur DANS la condition d'un If
+' fait executer la branche Then : toute lecture COM est faite dans une
+' variable AVANT le test (SafeStr).
+'=============================================================================
+
+Private Const MOD_VERSION As String = "v1.1 - 2026-11-16"
+
+Private Const SH_INDEX As String = "Campagnes"
+Private Const SH_MODEL As String = "_Modele"
+Private Const SH_HELP As String = "Aide"
+Private Const TAB_ID As String = "tabCampagne"
+Private Const APP_TITLE As String = "Campagnes"
+Private Const HEADER_SCAN_ROWS As Long = 40
+Private Const HEADER_SCAN_COLS As Long = 60
+Private Const IMPORT_MAX_ROWS As Long = 20000
+Private Const IMPORT_MAX_COLS As Long = 100
+Private Const STATUS_TIMEOUT_SEC As Long = 180
+Private Const CHK_OK As String = "OK"
+Private Const INDEX_COLS As Long = 12
+Private Const LAST_ROW_CHUNK As Long = 5000   ' v1.1 (F5-04) : lecture par paquets
+
+' Charte des classeurs (v1.1, F8-22, police Arial).
+Private Const CHARTER_FONT As String = "Arial"
+Private Const CHARTER_HEADER_HEIGHT As Double = 24
+
+' Canal de commandes vers Outlook (ThisOutlookSession v10.16+).
+Private Const CMD_FOLDER_NAME As String = "ClassicOutlook-Toolkit"
+Private Const OL_FOLDER_NOTES As Long = 12
+Private Const OL_NOTE_ITEM As Long = 5
+Private Const OL_FOLDER_DRAFTS As Long = 16
+
+' Roles de colonnes (memes noms que modMailCampaign).
+Private Const R_TO As String = "TO"
+Private Const R_CC As String = "CC"
+Private Const R_BCC As String = "BCC"
+Private Const R_SUBJECT As String = "SUBJECT"
+Private Const R_ATTACH As String = "ATTACH"
+Private Const R_BODY As String = "BODY"
+Private Const R_FUBODY As String = "FUBODY"
+Private Const R_TEMPLATE As String = "TEMPLATE"
+Private Const R_CHECK As String = "CHECK"
+Private Const R_STATUS As String = "STATUS"
+Private Const R_TRACK As String = "TRACK"
+Private Const R_REPLIES As String = "REPLIES"
+Private Const R_LASTREPLY As String = "LASTREPLY"
+Private Const R_FOLLOWUPS As String = "FOLLOWUPS"
+Private Const R_LASTFU As String = "LASTFU"
+Private Const R_CONV As String = "CONV"
+Private Const R_ENTRY As String = "ENTRY"
+Private Const R_SENTON As String = "SENTON"
+Private Const R_REPLYID As String = "REPLYID"
+
+' Cles du bloc de parametres (libelle normalise, test par prefixe).
+Private Const P_NAME As String = "campagne"
+Private Const P_CREATED As String = "cree"
+Private Const P_ACCOUNT As String = "compte"
+Private Const P_TEMPLATE As String = "modele"
+Private Const P_SUBJECT As String = "objet"
+Private Const P_ATTACH As String = "pieces"
+Private Const P_FOLDER As String = "dossier"
+Private Const P_MESSAGE As String = "message"
+Private Const P_FOLLOWUP As String = "messagederelance"
+
+' Disposition d'une feuille de campagne (relue a chaque action).
+Private Type SheetLayout
+    Ws As Worksheet
+    HeaderRow As Long
+    LastCol As Long
+    Fields As Object      ' en-tete normalise -> colonne
+    Roles As Object       ' role -> colonne
+    Params As Object      ' cle P_* -> ligne du bloc de parametres
+    Valid As Boolean
+End Type
+
+' Compteurs d'une campagne (ruban, index).
+Private Type CampaignStats
+    Contacts As Long
+    Ready As Long
+    ToFix As Long
+    Drafts As Long
+    Sent As Long
+    Failed As Long
+    Replied As Long
+    NoReply As Long
+    Ndr As Long
+    LastAction As Date
+End Type
+
+' Ruban (IRibbonUI) recu par Rbn_OnLoad. Perdu si le projet VBA est
+' reinitialise : l'onglet reste utilisable, les compteurs ne bougent plus
+' jusqu'a la prochaine ouverture du classeur.
+Private mRibbon As Object
+Private mStatusSet As Boolean
+' v1.1 (F5-11) : echeance Application.OnTime en attente (0 = aucune), pour
+' l'annuler avant d'en poser une autre et a la fermeture du classeur.
+Private mClearAt As Date
+
+'=============================================================================
+' ModVersion - version reellement collee dans le classeur.
+'=============================================================================
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+'=============================================================================
+' RUBAN - rappels de l'onglet "Campagnes". L'attribut tag="..." de chaque
+' bouton porte le nom de l'action.
+'=============================================================================
+Public Sub Rbn_OnLoad(ribbon As Object)
+    On Error Resume Next
+    Set mRibbon = ribbon
+    ActivateRibbonTab
+End Sub
+
+Public Sub Rbn_Action(control As Object)
+    Dim act As String
+    act = ""
+    On Error Resume Next
+    act = UCase$(CStr(control.Tag))
+    On Error GoTo 0
+    If Len(act) > 0 Then RunAction act
+End Sub
+
+' Libelles dynamiques : compteurs de la campagne active, compte d'envoi.
+Public Sub Rbn_GetLabel(control As Object, ByRef returnedVal)
+    On Error Resume Next
+    Dim id As String
+    id = ""
+    id = CStr(control.id)
+    Dim lay As SheetLayout, st As CampaignStats
+    Dim onCamp As Boolean
+    onCamp = ActiveCampaignLayout(lay)
+    If onCamp Then ComputeStats lay, st
+    Select Case id
+        Case "lblContacts"
+            If onCamp Then returnedVal = st.Contacts & " contact(s)" Else returnedVal = "-"
+        Case "lblAccount"
+            If onCamp Then
+                Dim acc As String
+                acc = ParamText(lay, P_ACCOUNT)
+                If Len(acc) = 0 Then acc = A("par d~efaut")
+                returnedVal = "Compte : " & acc
+            Else
+                returnedVal = "-"
+            End If
+        Case "lblReady"
+            If onCamp Then
+                returnedVal = st.Ready & A(" pr~xt(s) / ") & st.ToFix & A(" ~a corriger")
+            Else
+                returnedVal = "-"
+            End If
+        Case "lblSent"
+            If onCamp Then
+                returnedVal = st.Sent & A(" envoy~e(s) / ") & st.Drafts & " brouillon(s)"
+            Else
+                returnedVal = "-"
+            End If
+        Case "lblReplies"
+            If onCamp Then
+                returnedVal = st.Replied & A(" r~epondu(s) / ") & st.NoReply & A(" sans r~eponse")
+            Else
+                returnedVal = "-"
+            End If
+        Case Else
+            returnedVal = ""
+    End Select
+End Sub
+
+' Boutons actifs seulement sur une feuille de campagne (sauf les generaux).
+Public Sub Rbn_GetEnabled(control As Object, ByRef returnedVal)
+    On Error Resume Next
+    Dim tg As String
+    tg = ""
+    tg = UCase$(CStr(control.Tag))
+    Select Case tg
+        Case "NEW", "INDEX", "HELP", "STOP", "OPENDRAFTS"
+            returnedVal = True
+        Case Else
+            Dim lay As SheetLayout
+            returnedVal = ActiveCampaignLayout(lay)
+    End Select
+End Sub
+
+' Re-selectionne l'onglet (ouverture du classeur, retour sur sa fenetre).
+Public Sub ActivateRibbonTab()
+    On Error Resume Next
+    If mRibbon Is Nothing Then Exit Sub
+    mRibbon.ActivateTab TAB_ID
+End Sub
+
+' Compteurs et libelles recalcules.
+Public Sub RefreshRibbon()
+    On Error Resume Next
+    If mRibbon Is Nothing Then Exit Sub
+    mRibbon.Invalidate
+End Sub
+
+'=============================================================================
+' EVENEMENTS (appeles par ThisWorkbook) et RAPPEL D'OUTLOOK
+'=============================================================================
+Public Sub OnWorkbookOpen()
+    On Error Resume Next
+    Dim wsM As Worksheet
+    Set wsM = ModelSheet()
+    If Not wsM Is Nothing Then wsM.Visible = xlSheetHidden
+    RefreshIndex
+    RefreshRibbon
+End Sub
+
+Public Sub OnSheetActivated(ByVal sh As Object)
+    On Error Resume Next
+    If TypeName(sh) = "Worksheet" Then
+        If sh.Name = SH_INDEX Then RefreshIndex
+    End If
+    RefreshRibbon
+End Sub
+
+' Modification d'une feuille de campagne : compteurs du ruban.
+Public Sub OnSheetChanged(ByVal sh As Object, ByVal Target As Range)
+    On Error Resume Next
+    If TypeName(sh) <> "Worksheet" Then Exit Sub
+    If sh.Name = SH_INDEX Or sh.Name = SH_HELP Or sh.Name = SH_MODEL Then Exit Sub
+    RefreshRibbon
+End Sub
+
+' Double-clic sur une ligne de l'index : ouvre la campagne.
+Public Sub OnBeforeDoubleClick(ByVal sh As Object, ByVal Target As Range, ByRef Cancel As Boolean)
+    On Error Resume Next
+    If TypeName(sh) <> "Worksheet" Then Exit Sub
+    If sh.Name <> SH_INDEX Then Exit Sub
+    If Target.Row < 2 Then Exit Sub
+    Dim nm As String
+    nm = SafeStr(sh.Cells(Target.Row, 1).Value)
+    If Len(nm) = 0 Then Exit Sub
+    Dim ws As Worksheet
+    Set ws = Nothing
+    Set ws = ThisWorkbook.Worksheets(nm)
+    If ws Is Nothing Then Exit Sub
+    Cancel = True
+    ws.Activate
+End Sub
+
+' Appele par Outlook (Application.Run) a la fin de chaque commande
+' distante : Outlook a ecrit dans la feuille (Controle, Statut, Suivi...).
+' Le classeur est enregistre (les statuts protegent contre un double envoi).
+Public Sub AfterOutlookCampaign(ByVal sheetName As String)
+    On Error Resume Next
+    Dim ws As Worksheet, lay As SheetLayout
+    Set ws = Nothing
+    Set ws = ThisWorkbook.Worksheets(sheetName)
+    If Not ws Is Nothing Then
+        If LoadLayout(ws, lay) Then EnsureFilter lay
+    End If
+    RefreshIndex
+    RefreshRibbon
+    SetStatus A("Mis ~a jour par Outlook ~a ") & Format$(Now, "hh:nn") & " (" & sheetName & ")."
+    ScheduleStatusClear 30
+    AutoSave
+End Sub
+
+Public Sub ClearStatusBarSafe()
+    On Error Resume Next
+    mClearAt = 0
+    If mStatusSet Then
+        Application.StatusBar = False
+        mStatusSet = False
+    End If
+End Sub
+
+' v1.1 (F5-11) : appele par ThisWorkbook.Workbook_BeforeClose. Une echeance
+' Application.OnTime qui vise une macro d'un classeur ferme fait ROUVRIR ce
+' classeur par Excel au moment prevu : l'echeance en attente est annulee et
+' la barre d'etat effacee tout de suite.
+Public Sub CancelStatusClear()
+    On Error Resume Next
+    If mClearAt > 0 Then
+        Application.OnTime mClearAt, "'" & ThisWorkbook.Name & "'!ClearStatusBarSafe", , False
+    End If
+    mClearAt = 0
+    ClearStatusBarSafe
+End Sub
+
+'=============================================================================
+' AIGUILLAGE DES ACTIONS
+'=============================================================================
+Private Sub RunAction(ByVal act As String)
+    On Error GoTo Fin
+    Select Case act
+        Case "NEW": DoNewCampaign: Exit Sub
+        Case "INDEX": GoIndex: Exit Sub
+        Case "HELP": GoHelp: Exit Sub
+        Case "STOP": DoStop: Exit Sub
+        Case "OPENDRAFTS": DoOpenDrafts: Exit Sub
+    End Select
+
+    Dim lay As SheetLayout
+    If Not ActiveCampaignLayout(lay) Then
+        ShowInfo A("Choisis d'abord une feuille de campagne (ou cr~ee-la : Nouvelle campagne).")
+        Exit Sub
+    End If
+
+    Select Case act
+        Case "DUPLICATE": DoDuplicate lay
+        Case "IMPORT": DoImport lay
+        Case "CLEAN": DoClean lay
+        Case "ACCOUNT": DoPickAccount lay
+        Case "TEMPLATE": DoPickTemplate lay
+        Case "ATTACH": DoPickAttachments lay
+        Case "GENERATE": DoGenerate lay
+        Case "CHECK": DoCheck lay
+        Case "TEST": DoTest lay
+        Case "DRAFTS": DoDrafts lay
+        Case "SEND": DoSend lay
+        Case "CLEANDRAFTS": DoCleanDrafts lay
+        Case "REFRESH": DoRefresh lay
+        Case "FOLLOWUP_DRAFTS": DoFollowUp lay, "DRAFTS"
+        Case "FOLLOWUP_SEND": DoFollowUp lay, "SEND"
+        Case "OPENMAIL": DoOpenMail lay, R_ENTRY
+        Case "OPENREPLY": DoOpenMail lay, R_REPLYID
+        Case "RESET": DoResetStatuses lay
+    End Select
+    Exit Sub
+Fin:
+    Application.EnableEvents = True
+    Application.ScreenUpdating = True
+    MsgBox A("Action impossible : ") & Err.Number & " - " & Err.Description, vbExclamation, APP_TITLE
+End Sub
+
+'=============================================================================
+' CAMPAGNES : nouvelle, dupliquer, index, aide
+'=============================================================================
+Private Sub DoNewCampaign()
+    On Error GoTo Fin
+    Dim nm As String
+    nm = Trim$(InputBox(A("Nom de la nouvelle campagne (= nom de l'onglet) :"), _
+                        A("Nouvelle campagne"), "Campagne " & Format$(Date, "yyyy-mm-dd")))
+    If Len(nm) = 0 Then Exit Sub
+    Dim ws As Worksheet
+    Set ws = CreateCampaignSheet(nm)
+    If ws Is Nothing Then Exit Sub
+    ws.Activate
+    RefreshIndex
+    RefreshRibbon
+
+    Dim lay As SheetLayout
+    If LoadLayout(ws, lay) Then
+        DoPickAccount lay
+        If lay.Params.Exists(P_SUBJECT) Then ws.Cells(lay.Params(P_SUBJECT), 2).Select
+    End If
+    SetStatus A("Campagne cr~e~ee : renseigne l'Objet et le Message (bloc du haut), puis Importer / G~en~erer.")
+    ScheduleStatusClear 60
+    Exit Sub
+Fin:
+    MsgBox A("Cr~eation impossible : ") & Err.Number & " - " & Err.Description, vbExclamation, APP_TITLE
+End Sub
+
+' Nouvelle campagne reprenant les parametres de la campagne active (compte,
+' modele, objet, pieces jointes, dossier, messages) sans ses contacts.
+Private Sub DoDuplicate(ByRef src As SheetLayout)
+    On Error GoTo Fin
+    Dim nm As String
+    nm = Trim$(InputBox(A("Nom de la copie (param~ftres repris, contacts non repris) :"), _
+                        "Dupliquer", src.Ws.Name & " (copie)"))
+    If Len(nm) = 0 Then Exit Sub
+    Dim ws As Worksheet
+    Set ws = CreateCampaignSheet(nm)
+    If ws Is Nothing Then Exit Sub
+    Dim lay As SheetLayout
+    If LoadLayout(ws, lay) Then
+        CopyParam src, lay, P_ACCOUNT
+        CopyParam src, lay, P_TEMPLATE
+        CopyParam src, lay, P_SUBJECT
+        CopyParam src, lay, P_ATTACH
+        CopyParam src, lay, P_FOLDER
+        CopyParam src, lay, P_MESSAGE
+        CopyParam src, lay, P_FOLLOWUP
+    End If
+    ws.Activate
+    RefreshIndex
+    RefreshRibbon
+    SetStatus A("Copie cr~e~ee : importe ou colle les contacts, puis G~en~erer.")
+    ScheduleStatusClear 60
+    Exit Sub
+Fin:
+    MsgBox A("Duplication impossible : ") & Err.Number & " - " & Err.Description, vbExclamation, APP_TITLE
+End Sub
+
+Private Sub CopyParam(ByRef src As SheetLayout, ByRef dst As SheetLayout, ByVal key As String)
+    On Error Resume Next
+    If Not src.Params.Exists(key) Then Exit Sub
+    If Not dst.Params.Exists(key) Then Exit Sub
+    dst.Ws.Cells(dst.Params(key), 2).Value = src.Ws.Cells(src.Params(key), 2).Value
+End Sub
+
+' Feuille neuve : copie de "_Modele" (sinon construite par le code), nom
+' unique et valide, nom et date de creation poses dans le bloc.
+Private Function CreateCampaignSheet(ByVal nm As String) As Worksheet
+    On Error GoTo Fin
+    Set CreateCampaignSheet = Nothing
+    Dim wsM As Worksheet, ws As Worksheet
+    Set wsM = ModelSheet()
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    If Not wsM Is Nothing Then
+        wsM.Copy After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count)
+        Set ws = ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count)
+        ws.Visible = xlSheetVisible
+    Else
+        Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+        BuildCampaignSheet ws
+    End If
+    ws.Name = UniqueSheetName(SafeSheetName(nm))
+
+    Dim lay As SheetLayout
+    If LoadLayout(ws, lay) Then
+        SetParam lay, P_NAME, nm
+        SetParam lay, P_CREATED, Date
+        If lay.Params.Exists(P_CREATED) Then ws.Cells(lay.Params(P_CREATED), 2).NumberFormat = "dd/mm/yyyy"
+        ApplySheetCharter lay          ' v1.1 : charte des classeurs (F8-22)
+    End If
+    Application.EnableEvents = True
+    Application.ScreenUpdating = True
+    Set CreateCampaignSheet = ws
+    Exit Function
+Fin:
+    Application.EnableEvents = True
+    Application.ScreenUpdating = True
+    MsgBox A("Cr~eation de la feuille impossible : ") & Err.Number & " - " & Err.Description, vbExclamation, APP_TITLE
+End Function
+
+' Repli sans feuille "_Modele" : meme disposition, mise en forme minimale.
+Private Sub BuildCampaignSheet(ByVal ws As Worksheet)
+    On Error Resume Next
+    ws.Cells(1, 1).Value = "Campagne"
+    ws.Cells(2, 1).Value = "Cr" & ChrW$(233) & ChrW$(233) & "e le"
+    ws.Cells(3, 1).Value = "Compte d'envoi"
+    ws.Cells(4, 1).Value = "Mod" & ChrW$(232) & "le (.oft / .msg)"
+    ws.Cells(5, 1).Value = "Objet"
+    ws.Cells(6, 1).Value = "Pi" & ChrW$(232) & "ces jointes"
+    ws.Cells(7, 1).Value = "Dossier de classement"
+    ws.Cells(8, 1).Value = "Message"
+    ws.Cells(9, 1).Value = "Message de relance"
+    ws.Range("B8:H8").Merge
+    ws.Range("B9:H9").Merge
+    ws.Range("B8:H9").WrapText = True
+    ws.Range("B8:H9").VerticalAlignment = xlTop
+    ws.Rows(8).RowHeight = 90
+    ws.Rows(9).RowHeight = 60
+    ws.Range("A1:A9").Font.Bold = True
+    Dim hdr As Variant
+    hdr = Array("Email", "Pr" & ChrW$(233) & "nom", "Nom", "Soci" & ChrW$(233) & "t" & ChrW$(233), "Cc", "Objet", _
+                "Message (HTML)", "Relance (HTML)", "Pi" & ChrW$(232) & "ces jointes", "Mod" & ChrW$(232) & "le", _
+                "Contr" & ChrW$(244) & "le", "Statut", "Suivi", "R" & ChrW$(233) & "ponses", _
+                "Derni" & ChrW$(232) & "re r" & ChrW$(233) & "ponse", "Relances", "Derni" & ChrW$(232) & "re relance", _
+                "_ConvID", "_EntryID", "_SentOn", "_ReplyID")
+    Dim c As Long
+    For c = 0 To UBound(hdr)
+        ws.Cells(11, c + 1).Value = hdr(c)
+    Next c
+    ws.Rows(11).Font.Bold = True
+    ws.Columns(1).ColumnWidth = 32
+    ws.Columns(2).ColumnWidth = 18
+    ws.Columns(18).Hidden = True
+    ws.Columns(19).Hidden = True
+    ws.Columns(20).Hidden = True
+    ws.Columns(21).Hidden = True
+End Sub
+
+' v1.1 : charte commune des trois classeurs (audit 11/2026, F8-20 a F8-22,
+' police Arial retenue). En-tete de la table : fond 1F4E79 (colonnes
+' techniques "_..." en gris 7F7F7F), texte blanc gras centre, hauteur 24 ;
+' une seule police (Arial 11 pour l'en-tete et les libelles du bloc de
+' parametres, Arial 10 pour le reste) ; volets figes sous la ligne
+' d'en-tete. Les couleurs du bloc de parametres (DDEBF7) ne changent pas.
+' Appliquee a la creation d'une campagne, ou a la demande
+' (FormatCampaignSheet) : jamais a l'ouverture du classeur.
+Private Sub ApplySheetCharter(ByRef lay As SheetLayout)
+    On Error Resume Next
+    Dim ws As Worksheet, hr As Long, c As Long, nm As String
+    Set ws = lay.Ws
+    hr = lay.HeaderRow
+    If ws Is Nothing Or hr < 1 Then Exit Sub
+
+    ws.Cells.Font.Name = CHARTER_FONT
+    ws.Cells.Font.Size = 10
+    If hr > 1 Then ws.Range(ws.Cells(1, 1), ws.Cells(hr - 1, 1)).Font.Size = 11
+
+    With ws.Range(ws.Cells(hr, 1), ws.Cells(hr, lay.LastCol))
+        .Font.Size = 11
+        .Font.Bold = True
+        .Font.Color = RGB(255, 255, 255)
+        .HorizontalAlignment = xlCenter
+        .VerticalAlignment = xlCenter
+    End With
+    ws.Rows(hr).RowHeight = CHARTER_HEADER_HEIGHT
+    For c = 1 To lay.LastCol
+        nm = SafeStr(ws.Cells(hr, c).Value)
+        If Left$(nm, 1) = "_" Then
+            ws.Cells(hr, c).Interior.Color = RGB(127, 127, 127)
+        Else
+            ws.Cells(hr, c).Interior.Color = RGB(31, 78, 121)
+        End If
+    Next c
+    FreezeBelowHeader ws, hr
+End Sub
+
+' Volets figes sous la ligne d'en-tete (la feuille devient la feuille
+' active de sa fenetre : sans effet visible, l'appelant l'active ensuite).
+Private Sub FreezeBelowHeader(ByVal ws As Worksheet, ByVal hr As Long)
+    On Error Resume Next
+    ws.Activate
+    ActiveWindow.FreezePanes = False
+    ActiveWindow.ScrollRow = 1
+    ActiveWindow.ScrollColumn = 1
+    ActiveWindow.SplitColumn = 0
+    ActiveWindow.SplitRow = hr
+    ActiveWindow.FreezePanes = True
+End Sub
+
+' v1.1 : applique la charte a la feuille de campagne active (Alt+F8 >
+' FormatCampaignSheet). Pour les campagnes creees avant la v1.1 et pour le
+' modele "_Modele" (le rendre visible le temps de l'appliquer, puis le
+' masquer de nouveau).
+Public Sub FormatCampaignSheet()
+    On Error Resume Next
+    Dim sh As Object, lay As SheetLayout
+    Set sh = Nothing
+    Set sh = ActiveSheet
+    If sh Is Nothing Then Exit Sub
+    If TypeName(sh) <> "Worksheet" Then Exit Sub
+    If Not sh.Parent Is ThisWorkbook Then Exit Sub
+    If Not LoadLayout(sh, lay) Then
+        ShowInfo A("La feuille active n'est pas une feuille de campagne (aucune colonne Email).")
+        Exit Sub
+    End If
+    Application.ScreenUpdating = False
+    ApplySheetCharter lay
+    Application.ScreenUpdating = True
+    SetStatus A("Mise en forme appliqu~ee ~a la feuille ") & sh.Name & "."
+    ScheduleStatusClear 30
+End Sub
+
+Private Sub GoIndex()
+    On Error Resume Next
+    RefreshIndex
+    Dim ws As Worksheet
+    Set ws = IndexSheet()
+    If Not ws Is Nothing Then ws.Activate
+End Sub
+
+Private Sub GoHelp()
+    On Error Resume Next
+    Dim ws As Worksheet
+    Set ws = Nothing
+    Set ws = ThisWorkbook.Worksheets(SH_HELP)
+    If ws Is Nothing Then
+        ShowInfo A("La feuille Aide n'existe plus dans ce classeur.")
+    Else
+        ws.Activate
+    End If
+End Sub
+
+'=============================================================================
+' INDEX DES CAMPAGNES (feuille "Campagnes") : une ligne par feuille de
+' campagne, recalculee a l'ouverture, a l'activation de l'index et apres
+' chaque retour d'Outlook.
+'=============================================================================
+Public Sub RefreshIndex()
+    On Error GoTo Fin
+    Dim wsI As Worksheet
+    Set wsI = IndexSheet()
+    If wsI Is Nothing Then Exit Sub
+    Application.EnableEvents = False
+    Dim lastRow As Long
+    lastRow = wsI.Cells(wsI.Rows.Count, 1).End(xlUp).Row
+    If lastRow >= 2 Then wsI.Range(wsI.Cells(2, 1), wsI.Cells(lastRow, INDEX_COLS)).ClearContents
+
+    Dim sh As Worksheet, lay As SheetLayout, st As CampaignStats, r As Long
+    r = 1
+    For Each sh In ThisWorkbook.Worksheets
+        If sh.Name <> SH_INDEX And sh.Name <> SH_HELP And sh.Name <> SH_MODEL Then
+            If LoadLayout(sh, lay) Then
+                r = r + 1
+                ComputeStats lay, st
+                wsI.Cells(r, 1).Value = sh.Name
+                If lay.Params.Exists(P_CREATED) Then
+                    wsI.Cells(r, 2).Value = sh.Cells(lay.Params(P_CREATED), 2).Value
+                    wsI.Cells(r, 2).NumberFormat = "dd/mm/yyyy"
+                End If
+                wsI.Cells(r, 3).Value = ParamText(lay, P_ACCOUNT)
+                wsI.Cells(r, 4).Value = ParamText(lay, P_SUBJECT)
+                wsI.Cells(r, 5).Value = st.Contacts
+                wsI.Cells(r, 6).Value = st.Ready
+                wsI.Cells(r, 7).Value = st.Drafts
+                wsI.Cells(r, 8).Value = st.Sent
+                wsI.Cells(r, 9).Value = st.Replied
+                wsI.Cells(r, 10).Value = st.NoReply
+                If st.Sent > 0 Then
+                    wsI.Cells(r, 11).Value = st.Replied / st.Sent
+                    wsI.Cells(r, 11).NumberFormat = "0%"
+                Else
+                    wsI.Cells(r, 11).Value = ""
+                End If
+                If st.LastAction > 0 Then
+                    wsI.Cells(r, 12).Value = st.LastAction
+                    wsI.Cells(r, 12).NumberFormat = "dd/mm/yyyy hh:mm"
+                Else
+                    wsI.Cells(r, 12).Value = ""
+                End If
+            End If
+        End If
+    Next sh
+    Application.EnableEvents = True
+    Exit Sub
+Fin:
+    Application.EnableEvents = True
+End Sub
+
+Private Function IndexSheet() As Worksheet
+    On Error Resume Next
+    Set IndexSheet = Nothing
+    Set IndexSheet = ThisWorkbook.Worksheets(SH_INDEX)
+End Function
+
+Private Function ModelSheet() As Worksheet
+    On Error Resume Next
+    Set ModelSheet = Nothing
+    Set ModelSheet = ThisWorkbook.Worksheets(SH_MODEL)
+End Function
+
+' Compteurs d'une feuille de campagne (lecture par blocs).
+Private Sub ComputeStats(ByRef lay As SheetLayout, ByRef st As CampaignStats)
+    On Error Resume Next
+    Dim blank As CampaignStats
+    st = blank
+    Dim lastRow As Long, first As Long, nb As Long
+    lastRow = LastDataRow(lay)
+    first = lay.HeaderRow + 1
+    If lastRow < first Then Exit Sub
+    nb = lastRow - lay.HeaderRow
+
+    Dim toB As Variant, stB As Variant, chB As Variant, trB As Variant
+    toB = ColBlock(lay, R_TO, first, lastRow)
+    stB = ColBlock(lay, R_STATUS, first, lastRow)
+    chB = ColBlock(lay, R_CHECK, first, lastRow)
+    trB = ColBlock(lay, R_TRACK, first, lastRow)
+    Dim soB As Variant, fuB As Variant, lrB As Variant
+    soB = ColBlock(lay, R_SENTON, first, lastRow)
+    fuB = ColBlock(lay, R_LASTFU, first, lastRow)
+    lrB = ColBlock(lay, R_LASTREPLY, first, lastRow)
+
+    Dim i As Long, em As String, s As String, chk As String, tr As String, d As Date
+    For i = 1 To nb
+        em = Trim$(SafeStr(toB(i, 1)))
+        If Len(em) > 0 Then
+            st.Contacts = st.Contacts + 1
+            s = Trim$(SafeStr(stB(i, 1)))
+            chk = Trim$(SafeStr(chB(i, 1)))
+            tr = Trim$(SafeStr(trB(i, 1)))
+            If Len(s) = 0 Then
+                If chk = CHK_OK Then
+                    st.Ready = st.Ready + 1
+                ElseIf Len(chk) > 0 Then
+                    st.ToFix = st.ToFix + 1
+                End If
+            ElseIf Left$(s, 9) = "Brouillon" Then
+                st.Drafts = st.Drafts + 1
+            ElseIf Left$(s, 6) = "Envoye" Then
+                st.Sent = st.Sent + 1
+            ElseIf Left$(s, 5) = "ECHEC" Then
+                st.Failed = st.Failed + 1
+            End If
+            If tr = TrkReplied() Then
+                st.Replied = st.Replied + 1
+            ElseIf tr = TrkNoReply() Or tr = TrkFollowed() Or tr = TrkFuDraft() Then
+                st.NoReply = st.NoReply + 1
+            ElseIf tr = TrkNdr() Then
+                st.Ndr = st.Ndr + 1
+            End If
+            d = DateOf(soB(i, 1))
+            If d > st.LastAction Then st.LastAction = d
+            d = DateOf(fuB(i, 1))
+            If d > st.LastAction Then st.LastAction = d
+            d = DateOf(lrB(i, 1))
+            If d > st.LastAction Then st.LastAction = d
+        End If
+    Next i
+End Sub
+
+' Bloc d'une colonne de role (tableau nb x 1, vide si le role manque).
+Private Function ColBlock(ByRef lay As SheetLayout, ByVal role As String, ByVal r1 As Long, ByVal r2 As Long) As Variant
+    Dim c As Long
+    c = RoleCol(lay, role)
+    If c = 0 Then
+        Dim emptyB() As Variant
+        ReDim emptyB(1 To r2 - r1 + 1, 1 To 1)
+        ColBlock = emptyB
+    Else
+        ColBlock = BlockOf(lay.Ws, r1, c, r2, c)
+    End If
+End Function
+
+Private Function DateOf(ByVal v As Variant) As Date
+    On Error Resume Next
+    DateOf = 0
+    If IsError(v) Then Exit Function
+    If IsEmpty(v) Then Exit Function
+    If IsNull(v) Then Exit Function
+    If IsDate(v) Then DateOf = CDate(v)
+End Function
+
+'=============================================================================
+' DISPOSITION D'UNE FEUILLE : ligne d'en-tete cherchee (premiere ligne
+' portant une colonne Email / Destinataires), colonnes par en-tete,
+' parametres par libelle. Memes regles que modMailCampaign (Outlook).
+'=============================================================================
+Private Function LoadLayout(ByVal ws As Worksheet, ByRef lay As SheetLayout) As Boolean
+    On Error GoTo Fin
+    LoadLayout = False
+    lay.Valid = False
+    Set lay.Ws = ws
+    Set lay.Fields = CreateObject("Scripting.Dictionary")
+    Set lay.Roles = CreateObject("Scripting.Dictionary")
+    Set lay.Params = CreateObject("Scripting.Dictionary")
+    If ws Is Nothing Then Exit Function
+    If ws.Name = SH_INDEX Or ws.Name = SH_HELP Then Exit Function
+
+    lay.HeaderRow = FindHeaderRow(ws)
+    If lay.HeaderRow = 0 Then Exit Function
+    lay.LastCol = ws.Cells(lay.HeaderRow, ws.Columns.Count).End(xlToLeft).Column
+    If lay.LastCol < 1 Then lay.LastCol = 1
+
+    Dim blk As Variant, c As Long, nrm As String, role As String
+    blk = BlockOf(ws, lay.HeaderRow, 1, lay.HeaderRow, lay.LastCol)
+    For c = 1 To lay.LastCol
+        nrm = NormalizeHeader(SafeStr(blk(1, c)))
+        If Len(nrm) > 0 Then
+            If Not lay.Fields.Exists(nrm) Then lay.Fields.Add nrm, c
+            role = RoleFromHeader(nrm)
+            If Len(role) > 0 Then
+                If Not lay.Roles.Exists(role) Then lay.Roles.Add role, c
+            End If
+        End If
+    Next c
+    If Not lay.Roles.Exists(R_TO) Then Exit Function
+
+    If lay.HeaderRow > 1 Then
+        blk = BlockOf(ws, 1, 1, lay.HeaderRow - 1, 1)
+        Dim r As Long, key As String
+        For r = 1 To UBound(blk, 1)
+            key = ParamKeyFor(NormalizeHeader(SafeStr(blk(r, 1))))
+            If Len(key) > 0 Then
+                If Not lay.Params.Exists(key) Then lay.Params.Add key, r
+            End If
+        Next r
+    End If
+    lay.Valid = True
+    LoadLayout = True
+    Exit Function
+Fin:
+    lay.Valid = False
+    LoadLayout = False
+End Function
+
+' Disposition de la feuille active si c'est une feuille de campagne de CE
+' classeur (ni l'index, ni l'aide, ni le modele).
+Private Function ActiveCampaignLayout(ByRef lay As SheetLayout) As Boolean
+    On Error Resume Next
+    ActiveCampaignLayout = False
+    Dim sh As Object
+    Set sh = Nothing
+    Set sh = ActiveSheet
+    If sh Is Nothing Then Exit Function
+    If TypeName(sh) <> "Worksheet" Then Exit Function
+    If Not sh.Parent Is ThisWorkbook Then Exit Function
+    If sh.Name = SH_MODEL Then Exit Function
+    ActiveCampaignLayout = LoadLayout(sh, lay)
+End Function
+
+' Premiere ligne (1..HEADER_SCAN_ROWS) portant une colonne Email. Une ligne
+' du bloc de parametres (libelle connu en A, valeur en B, rien d'autre)
+' n'est jamais prise pour l'en-tete.
+Private Function FindHeaderRow(ByVal ws As Worksheet) As Long
+    On Error Resume Next
+    FindHeaderRow = 0
+    Dim blk As Variant
+    blk = BlockOf(ws, 1, 1, HEADER_SCAN_ROWS, HEADER_SCAN_COLS)
+    Dim r As Long, c As Long, filled As Long, isParam As Boolean
+    For r = 1 To UBound(blk, 1)
+        filled = 0
+        For c = 1 To UBound(blk, 2)
+            If Len(Trim$(SafeStr(blk(r, c)))) > 0 Then filled = filled + 1
+        Next c
+        isParam = (filled <= 2 And Len(ParamKeyFor(NormalizeHeader(SafeStr(blk(r, 1))))) > 0)
+        If Not isParam Then
+            For c = 1 To UBound(blk, 2)
+                If RoleFromHeader(NormalizeHeader(SafeStr(blk(r, c)))) = R_TO Then
+                    FindHeaderRow = r
+                    Exit Function
+                End If
+            Next c
+        End If
+    Next r
+End Function
+
+' minuscules, sans accents, lettres et chiffres seulement.
+Private Function NormalizeHeader(ByVal s As String) As String
+    Dim x As String
+    x = LCase$(Trim$(s))
+    x = Replace(x, ChrW$(233), "e"): x = Replace(x, ChrW$(232), "e")
+    x = Replace(x, ChrW$(234), "e"): x = Replace(x, ChrW$(235), "e")
+    x = Replace(x, ChrW$(224), "a"): x = Replace(x, ChrW$(226), "a")
+    x = Replace(x, ChrW$(238), "i"): x = Replace(x, ChrW$(239), "i")
+    x = Replace(x, ChrW$(244), "o"): x = Replace(x, ChrW$(249), "u")
+    x = Replace(x, ChrW$(251), "u"): x = Replace(x, ChrW$(231), "c")
+    Dim i As Long, ch As String, out As String
+    For i = 1 To Len(x)
+        ch = Mid$(x, i, 1)
+        If (ch >= "a" And ch <= "z") Or (ch >= "0" And ch <= "9") Then out = out & ch
+    Next i
+    NormalizeHeader = out
+End Function
+
+' Role d'un en-tete normalise. COPIE IDENTIQUE de
+' modMailCampaign.RoleFromHeader (v12.1, F5-07) : noms EXACTS seulement (plus
+' aucun fragment : "Src Statut", "Statut client", "Objet du marketing" ou
+' "Logiciel Microsoft" ne prennent plus la place d'une colonne de
+' pilotage) ; anciens en-tetes connus listes (feuille 9 colonnes :
+' "Destinataires (A)", "Copies (Cc)", "Caches (Cci)", "Message (HTML)"...).
+' Seule la colonne destinataire garde des prefixes (email..., courriel...,
+' adresse...).
+Private Function RoleFromHeader(ByVal n As String) As String
+    RoleFromHeader = ""
+    If Len(n) = 0 Then Exit Function
+    Select Case n
+        Case "convid": RoleFromHeader = R_CONV
+        Case "entryid": RoleFromHeader = R_ENTRY
+        Case "senton": RoleFromHeader = R_SENTON
+        Case "replyid": RoleFromHeader = R_REPLYID
+        Case "controle", "check": RoleFromHeader = R_CHECK
+        Case "statut", "status": RoleFromHeader = R_STATUS
+        Case "suivi", "tracking": RoleFromHeader = R_TRACK
+        Case "reponses", "replies": RoleFromHeader = R_REPLIES
+        Case "dernierereponse", "lastreply": RoleFromHeader = R_LASTREPLY
+        Case "relances", "followups": RoleFromHeader = R_FOLLOWUPS
+        Case "derniererelance", "lastfollowup": RoleFromHeader = R_LASTFU
+        Case "relancehtml", "followuphtml": RoleFromHeader = R_FUBODY
+        Case "messagehtml", "html", "corpshtml", "bodyhtml", "htmlbody": RoleFromHeader = R_BODY
+        Case "cc", "copie", "copies", "copiescc", "encopie": RoleFromHeader = R_CC
+        Case "bcc", "cci", "cachescci", "cachecci", "copiecachee", "copiescachees": RoleFromHeader = R_BCC
+        Case "objet", "subject": RoleFromHeader = R_SUBJECT
+        Case "piecesjointes", "piecejointe", "attachments", "attachment": RoleFromHeader = R_ATTACH
+        Case "modele", "modeleoft", "modeleoftmsg", "template": RoleFromHeader = R_TEMPLATE
+        Case "destinataire", "destinataires", "destinatairea", "destinatairesa", "mail", "to"
+            RoleFromHeader = R_TO
+        Case Else
+            If Left$(n, 5) = "email" Or Left$(n, 8) = "courriel" Or Left$(n, 7) = "adresse" Then RoleFromHeader = R_TO
+    End Select
+End Function
+
+' Cle P_* d'un libelle normalise (copie de modMailCampaign.ParamKeyFor).
+Private Function ParamKeyFor(ByVal nrm As String) As String
+    ParamKeyFor = ""
+    If Len(nrm) = 0 Then Exit Function
+    If Left$(nrm, Len(P_FOLLOWUP)) = P_FOLLOWUP Or Left$(nrm, 7) = "relance" Then
+        ParamKeyFor = P_FOLLOWUP
+    ElseIf Left$(nrm, Len(P_MESSAGE)) = P_MESSAGE Then
+        ParamKeyFor = P_MESSAGE
+    ElseIf Left$(nrm, Len(P_ACCOUNT)) = P_ACCOUNT Or Left$(nrm, 7) = "account" Then
+        ParamKeyFor = P_ACCOUNT
+    ElseIf Left$(nrm, Len(P_TEMPLATE)) = P_TEMPLATE Or Left$(nrm, 8) = "template" Then
+        ParamKeyFor = P_TEMPLATE
+    ElseIf Left$(nrm, Len(P_SUBJECT)) = P_SUBJECT Or Left$(nrm, 7) = "subject" Then
+        ParamKeyFor = P_SUBJECT
+    ElseIf Left$(nrm, Len(P_ATTACH)) = P_ATTACH Or Left$(nrm, 6) = "attach" Then
+        ParamKeyFor = P_ATTACH
+    ElseIf Left$(nrm, Len(P_FOLDER)) = P_FOLDER Or Left$(nrm, 6) = "folder" Then
+        ParamKeyFor = P_FOLDER
+    ElseIf Left$(nrm, Len(P_CREATED)) = P_CREATED Or Left$(nrm, 7) = "created" Then
+        ParamKeyFor = P_CREATED
+    ElseIf Left$(nrm, Len(P_NAME)) = P_NAME Or Left$(nrm, 8) = "campaign" Then
+        ParamKeyFor = P_NAME
+    End If
+End Function
+
+Private Function ParamText(ByRef lay As SheetLayout, ByVal key As String) As String
+    On Error Resume Next
+    ParamText = ""
+    If lay.Params Is Nothing Then Exit Function
+    If Not lay.Params.Exists(key) Then Exit Function
+    ParamText = Trim$(SafeStr(lay.Ws.Cells(lay.Params(key), 2).Value))
+End Function
+
+Private Sub SetParam(ByRef lay As SheetLayout, ByVal key As String, ByVal v As Variant)
+    On Error Resume Next
+    If Not lay.Params.Exists(key) Then Exit Sub
+    lay.Ws.Cells(lay.Params(key), 2).Value = v
+End Sub
+
+Private Function RoleCol(ByRef lay As SheetLayout, ByVal role As String) As Long
+    On Error Resume Next
+    RoleCol = 0
+    If lay.Roles Is Nothing Then Exit Function
+    If lay.Roles.Exists(role) Then RoleCol = CLng(lay.Roles(role))
+End Function
+
+Private Function CellText(ByRef lay As SheetLayout, ByVal r As Long, ByVal role As String) As String
+    On Error Resume Next
+    CellText = ""
+    Dim c As Long
+    c = RoleCol(lay, role)
+    If c = 0 Then Exit Function
+    CellText = SafeStr(lay.Ws.Cells(r, c).Value)
+End Function
+
+Private Sub PutCell(ByRef lay As SheetLayout, ByVal r As Long, ByVal role As String, ByVal v As Variant)
+    On Error Resume Next
+    Dim c As Long
+    c = RoleCol(lay, role)
+    If c = 0 Then Exit Sub
+    lay.Ws.Cells(r, c).Value = v
+End Sub
+
+' Derniere ligne de donnees (colonne Email ou Statut).
+' v1.1 (F5-04) : lignes masquees par un filtre COMPRISES. End(xlUp) s'arrete
+' sur la derniere cellule VISIBLE : avec un filtre qui masquait le bas de la
+' table, la "derniere ligne" etait trop haute (import ecrit par-dessus des
+' contacts caches, lignes du bas ignorees par les compteurs, Nettoyer,
+' Generer, Reinitialiser). Le resultat End(xlUp) sert de plancher, puis les
+' lignes entre ce plancher et le bas de la zone utilisee sont lues en blocs
+' (les lectures de valeurs voient aussi les lignes masquees), en remontant.
+Private Function LastDataRow(ByRef lay As SheetLayout) As Long
+    On Error Resume Next
+    Dim l1 As Long, l2 As Long, cTo As Long, cSt As Long
+    cTo = RoleCol(lay, R_TO)
+    cSt = RoleCol(lay, R_STATUS)
+    l1 = lay.Ws.Cells(lay.Ws.Rows.Count, cTo).End(xlUp).Row
+    l2 = 0
+    If cSt > 0 Then l2 = lay.Ws.Cells(lay.Ws.Rows.Count, cSt).End(xlUp).Row
+    LastDataRow = l1
+    If l2 > LastDataRow Then LastDataRow = l2
+    If LastDataRow < lay.HeaderRow Then LastDataRow = lay.HeaderRow
+    If cTo = 0 Then Exit Function
+
+    Dim usedLast As Long, floorRow As Long, r1 As Long, r2 As Long, k As Long
+    Dim bTo As Variant, bSt As Variant
+    usedLast = 0
+    usedLast = lay.Ws.UsedRange.Row + lay.Ws.UsedRange.Rows.Count - 1
+    floorRow = LastDataRow
+    If usedLast <= floorRow Then Exit Function
+    r2 = usedLast
+    Do While r2 > floorRow
+        r1 = r2 - LAST_ROW_CHUNK + 1
+        If r1 <= floorRow Then r1 = floorRow + 1
+        bTo = Empty
+        bTo = BlockOf(lay.Ws, r1, cTo, r2, cTo)
+        bSt = Empty
+        If cSt > 0 Then bSt = BlockOf(lay.Ws, r1, cSt, r2, cSt)
+        If Not IsArray(bTo) Then Exit Function      ' lecture impossible : plancher
+        For k = r2 - r1 + 1 To 1 Step -1
+            If Len(SafeStr(bTo(k, 1))) > 0 Then
+                LastDataRow = r1 + k - 1
+                Exit Function
+            End If
+            If IsArray(bSt) Then
+                If Len(SafeStr(bSt(k, 1))) > 0 Then
+                    LastDataRow = r1 + k - 1
+                    Exit Function
+                End If
+            End If
+        Next k
+        r2 = r1 - 1
+    Loop
+End Function
+
+' Toujours un tableau 2D 1-based, meme pour une cellule.
+Private Function BlockOf(ByVal ws As Worksheet, ByVal r1 As Long, ByVal c1 As Long, ByVal r2 As Long, ByVal c2 As Long) As Variant
+    Dim v As Variant
+    If r2 < r1 Then r2 = r1
+    If c2 < c1 Then c2 = c1
+    v = ws.Range(ws.Cells(r1, c1), ws.Cells(r2, c2)).Value
+    If Not IsArray(v) Then
+        Dim one(1 To 1, 1 To 1) As Variant
+        one(1, 1) = v
+        v = one
+    End If
+    BlockOf = v
+End Function
+
+' Valeur texte sure d'une cellule (erreur #N/A, Null, vide -> "").
+Private Function SafeStr(ByVal v As Variant) As String
+    On Error Resume Next
+    SafeStr = ""
+    If IsError(v) Then Exit Function
+    If IsNull(v) Then Exit Function
+    If IsEmpty(v) Then Exit Function
+    SafeStr = CStr(v)
+End Function
+
+' v1.1 (F5-04) : reaffiche les lignes masquees par le filtre de la feuille
+' (les fleches restent). Jamais d'erreur.
+Private Sub ShowAllRows(ByVal ws As Worksheet)
+    On Error Resume Next
+    Dim fm As Boolean
+    fm = False
+    fm = CBool(ws.FilterMode)
+    If fm Then ws.ShowAllData
+End Sub
+
+' Filtre automatique sur TOUTE la table (colonnes techniques masquees
+' comprises) : un tri depuis une fleche du filtre deplace la ligne entiere.
+Private Sub EnsureFilter(ByRef lay As SheetLayout)
+    On Error Resume Next
+    Dim lastRow As Long
+    lastRow = LastDataRow(lay)
+    If lastRow <= lay.HeaderRow Then Exit Sub
+    Dim evOn As Boolean
+    evOn = Application.EnableEvents
+    Application.EnableEvents = False
+    lay.Ws.AutoFilterMode = False
+    lay.Ws.Range(lay.Ws.Cells(lay.HeaderRow, 1), lay.Ws.Cells(lastRow, lay.LastCol)).AutoFilter
+    Application.EnableEvents = evOn
+End Sub
+
+' Lignes de donnees de la selection courante (dans la table, sans doublon).
+' v1.1 (F5-03) : les lignes MASQUEES (filtre) sont ignorees. Une selection
+' faite a la souris sur une table filtree est une plage continue qui
+' englobe les lignes cachees : "Relancer les lignes selectionnees" visait
+' aussi des contacts invisibles (deja repondus compris).
+Private Function SelectedDataRows(ByRef lay As SheetLayout) As Collection
+    Dim res As Collection
+    Set res = New Collection
+    Set SelectedDataRows = res
+    On Error Resume Next
+    Dim sel As Range
+    Set sel = Nothing
+    Set sel = Selection
+    If sel Is Nothing Then Exit Function
+    If Not sel.Parent Is lay.Ws Then Exit Function
+    Dim lastRow As Long
+    lastRow = LastDataRow(lay)
+    If lastRow <= lay.HeaderRow Then Exit Function
+    Dim isect As Range
+    Set isect = Nothing
+    Set isect = Application.Intersect(sel, lay.Ws.Range(lay.Ws.Cells(lay.HeaderRow + 1, 1), lay.Ws.Cells(lastRow, lay.LastCol)))
+    If isect Is Nothing Then Exit Function
+    Dim seen As Object
+    Set seen = CreateObject("Scripting.Dictionary")
+    Dim area As Range, rw As Range, r As Long, hid As Boolean
+    For Each area In isect.Areas
+        For Each rw In area.Rows
+            r = rw.Row
+            hid = False
+            hid = CBool(rw.EntireRow.Hidden)    ' lu AVANT le test (piege On Error)
+            If Not hid Then
+                If Not seen.Exists(r) Then
+                    seen.Add r, True
+                    res.Add r
+                End If
+            End If
+        Next rw
+    Next area
+End Function
+
+'=============================================================================
+' VALEURS DE SUIVI (contrat de donnees, avec accents)
+'=============================================================================
+Private Function TrkReplied() As String
+    TrkReplied = "R" & ChrW$(233) & "pondu"
+End Function
+
+Private Function TrkNoReply() As String
+    TrkNoReply = "Sans r" & ChrW$(233) & "ponse"
+End Function
+
+Private Function TrkFollowed() As String
+    TrkFollowed = "Relanc" & ChrW$(233)
+End Function
+
+Private Function TrkNdr() As String
+    TrkNdr = "Non remis"
+End Function
+
+Private Function TrkFuDraft() As String
+    TrkFuDraft = "Relance en brouillon"
+End Function
+
+'=============================================================================
+' CONTACTS : IMPORTER UN FICHIER (Excel / CSV du marketing)
+' La colonne e-mail est reconnue par son CONTENU (la colonne qui contient le
+' plus d'adresses), la ligne d'en-tete est celle juste au-dessus de la
+' premiere adresse (si elle porte du texte). Prenom / Nom / Societe sont
+' reconnus par leur en-tete ; toute autre colonne devient un champ {{...}}
+' (colonne ajoutee devant Cc si elle n'existe pas). Adresses deja presentes
+' dans la campagne ignorees.
+'=============================================================================
+Private Sub DoImport(ByRef lay As SheetLayout)
+    Dim srcWb As Workbook
+    Set srcWb = Nothing
+    On Error GoTo Fin
+    Dim f As Variant
+    f = Application.GetOpenFilename( _
+        "Fichiers de contacts (*.xlsx;*.xlsm;*.xls;*.csv;*.txt),*.xlsx;*.xlsm;*.xls;*.csv;*.txt", , _
+        A("Importer des contacts (fichier Excel ou CSV)"))
+    If VarType(f) = vbBoolean Then Exit Sub
+    Dim path As String
+    path = CStr(f)
+    If StrComp(path, ThisWorkbook.FullName, vbTextCompare) = 0 Then
+        ShowInfo A("Choisis un autre fichier que ce classeur.")
+        Exit Sub
+    End If
+
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.DisplayAlerts = False
+    Set srcWb = OpenSourceWorkbook(path)
+    If srcWb Is Nothing Then
+        Application.DisplayAlerts = True
+        Application.EnableEvents = True
+        Application.ScreenUpdating = True
+        ShowInfo A("Ouverture du fichier impossible.")
+        Exit Sub
+    End If
+
+    Dim wsS As Worksheet
+    Set wsS = PickSourceSheet(srcWb)
+    If wsS Is Nothing Then
+        srcWb.Close SaveChanges:=False
+        Application.DisplayAlerts = True
+        Application.EnableEvents = True
+        Application.ScreenUpdating = True
+        ThisWorkbook.Activate
+        ShowInfo A("Aucune adresse e-mail trouv~ee dans ce fichier.")
+        Exit Sub
+    End If
+
+    Dim ur As Range, nR As Long, nC As Long
+    Set ur = wsS.UsedRange
+    nR = ur.Rows.Count
+    nC = ur.Columns.Count
+    If nR > IMPORT_MAX_ROWS Then nR = IMPORT_MAX_ROWS
+    If nC > IMPORT_MAX_COLS Then nC = IMPORT_MAX_COLS
+    Dim blk As Variant
+    blk = BlockOf(wsS, ur.Row, ur.Column, ur.Row + nR - 1, ur.Column + nC - 1)
+    Dim srcName As String, sheetName As String
+    srcName = srcWb.Name
+    sheetName = wsS.Name
+    srcWb.Close SaveChanges:=False
+    Set srcWb = Nothing
+    ThisWorkbook.Activate
+    lay.Ws.Activate
+
+    Dim emailCol As Long, firstData As Long
+    emailCol = DetectEmailColumn(blk, firstData)
+    If emailCol = 0 Then
+        Application.DisplayAlerts = True
+        Application.EnableEvents = True
+        Application.ScreenUpdating = True
+        ShowInfo A("Aucune colonne d'adresses e-mail reconnue dans la feuille ") & sheetName & "."
+        Exit Sub
+    End If
+    Dim hdrRow As Long
+    hdrRow = 0
+    If firstData > 1 Then
+        If RowIsHeader(blk, firstData - 1) Then hdrRow = firstData - 1
+    End If
+
+    ' 1) plan de colonnes : nom de champ cible par colonne source
+    Dim nCols As Long
+    nCols = UBound(blk, 2)
+    Dim targetName() As String
+    ReDim targetName(1 To nCols)
+    Dim c As Long, hdr As String, nrm As String, kind As String
+    Dim newFields As Collection
+    Set newFields = New Collection
+    Dim mapReport As String, extraReport As String
+    For c = 1 To nCols
+        targetName(c) = ""
+        If c = emailCol Then
+            targetName(c) = "*EMAIL*"
+            If hdrRow > 0 Then mapReport = mapReport & "Email <- " & Trim$(SafeStr(blk(hdrRow, c))) & " ; "
+        ElseIf ColumnHasData(blk, c, firstData) Then
+            hdr = ""
+            If hdrRow > 0 Then hdr = Trim$(SafeStr(blk(hdrRow, c)))
+            nrm = NormalizeHeader(hdr)
+            kind = HeaderKind(nrm)
+            Select Case kind
+                Case "FIRST"
+                    targetName(c) = "Pr" & ChrW$(233) & "nom"
+                    mapReport = mapReport & "Pr" & ChrW$(233) & "nom <- " & hdr & " ; "
+                Case "LAST"
+                    targetName(c) = "Nom"
+                    mapReport = mapReport & "Nom <- " & hdr & " ; "
+                Case "COMPANY"
+                    targetName(c) = "Soci" & ChrW$(233) & "t" & ChrW$(233)
+                    mapReport = mapReport & "Soci" & ChrW$(233) & "t" & ChrW$(233) & " <- " & hdr & " ; "
+                Case "CC"
+                    targetName(c) = "Cc"
+                    mapReport = mapReport & "Cc <- " & hdr & " ; "
+                Case Else
+                    If Len(hdr) = 0 Then hdr = "Champ " & c
+                    ' un en-tete qui serait pris pour une colonne de pilotage
+                    ' (Statut, Objet...) est prefixe : jamais de confusion.
+                    If Len(RoleFromHeader(nrm)) > 0 Then hdr = "Src " & hdr
+                    targetName(c) = hdr
+            End Select
+            ' Colonne cible absente de la feuille (modele personnalise) :
+            ' creee avec les autres champs, jamais de valeur perdue en silence.
+            If Len(targetName(c)) > 0 And targetName(c) <> "*EMAIL*" Then
+                If Not lay.Fields.Exists(NormalizeHeader(targetName(c))) Then
+                    If Not InCollection(newFields, NormalizeHeader(targetName(c))) Then
+                        newFields.Add targetName(c), NormalizeHeader(targetName(c))
+                    End If
+                End If
+            End If
+        End If
+    Next c
+
+    ' 2) colonnes manquantes creees d'un bloc devant Cc (ou avant Objet)
+    If newFields.Count > 0 Then
+        Dim insertAt As Long
+        insertAt = RoleCol(lay, R_CC)
+        If insertAt = 0 Then insertAt = RoleCol(lay, R_SUBJECT)
+        If insertAt = 0 Then insertAt = RoleCol(lay, R_BODY)
+        If insertAt = 0 Then insertAt = lay.LastCol + 1
+        Dim k As Long
+        For k = newFields.Count To 1 Step -1
+            lay.Ws.Columns(insertAt).Insert Shift:=xlToRight
+            lay.Ws.Cells(lay.HeaderRow, insertAt).Value = CStr(newFields(k))
+            lay.Ws.Cells(lay.HeaderRow, insertAt).Font.Bold = True
+            lay.Ws.Columns(insertAt).ColumnWidth = 18
+            lay.Ws.Columns(insertAt).Hidden = False
+            If Len(extraReport) > 0 Then extraReport = ", " & extraReport
+            extraReport = CStr(newFields(k)) & extraReport
+        Next k
+        If Not LoadLayout(lay.Ws, lay) Then Err.Raise vbObjectError + 1, , "disposition illisible apres insertion"
+    End If
+
+    ' 3) colonnes cibles resolues
+    Dim targetCol() As Long
+    ReDim targetCol(1 To nCols)
+    For c = 1 To nCols
+        targetCol(c) = 0
+        If targetName(c) = "*EMAIL*" Then
+            targetCol(c) = RoleCol(lay, R_TO)
+        ElseIf Len(targetName(c)) > 0 Then
+            nrm = NormalizeHeader(targetName(c))
+            If lay.Fields.Exists(nrm) Then targetCol(c) = CLng(lay.Fields(nrm))
+        End If
+    Next c
+
+    ' 4) adresses deja presentes. v1.1 (F5-04) : toutes les lignes sont
+    '    reaffichees avant de calculer ou ecrire la suite (ceinture : la
+    '    derniere ligne est de toute facon calculee lignes masquees comprises).
+    ShowAllRows lay.Ws
+    Dim seen As Object
+    Set seen = CreateObject("Scripting.Dictionary")
+    Dim lastRow As Long, i As Long, em As String
+    lastRow = LastDataRow(lay)
+    If lastRow > lay.HeaderRow Then
+        Dim toB As Variant
+        toB = ColBlock(lay, R_TO, lay.HeaderRow + 1, lastRow)
+        For i = 1 To UBound(toB, 1)
+            em = CleanEmail(SafeStr(toB(i, 1)))
+            If Len(em) > 0 Then seen(em) = True
+        Next i
+    End If
+
+    ' 5) copie des lignes (bloc en memoire, ecrit en une fois)
+    Dim nSrc As Long
+    nSrc = UBound(blk, 1) - firstData + 1
+    Dim outB() As Variant
+    ReDim outB(1 To nSrc, 1 To lay.LastCol)
+    Dim r As Long, n As Long, dup As Long, noMail As Long, v As Variant
+    n = 0
+    For r = firstData To UBound(blk, 1)
+        em = CleanEmail(SafeStr(blk(r, emailCol)))
+        If Len(em) = 0 Then
+            If RowHasData(blk, r) Then noMail = noMail + 1
+        ElseIf seen.Exists(em) Then
+            dup = dup + 1
+        Else
+            seen(em) = True
+            n = n + 1
+            For c = 1 To nCols
+                If targetCol(c) > 0 Then
+                    If c = emailCol Then
+                        outB(n, targetCol(c)) = em
+                    Else
+                        v = blk(r, c)
+                        If IsError(v) Then v = ""
+                        If VarType(v) = vbString Then v = Trim$(CStr(v))
+                        outB(n, targetCol(c)) = v
+                    End If
+                End If
+            Next c
+        End If
+    Next r
+    If n > 0 Then
+        lay.Ws.Range(lay.Ws.Cells(lastRow + 1, 1), lay.Ws.Cells(lastRow + n, lay.LastCol)).Value = outB
+        lay.Ws.Range(lay.Ws.Cells(lastRow + 1, 1), lay.Ws.Cells(lastRow + n, lay.LastCol)).Font.Bold = False
+        EnsureFilter lay
+    End If
+
+    Application.DisplayAlerts = True
+    Application.EnableEvents = True
+    Application.ScreenUpdating = True
+    RefreshRibbon
+
+    Dim msg As String
+    msg = n & A(" contact(s) import~e(s) depuis ") & srcName & " (feuille " & sheetName & ")." & vbCrLf
+    If dup > 0 Then msg = msg & dup & A(" doublon(s) ignor~e(s) (adresse d~ej~a pr~esente).") & vbCrLf
+    If noMail > 0 Then msg = msg & noMail & A(" ligne(s) sans adresse valable ignor~ee(s).") & vbCrLf
+    If Len(mapReport) > 0 Then msg = msg & vbCrLf & "Colonnes : " & mapReport & vbCrLf
+    If Len(extraReport) > 0 Then msg = msg & A("Champs ajout~es (utilisables en {{...}}) : ") & extraReport & vbCrLf
+    If hdrRow = 0 Then msg = msg & A("(Pas de ligne d'en-t~xte reconnue : seules les adresses ont ~et~e reprises.)") & vbCrLf
+    msg = msg & vbCrLf & A("~Etape suivante : Nettoyer (facultatif), puis G~en~erer.")
+    MsgBox msg, vbInformation, A("Importer des contacts")
+    Exit Sub
+Fin:
+    Dim errNo As Long, errDesc As String
+    errNo = Err.Number
+    errDesc = Err.Description
+    On Error Resume Next
+    If Not srcWb Is Nothing Then srcWb.Close SaveChanges:=False
+    ThisWorkbook.Activate
+    Application.DisplayAlerts = True
+    Application.EnableEvents = True
+    Application.ScreenUpdating = True
+    MsgBox A("Import impossible : ") & errNo & " - " & errDesc, vbExclamation, A("Importer des contacts")
+End Sub
+
+' Ouvre le fichier source en lecture seule. CSV / TXT : separateur detecte
+' sur la premiere ligne, encodage UTF-8 reconnu (BOM ou sequences UTF-8).
+Private Function OpenSourceWorkbook(ByVal path As String) As Workbook
+    On Error GoTo Fin
+    Set OpenSourceWorkbook = Nothing
+    Dim ext As String
+    ext = LCase$(Mid$(path, InStrRev(path, ".") + 1))
+    If ext = "csv" Or ext = "txt" Then
+        Dim delim As String, isUtf8 As Boolean
+        ProbeTextFile path, delim, isUtf8
+        If isUtf8 Then
+            Workbooks.OpenText Filename:=path, Origin:=65001, StartRow:=1, DataType:=xlDelimited, _
+                TextQualifier:=xlTextQualifierDoubleQuote, Tab:=(delim = vbTab), Semicolon:=(delim = ";"), _
+                Comma:=(delim = ","), Space:=False, Other:=False, Local:=True
+        Else
+            Workbooks.OpenText Filename:=path, StartRow:=1, DataType:=xlDelimited, _
+                TextQualifier:=xlTextQualifierDoubleQuote, Tab:=(delim = vbTab), Semicolon:=(delim = ";"), _
+                Comma:=(delim = ","), Space:=False, Other:=False, Local:=True
+        End If
+        Set OpenSourceWorkbook = ActiveWorkbook
+    Else
+        Set OpenSourceWorkbook = Workbooks.Open(Filename:=path, ReadOnly:=True, UpdateLinks:=0)
+    End If
+    Exit Function
+Fin:
+    Set OpenSourceWorkbook = Nothing
+End Function
+
+' Premiere ligne d'un fichier texte : separateur le plus frequent (; , tab)
+' et encodage (BOM EF BB BF ou octet C3 suivi d'un octet 80-BF = UTF-8).
+Private Sub ProbeTextFile(ByVal path As String, ByRef delim As String, ByRef isUtf8 As Boolean)
+    On Error Resume Next
+    delim = ";"
+    isUtf8 = False
+    Dim fnum As Integer, sz As Long
+    Dim buf() As Byte
+    fnum = FreeFile
+    Open path For Binary Access Read As #fnum
+    sz = LOF(fnum)
+    If sz > 4000 Then sz = 4000
+    If sz <= 0 Then
+        Close #fnum
+        Exit Sub
+    End If
+    ReDim buf(0 To sz - 1)
+    Get #fnum, 1, buf
+    Close #fnum
+
+    ' Encodage : BOM UTF-8, sinon un octet C3 suivi d'un octet 80-BF.
+    If sz >= 3 Then
+        If buf(0) = 239 And buf(1) = 187 And buf(2) = 191 Then isUtf8 = True
+    End If
+    Dim i As Long
+    If Not isUtf8 Then
+        For i = 0 To sz - 2
+            If buf(i) = 195 Then
+                If buf(i + 1) >= 128 And buf(i + 1) <= 191 Then
+                    isUtf8 = True
+                    Exit For
+                End If
+            End If
+        Next i
+    End If
+
+    ' Separateur : le plus frequent sur la premiere ligne.
+    Dim nSemi As Long, nComma As Long, nTab As Long
+    For i = 0 To sz - 1
+        If buf(i) = 10 Then Exit For
+        If buf(i) = 59 Then nSemi = nSemi + 1
+        If buf(i) = 44 Then nComma = nComma + 1
+        If buf(i) = 9 Then nTab = nTab + 1
+    Next i
+    delim = ";"
+    If nComma > nSemi And nComma >= nTab Then delim = ","
+    If nTab > nSemi And nTab > nComma Then delim = vbTab
+End Sub
+
+' Premiere feuille contenant au moins une adresse (@ avec un point apres).
+Private Function PickSourceSheet(ByVal wb As Workbook) As Worksheet
+    On Error Resume Next
+    Set PickSourceSheet = Nothing
+    Dim sh As Worksheet, found As Range
+    For Each sh In wb.Worksheets
+        Set found = Nothing
+        Set found = sh.UsedRange.Find(What:="@", LookIn:=xlValues, LookAt:=xlPart, MatchCase:=False)
+        If Not found Is Nothing Then
+            Set PickSourceSheet = sh
+            Exit Function
+        End If
+    Next sh
+End Function
+
+' Colonne contenant le plus d'adresses plausibles ; firstData = premiere
+' ligne portant une adresse dans cette colonne. 0 si aucune.
+Private Function DetectEmailColumn(ByRef blk As Variant, ByRef firstData As Long) As Long
+    Dim c As Long, r As Long, cnt As Long, best As Long, bestCnt As Long, firstR As Long, bestFirst As Long
+    best = 0
+    bestCnt = 0
+    bestFirst = 0
+    For c = 1 To UBound(blk, 2)
+        cnt = 0
+        firstR = 0
+        For r = 1 To UBound(blk, 1)
+            If IsPlausibleEmail(CleanEmail(SafeStr(blk(r, c)))) Then
+                cnt = cnt + 1
+                If firstR = 0 Then firstR = r
+            End If
+        Next r
+        If cnt > bestCnt Then
+            bestCnt = cnt
+            best = c
+            bestFirst = firstR
+        End If
+    Next c
+    DetectEmailColumn = best
+    firstData = bestFirst
+End Function
+
+' La ligne porte-t-elle des en-tetes (du texte, sans adresse) ?
+Private Function RowIsHeader(ByRef blk As Variant, ByVal r As Long) As Boolean
+    Dim c As Long, s As String, nText As Long
+    RowIsHeader = False
+    For c = 1 To UBound(blk, 2)
+        s = Trim$(SafeStr(blk(r, c)))
+        If Len(s) > 0 Then
+            If InStr(s, "@") > 0 Then Exit Function
+            If Not IsNumeric(s) Then nText = nText + 1
+        End If
+    Next c
+    RowIsHeader = (nText > 0)
+End Function
+
+Private Function ColumnHasData(ByRef blk As Variant, ByVal c As Long, ByVal firstData As Long) As Boolean
+    Dim r As Long
+    ColumnHasData = False
+    For r = firstData To UBound(blk, 1)
+        If Len(Trim$(SafeStr(blk(r, c)))) > 0 Then
+            ColumnHasData = True
+            Exit Function
+        End If
+    Next r
+End Function
+
+Private Function RowHasData(ByRef blk As Variant, ByVal r As Long) As Boolean
+    Dim c As Long
+    RowHasData = False
+    For c = 1 To UBound(blk, 2)
+        If Len(Trim$(SafeStr(blk(r, c)))) > 0 Then
+            RowHasData = True
+            Exit Function
+        End If
+    Next c
+End Function
+
+' Nature d'un en-tete source : FIRST / LAST / COMPANY / CC / "" (champ libre).
+Private Function HeaderKind(ByVal nrm As String) As String
+    HeaderKind = ""
+    If Len(nrm) = 0 Then Exit Function
+    If InStr(nrm, "prenom") > 0 Or nrm = "firstname" Or nrm = "first" Or InStr(nrm, "givenname") > 0 Then
+        HeaderKind = "FIRST"
+    ElseIf nrm = "cc" Or nrm = "copie" Or nrm = "encopie" Then
+        HeaderKind = "CC"
+    ElseIf InStr(nrm, "societe") > 0 Or InStr(nrm, "entreprise") > 0 Or InStr(nrm, "company") > 0 _
+           Or InStr(nrm, "organis") > 0 Or nrm = "structure" Or nrm = "organisme" Or nrm = "etablissement" Then
+        HeaderKind = "COMPANY"
+    ElseIf nrm = "nom" Or nrm = "nomdefamille" Or nrm = "lastname" Or nrm = "surname" Or nrm = "familyname" _
+           Or nrm = "name" Or nrm = "nomcontact" Or nrm = "nomducontact" Then
+        HeaderKind = "LAST"
+    End If
+End Function
+
+Private Function InCollection(ByVal col As Collection, ByVal key As String) As Boolean
+    On Error Resume Next
+    InCollection = False
+    Dim v As Variant
+    v = col.Item(key)
+    InCollection = (Err.Number = 0)
+    Err.Clear
+End Function
+
+'=============================================================================
+' CONTACTS : NETTOYER. Adresses en minuscules, extraites d'un "Nom <adr>",
+' separateurs normalises (; ), champs Prenom / Nom / Societe sans espaces
+' parasites. Lignes sans statut : Controle = "" / adresse manquante /
+' adresse douteuse / doublon de la ligne N (suppression proposee).
+'=============================================================================
+Private Sub DoClean(ByRef lay As SheetLayout)
+    On Error GoTo Fin
+    Dim lastRow As Long, first As Long, nb As Long
+    lastRow = LastDataRow(lay)
+    first = lay.HeaderRow + 1
+    If lastRow < first Then
+        ShowInfo A("Aucun contact dans cette campagne.")
+        Exit Sub
+    End If
+    nb = lastRow - lay.HeaderRow
+
+    Application.EnableEvents = False
+    Application.ScreenUpdating = False
+    Dim colTo As Long, colSt As Long, colChk As Long
+    colTo = RoleCol(lay, R_TO)
+    colSt = RoleCol(lay, R_STATUS)
+    colChk = RoleCol(lay, R_CHECK)
+    Dim toB As Variant, stB As Variant, chB As Variant
+    toB = ColBlock(lay, R_TO, first, lastRow)
+    stB = ColBlock(lay, R_STATUS, first, lastRow)
+    chB = ColBlock(lay, R_CHECK, first, lastRow)
+
+    Dim seen As Object
+    Set seen = CreateObject("Scripting.Dictionary")
+    Dim dupRows As Collection
+    Set dupRows = New Collection
+    Dim i As Long, r As Long, raw As String, em As String, st As String, pb As String
+    Dim nFixed As Long, nDup As Long, nBad As Long, nMissing As Long
+    For i = 1 To nb
+        r = lay.HeaderRow + i
+        raw = SafeStr(toB(i, 1))
+        em = CleanEmail(raw)
+        If em <> raw Then
+            toB(i, 1) = em
+            If Len(em) > 0 Then nFixed = nFixed + 1
+        End If
+        TrimFields lay, r
+        st = Trim$(SafeStr(stB(i, 1)))
+        If Len(st) = 0 Then
+            pb = ""
+            If Len(em) = 0 Then
+                If RowHasValues(lay, r) Then
+                    pb = A("adresse manquante")
+                    nMissing = nMissing + 1
+                End If
+            ElseIf Not IsPlausibleEmail(em) Then
+                pb = A("adresse douteuse")
+                nBad = nBad + 1
+            ElseIf seen.Exists(em) Then
+                pb = A("doublon de la ligne ") & seen(em)
+                nDup = nDup + 1
+                dupRows.Add r
+            Else
+                seen(em) = r
+            End If
+            chB(i, 1) = pb
+        Else
+            If Len(em) > 0 Then
+                If Not seen.Exists(em) Then seen(em) = r
+            End If
+        End If
+    Next i
+    lay.Ws.Range(lay.Ws.Cells(first, colTo), lay.Ws.Cells(lastRow, colTo)).Value = toB
+    If colChk > 0 Then lay.Ws.Range(lay.Ws.Cells(first, colChk), lay.Ws.Cells(lastRow, colChk)).Value = chB
+    Application.ScreenUpdating = True
+    Application.EnableEvents = True
+
+    If dupRows.Count > 0 Then
+        If MsgBox(dupRows.Count & A(" doublon(s) (m~xme adresse qu'une ligne pr~ec~edente).") & vbCrLf & vbCrLf & _
+                  A("Supprimer ces lignes en double ?") & vbCrLf & _
+                  A("Oui = supprimer ; Non = les garder, marqu~ees dans la colonne Contr~ole."), _
+                  vbQuestion + vbYesNo, "Nettoyer") = vbYes Then
+            Application.EnableEvents = False
+            Application.ScreenUpdating = False
+            Dim k As Long
+            For k = dupRows.Count To 1 Step -1
+                lay.Ws.Rows(CLng(dupRows(k))).Delete
+            Next k
+            Application.ScreenUpdating = True
+            Application.EnableEvents = True
+            nDup = 0
+        End If
+    End If
+    EnsureFilter lay
+    RefreshRibbon
+
+    Dim msg As String
+    msg = nFixed & A(" adresse(s) corrig~ee(s) (minuscules, espaces, format).")
+    If nDup > 0 Then msg = msg & vbCrLf & nDup & A(" doublon(s) conserv~e(s) (voir Contr~ole).")
+    If nBad > 0 Then msg = msg & vbCrLf & nBad & A(" adresse(s) douteuse(s) (voir Contr~ole).")
+    If nMissing > 0 Then msg = msg & vbCrLf & nMissing & A(" ligne(s) sans adresse (voir Contr~ole).")
+    If nDup + nBad + nMissing = 0 Then msg = msg & vbCrLf & A("Aucune anomalie.")
+    MsgBox msg, vbInformation, "Nettoyer"
+    Exit Sub
+Fin:
+    Application.ScreenUpdating = True
+    Application.EnableEvents = True
+    MsgBox A("Nettoyage impossible : ") & Err.Number & " - " & Err.Description, vbExclamation, "Nettoyer"
+End Sub
+
+' Champs Prenom / Nom / Societe : espaces de debut/fin et doubles espaces.
+Private Sub TrimFields(ByRef lay As SheetLayout, ByVal r As Long)
+    On Error Resume Next
+    Dim keys As Variant, k As Variant, c As Long, s As String, s2 As String
+    keys = Array("prenom", "nom", "societe")
+    For Each k In keys
+        If lay.Fields.Exists(CStr(k)) Then
+            c = CLng(lay.Fields(CStr(k)))
+            s = SafeStr(lay.Ws.Cells(r, c).Value)
+            If Len(s) > 0 Then
+                s2 = Trim$(s)
+                Do While InStr(s2, "  ") > 0
+                    s2 = Replace(s2, "  ", " ")
+                Loop
+                If s2 <> s Then lay.Ws.Cells(r, c).Value = s2
+            End If
+        End If
+    Next k
+End Sub
+
+' La ligne porte-t-elle une valeur hors colonnes de pilotage ?
+Private Function RowHasValues(ByRef lay As SheetLayout, ByVal r As Long) As Boolean
+    On Error Resume Next
+    RowHasValues = False
+    Dim c As Long
+    For c = 1 To lay.LastCol
+        If Len(Trim$(SafeStr(lay.Ws.Cells(r, c).Value))) > 0 Then
+            RowHasValues = True
+            Exit Function
+        End If
+    Next c
+End Function
+
+' "Jean Dupont <Jean.Dupont@Exemple.fr>; x@y.fr" -> "jean.dupont@exemple.fr; x@y.fr".
+Private Function CleanEmail(ByVal raw As String) As String
+    Dim s As String, parts() As String, i As Long, one As String, p As Long, q As Long, out As String
+    s = Replace(Replace(Replace(raw, vbCr, ";"), vbLf, ";"), ",", ";")
+    parts = Split(s, ";")
+    For i = LBound(parts) To UBound(parts)
+        one = Trim$(parts(i))
+        p = InStr(one, "<")
+        q = InStr(one, ">")
+        If p > 0 And q > p Then one = Mid$(one, p + 1, q - p - 1)
+        one = Replace(one, "mailto:", "", , , vbTextCompare)
+        one = Replace(one, " ", "")
+        one = Replace(one, Chr$(160), "")
+        one = LCase$(Trim$(one))
+        If Len(one) > 0 Then
+            If Len(out) > 0 Then out = out & "; "
+            out = out & one
+        End If
+    Next i
+    CleanEmail = out
+End Function
+
+' Toutes les adresses d'une liste "a; b" ont un @ suivi d'un point.
+Private Function IsPlausibleEmail(ByVal listText As String) As Boolean
+    Dim parts() As String, i As Long, one As String, pos As Long
+    IsPlausibleEmail = False
+    If Len(Trim$(listText)) = 0 Then Exit Function
+    parts = Split(listText, ";")
+    For i = LBound(parts) To UBound(parts)
+        one = Trim$(parts(i))
+        If Len(one) > 0 Then
+            pos = InStr(one, "@")
+            If pos < 2 Then Exit Function
+            If InStr(one, " ") > 0 Then Exit Function
+            If InStr(pos + 1, one, ".") = 0 Then Exit Function
+            If InStr(pos + 1, one, "@") > 0 Then Exit Function
+        End If
+    Next i
+    IsPlausibleEmail = True
+End Function
+
+'=============================================================================
+' PARAMETRES : compte d'envoi, modele, pieces jointes
+'=============================================================================
+' Liste les comptes du profil Outlook (adresse) et les boites partagees sans
+' compte propre (envoi "de la part de"). 0 = compte par defaut.
+Private Sub DoPickAccount(ByRef lay As SheetLayout)
+    On Error GoTo Fin
+    Dim ol As Object
+    Set ol = GetOutlook()
+    If ol Is Nothing Then Exit Sub
+
+    Dim labels As Collection, values As Collection
+    Set labels = New Collection
+    Set values = New Collection
+    Dim acc As Object, s As String, dn As String, known As Object
+    Set known = CreateObject("Scripting.Dictionary")
+    On Error Resume Next
+    For Each acc In ol.Session.Accounts
+        s = ""
+        s = Trim$(CStr(acc.SmtpAddress))
+        dn = ""
+        dn = Trim$(CStr(acc.DisplayName))
+        If Len(s) = 0 Then s = dn
+        If Len(s) > 0 Then
+            labels.Add s & " (compte)"
+            values.Add s
+            known(LCase$(s)) = True
+            If Len(dn) > 0 Then known(LCase$(dn)) = True
+            Dim stId As String
+            stId = ""
+            stId = CStr(acc.DeliveryStore.StoreID)
+            If Len(stId) > 0 Then known("#" & stId) = True
+        End If
+    Next acc
+    Dim st As Object, ty As Long
+    For Each st In ol.Session.Stores
+        ty = -1
+        ty = CLng(st.ExchangeStoreType)
+        If ty = 0 Or ty = 1 Then
+            dn = ""
+            dn = Trim$(CStr(st.DisplayName))
+            stId = ""
+            stId = CStr(st.StoreID)
+            If Len(dn) > 0 Then
+                If Not known.Exists(LCase$(dn)) And Not known.Exists("#" & stId) Then
+                    labels.Add dn & A(" (bo~ite partag~ee, envoi 'de la part de')")
+                    values.Add dn
+                    known(LCase$(dn)) = True
+                End If
+            End If
+        End If
+    Next st
+    On Error GoTo Fin
+
+    Dim cur As String
+    cur = ParamText(lay, P_ACCOUNT)
+    Dim prompt As String, i As Long
+    prompt = A("Compte d'envoi de la campagne (actuel : ") & IIf(Len(cur) = 0, A("par d~efaut"), cur) & ")" & vbCrLf & vbCrLf & _
+             A("0 - compte par d~efaut d'Outlook") & vbCrLf
+    For i = 1 To labels.Count
+        prompt = prompt & i & " - " & labels(i) & vbCrLf
+    Next i
+    prompt = prompt & vbCrLf & A("Num~ero :")
+    Dim ans As String
+    ans = Trim$(InputBox(prompt, A("Compte d'envoi"), ""))
+    If Len(ans) = 0 Then Exit Sub
+    If Not IsNumeric(ans) Then Exit Sub
+    Dim n As Long
+    n = CLng(Val(ans))
+    If n = 0 Then
+        SetParam lay, P_ACCOUNT, ""
+    ElseIf n >= 1 And n <= values.Count Then
+        SetParam lay, P_ACCOUNT, CStr(values(n))
+    Else
+        Exit Sub
+    End If
+    RefreshRibbon
+    Exit Sub
+Fin:
+    MsgBox A("Choix du compte impossible : ") & Err.Number & " - " & Err.Description, vbExclamation, A("Compte d'envoi")
+End Sub
+
+' Modele .oft / .msg (vide = mail neuf avec la signature par defaut).
+Private Sub DoPickTemplate(ByRef lay As SheetLayout)
+    On Error GoTo Fin
+    Dim cur As String
+    cur = ParamText(lay, P_TEMPLATE)
+    If Len(cur) > 0 Then
+        Dim rep As Long
+        rep = MsgBox(A("Mod~fle actuel : ") & cur & vbCrLf & vbCrLf & _
+                     A("Oui = choisir un autre fichier ; Non = aucun mod~fle (mail neuf avec la signature par d~efaut) ; Annuler."), _
+                     vbQuestion + vbYesNoCancel, A("Mod~fle"))
+        If rep = vbCancel Then Exit Sub
+        If rep = vbNo Then
+            SetParam lay, P_TEMPLATE, ""
+            Exit Sub
+        End If
+    End If
+    Dim f As Variant
+    f = Application.GetOpenFilename("Modeles Outlook (*.oft;*.msg),*.oft;*.msg", , _
+                                    A("Mod~fle de message (.oft ou .msg) - Annuler = mail neuf avec signature"))
+    If VarType(f) = vbBoolean Then Exit Sub
+    SetParam lay, P_TEMPLATE, CStr(f)
+    Exit Sub
+Fin:
+    MsgBox A("Choix du mod~fle impossible : ") & Err.Number & " - " & Err.Description, vbExclamation, A("Mod~fle")
+End Sub
+
+' Pieces jointes de la campagne (ajoutees a la liste, separateur ;).
+Private Sub DoPickAttachments(ByRef lay As SheetLayout)
+    On Error GoTo Fin
+    Dim cur As String
+    cur = ParamText(lay, P_ATTACH)
+    If Len(cur) > 0 Then
+        Dim rep As Long
+        rep = MsgBox(A("Pi~fces jointes actuelles : ") & vbCrLf & Replace(cur, ";", vbCrLf) & vbCrLf & vbCrLf & _
+                     A("Oui = ajouter des fichiers ; Non = tout retirer ; Annuler."), _
+                     vbQuestion + vbYesNoCancel, A("Pi~fces jointes"))
+        If rep = vbCancel Then Exit Sub
+        If rep = vbNo Then
+            SetParam lay, P_ATTACH, ""
+            Exit Sub
+        End If
+    End If
+    Dim f As Variant
+    f = Application.GetOpenFilename("Tous les fichiers (*.*),*.*", , A("Pi~fces jointes de la campagne"), , True)
+    If VarType(f) = vbBoolean Then Exit Sub
+    Dim i As Long, lst As String
+    lst = cur
+    For i = LBound(f) To UBound(f)
+        If Len(lst) > 0 Then lst = lst & ";"
+        lst = lst & CStr(f(i))
+    Next i
+    SetParam lay, P_ATTACH, lst
+    Exit Sub
+Fin:
+    MsgBox A("Choix des pi~fces jointes impossible : ") & Err.Number & " - " & Err.Description, vbExclamation, A("Pi~fces jointes")
+End Sub
+
+'=============================================================================
+' GENERER : Message (HTML) et Relance (HTML) de chaque ligne a partir des
+' textes du bloc (champs {{...}} remplaces, texte -> HTML Calibri 11).
+' Une ligne deja envoyee n'est jamais touchee ; une ligne deja remplie n'est
+' regeneree que sur demande (retouches manuelles perdues).
+'=============================================================================
+Private Sub DoGenerate(ByRef lay As SheetLayout)
+    On Error GoTo Fin
+    Dim msgTpl As String, fuTpl As String, subj As String
+    msgTpl = ParamText(lay, P_MESSAGE)
+    fuTpl = ParamText(lay, P_FOLLOWUP)
+    subj = ParamText(lay, P_SUBJECT)
+    If Len(msgTpl) = 0 And Len(fuTpl) = 0 Then
+        ShowInfo A("~Ecris d'abord le Message du bloc du haut (et, si besoin, le Message de relance).")
+        Exit Sub
+    End If
+    Dim unk As String
+    unk = UnknownFields(lay, subj & " " & msgTpl & " " & fuTpl)
+    If Len(unk) > 0 Then
+        ShowInfo A("Champ inconnu : ") & unk & vbCrLf & vbCrLf & _
+                 A("Chaque {{Champ}} doit correspondre ~a un en-t~xte de colonne de la table (ex. {{Pr~enom}}, {{Soci~et~e}}). ") & _
+                 A("Corrige le texte ou ajoute la colonne.")
+        Exit Sub
+    End If
+    Dim colBody As Long, colFu As Long
+    colBody = RoleCol(lay, R_BODY)
+    colFu = RoleCol(lay, R_FUBODY)
+    If colBody = 0 And colFu = 0 Then
+        ShowInfo A("Colonnes Message (HTML) / Relance (HTML) introuvables dans la table.")
+        Exit Sub
+    End If
+
+    Dim lastRow As Long, first As Long, nb As Long
+    lastRow = LastDataRow(lay)
+    first = lay.HeaderRow + 1
+    If lastRow < first Then
+        ShowInfo A("Aucun contact : importe ou colle d'abord les adresses sous la ligne d'en-t~xte.")
+        Exit Sub
+    End If
+    nb = lastRow - lay.HeaderRow
+    Dim toB As Variant, stB As Variant, boB As Variant, fuB As Variant, nfB As Variant
+    toB = ColBlock(lay, R_TO, first, lastRow)
+    stB = ColBlock(lay, R_STATUS, first, lastRow)
+    boB = ColBlock(lay, R_BODY, first, lastRow)
+    fuB = ColBlock(lay, R_FUBODY, first, lastRow)
+    nfB = ColBlock(lay, R_FOLLOWUPS, first, lastRow)
+
+    Dim i As Long, nFilled As Long
+    For i = 1 To nb
+        If Len(Trim$(SafeStr(toB(i, 1)))) > 0 And Len(Trim$(SafeStr(stB(i, 1)))) = 0 Then
+            If Len(Trim$(SafeStr(boB(i, 1)))) > 0 Then nFilled = nFilled + 1
+        End If
+    Next i
+    Dim overwrite As Boolean
+    overwrite = False
+    If nFilled > 0 And Len(msgTpl) > 0 Then
+        Dim rep As Long
+        rep = MsgBox(nFilled & A(" ligne(s) non envoy~ee(s) ont d~ej~a un message.") & vbCrLf & vbCrLf & _
+                     A("Oui = les r~eg~en~erer aussi (les retouches faites ~a la main sont perdues)") & vbCrLf & _
+                     A("Non = compl~eter seulement les lignes vides") & vbCrLf & "Annuler", _
+                     vbQuestion + vbYesNoCancel, A("G~en~erer"))
+        If rep = vbCancel Then Exit Sub
+        overwrite = (rep = vbYes)
+    End If
+
+    Application.EnableEvents = False
+    Application.ScreenUpdating = False
+    Dim r As Long, nMsg As Long, nFu As Long, html As String, st As String, nFuDone As Long
+    For i = 1 To nb
+        r = lay.HeaderRow + i
+        If Len(Trim$(SafeStr(toB(i, 1)))) > 0 Then
+            st = Trim$(SafeStr(stB(i, 1)))
+            If Len(msgTpl) > 0 And colBody > 0 And Len(st) = 0 Then
+                If overwrite Or Len(Trim$(SafeStr(boB(i, 1)))) = 0 Then
+                    html = TextToHtml(MergeFields(lay, r, msgTpl))
+                    lay.Ws.Cells(r, colBody).Value = html
+                    PutCell lay, r, R_CHECK, ""
+                    nMsg = nMsg + 1
+                End If
+            End If
+            If Len(fuTpl) > 0 And colFu > 0 Then
+                nFuDone = CLng(Val(SafeStr(nfB(i, 1))))
+                If nFuDone = 0 Then
+                    If overwrite Or Len(Trim$(SafeStr(fuB(i, 1)))) = 0 Then
+                        html = TextToHtml(MergeFields(lay, r, fuTpl))
+                        lay.Ws.Cells(r, colFu).Value = html
+                        nFu = nFu + 1
+                    End If
+                End If
+            End If
+        End If
+        If (i Mod 50) = 0 Then DoEvents
+    Next i
+    If colBody > 0 Then lay.Ws.Columns(colBody).WrapText = False
+    If colFu > 0 Then lay.Ws.Columns(colFu).WrapText = False
+    EnsureFilter lay
+    Application.ScreenUpdating = True
+    Application.EnableEvents = True
+    RefreshRibbon
+
+    MsgBox nMsg & A(" message(s) et ") & nFu & A(" relance(s) g~en~er~e(s).") & vbCrLf & vbCrLf & _
+           A("~Etape suivante : V~erifier (Outlook contr~ole chaque ligne), puis Tester la ligne pour relire un brouillon."), _
+           vbInformation, A("G~en~erer")
+    Exit Sub
+Fin:
+    Application.ScreenUpdating = True
+    Application.EnableEvents = True
+    MsgBox A("G~en~eration impossible : ") & Err.Number & " - " & Err.Description, vbExclamation, A("G~en~erer")
+End Sub
+
+' Remplace {{Champ}} par la valeur de la colonne dont l'en-tete normalise
+' correspond. Un champ inconnu reste tel quel.
+Private Function MergeFields(ByRef lay As SheetLayout, ByVal r As Long, ByVal txt As String) As String
+    On Error Resume Next
+    MergeFields = txt
+    If InStr(txt, "{{") = 0 Then Exit Function
+    Dim out As String, p As Long, q As Long, fld As String, key As String, v As String
+    out = txt
+    p = InStr(out, "{{")
+    Do While p > 0
+        q = InStr(p + 2, out, "}}")
+        If q = 0 Then Exit Do
+        fld = Mid$(out, p + 2, q - p - 2)
+        key = NormalizeHeader(fld)
+        If lay.Fields.Exists(key) Then
+            v = SafeStr(lay.Ws.Cells(r, CLng(lay.Fields(key))).Value)
+            out = Left$(out, p - 1) & v & Mid$(out, q + 2)
+            p = InStr(p + Len(v), out, "{{")
+        Else
+            p = InStr(q + 2, out, "{{")
+        End If
+    Loop
+    MergeFields = out
+End Function
+
+' Champs inconnus ({{x}} sans colonne), separes par ", ".
+Private Function UnknownFields(ByRef lay As SheetLayout, ByVal txt As String) As String
+    On Error Resume Next
+    UnknownFields = ""
+    If InStr(txt, "{{") = 0 Then Exit Function
+    Dim p As Long, q As Long, fld As String, out As String
+    p = InStr(txt, "{{")
+    Do While p > 0
+        q = InStr(p + 2, txt, "}}")
+        If q = 0 Then Exit Do
+        fld = Mid$(txt, p + 2, q - p - 2)
+        If Not lay.Fields.Exists(NormalizeHeader(fld)) Then
+            If InStr(out, "{{" & fld & "}}") = 0 Then
+                If Len(out) > 0 Then out = out & ", "
+                out = out & "{{" & fld & "}}"
+            End If
+        End If
+        p = InStr(q + 2, txt, "{{")
+    Loop
+    UnknownFields = out
+End Function
+
+' Texte d'une cellule -> HTML : paragraphes (ligne vide), retours a la ligne,
+' liens cliquables, Calibri 11. Un texte deja en HTML est garde tel quel.
+Private Function TextToHtml(ByVal txt As String) As String
+    If LooksLikeHtml(txt) Then
+        TextToHtml = txt
+        Exit Function
+    End If
+    Dim s As String
+    s = Replace(Replace(txt, vbCrLf, vbLf), vbCr, vbLf)
+    s = Linkify(EncodeHtml(s))
+    Dim paras() As String, i As Long, p As String, out As String
+    paras = Split(s, vbLf & vbLf)
+    For i = LBound(paras) To UBound(paras)
+        p = paras(i)
+        Do While Left$(p, 1) = vbLf
+            p = Mid$(p, 2)
+        Loop
+        Do While Right$(p, 1) = vbLf
+            p = Left$(p, Len(p) - 1)
+        Loop
+        If Len(Trim$(p)) > 0 Then
+            out = out & "<p style=""margin:0 0 11pt 0"">" & Replace(p, vbLf, "<br>") & "</p>"
+        End If
+    Next i
+    TextToHtml = "<div style=""font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000000"">" & out & "</div>"
+End Function
+
+Private Function LooksLikeHtml(ByVal txt As String) As Boolean
+    Dim s As String
+    s = LCase$(Trim$(txt))
+    LooksLikeHtml = False
+    If Left$(s, 1) = "<" Then LooksLikeHtml = True
+    If InStr(s, "<p") > 0 Or InStr(s, "<br") > 0 Or InStr(s, "<div") > 0 Or InStr(s, "<table") > 0 Then LooksLikeHtml = True
+End Function
+
+Private Function EncodeHtml(ByVal s As String) As String
+    s = Replace(s, "&", "&amp;")
+    s = Replace(s, "<", "&lt;")
+    s = Replace(s, ">", "&gt;")
+    EncodeHtml = s
+End Function
+
+' http(s)://... et www.... -> liens (sur un texte deja encode).
+Private Function Linkify(ByVal s As String) As String
+    Dim out As String, pos As Long, startP As Long, endP As Long, url As String, href As String, tail As String, ch As String
+    out = ""
+    pos = 1
+    Do
+        startP = NextUrlStart(s, pos)
+        If startP = 0 Then
+            out = out & Mid$(s, pos)
+            Exit Do
+        End If
+        out = out & Mid$(s, pos, startP - pos)
+        endP = startP
+        Do While endP <= Len(s)
+            ch = Mid$(s, endP, 1)
+            If ch = " " Or ch = vbLf Or ch = vbCr Or ch = vbTab Or ch = "<" Or ch = ">" Or ch = """" Then Exit Do
+            endP = endP + 1
+        Loop
+        url = Mid$(s, startP, endP - startP)
+        tail = ""
+        Do While Len(url) > 0
+            ch = Right$(url, 1)
+            If ch = "." Or ch = "," Or ch = ";" Or ch = ":" Or ch = ")" Or ch = "!" Or ch = "?" Then
+                tail = ch & tail
+                url = Left$(url, Len(url) - 1)
+            Else
+                Exit Do
+            End If
+        Loop
+        href = url
+        If LCase$(Left$(href, 4)) = "www." Then href = "http://" & href
+        out = out & "<a href=""" & href & """>" & url & "</a>" & tail
+        pos = endP
+        If pos > Len(s) Then Exit Do
+    Loop
+    Linkify = out
+End Function
+
+' Position du prochain debut d'URL (http://, https://, www. en debut de mot).
+Private Function NextUrlStart(ByVal s As String, ByVal fromPos As Long) As Long
+    Dim p1 As Long, p2 As Long, p3 As Long, best As Long, prev As String
+    p1 = InStr(fromPos, s, "http://", vbTextCompare)
+    p2 = InStr(fromPos, s, "https://", vbTextCompare)
+    p3 = InStr(fromPos, s, "www.", vbTextCompare)
+    Do While p3 > 1
+        prev = Mid$(s, p3 - 1, 1)
+        If prev = " " Or prev = vbLf Or prev = vbCr Or prev = vbTab Or prev = "(" Or prev = ";" Then Exit Do
+        p3 = InStr(p3 + 1, s, "www.", vbTextCompare)
+    Loop
+    best = 0
+    If p1 > 0 Then best = p1
+    If p2 > 0 Then
+        If best = 0 Or p2 < best Then best = p2
+    End If
+    If p3 > 0 Then
+        If best = 0 Or p3 < best Then best = p3
+    End If
+    NextUrlStart = best
+End Function
+
+'=============================================================================
+' ACTIONS OUTLOOK (canal de commandes). Outlook travaille en differe (toasts
+' Outlook), ecrit dans la feuille puis rappelle AfterOutlookCampaign.
+'=============================================================================
+Private Sub DoCheck(ByRef lay As SheetLayout)
+    Dim n As Long
+    n = CandidateCount(lay)
+    If n = 0 Then
+        ShowInfo A("Aucune ligne ~a v~erifier (adresse renseign~ee et Statut vide).")
+        Exit Sub
+    End If
+    SendCampaignCommand lay, "CAMPAIGN_CHECK", "", "", A("V~erification de ") & n & A(" ligne(s) dans Outlook...")
+End Sub
+
+' Un brouillon OUVERT dans Outlook pour la ligne active (relecture).
+Private Sub DoTest(ByRef lay As SheetLayout)
+    Dim r As Long
+    r = 0
+    On Error Resume Next
+    r = ActiveCell.Row
+    On Error GoTo 0
+    If r <= lay.HeaderRow Or r > LastDataRow(lay) Then
+        ShowInfo A("Place le curseur sur une ligne de contact de la table.")
+        Exit Sub
+    End If
+    If Len(Trim$(CellText(lay, r, R_TO))) = 0 Then
+        ShowInfo A("Cette ligne n'a pas d'adresse.")
+        Exit Sub
+    End If
+    SendCampaignCommand lay, "CAMPAIGN_TEST", CStr(r), "", A("Brouillon de test de la ligne ") & r & A(" en pr~eparation dans Outlook...")
+End Sub
+
+Private Sub DoDrafts(ByRef lay As SheetLayout)
+    Dim n As Long
+    n = CandidateCount(lay)
+    If n = 0 Then
+        ShowInfo A("Aucune ligne ~a traiter (adresse renseign~ee et Statut vide).")
+        Exit Sub
+    End If
+    If MsgBox(n & A(" brouillon(s) ~a cr~eer dans les Brouillons d'Outlook (") & AccountLabel(lay) & ")." & vbCrLf & _
+              A("Outlook v~erifie d'abord chaque ligne : une anomalie bloque tout (colonne Contr~ole).") & vbCrLf & vbCrLf & _
+              A("Continuer ?"), vbQuestion + vbYesNo, "Brouillons") <> vbYes Then Exit Sub
+    SendCampaignCommand lay, "CAMPAIGN_DRAFTS", "", "", A("Cr~eation de ") & n & A(" brouillon(s) dans Outlook...")
+End Sub
+
+' ENVOI REEL cadence par Outlook : recapitulatif + mot de confirmation.
+Private Sub DoSend(ByRef lay As SheetLayout)
+    Dim ol As Object
+    Set ol = GetOutlook()
+    If ol Is Nothing Then Exit Sub
+    Dim n As Long, nOk As Long
+    n = CandidateCount(lay, nOk)
+    If n = 0 Then
+        ShowInfo A("Aucune ligne ~a envoyer (adresse renseign~ee et Statut vide).")
+        Exit Sub
+    End If
+    Dim tpl As String, pj As String, fld As String
+    tpl = ParamText(lay, P_TEMPLATE)
+    If Len(tpl) = 0 Then tpl = A("(aucun : mail neuf avec la signature par d~efaut)")
+    pj = ParamText(lay, P_ATTACH)
+    If Len(pj) = 0 Then pj = "(aucune)"
+    fld = ParamText(lay, P_FOLDER)
+    If Len(fld) = 0 Then fld = A("(automatique, d'apr~fs l'objet)")
+
+    Dim prompt As String
+    prompt = "Campagne : " & lay.Ws.Name & vbCrLf & _
+             "Compte d'envoi : " & AccountLabel(lay) & vbCrLf & _
+             "Objet : " & ParamText(lay, P_SUBJECT) & vbCrLf & _
+             A("Mod~fle : ") & tpl & vbCrLf & _
+             A("Pi~fces jointes : ") & pj & vbCrLf & _
+             "Dossier de classement : " & fld & vbCrLf & vbCrLf & _
+             A("Lignes ~a envoyer : ") & n & A(" (dont ") & nOk & A(" avec Contr~ole OK)") & vbCrLf & _
+             A("Outlook rev~erifie tout avant d'envoyer : une anomalie bloque l'envoi.") & vbCrLf & _
+             A("Pendant l'envoi, laisse Excel tranquille (aucune cellule en cours de saisie).") & vbCrLf & vbCrLf & _
+             A("Pour confirmer l'ENVOI R~EEL, tape ENVOYER :")
+    Dim ans As String
+    ans = InputBox(prompt, A("Envoyer la campagne"), "")
+    If UCase$(Trim$(ans)) <> "ENVOYER" Then
+        If Len(Trim$(ans)) > 0 Then ShowInfo A("Mot de confirmation incorrect : rien n'a ~et~e envoy~e.")
+        Exit Sub
+    End If
+    SendCampaignCommand lay, "CAMPAIGN_SEND", "", "", A("Envoi de ") & n & A(" mail(s) en cours dans Outlook (cadenc~e)...")
+End Sub
+
+Private Sub DoStop()
+    Dim lay As SheetLayout
+    Dim sheetName As String
+    sheetName = ""
+    If ActiveCampaignLayout(lay) Then sheetName = lay.Ws.Name
+    Dim ol As Object
+    Set ol = GetOutlook()
+    If ol Is Nothing Then Exit Sub
+    Dim why As String
+    If Not SendOutlookCommand(ol, "CAMPAIGN_STOP", ThisWorkbook.Name & "|" & sheetName & "||", why) Then
+        MsgBox A("Outlook n'a pas re~cu la demande d'arr~xt : ") & why, vbExclamation, APP_TITLE
+        Exit Sub
+    End If
+    SetStatus A("Arr~xt demand~e ~a Outlook.")
+    ScheduleStatusClear 30
+End Sub
+
+Private Sub DoCleanDrafts(ByRef lay As SheetLayout)
+    If MsgBox(A("Supprimer les brouillons Outlook de CETTE campagne (") & lay.Ws.Name & ") ?" & vbCrLf & _
+              A("Les lignes au statut 'Brouillon cr~e~e le' restent telles quelles : R~einitialiser les statuts pour les reg~en~erer."), _
+              vbQuestion + vbYesNo, A("Nettoyer les brouillons")) <> vbYes Then Exit Sub
+    SendCampaignCommand lay, "CAMPAIGN_CLEANDRAFTS", "", "", A("Suppression des brouillons de la campagne dans Outlook...")
+End Sub
+
+Private Sub DoRefresh(ByRef lay As SheetLayout)
+    Dim st As CampaignStats
+    ComputeStats lay, st
+    If st.Sent = 0 Then
+        ShowInfo A("Aucune ligne envoy~ee dans cette campagne : rien ~a actualiser.")
+        Exit Sub
+    End If
+    SendCampaignCommand lay, "CAMPAIGN_REFRESH", "", "", A("Lecture des r~eponses de ") & st.Sent & A(" mail(s) dans Outlook...")
+End Sub
+
+' Relances : lignes selectionnees (envoyees) ou toutes les lignes
+' "Sans reponse" ; en brouillons (mode DRAFTS) ou envoi cadence (SEND).
+Private Sub DoFollowUp(ByRef lay As SheetLayout, ByVal mode As String)
+    On Error GoTo Fin
+    If Len(ParamText(lay, P_FOLLOWUP)) = 0 And RoleCol(lay, R_FUBODY) = 0 Then
+        ShowInfo A("~Ecris d'abord le Message de relance (bloc du haut), puis G~en~erer.")
+        Exit Sub
+    End If
+    Dim selRows As Collection, rowsArg As String, v As Variant, nSel As Long, nOther As Long, tr As String
+    Set selRows = SelectedDataRows(lay)      ' v1.1 (F5-03) : lignes visibles seulement
+    rowsArg = ""
+    nSel = 0
+    nOther = 0
+    For Each v In selRows
+        If Left$(Trim$(CellText(lay, CLng(v), R_STATUS)), 6) = "Envoye" Then
+            If Len(rowsArg) > 0 Then rowsArg = rowsArg & ";"
+            rowsArg = rowsArg & CStr(v)
+            nSel = nSel + 1
+            ' v1.1 (F5-03) : deja repondue, relancee, non remise... : signalee.
+            tr = Trim$(CellText(lay, CLng(v), R_TRACK))
+            If Len(tr) > 0 And tr <> TrkNoReply() Then nOther = nOther + 1
+        End If
+    Next v
+
+    Dim st As CampaignStats
+    ComputeStats lay, st
+    Dim scopeTxt As String
+    If nSel > 0 Then
+        Dim rep As Long
+        rep = MsgBox(A("Relancer : les ") & nSel & A(" ligne(s) envoy~ee(s) s~electionn~ee(s) (Oui), ") & _
+                     A("ou toutes les lignes 'Sans r~eponse' (Non) ?") & _
+                     IIf(nOther > 0, vbCrLf & vbCrLf & A("Attention : parmi les lignes s~electionn~ees, ") & nOther & _
+                         A(" ne sont pas 'Sans r~eponse' (d~ej~a r~epondu, relanc~e ou non remis : colonne Suivi)."), ""), _
+                     vbQuestion + vbYesNoCancel, "Relancer")
+        If rep = vbCancel Then Exit Sub
+        If rep = vbNo Then
+            rowsArg = ""
+            scopeTxt = A("toutes les lignes 'Sans r~eponse' (") & st.NoReply & A(" d'apr~fs la colonne Suivi)")
+        Else
+            scopeTxt = nSel & A(" ligne(s) s~electionn~ee(s)")
+        End If
+    Else
+        If st.Sent = 0 Then
+            ShowInfo A("Aucune ligne envoy~ee : rien ~a relancer.")
+            Exit Sub
+        End If
+        scopeTxt = A("toutes les lignes 'Sans r~eponse' (") & st.NoReply & A(" d'apr~fs la colonne Suivi)")
+        If MsgBox(A("Relancer ") & scopeTxt & " ?" & vbCrLf & _
+                  A("(Pour viser certaines lignes : s~electionne-les d'abord.)"), vbQuestion + vbYesNo, "Relancer") <> vbYes Then Exit Sub
+    End If
+
+    If mode = "SEND" Then
+        Dim ans As String
+        ans = InputBox(A("ENVOI R~EEL des relances : ") & scopeTxt & vbCrLf & _
+                       A("Chaque relance r~epond au mail d'origine (fil conserv~e) avec le texte Relance (HTML).") & vbCrLf & vbCrLf & _
+                       A("Pour confirmer, tape ENVOYER :"), A("Relancer - envoi"), "")
+        If UCase$(Trim$(ans)) <> "ENVOYER" Then
+            If Len(Trim$(ans)) > 0 Then ShowInfo A("Mot de confirmation incorrect : rien n'a ~et~e envoy~e.")
+            Exit Sub
+        End If
+        SendCampaignCommand lay, "CAMPAIGN_FOLLOWUP", "SEND", rowsArg, A("Envoi des relances en cours dans Outlook...")
+    Else
+        SendCampaignCommand lay, "CAMPAIGN_FOLLOWUP", "DRAFTS", rowsArg, A("Relances en pr~eparation dans les Brouillons d'Outlook...")
+    End If
+    Exit Sub
+Fin:
+    MsgBox A("Relance impossible : ") & Err.Number & " - " & Err.Description, vbExclamation, "Relancer"
+End Sub
+
+' Lignes candidates a un envoi : adresse renseignee ET Statut vide.
+' okCount = celles dont le Controle est deja "OK".
+Private Function CandidateCount(ByRef lay As SheetLayout, Optional ByRef okCount As Long = 0) As Long
+    On Error Resume Next
+    CandidateCount = 0
+    okCount = 0
+    Dim lastRow As Long, first As Long
+    lastRow = LastDataRow(lay)
+    first = lay.HeaderRow + 1
+    If lastRow < first Then Exit Function
+    Dim toB As Variant, stB As Variant, chB As Variant, i As Long
+    toB = ColBlock(lay, R_TO, first, lastRow)
+    stB = ColBlock(lay, R_STATUS, first, lastRow)
+    chB = ColBlock(lay, R_CHECK, first, lastRow)
+    For i = 1 To UBound(toB, 1)
+        If Len(Trim$(SafeStr(toB(i, 1)))) > 0 And Len(Trim$(SafeStr(stB(i, 1)))) = 0 Then
+            CandidateCount = CandidateCount + 1
+            If Trim$(SafeStr(chB(i, 1))) = CHK_OK Then okCount = okCount + 1
+        End If
+    Next i
+End Function
+
+Private Function AccountLabel(ByRef lay As SheetLayout) As String
+    AccountLabel = ParamText(lay, P_ACCOUNT)
+    If Len(AccountLabel) = 0 Then AccountLabel = A("compte par d~efaut d'Outlook")
+End Function
+
+' Envoie une commande de campagne a Outlook : "classeur|feuille|extra1|extra2".
+Private Function SendCampaignCommand(ByRef lay As SheetLayout, ByVal cmd As String, ByVal extra1 As String, _
+                                     ByVal extra2 As String, ByVal waitText As String) As Boolean
+    SendCampaignCommand = False
+    Dim ol As Object
+    Set ol = GetOutlook()
+    If ol Is Nothing Then Exit Function
+    If InStr(lay.Ws.Name, "|") > 0 Then
+        ShowInfo A("Le nom de l'onglet ne doit pas contenir le caract~fre | : renomme la feuille.")
+        Exit Function
+    End If
+    Dim args As String, why As String
+    args = ThisWorkbook.Name & "|" & lay.Ws.Name & "|" & extra1 & "|" & extra2
+    If Not SendOutlookCommand(ol, cmd, args, why) Then
+        MsgBox A("Outlook n'a pas re~cu la demande : ") & why & vbCrLf & vbCrLf & _
+               A("Pr~erequis c~ot~e Outlook : ThisOutlookSession v10.19, modMailCampaign v12.1, modDefer v1.17, modConfig v3.16 (ou plus r~ecents)."), _
+               vbExclamation, APP_TITLE
+        Exit Function
+    End If
+    SetStatus waitText
+    ScheduleStatusClear STATUS_TIMEOUT_SEC
+    SendCampaignCommand = True
+End Function
+
+' Ecrit une commande pour Outlook dans la note unique du dossier
+' Notes\ClassicOutlook-Toolkit : "TOOLKIT|<cmd>|<horodatage>|<args>".
+' Outlook (ThisOutlookSession v10.16+) surveille ce dossier.
+Private Function SendOutlookCommand(ByVal ol As Object, ByVal cmd As String, ByVal args As String, ByRef why As String) As Boolean
+    SendOutlookCommand = False
+    why = ""
+    On Error Resume Next
+
+    Dim notesFld As Object
+    Set notesFld = Nothing
+    Set notesFld = ol.Session.GetDefaultFolder(OL_FOLDER_NOTES)
+    If notesFld Is Nothing Then
+        why = A("dossier Notes d'Outlook inaccessible.")
+        Exit Function
+    End If
+
+    Dim fld As Object
+    Set fld = Nothing
+    Set fld = notesFld.Folders(CMD_FOLDER_NAME)
+    If fld Is Nothing Then
+        why = A("le dossier de commandes n'existe pas encore (Notes\ClassicOutlook-Toolkit). ") & _
+              A("Colle ThisOutlookSession v10.19 dans Outlook, puis ferme et rouvre Outlook.")
+        Exit Function
+    End If
+
+    Dim itm As Object
+    Set itm = Nothing
+    Set itm = fld.Items.GetFirst
+    If itm Is Nothing Then
+        Err.Clear
+        Set itm = fld.Items.Add(OL_NOTE_ITEM)
+    End If
+    If itm Is Nothing Then
+        why = A("cr~eation de la note de commande impossible.")
+        Exit Function
+    End If
+
+    Dim body As String
+    body = "TOOLKIT|" & cmd & "|" & Format$(Now, "yyyymmddhhnnss") & "-" & _
+           Format$(Int(Timer * 1000) Mod 1000, "000")
+    If Len(args) > 0 Then body = body & "|" & args
+    Err.Clear
+    itm.Body = body
+    itm.Save
+    If Err.Number <> 0 Then
+        why = A("~ecriture de la note de commande impossible (erreur ") & Err.Number & ")."
+        Err.Clear
+        Exit Function
+    End If
+    SendOutlookCommand = True
+End Function
+
+'=============================================================================
+' OUVRIR DANS OUTLOOK : mail envoye / derniere reponse de la ligne active,
+' dossier Brouillons de la boite d'envoi.
+'=============================================================================
+Private Sub DoOpenMail(ByRef lay As SheetLayout, ByVal role As String)
+    On Error GoTo Fin
+    Dim r As Long
+    r = 0
+    On Error Resume Next
+    r = ActiveCell.Row
+    On Error GoTo Fin
+    If r <= lay.HeaderRow Or r > LastDataRow(lay) Then
+        ShowInfo A("Place le curseur sur une ligne de contact de la table.")
+        Exit Sub
+    End If
+    Dim eid As String
+    eid = Trim$(CellText(lay, r, role))
+    If Len(eid) = 0 Then
+        If role = R_REPLYID Then
+            ShowInfo A("Aucune r~eponse enregistr~ee pour cette ligne (Actualiser les r~eponses).")
+        Else
+            ShowInfo A("Aucun mail envoy~e enregistr~e pour cette ligne (Actualiser les r~eponses retrouve les envois anciens).")
+        End If
+        Exit Sub
+    End If
+    Dim ol As Object
+    Set ol = GetOutlook()
+    If ol Is Nothing Then Exit Sub
+    Dim itm As Object
+    Set itm = Nothing
+    On Error Resume Next
+    Set itm = ol.Session.GetItemFromID(eid)
+    On Error GoTo Fin
+    If itm Is Nothing Then
+        ' v1.1 (F5-23) : Outlook (modMailCampaign v12.1) retrouve un mail
+        ' deplace s'il est reste dans un des dossiers fouilles.
+        ShowInfo A("Mail introuvable : d~eplac~e ou supprim~e.") & vbCrLf & vbCrLf & _
+                 A("Actualiser les r~eponses le retrouve s'il est dans les ~El~ements envoy~es, le dossier de classement ") & _
+                 A("de la campagne ou le dossier du code de l'objet, puis met la ligne ~a jour.")
+        Exit Sub
+    End If
+    itm.Display
+    On Error Resume Next
+    ol.ActiveWindow.Activate
+    Exit Sub
+Fin:
+    MsgBox A("Ouverture impossible : ") & Err.Number & " - " & Err.Description, vbExclamation, APP_TITLE
+End Sub
+
+' Brouillons de la boite d'envoi de la campagne active (sinon par defaut).
+Private Sub DoOpenDrafts()
+    On Error GoTo Fin
+    Dim ol As Object
+    Set ol = GetOutlook()
+    If ol Is Nothing Then Exit Sub
+    Dim wanted As String
+    wanted = ""
+    Dim lay As SheetLayout
+    If ActiveCampaignLayout(lay) Then wanted = LCase$(ParamText(lay, P_ACCOUNT))
+
+    Dim fld As Object, acc As Object, st As Object
+    Set fld = Nothing
+    On Error Resume Next
+    If Len(wanted) > 0 Then
+        For Each acc In ol.Session.Accounts
+            If LCase$(CStr(acc.SmtpAddress)) = wanted Or LCase$(CStr(acc.DisplayName)) = wanted Then
+                Set fld = acc.DeliveryStore.GetDefaultFolder(OL_FOLDER_DRAFTS)
+                Exit For
+            End If
+        Next acc
+        If fld Is Nothing Then
+            For Each st In ol.Session.Stores
+                If LCase$(CStr(st.DisplayName)) = wanted Then
+                    Set fld = st.GetDefaultFolder(OL_FOLDER_DRAFTS)
+                    Exit For
+                End If
+            Next st
+        End If
+    End If
+    If fld Is Nothing Then Set fld = ol.Session.GetDefaultFolder(OL_FOLDER_DRAFTS)
+    On Error GoTo Fin
+    If fld Is Nothing Then Exit Sub
+
+    Dim olExp As Object
+    Set olExp = Nothing
+    On Error Resume Next
+    Set olExp = ol.ActiveExplorer
+    On Error GoTo Fin
+    If olExp Is Nothing Then
+        fld.Display
+    Else
+        Set olExp.CurrentFolder = fld
+        On Error Resume Next
+        If olExp.WindowState = 1 Then olExp.WindowState = 0
+        olExp.Activate
+        AppActivate CStr(olExp.Caption)
+    End If
+    Exit Sub
+Fin:
+    MsgBox A("Ouverture des Brouillons impossible : ") & Err.Number & " - " & Err.Description, vbExclamation, APP_TITLE
+End Sub
+
+'=============================================================================
+' REINITIALISER LES STATUTS : les lignes redeviennent envoyables.
+' Oui = lignes non envoyees seulement (brouillons, echecs) ; Non = TOUTES les
+' lignes, envoyees comprises (suivi des reponses perdu, double confirmation).
+'=============================================================================
+Private Sub DoResetStatuses(ByRef lay As SheetLayout)
+    On Error GoTo Fin
+    Dim rep As Long
+    rep = MsgBox(A("R~einitialiser les statuts de la campagne ") & lay.Ws.Name & " ?" & vbCrLf & vbCrLf & _
+                 A("Oui = seulement les lignes NON envoy~ees (brouillons cr~e~es, ~echecs) : elles redeviennent envoyables.") & vbCrLf & _
+                 A("Non = TOUTES les lignes, envoy~ees comprises : le suivi des r~eponses est perdu et les mails pourraient ~xtre renvoy~es.") & vbCrLf & _
+                 "Annuler", vbQuestion + vbYesNoCancel + vbDefaultButton1, A("R~einitialiser les statuts"))
+    If rep = vbCancel Then Exit Sub
+    Dim allRows As Boolean
+    allRows = (rep = vbNo)
+    If allRows Then
+        If MsgBox(A("Confirmer : effacer AUSSI les lignes d~ej~a envoy~ees ?"), vbExclamation + vbYesNo + vbDefaultButton2, _
+                  A("R~einitialiser les statuts")) <> vbYes Then Exit Sub
+    End If
+
+    Dim lastRow As Long, first As Long, i As Long, r As Long, st As String, n As Long
+    lastRow = LastDataRow(lay)
+    first = lay.HeaderRow + 1
+    If lastRow < first Then Exit Sub
+    Application.EnableEvents = False
+    Application.ScreenUpdating = False
+    Dim stB As Variant
+    stB = ColBlock(lay, R_STATUS, first, lastRow)
+    For i = 1 To UBound(stB, 1)
+        r = lay.HeaderRow + i
+        st = Trim$(SafeStr(stB(i, 1)))
+        If Len(st) > 0 Then
+            If allRows Or Left$(st, 6) <> "Envoye" Then
+                ClearRole lay, r, R_STATUS
+                ClearRole lay, r, R_CHECK
+                If allRows Then
+                    ClearRole lay, r, R_TRACK
+                    ClearRole lay, r, R_REPLIES
+                    ClearRole lay, r, R_LASTREPLY
+                    ClearRole lay, r, R_FOLLOWUPS
+                    ClearRole lay, r, R_LASTFU
+                    ClearRole lay, r, R_CONV
+                    ClearRole lay, r, R_ENTRY
+                    ClearRole lay, r, R_SENTON
+                    ClearRole lay, r, R_REPLYID
+                End If
+                n = n + 1
+            End If
+        End If
+    Next i
+    Application.ScreenUpdating = True
+    Application.EnableEvents = True
+    RefreshRibbon
+    RefreshIndex
+    MsgBox n & A(" ligne(s) r~einitialis~ee(s)."), vbInformation, A("R~einitialiser les statuts")
+    Exit Sub
+Fin:
+    Application.ScreenUpdating = True
+    Application.EnableEvents = True
+    MsgBox A("R~einitialisation impossible : ") & Err.Number & " - " & Err.Description, vbExclamation, APP_TITLE
+End Sub
+
+Private Sub ClearRole(ByRef lay As SheetLayout, ByVal r As Long, ByVal role As String)
+    On Error Resume Next
+    Dim c As Long
+    c = RoleCol(lay, role)
+    If c > 0 Then lay.Ws.Cells(r, c).ClearContents
+End Sub
+
+'=============================================================================
+' OUTILS
+'=============================================================================
+Private Function GetOutlook() As Object
+    On Error Resume Next
+    Set GetOutlook = GetObject(, "Outlook.Application")
+    On Error GoTo 0
+    If GetOutlook Is Nothing Then
+        MsgBox A("Outlook n'est pas ouvert. Ouvre Outlook, puis recommence."), vbExclamation, APP_TITLE
+    End If
+End Function
+
+' Enregistre le classeur si possible (jamais bloquant).
+Private Sub AutoSave()
+    On Error Resume Next
+    If ThisWorkbook.ReadOnly Then Exit Sub
+    If Len(ThisWorkbook.Path) = 0 Then Exit Sub
+    ThisWorkbook.Save
+End Sub
+
+Private Sub SetStatus(ByVal msg As String)
+    On Error Resume Next
+    Application.StatusBar = msg
+    mStatusSet = True
+End Sub
+
+' v1.1 (F5-11) : une seule echeance a la fois. La precedente est annulee
+' (sinon celle d'un message ancien efface un message plus recent avant son
+' delai) et l'heure est memorisee pour CancelStatusClear (fermeture).
+Private Sub ScheduleStatusClear(ByVal seconds As Long)
+    On Error Resume Next
+    Dim proc As String
+    proc = "'" & ThisWorkbook.Name & "'!ClearStatusBarSafe"
+    If mClearAt > 0 Then Application.OnTime mClearAt, proc, , False
+    mClearAt = Now + TimeSerial(0, 0, seconds)
+    Application.OnTime mClearAt, proc
+End Sub
+
+Private Sub ShowInfo(ByVal msg As String)
+    MsgBox msg, vbInformation, APP_TITLE
+End Sub
+
+' Nom d'onglet valide : 31 caracteres max, sans : \ / ? * [ ] ni |.
+Private Function SafeSheetName(ByVal s As String) As String
+    Dim bad As Variant, i As Long
+    bad = Array(":", "\", "/", "?", "*", "[", "]", "|")
+    For i = LBound(bad) To UBound(bad)
+        s = Replace(s, CStr(bad(i)), "-")
+    Next i
+    s = Trim$(s)
+    Do While Left$(s, 1) = "'"
+        s = Mid$(s, 2)
+    Loop
+    Do While Right$(s, 1) = "'"
+        s = Left$(s, Len(s) - 1)
+    Loop
+    If Len(s) > 31 Then s = Left$(s, 31)
+    If Len(s) = 0 Then s = "Campagne"
+    SafeSheetName = s
+End Function
+
+Private Function UniqueSheetName(ByVal base As String) As String
+    Dim nm As String, n As Long, ws As Worksheet
+    nm = base
+    n = 1
+    Do
+        Set ws = Nothing
+        On Error Resume Next
+        Set ws = ThisWorkbook.Worksheets(nm)
+        On Error GoTo 0
+        If ws Is Nothing Then Exit Do
+        n = n + 1
+        nm = Left$(base, 31 - Len(" (" & n & ")")) & " (" & n & ")"
+    Loop
+    UniqueSheetName = nm
+End Function
+
+'=============================================================================
+' A : decode les marqueurs d'accent ASCII (table de modConfig.A() cote
+' Outlook) : ~e e aigu, ~f e grave, ~a a grave, ~E E aigu, ~i i circ,
+' ~o o circ, ~x e circ, ~c c cedille, ~u u circ, ~U u grave, ~A a circ,
+' ~y i trema, ~I I circ. Marqueur inconnu : "~" conserve tel quel.
+'=============================================================================
+Private Function A(ByVal s As String) As String
+    Dim out As String, i As Long, n As Long, ch As String
+    n = Len(s)
+    i = 1
+    Do While i <= n
+        ch = Mid$(s, i, 1)
+        If ch = "~" And i < n Then
+            Select Case Mid$(s, i + 1, 1)
+                Case "e": out = out & ChrW$(233): i = i + 2
+                Case "f": out = out & ChrW$(232): i = i + 2
+                Case "a": out = out & ChrW$(224): i = i + 2
+                Case "E": out = out & ChrW$(201): i = i + 2
+                Case "i": out = out & ChrW$(238): i = i + 2
+                Case "o": out = out & ChrW$(244): i = i + 2
+                Case "x": out = out & ChrW$(234): i = i + 2
+                Case "c": out = out & ChrW$(231): i = i + 2
+                Case "u": out = out & ChrW$(251): i = i + 2
+                Case "U": out = out & ChrW$(249): i = i + 2
+                Case "A": out = out & ChrW$(226): i = i + 2
+                Case "y": out = out & ChrW$(239): i = i + 2
+                Case "I": out = out & ChrW$(206): i = i + 2
+                Case Else
+                    out = out & ch
+                    i = i + 1
+            End Select
+        Else
+            out = out & ch
+            i = i + 1
+        End If
+    Loop
+    A = out
+End Function

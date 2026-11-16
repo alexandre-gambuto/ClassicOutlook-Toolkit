@@ -1,14 +1,21 @@
 Option Explicit
 
 ' =====================================================================
-' modNewMeetingDefault v7
+' modNewMeetingDefault v7.1
 ' Purpose (EN): forces a default duration (config: DefaultAppointmentDuration)
-'   on every new appointment/meeting inspector opened in Outlook. End is set
-'   once on NewInspector, then re-applied ~1s later (modDefer) because
+'   on every new appointment/meeting inspector opened in Outlook with
+'   Outlook's own default slot (config: OutlookDefaultSlot, 30 min). End is
+'   set once on NewInspector, then re-applied ~1s later (modDefer) because
 '   converting an appointment to a meeting resets the duration.
 '
 ' Force une duree par defaut (cle DefaultAppointmentDuration) sur toute
-' nouvelle fiche de RDV ou reunion ouverte depuis Outlook.
+' nouvelle fiche de RDV ou reunion ouverte depuis Outlook avec la duree
+' qu'Outlook donne d'office (cle OutlookDefaultSlot, 30 min).
+' v7.1 (2026-11-16) : audit 11/2026 - F6-04 : une plage choisie a la souris
+'   ou un evenement importe (.ics) garde sa duree ; seule la duree par
+'   defaut d'Outlook est remplacee (a l'ouverture et apres conversion en
+'   reunion). integration : "clsAppEvents instancie" au journal en
+'   DEBUG (F10-13).
 ' v5 (2026-06-10) : accesseurs InspectorEventsBound / InlineExplorerBound
 ' (etat reel du binding porte par g_AppEvents/clsAppEvents, lus par
 ' modMaintenance.AssertBindings).
@@ -35,7 +42,7 @@ Private g_AppEvents As clsAppEvents
 
 ' Pack v3 (C12) : la file des inspecteurs en attente du differe vit dans
 ' modInspectorQueue (plus de dictionnaire + sequence prives ici).
-Private Const MOD_VERSION As String = "v7 - 2026-07-10"
+Private Const MOD_VERSION As String = "v7.1 - 2026-11-16"
 
 Public Function ModVersion() As String
     ModVersion = MOD_VERSION
@@ -44,7 +51,7 @@ End Function
 Public Sub InitEvents()
     If g_AppEvents Is Nothing Then
         Set g_AppEvents = New clsAppEvents
-        modDebugLog.DInfo MOD_NAME, "clsAppEvents instancie"
+        modDebugLog.DDebug MOD_NAME, "clsAppEvents instancie"
     End If
 End Sub
 
@@ -81,6 +88,18 @@ Public Sub OnNewInspector(ByVal Inspector As Outlook.Inspector)
     If Err.Number <> 0 Then
         modDebugLog.DDebug MOD_NAME, "OnNewInspector : Start illisible, abandon"
         Err.Clear
+        Exit Sub
+    End If
+    
+    ' v7.1 (F6-04) : on ne remplace QUE la duree qu'Outlook donne d'office a
+    ' une fiche neuve (OutlookDefaultSlot, 30 min). Une plage choisie a la
+    ' souris (1 h, 2 h...) ou un evenement importe (.ics) garde sa duree.
+    Dim curDur As Long
+    curDur = -1
+    curDur = appt.Duration
+    If curDur <> modConfig.OutlookDefaultSlotMinutes() Then
+        modDebugLog.DTrace MOD_NAME, "OnNewInspector : duree " & curDur & _
+            " min choisie (pas celle d'Outlook), conservee"
         Exit Sub
     End If
     
@@ -136,6 +155,10 @@ Public Sub DelayedAdjust(ByVal key As String)
     Dim durMin As Long
     durMin = modConfig.DefaultAppointmentDuration()
     If dur = durMin Then Exit Sub
+    ' v7.1 (F6-04) : ne reposer la fin que si Outlook a remis SA duree par
+    ' defaut (conversion rendez-vous -> reunion) ; une duree changee a la
+    ' main entre-temps est conservee.
+    If dur <> modConfig.OutlookDefaultSlotMinutes() Then Exit Sub
     
     Dim startVal As Date
     startVal = appt.Start

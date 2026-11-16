@@ -1,7 +1,17 @@
 Option Explicit
 
 '=============================================================================
-' modContactImport v1.4  (2026-08-17)
+' modContactImport v1.5  (2026-11-16)
+' v1.5 (2026-11-16) : audit 11/2026 - F7-07, F7-13, F7-14, F7-15, F7-16,
+'   F7-17 : CSV repasse par Excel - telephone dont seuls le "+" ou les
+'   espaces ont disparu, code postal sans son 0 initial = valeur inchangee ;
+'   caracteres changes en "?", notation scientifique et notes tronquees =
+'   refuses avec une note ; photo d'un AUTRE fichier que celui de l'export
+'   = posee quelle que soit sa date ; fichier d'annulation (ContactUndoLastRun) ;
+'   [Appliquer maintenant] apres une simulation ; outils communs.
+'   integration - F7-16 : ligne "(Boutons natifs : ...)" retiree du
+'   choix Simulation / Appliquer : modMsgBoxCustom v2.1 l'ajoute lui-meme
+'   en cas de repli sur des boutons natifs.
 ' Purpose (EN): re-import a contacts.csv produced by modContactExport (and
 '   edited in Excel or by batch) into the chosen store: matches each row to
 '   its card by ContactSyncID (then EntryID, then normalised name), updates
@@ -20,9 +30,17 @@ Option Explicit
 '   Colonne absente = champ non touche. Colonne inconnue = ignoree (note).
 '   Dates AAAA-MM-JJ (JJ/MM/AAAA accepte), Sensitivity 0..3, Categories
 '   separees par ";", Body compare a plat.
+'   CSV PASSE PAR EXCEL (v1.5, F7-07) : Excel convertit a l'ouverture
+'   "+33612345678" en 33612345678 et "01000" en 1000. Telephone (*Telephone
+'   Number, *FaxNumber, PagerNumber) relu en chiffres seuls identiques =
+'   inchange ; code postal relu sans ses 0 initiaux = inchange (compteur
+'   "formats perdus par Excel" au bilan). Refuses avec une note au rapport :
+'   numero en notation scientifique ("3,36E+11"), valeur dont des lettres
+'   sont devenues "?" (CSV ANSI), notes coupees a 32 767 caracteres.
 '   PHOTO (_Photo) : nom de fichier dans photos\ = posee si la fiche n'en a
-'   pas ou si le fichier est plus recent que l'export ; "-" = retiree ;
-'   vide = inchangee.
+'   pas, si le fichier n'est pas celui de l'export (<SyncID>.jpg : v1.5,
+'   F7-17 - une copie Windows garde sa date d'origine) ou s'il est plus
+'   recent que l'export ; "-" = retiree ; vide = inchangee.
 '   DOSSIER (_Folder) : different du dossier actuel = fiche DEPLACEE
 '   (dossier cree sous son parent s'il manque, ContactImportCreateFolders).
 '   CONFLIT : fiche modifiee dans Outlook APRES l'export (_Exported) =
@@ -41,26 +59,31 @@ Option Explicit
 ' ContactExportDir. Separateur (; ou ,) et encodage (UTF-8 avec/sans BOM,
 ' Windows-1252 apres un enregistrement Excel "CSV") detectes.
 '
-' RAPPORT : <Bureau>\Macro VBA\Outlook\ContactImport-AAAAMMJJ-HHMMSS.txt
-' (UTF-8) : par fiche, champ par champ "avant -> apres" ; conflits ; lignes
-' sans correspondance ; deplacements ; photos.
+' RAPPORT : <outil>\Sorties\ (modConfig.MacroVBADir)
+' ContactImport-AAAAMMJJ-HHMMSS.txt (UTF-8) : par fiche, champ par champ
+' "avant -> apres" ; conflits ; lignes sans correspondance ; deplacements ;
+' photos. v1.5 : en mode Appliquer, a cote, ContactImport-...-undo.tsv
+' (F7-13 ; photos, deplacements et fiches creees hors annulation) -
+' modContactCommon.ContactUndoLastRun. Apres une simulation, le bilan
+' propose [Appliquer maintenant] (memes comptes, meme fichier) (F7-16).
 '
 ' SUB PUBLIQUE (epinglable au QAT) : ContactImportCsv
 '
 ' Dependances : modConfig (Cfg/CfgB, T, A, MacroVBADir), modDebugLog,
-'   modMsgBoxCustom.Confirm3.
+'   modMsgBoxCustom.Confirm3, modContactCommon v1.1+.
 ' Cles config.ini : ContactExportDir, ContactImportAllowMove,
 '   ContactImportCreateFolders, ContactSkipFolders (partagee).
 '=============================================================================
 
 Private Const MOD_NAME As String = "ContImp"
-Private Const MOD_VERSION As String = "v1.4 - 2026-08-17"
+Private Const MOD_VERSION As String = "v1.5 - 2026-11-16"
 
 Private Const UP_SYNC As String = "ContactSyncID"
 Private Const UP_NAMEDAY As String = "NameDay"
-Private Const PROPTAG_HIDDEN As String = "http://schemas.microsoft.com/mapi/proptag/0x10F4000B"
-Private Const DEFAULT_SKIP As String = "{*|Recipient Cache|*sugg*|GAL Contacts|Organizational Contacts|Companies|PeopleCentricConversation Buddies|*Lync*|*Skype*|ExternalContacts"
+' v1.5 (F7-14) : dossiers exclus par defaut = modContactCommon.ContactSkipDefault.
 Private Const NO_DATE_YEAR As Long = 4500
+' v1.5 (F7-07) : longueur maximale d'une cellule Excel (notes au-dela coupees).
+Private Const EXCEL_CELL_MAX As Long = 32767
 Private Const CLEAR_TOKEN As String = "-"
 ' Tolerance (secondes) entre LastModificationTime et _Exported : le Save de
 ' l'etiquette precede de peu l'horodatage de la ligne.
@@ -81,8 +104,6 @@ Private Const FIELDS As String = "FullName|Title|FirstName|MiddleName|LastName|S
 Private Const DATE_FIELDS As String = "|Birthday|Anniversary|"
 Private Const LONG_FIELDS As String = "|Sensitivity|"
 
-Private Declare PtrSafe Sub Sleep Lib "kernel32" (ByVal dwMilliseconds As Long)
-
 ' --- Reglages ---
 Private mExportDir As String
 Private mAllowMove As Boolean
@@ -101,6 +122,9 @@ Private mBySync As Object          ' SyncID -> ContactItem ou "DUP"
 Private mByName As Object          ' cle nom -> ContactItem ou "DUP"
 Private mFolders As Object         ' LCase(store & "|" & chemin relatif) -> MAPIFolder
 Private mExportStamp As Date
+Private mUnknownCols As String     ' v1.5 : colonnes inconnues (ecrites en tete de chaque passe)
+Private mUndo As String            ' v1.5 (F7-13) : lignes d'annulation de la passe
+Private mCardUndo As String        ' v1.5 (F7-13) : lignes de la fiche en cours
 
 ' --- Compteurs ---
 Private mRows As Long
@@ -117,6 +141,7 @@ Private mErrors As Long
 Private mFieldChanges As Long
 Private mNameDays As Long
 Private mBadStore As Long
+Private mExcelKept As Long         ' v1.5 (F7-07) : valeurs reformatees par Excel, laissees telles quelles
 
 '=============================================================================
 ' ModVersion - version REELLEMENT chargee dans le VBE.
@@ -165,43 +190,50 @@ Public Sub ContactImportCsv()
         T("Fichier : ", "File: ") & csvPath & vbCrLf & _
         T("Lignes : ", "Rows: ") & (rows.Count - 1) & vbCrLf & vbCrLf & _
         T("Simulation : rien n'est ~ecrit, le rapport liste champ par champ ce qui SERAIT chang~e." & vbCrLf & _
-          "Appliquer : met ~a jour les fiches (jamais de suppression)." & vbCrLf & _
-          "(Boutons natifs : Oui = Simulation, Non = Appliquer.)", _
+          "Appliquer : met ~a jour les fiches (jamais de suppression).", _
           "Dry run: nothing is written, the report lists field by field what WOULD change." & vbCrLf & _
-          "Apply: updates the cards (never deletes)." & vbCrLf & _
-          "(Native buttons: Yes = Dry run, No = Apply.)"), _
+          "Apply: updates the cards (never deletes)."), _
         UiTitle(), T("&Simulation", "&Dry run"), T("&Appliquer", "&Apply"), T("A&nnuler", "&Cancel"))
     If choice = vbCancel Then Exit Sub
     Dim dryRun As Boolean
     dryRun = (choice = vbYes)
 
-    modDebugLog.DInfo MOD_NAME, "Import start stores=" & storeNames & " file=" & csvPath & " dryRun=" & dryRun
-    ReportLine "modContactImport " & MOD_VERSION & " - " & Format$(Now, "yyyy-mm-dd hh:nn:ss")
-    ReportLine IIf(dryRun, "MODE : SIMULATION (aucune modification)", "MODE : APPLIQUE")
-    ReportLine "Compte(s) : " & storeNames
-    ReportLine "Fichier : " & csvPath & " (" & (rows.Count - 1) & " lignes)"
-    ReportLine "Deplacement par _Folder : " & mAllowMove & " | creation de dossiers : " & mCreateFolders
-    ReportLine String$(78, "-")
-
-    For Each k In mStores
-        Set st = k
-        IndexFolderTree st.GetRootFolder
-    Next k
-    ReportLine "Fiches indexees : " & mBySync.Count & " etiquettes, " & mByName.Count & " noms"
-    ReportLine String$(78, "-")
-
+    ' v1.5 (F7-16) : [Appliquer maintenant] apres la simulation relance la
+    ' passe sur les memes comptes et le meme fichier (deja lu), sans reposer
+    ' les questions ; index des fiches reconstruit a chaque passe.
     Dim ri As Long
-    For ri = 2 To rows.Count
-        ProcessRow rows.Item(ri), ri, dryRun
-        If (ri Mod 20) = 0 Then DoEvents
-    Next ri
+    Do
+        ResetPass
+        modDebugLog.DInfo MOD_NAME, "Import start stores=" & storeNames & " file=" & csvPath & " dryRun=" & dryRun
+        ReportLine "modContactImport " & MOD_VERSION & " - " & Format$(Now, "yyyy-mm-dd hh:nn:ss")
+        ReportLine IIf(dryRun, "MODE : SIMULATION (aucune modification)", "MODE : APPLIQUE")
+        ReportLine "Compte(s) : " & storeNames
+        ReportLine "Fichier : " & csvPath & " (" & (rows.Count - 1) & " lignes)"
+        ReportLine "Deplacement par _Folder : " & mAllowMove & " | creation de dossiers : " & mCreateFolders
+        If Len(mUnknownCols) > 0 Then ReportLine "Colonnes inconnues ignorees : " & mUnknownCols
+        ReportLine String$(78, "-")
 
-    WriteReport
-    modDebugLog.DInfo MOD_NAME, "Import end rows=" & mRows & " updated=" & mUpdated & " unchanged=" & mUnchanged & _
-        " created=" & mCreated & " moved=" & mMoved & " photos=" & mPhotos & " namedays=" & mNameDays & _
-        " skipped=" & mSkipped & " conflicts=" & mConflicts & " nomatch=" & mNoMatch & " ambiguous=" & mAmbiguous & _
-        " badstore=" & mBadStore & " errors=" & mErrors
-    ShowSummary dryRun
+        For Each k In mStores
+            Set st = k
+            IndexFolderTree st.GetRootFolder
+        Next k
+        ReportLine "Fiches indexees : " & mBySync.Count & " etiquettes, " & mByName.Count & " noms"
+        ReportLine String$(78, "-")
+
+        For ri = 2 To rows.Count
+            ProcessRow rows.Item(ri), ri, dryRun
+            If (ri Mod 20) = 0 Then DoEvents
+        Next ri
+
+        WriteReport
+        SaveUndo dryRun
+        modDebugLog.DInfo MOD_NAME, "Import end rows=" & mRows & " updated=" & mUpdated & " unchanged=" & mUnchanged & _
+            " created=" & mCreated & " moved=" & mMoved & " photos=" & mPhotos & " namedays=" & mNameDays & _
+            " skipped=" & mSkipped & " conflicts=" & mConflicts & " nomatch=" & mNoMatch & " ambiguous=" & mAmbiguous & _
+            " badstore=" & mBadStore & " excel=" & mExcelKept & " errors=" & mErrors & " dryRun=" & dryRun
+        If Not ShowSummary(dryRun) Then Exit Do
+        dryRun = False
+    Loop
     Exit Sub
 ErrH:
     errNo = Err.Number
@@ -210,6 +242,7 @@ ErrH:
     modDebugLog.DError MOD_NAME, "ContactImportCsv err " & errNo & " - " & errDesc
     ReportLine "!! ERREUR " & errNo & " - " & errDesc
     WriteReport
+    SaveUndo dryRun
     MsgBox T("Erreur : ", "Error: ") & errNo & " - " & errDesc, vbExclamation, UiTitle()
 End Sub
 
@@ -223,19 +256,26 @@ Private Sub LoadSettings()
     If Right$(mExportDir, 1) = "\" Then mExportDir = Left$(mExportDir, Len(mExportDir) - 1)
     mAllowMove = modConfig.CfgB("ContactImportAllowMove", True)
     mCreateFolders = modConfig.CfgB("ContactImportCreateFolders", True)
-    mSkipFolders = modConfig.Cfg("ContactSkipFolders", DEFAULT_SKIP)
+    mSkipFolders = modConfig.Cfg("ContactSkipFolders", modContactCommon.ContactSkipDefault())
 End Sub
 
 Private Sub ResetState()
-    mReport = "": mReportPath = "": mCsvDir = ""
+    mCsvDir = "": mUnknownCols = ""
     Set mColIdx = CreateObject("Scripting.Dictionary")
+    ResetPass
+End Sub
+
+' v1.5 (F7-16) : etat d'UNE passe (rapport, index des fiches, compteurs) ;
+' l'en-tete du CSV et les comptes choisis restent.
+Private Sub ResetPass()
+    mReport = "": mReportPath = "": mUndo = "": mCardUndo = ""
     Set mBySync = CreateObject("Scripting.Dictionary")
     Set mByName = CreateObject("Scripting.Dictionary")
     Set mFolders = CreateObject("Scripting.Dictionary")
     mExportStamp = 0
     mRows = 0: mUpdated = 0: mUnchanged = 0: mCreated = 0: mMoved = 0: mPhotos = 0
     mSkipped = 0: mConflicts = 0: mNoMatch = 0: mAmbiguous = 0: mErrors = 0: mFieldChanges = 0
-    mNameDays = 0: mBadStore = 0
+    mNameDays = 0: mBadStore = 0: mExcelKept = 0
 End Sub
 
 Private Function UiTitle() As String
@@ -473,7 +513,7 @@ Private Function BuildHeaderIndex(ByVal hdr As Variant) As Boolean
                vbExclamation, UiTitle()
         Exit Function
     End If
-    If Len(unknown) > 0 Then ReportLine "Colonnes inconnues ignorees : " & unknown
+    mUnknownCols = Trim$(unknown)      ' v1.5 : ecrit en tete de chaque passe
     BuildHeaderIndex = True
 End Function
 
@@ -571,12 +611,6 @@ Private Function IsSkippedFolder(ByVal fld As Outlook.MAPIFolder) As Boolean
     IsSkippedFolder = modContactCommon.IsSkippedFolder(fld, mSkipFolders)
 End Function
 
-' Dossier situe sous les Elements supprimes de son compte (corbeille) ?
-Private Function IsInDeletedItems(ByVal fld As Outlook.MAPIFolder) As Boolean
-    ' Pack v3 (C3) : delegation modContactCommon (helper partage).
-    IsInDeletedItems = modContactCommon.IsInDeletedItems(fld)
-End Function
-
 
 Private Function ShortPath(ByVal fld As Outlook.MAPIFolder) As String
     On Error Resume Next
@@ -616,6 +650,7 @@ Private Sub ProcessRow(ByVal row As Variant, ByVal rowNo As Long, ByVal dryRun A
     Dim who As String
     On Error GoTo ErrH
     mRows = mRows + 1
+    mCardUndo = ""
 
     Dim action As String
     action = LCase$(Trim$(Cell(row, "_Action")))
@@ -686,6 +721,8 @@ Private Sub ProcessRow(ByVal row As Variant, ByVal rowNo As Long, ByVal dryRun A
                 ReportLine "   !! Save en echec"
                 Exit Sub
             End If
+            ' v1.5 (F7-13) : fiche enregistree -> ses lignes d'annulation comptent.
+            mUndo = mUndo & mCardUndo
         End If
     Else
         mUnchanged = mUnchanged + 1
@@ -715,9 +752,12 @@ Private Sub ProcessRow(ByVal row As Variant, ByVal rowNo As Long, ByVal dryRun A
                     mErrors = mErrors + 1
                     ReportLine "   !! dossier cible introuvable / non cree : " & wantFolder
                 Else
-                    Dim moved As Object
+                    Dim moved As Object, oldEid As String
+                    oldEid = ct.EntryID
                     Set moved = ct.Move(target)
                     mMoved = mMoved + 1
+                    ' v1.5 (F7-13) : l'identifiant change au deplacement.
+                    RetargetUndo oldEid, moved
                 End If
             Else
                 mMoved = mMoved + 1
@@ -813,6 +853,7 @@ Private Function ApplyFields(ByVal ct As Outlook.ContactItem, ByVal row As Varia
                         cnt = cnt + 1
                         AddLine lines, nm, oldV, newV
                         If Not dryRun Then
+                            UndoAdd ct, "DATE:" & nm, oldV, newV
                             If Len(newV) = 0 Then
                                 CallByName ct, nm, VbLet, DateSerial(4501, 1, 1)
                             Else
@@ -829,19 +870,48 @@ Private Function ApplyFields(ByVal ct As Outlook.ContactItem, ByVal row As Varia
                     If StrComp(oldV, CStr(CLng(newV)), vbBinaryCompare) <> 0 Then
                         cnt = cnt + 1
                         AddLine lines, nm, oldV, newV
-                        If Not dryRun Then CallByName ct, nm, VbLet, CLng(newV)
+                        If Not dryRun Then
+                            UndoAdd ct, "LONG:" & nm, oldV, CStr(CLng(newV))
+                            CallByName ct, nm, VbLet, CLng(newV)
+                        End If
                     End If
                 ElseIf nm = "Body" Then
                     If StrComp(FlatText(oldV), FlatText(newV), vbBinaryCompare) <> 0 Then
+                        ' v1.5 (F7-07) : Excel coupe une cellule a 32 767 caracteres.
+                        If Len(newV) >= EXCEL_CELL_MAX - 100 And Len(newV) < Len(oldV) Then
+                            AddNote lines, "!! Body : notes coupees par Excel (" & EXCEL_CELL_MAX & _
+                                           " caracteres au plus), notes de la fiche gardees"
+                            mExcelKept = mExcelKept + 1
+                            GoTo NextField
+                        End If
                         cnt = cnt + 1
                         AddLine lines, nm, Left$(oldV, 60), Left$(newV, 60)
-                        If Not dryRun Then ct.Body = newV
+                        If Not dryRun Then
+                            UndoAdd ct, "Body", oldV, newV
+                            ct.Body = newV
+                        End If
                     End If
                 Else
                     If StrComp(oldV, newV, vbBinaryCompare) <> 0 Then
-                        cnt = cnt + 1
-                        AddLine lines, nm, oldV, newV
-                        If Not dryRun Then CallByName ct, nm, VbLet, newV
+                        ' v1.5 (F7-07) : valeur abimee par Excel ?
+                        Select Case ExcelDamage(nm, oldV, newV)
+                            Case 1
+                                ' format seul perdu ("+", espaces, 0 initial) : inchange
+                                mExcelKept = mExcelKept + 1
+                            Case 2
+                                AddNote lines, "!! " & nm & " : numero en notation scientifique (Excel), ignore : " & newV
+                                mExcelKept = mExcelKept + 1
+                            Case 3
+                                AddNote lines, "!! " & nm & " : caractere(s) remplace(s) par '?' a l'enregistrement, valeur gardee : " & oldV
+                                mExcelKept = mExcelKept + 1
+                            Case Else
+                                cnt = cnt + 1
+                                AddLine lines, nm, oldV, newV
+                                If Not dryRun Then
+                                    UndoAdd ct, nm, oldV, newV
+                                    CallByName ct, nm, VbLet, newV
+                                End If
+                        End Select
                     End If
                 End If
             End If
@@ -884,6 +954,11 @@ Private Function ApplyPhoto(ByVal ct As Outlook.ContactItem, ByVal row As Varian
     Dim apply As Boolean
     If Not ct.HasPicture Then
         apply = True
+    ElseIf LCase$(Mid$(v, InStrRev(v, "\") + 1)) <> LCase$(Trim$(Cell(row, "_SyncID")) & ".jpg") Then
+        ' v1.5 (F7-17) : un AUTRE fichier que celui de l'export (<SyncID>.jpg)
+        ' = nouvelle photo, quelle que soit sa date (une copie sous Windows
+        ' garde la date d'origine du fichier).
+        apply = True
     ElseIf mExportStamp > 0 Then
         apply = (FileDateTime(path) > DateAdd("s", CONFLICT_TOLERANCE_SEC, mExportStamp))
     End If
@@ -911,7 +986,10 @@ Private Function ApplyNameDay(ByVal ct As Outlook.ContactItem, ByVal row As Vari
     If v = CLEAR_TOKEN Then
         If Len(cur) = 0 Then Exit Function
         AddLine lines, "_NameDay", cur, ""
-        If Not dryRun Then up.Value = ""
+        If Not dryRun Then
+            UndoAdd ct, "UP:" & UP_NAMEDAY, cur, ""
+            up.Value = ""
+        End If
     Else
         If Not v Like "##-##" Then
             AddNote lines, "!! _NameDay : format attendu MM-JJ, ignoree : " & v
@@ -920,6 +998,7 @@ Private Function ApplyNameDay(ByVal ct As Outlook.ContactItem, ByVal row As Vari
         If cur = v Then Exit Function
         AddLine lines, "_NameDay", cur, v
         If Not dryRun Then
+            UndoAdd ct, "UP:" & UP_NAMEDAY, cur, v
             If up Is Nothing Then Set up = ct.UserProperties.Add(UP_NAMEDAY, olText, False)
             up.Value = v
         End If
@@ -1019,6 +1098,89 @@ Private Function ResolveFolder(ByVal st As Outlook.Store, ByVal relPath As Strin
 End Function
 
 '=============================================================================
+' v1.5 (F7-07) : valeur d'un champ texte abimee par un passage dans Excel ?
+'   0 = non (vraie modification) ;
+'   1 = format seul perdu : telephone relu avec les memes chiffres
+'       ("+33612345678" -> 33612345678), code postal relu sans ses 0
+'       initiaux ("01000" -> 1000) - la fiche est gardee telle quelle ;
+'   2 = telephone en notation scientifique ("3,36123E+11") - chiffres perdus ;
+'   3 = lettres remplacees par "?" (CSV enregistre en ANSI) - meme longueur,
+'       seules differences = "?" la ou la fiche a une autre lettre.
+'=============================================================================
+Private Function ExcelDamage(ByVal nm As String, ByVal oldV As String, ByVal newV As String) As Long
+    Dim k As Long, diffQ As Boolean, chO As String, chN As String
+    If Len(oldV) = 0 Or Len(newV) = 0 Then Exit Function
+    If Right$(nm, 15) = "TelephoneNumber" Or Right$(nm, 9) = "FaxNumber" Or nm = "PagerNumber" Then
+        If UCase$(newV) Like "*#E+#*" Or UCase$(newV) Like "*#E-#*" Then
+            ExcelDamage = 2
+            Exit Function
+        End If
+        If modContactCommon.DigitsOnly(newV) = Replace(newV, " ", "") Then
+            ' "+33612345678" -> 33612345678 ; "0612345678" -> 612345678
+            If NoLeadZero(modContactCommon.DigitsOnly(oldV)) = NoLeadZero(Replace(newV, " ", "")) Then
+                ExcelDamage = 1
+                Exit Function
+            End If
+        End If
+    ElseIf Right$(nm, 10) = "PostalCode" Then
+        If modContactCommon.DigitsOnly(newV) = newV And Len(newV) < Len(oldV) Then
+            If Right$(String$(Len(oldV), "0") & newV, Len(oldV)) = oldV Then
+                ExcelDamage = 1
+                Exit Function
+            End If
+        End If
+    End If
+    If Len(newV) = Len(oldV) And InStr(newV, "?") > 0 Then
+        For k = 1 To Len(newV)
+            chN = Mid$(newV, k, 1)
+            chO = Mid$(oldV, k, 1)
+            If chN <> chO Then
+                If chN <> "?" Then Exit Function      ' autre difference : vraie modification
+                diffQ = True
+            End If
+        Next k
+        If diffQ Then ExcelDamage = 3
+    End If
+End Function
+
+Private Function NoLeadZero(ByVal d As String) As String
+    Do While Left$(d, 1) = "0"
+        d = Mid$(d, 2)
+    Loop
+    NoLeadZero = d
+End Function
+
+' v1.5 (F7-13) : ligne d'annulation d'un champ de la fiche en cours (gardee
+' dans mUndo seulement apres un Save reussi).
+Private Sub UndoAdd(ByVal ct As Object, ByVal propName As String, ByVal oldV As String, ByVal newV As String)
+    If StrComp(oldV, newV, vbBinaryCompare) = 0 Then Exit Sub
+    mCardUndo = mCardUndo & modContactCommon.UndoLine(ct, propName, oldV, newV)
+End Sub
+
+' v1.5 (F7-13) : fiche deplacee -> son nouvel identifiant dans les lignes
+' d'annulation deja gardees.
+Private Sub RetargetUndo(ByVal oldEid As String, ByVal moved As Object)
+    On Error Resume Next
+    Dim newEid As String
+    If moved Is Nothing Or Len(oldEid) = 0 Or Len(mUndo) = 0 Then Exit Sub
+    newEid = moved.EntryID
+    If Len(newEid) > 0 And newEid <> oldEid Then
+        mUndo = Replace(mUndo, vbTab & oldEid & vbTab, vbTab & newEid & vbTab)
+    End If
+    Err.Clear
+End Sub
+
+' v1.5 (F7-13) : fichier d'annulation de la passe, a cote du rapport (mode
+' Appliquer seulement ; une seule fois par passe).
+Private Sub SaveUndo(ByVal dryRun As Boolean)
+    On Error Resume Next
+    If dryRun Or Len(mUndo) = 0 Or Len(mReportPath) = 0 Then Exit Sub
+    modContactCommon.UndoSave modContactCommon.UndoPathFor(mReportPath), "ContactImport", mUndo
+    mUndo = ""
+    Err.Clear
+End Sub
+
+'=============================================================================
 ' Helpers
 '=============================================================================
 Private Function ReadField(ByVal ct As Outlook.ContactItem, ByVal nm As String) As String
@@ -1075,16 +1237,6 @@ Private Function NormKey(ByVal s As String) As String
     NormKey = modContactCommon.NormKey(s)
 End Function
 
-Private Function StripAccents(ByVal s As String) As String
-    ' Pack v3 (C3) : delegation modContactCommon (helper partage).
-    StripAccents = modContactCommon.StripAccents(s)
-End Function
-
-Private Function CollapseSpaces(ByVal s As String) As String
-    ' Pack v3 (C3) : delegation modContactCommon (helper partage).
-    CollapseSpaces = modContactCommon.CollapseSpaces(s)
-End Function
-
 Private Function FlatText(ByVal s As String) As String
     ' Pack v3 (C3) : delegation modContactCommon (helper partage).
     FlatText = modContactCommon.FlatText(s)
@@ -1103,19 +1255,8 @@ Private Function Flat(ByVal s As String) As String
 End Function
 
 Private Function SafeSave(ByVal itm As Object) As Boolean
-    Dim tries As Long
-    On Error Resume Next
-    For tries = 1 To 3
-        Err.Clear
-        itm.Save
-        If Err.Number = 0 Then
-            SafeSave = True
-            Exit Function
-        End If
-        modDebugLog.DDebug MOD_NAME, "Save essai " & tries & " err " & Err.Number & " - " & Err.Description
-        Sleep 300 * tries
-    Next tries
-    SafeSave = False
+    ' v1.5 (F7-14) : delegation modContactCommon (Save avec 3 essais).
+    SafeSave = modContactCommon.SafeSave(itm, MOD_NAME)
 End Function
 
 '=============================================================================
@@ -1131,22 +1272,15 @@ Private Sub WriteReport()
     dirPath = modConfig.MacroVBADir()
     If Dir(dirPath, vbDirectory) = "" Then MkDir dirPath
     mReportPath = dirPath & "\ContactImport-" & Format$(Now, "yyyymmdd-hhnnss") & ".txt"
-    Dim stm As Object
-    Set stm = CreateObject("ADODB.Stream")
-    stm.Type = 2
-    stm.Charset = "utf-8"
-    stm.Open
-    stm.WriteText mReport
-    stm.SaveToFile mReportPath, 2
-    stm.Close
-    If Err.Number <> 0 Then
-        modDebugLog.DError MOD_NAME, "WriteReport err " & Err.Number & " - " & Err.Description
-        Err.Clear
-    End If
+    ' v1.5 (F7-14) : ecriture UTF-8 partagee (erreur journalisee par elle).
+    modContactCommon.WriteUtf8 mReportPath, mReport
+    Err.Clear
 End Sub
 
-Private Sub ShowSummary(ByVal dryRun As Boolean)
-    Dim msg As String
+' Bilan. v1.5 (F7-16) : apres une simulation qui trouve des changements,
+' [Appliquer maintenant] / [Ouvrir le rapport] / [Fermer] ; True = appliquer.
+Private Function ShowSummary(ByVal dryRun As Boolean) As Boolean
+    Dim msg As String, r As VbMsgBoxResult
     msg = IIf(dryRun, T("SIMULATION - rien n'a ~et~e ~ecrit.", "DRY RUN - nothing was written."), _
                       T("Termin~e.", "Done.")) & vbCrLf & vbCrLf & _
           T("Lignes trait~ees : ", "Rows processed: ") & mRows & vbCrLf & _
@@ -1161,11 +1295,25 @@ Private Sub ShowSummary(ByVal dryRun As Boolean)
           T("Compte refus~e : ", "Account refused: ") & mBadStore & vbCrLf & _
           T("Conflits (modifi~ees apr~fs l'export) : ", "Conflicts (modified after export): ") & mConflicts & vbCrLf & _
           T("Sans correspondance : ", "No match: ") & mNoMatch & "   " & _
-          T("Ambigu~es : ", "Ambiguous: ") & mAmbiguous & vbCrLf & _
-          T("Erreurs : ", "Errors: ") & mErrors & vbCrLf & vbCrLf & _
-          T("Rapport : ", "Report: ") & mReportPath & vbCrLf & vbCrLf & _
-          T("Ouvrir le rapport ?", "Open the report?")
-    If MsgBox(msg, vbYesNo + vbInformation, UiTitle()) = vbYes Then
-        If Dir(mReportPath) <> "" Then Shell "notepad.exe """ & mReportPath & """", vbNormalFocus
+          T("Ambigu~es : ", "Ambiguous: ") & mAmbiguous & vbCrLf
+    If mExcelKept > 0 Then
+        msg = msg & T("Valeurs reformat~ees par Excel, fiches gard~ees (voir rapport) : ", _
+                      "Values reformatted by Excel, cards kept (see report): ") & mExcelKept & vbCrLf
     End If
-End Sub
+    msg = msg & T("Erreurs : ", "Errors: ") & mErrors & vbCrLf & vbCrLf & _
+          T("Rapport : ", "Report: ") & mReportPath
+    If dryRun And (mUpdated + mCreated + mMoved) > 0 Then
+        r = modMsgBoxCustom.Confirm3(msg & vbCrLf & vbCrLf & T("Appliquer maintenant ces changements ?", "Apply these changes now?"), _
+                                     UiTitle(), T("&Appliquer maintenant", "&Apply now"), _
+                                     T("&Ouvrir le rapport", "&Open report"), T("&Fermer", "&Close"), vbInformation)
+        If r = vbYes Then
+            ShowSummary = True
+            Exit Function
+        End If
+        If r <> vbNo Then Exit Function
+    ElseIf MsgBox(msg & vbCrLf & vbCrLf & T("Ouvrir le rapport ?", "Open the report?"), _
+                  vbYesNo + vbInformation, UiTitle()) <> vbYes Then
+        Exit Function
+    End If
+    If Dir(mReportPath) <> "" Then Shell "notepad.exe """ & mReportPath & """", vbNormalFocus
+End Function

@@ -1,6 +1,23 @@
 Option Explicit
 
 ' =====================================================================
+' v4.2 (2026-11-16) : audit 11/2026 - F3-16 :
+'   (a) RATTRAPAGE : SnoozeCatchUp (a lancer au demarrage, en differe)
+'       ramene les mails de _Snoozed (toutes les boites) dont le rappel a ete
+'       ferme a la main ou est echu sans avoir declenche le retour (code VBA
+'       arrete, rappel d'une boite secondaire...). Avant, rien ne les
+'       rattrapait : ils restaient indefiniment dans _Snoozed.
+'   (b) ORIGINE ROBUSTE : l'identifiant du dossier d'origine est memorise
+'       (UserProperty SnoozeOriginId = EntryID|StoreID) en plus du chemin ;
+'       au retour, GetFolderFromID est essaye avant le chemin, qui change
+'       quand le dossier est renomme, deplace ou archive.
+'   (c) Le mail revenu est marque NON LU (visible dans la liste).
+'   (d) SnoozeList : "Message remis..." seulement si le deplacement a
+'       reussi (HandleSnoozeReminder, parametre facultatif movedOk).
+'   (e) integration : SnoozeList borne sa liste a ~650 caracteres
+'       (MSGLOOP : 20 lignes pouvaient depasser la taille d'une boite) ;
+'       SnoozeCatchUp branche au demarrage (cle modDefer "SnoozeCatchUp",
+'       +180 s, ThisOutlookSession.ArmStartupTasks).
 ' modSnooze v4.0 (2026-08-21) : MULTIBOITE. Le dossier _Snoozed est celui
 ' v4.1 (2026-08-22) : TOAST DE CONFIRMATION AJOUTE. Le snooze deplacait des
 '   mails hors de la boite de reception sans aucun retour visible : seul le
@@ -38,9 +55,12 @@ Option Explicit
 ' =====================================================================
 
 Private Const MOD_NAME As String = "Snooze"
-Private Const MOD_VERSION As String = "v4.1 - 2026-08-22"
+Private Const MOD_VERSION As String = "v4.2 - 2026-11-16"
 Private Const SNOOZED_FOLDER = "_Snoozed"
 Private Const OL_FOLDER_INBOX As Long = 6
+' v4.2 (F3-16) : UserProperty portant l'identifiant du dossier d'origine
+' (EntryID & "|" & StoreID), en plus du chemin texte SnoozeOriginFolder.
+Private Const PROP_ORIGIN_ID As String = "SnoozeOriginId"
 
 
 '=============================================================================
@@ -163,7 +183,26 @@ Public Sub SnoozeEmail()
             Set userProp = Item.UserProperties.Add("SnoozeOriginFolder", 1) ' olText = 1
         End If
         userProp.Value = origFolder
-        
+
+        ' v4.2 (F3-16) : identifiant du dossier d'origine (survit a un
+        ' renommage, un deplacement ou un archivage du dossier). Facultatif :
+        ' un echec ici ne compte pas comme un echec du report (le chemin
+        ' reste le repli) ; une erreur des etapes precedentes est conservee.
+        Dim prevErr As Long
+        prevErr = Err.Number
+        Dim origId As String
+        origId = ""
+        origId = CStr(Item.parent.EntryID) & "|" & CStr(Item.parent.StoreID)
+        Dim idProp As Object
+        Set idProp = Nothing
+        Set idProp = Item.UserProperties.Find(PROP_ORIGIN_ID)
+        If idProp Is Nothing Then
+            Set idProp = Item.UserProperties.Add(PROP_ORIGIN_ID, 1) ' olText = 1
+        End If
+        If Not idProp Is Nothing Then idProp.Value = origId
+        Err.Clear
+        If prevErr <> 0 Then Err.Number = prevErr
+
         Item.Save
         
         ' Deplacer dans _Snoozed
@@ -195,30 +234,50 @@ End Sub
 ' ============================================================================
 ' UNSNOOZE - Appele par Application_Reminder dans ThisOutlookSession
 ' ============================================================================
-Public Function HandleSnoozeReminder(Item As Object) As Boolean
-    ' Retourne True si c'etait un rappel Snooze (traite), False sinon
+Public Function HandleSnoozeReminder(Item As Object, Optional ByRef movedOk As Boolean) As Boolean
+    ' Retourne True si c'etait un rappel Snooze (traite), False sinon.
+    ' v4.2 (F3-16) : movedOk (facultatif) = True seulement si le mail a
+    ' REELLEMENT ete remis en place (la fonction renvoie True meme quand le
+    ' deplacement echoue : metadonnees conservees pour un nouvel essai).
     HandleSnoozeReminder = False
-    
+    movedOk = False
+
     On Error Resume Next
     Dim flagReq As String
     flagReq = Item.FlagRequest
     On Error GoTo 0
-    
+
     If flagReq <> "Snooze" Then Exit Function
-    
+
     ' C'est un mail snooze -> le remettre dans son dossier d'origine
-    Dim origPath As String
+    Dim origPath As String, origId As String
     On Error Resume Next
     Dim userProp As Object
     Set userProp = Item.UserProperties.Find("SnoozeOriginFolder")
     If Not userProp Is Nothing Then
         origPath = userProp.Value
     End If
+    Set userProp = Nothing
+    Set userProp = Item.UserProperties.Find(PROP_ORIGIN_ID)
+    If Not userProp Is Nothing Then
+        origId = CStr(userProp.Value)
+    End If
     On Error GoTo 0
-    
+
     ' Trouver le dossier d'origine
+    ' v4.2 (F3-16) : par identifiant d'abord (survit au renommage, au
+    ' deplacement et a l'archivage du dossier), puis par chemin.
     Dim destFolder As Object
-    If Len(origPath) > 0 Then
+    Dim sepPos As Long
+    sepPos = InStr(origId, "|")
+    If sepPos > 1 Then
+        On Error Resume Next
+        Set destFolder = Application.Session.GetFolderFromID(Left$(origId, sepPos - 1), Mid$(origId, sepPos + 1))
+        If Err.Number <> 0 Then Set destFolder = Nothing
+        Err.Clear
+        On Error GoTo 0
+    End If
+    If destFolder Is Nothing And Len(origPath) > 0 Then
         Set destFolder = modCommon.GetFolderByPath(origPath)
     End If
     
@@ -233,6 +292,11 @@ Public Function HandleSnoozeReminder(Item As Object) As Boolean
     If destFolder Is Nothing Then
         Set destFolder = Application.GetNamespace("MAPI").GetDefaultFolder(OL_FOLDER_INBOX)
     End If
+    Dim destPath As String
+    destPath = ""
+    On Error Resume Next
+    destPath = CStr(destFolder.FolderPath)
+    On Error GoTo 0
     
     ' v3.2 : TRANSACTIONNEL - deplacer D'ABORD, nettoyer ENSUITE sur
     ' l'objet deplace. Avant : flag/rappel/SnoozeOriginFolder supprimes et
@@ -255,6 +319,7 @@ Public Function HandleSnoozeReminder(Item As Object) As Boolean
     moved.FlagRequest = ""
     moved.ReminderSet = False
     moved.FlagStatus = 0 ' olNoFlag
+    moved.UnRead = True  ' v4.2 (F3-16) : le mail revenu se voit dans la liste
 
     Dim props As Object
     Set props = moved.UserProperties
@@ -263,13 +328,106 @@ Public Function HandleSnoozeReminder(Item As Object) As Boolean
     If Not p Is Nothing Then
         p.Delete
     End If
+    Set p = Nothing
+    Set p = props.Find(PROP_ORIGIN_ID)
+    If Not p Is Nothing Then
+        p.Delete
+    End If
 
     moved.Save
     On Error GoTo 0
 
-    modDebugLog.DInfo MOD_NAME, "Unsnooze : mail remis -> " & origPath
+    modDebugLog.DInfo MOD_NAME, "Unsnooze : mail remis -> " & destPath
+    movedOk = True
     HandleSnoozeReminder = True
 End Function
+
+' ============================================================================
+' v4.2 (F3-16) : RATTRAPAGE DES MAILS REPORTES
+' A lancer au demarrage, en differe (demande d'audit : cle modDefer
+' "SnoozeCatchUp"), ou a la main. Pour chaque boite, dossier _Snoozed
+' existant (aucune creation) : tout mail reporte dont le rappel a ete ferme
+' (ReminderSet = False) ou est echu (ReminderTime <= maintenant) est remis
+' a sa place par HandleSnoozeReminder. Deux temps : EntryID releves, puis
+' deplacements (Move fait muter la collection). Toast seulement si au moins
+' un mail est revenu.
+' ============================================================================
+Public Sub SnoozeCatchUp()
+    On Error Resume Next
+    Dim ns As Object, st As Object, inbox As Object, snoozed As Object
+    Dim itms As Object, itm As Object
+    Dim eids As Collection, sids As Collection
+    Dim j As Long, n As Long, due As Boolean
+    Dim flagReq As String, remSet As Boolean, remTime As Date
+
+    Set ns = Application.Session
+    Set eids = New Collection
+    Set sids = New Collection
+
+    ' --- 1) Releve (aucun deplacement) ---
+    For Each st In ns.Stores
+        Set inbox = Nothing
+        Set snoozed = Nothing
+        Set inbox = st.GetDefaultFolder(OL_FOLDER_INBOX)
+        If Not inbox Is Nothing Then Set snoozed = inbox.Folders(SNOOZED_FOLDER)
+        Err.Clear
+        If Not snoozed Is Nothing Then
+            Set itms = Nothing
+            Set itms = snoozed.items
+            n = 0
+            If Not itms Is Nothing Then n = itms.count
+            For j = 1 To n
+                Set itm = Nothing
+                Set itm = itms.Item(j)
+                If Not itm Is Nothing Then
+                    flagReq = ""
+                    flagReq = CStr(itm.FlagRequest)
+                    remSet = False
+                    remSet = itm.ReminderSet
+                    remTime = 0
+                    remTime = itm.ReminderTime
+                    due = (Not remSet) Or (remTime <= Now)
+                    If flagReq = "Snooze" And due Then
+                        eids.Add CStr(itm.EntryID)
+                        sids.Add CStr(snoozed.StoreID)
+                    End If
+                End If
+                Err.Clear
+            Next j
+        End If
+    Next st
+
+    If eids.count = 0 Then
+        modDebugLog.DDebug MOD_NAME, "SnoozeCatchUp : aucun mail a rattraper"
+        Exit Sub
+    End If
+
+    ' --- 2) Retour a la place d'origine ---
+    Dim k As Long, ok As Boolean, nBack As Long, nFail As Long
+    For k = 1 To eids.count
+        Set itm = Nothing
+        Set itm = ns.GetItemFromID(CStr(eids(k)), CStr(sids(k)))
+        Err.Clear
+        If itm Is Nothing Then
+            nFail = nFail + 1
+        Else
+            ok = False
+            HandleSnoozeReminder itm, ok
+            If ok Then
+                nBack = nBack + 1
+            Else
+                nFail = nFail + 1
+            End If
+        End If
+    Next k
+
+    modDebugLog.DInfo MOD_NAME, "SnoozeCatchUp : " & nBack & " mail(s) remis, " & nFail & _
+        " echec(s) sur " & eids.count
+    If nBack > 0 Then
+        modUi.Toast nBack & T(" mail(s) report~e(s) revenu(s) dans leur dossier.", _
+                              " snoozed mail(s) moved back to their folder."), uiInfo
+    End If
+End Sub
 
 ' ============================================================================
 ' LISTE DES MAILS SNOOZES
@@ -318,7 +476,9 @@ Public Sub SnoozeList()
                 If Len(itm.subject) > 50 Then subj = subj & "..."
                 On Error GoTo 0
 
-                If shown < 20 Then
+                ' Integration 11/2026 : liste bornee aussi en caracteres (une boite
+                ' de saisie est coupee vers 1 024 caracteres).
+                If shown < 20 And Len(listing) < 650 Then
                     listing = listing & "[" & allItems.count & "] " & prefixe & wakeTime & " - " & subj & vbCrLf
                     shown = shown + 1
                 End If
@@ -339,6 +499,7 @@ Public Sub SnoozeList()
     listing = listing & vbCrLf & T("ou laissez vide pour fermer :", "or leave empty to close:")
 
     Dim choice As String
+    ' MSGLOOP-OK : 20 lignes et ~650 caracteres au plus (boucle ci-dessus).
     choice = modUi.AskText(listing, T("Snooze - Liste", "Snooze - List"), "")
 
     If Len(Trim(choice)) = 0 Then Exit Sub
@@ -348,8 +509,18 @@ Public Sub SnoozeList()
         choiceNum = CLng(Trim(choice))
         If choiceNum >= 1 And choiceNum <= allItems.count Then
             ' Unsnooze manuellement
-            HandleSnoozeReminder allItems.Item(choiceNum)
-            MsgBox T("Message remis dans son dossier d'origine (ou la bo~ite de r~eception).", "Message moved back to its original folder (or the Inbox)."), vbInformation, "Snooze"
+            ' v4.2 (F3-16) : confirmation seulement si le mail a vraiment
+            ' ete deplace (avant : affichee meme en cas d'echec).
+            Dim movedOk As Boolean
+            movedOk = False
+            HandleSnoozeReminder allItems.Item(choiceNum), movedOk
+            If movedOk Then
+                modUi.Toast T("Message remis dans son dossier d'origine (ou la bo~ite de r~eception).", _
+                              "Message moved back to its original folder (or the Inbox)."), uiSuccess
+            Else
+                MsgBox T("Le message n'a pas pu " & ChrW$(234) & "tre remis en place (voir le journal).", _
+                         "The message could not be moved back (see the log)."), vbExclamation, "Snooze"
+            End If
         Else
             MsgBox T("Num~ero invalide.", "Invalid number."), vbExclamation, "Snooze"
         End If

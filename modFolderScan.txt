@@ -1,7 +1,14 @@
 Option Explicit
 
 '=============================================================================
-' modFolderScan (v6)
+' modFolderScan (v6.2)
+' v6.2 (2026-11-16) : audit 11/2026 - F3-17 : (a) un dossier TOUT NEUF (ni
+'   element ni sous-dossier, derniere activite "1900") n'est plus archive :
+'   avant, le dossier cree la veille pour un nouveau projet partait dans
+'   _Archives des le lendemain (3 cas au journal) ; (b) un deplacement
+'   refuse (nom deja present dans _Archives, dossier verrouille) est ecrit
+'   au journal (ERR) dans les deux sens, au lieu d'etre efface en silence et
+'   retente chaque jour.
 ' v6 (2026-07-05) : lecture config via getters modConfig (EnsureLoaded-safe)
 ' au lieu des globales g_ en direct (AutoArchiveFolders/Months,
 ' ArchiveSubfolderName) : valeurs a zero apres un Ctrl+S VBE sinon.
@@ -40,7 +47,7 @@ Option Explicit
 '=============================================================================
 
 Private Const MOD_NAME As String = "FolderScan"
-Private Const MOD_VERSION As String = "v6.1 - 2026-07-05"
+Private Const MOD_VERSION As String = "v6.2 - 2026-11-16"
 
 Public Function ModVersion() As String
     ModVersion = MOD_VERSION
@@ -138,16 +145,28 @@ Private Sub archiveFolder(inbox As Outlook.folder, folderName As String, _
             If subFolder.name <> modConfig.ArchiveSubfolderName() Then
                 latestMailDate = GetLastMailDate(subFolder)
                 If latestMailDate < cutoffDate Then
-                    On Error Resume Next
-                    subFolder.MoveTo archivesFolder
-                    If Err.Number = 0 Then
-                        archivedCount = archivedCount + 1
-                        modDebugLog.DInfo MOD_NAME, "Archive '" & _
-                            subFolder.name & "' sous " & folderName & _
-                            " (derniere activite " & Format(latestMailDate, "yyyy-mm-dd") & ")"
+                    ' v6.2 (F3-17) : dossier tout neuf (aucun element, aucun
+                    ' sous-dossier) : pas une inactivite, on le laisse.
+                    If latestMailDate = #1/1/1900# And IsEmptyFolder(subFolder) Then
+                        modDebugLog.DDebug MOD_NAME, "Dossier vide (neuf ?) laisse en place : '" & _
+                            subFolder.name & "' sous " & folderName
+                    Else
+                        On Error Resume Next
+                        subFolder.MoveTo archivesFolder
+                        If Err.Number = 0 Then
+                            archivedCount = archivedCount + 1
+                            modDebugLog.DInfo MOD_NAME, "Archive '" & _
+                                subFolder.name & "' sous " & folderName & _
+                                " (derniere activite " & Format(latestMailDate, "yyyy-mm-dd") & ")"
+                        Else
+                            ' v6.2 (F3-17) : echec trace (avant : efface en silence).
+                            modDebugLog.DError MOD_NAME, "MoveTo refuse '" & subFolder.name & _
+                                "' vers les archives de " & folderName & " : err " & _
+                                Err.Number & " - " & Err.Description
+                        End If
+                        Err.Clear
+                        On Error GoTo 0
                     End If
-                    Err.Clear
-                    On Error GoTo 0
                 End If
             End If
         End If
@@ -172,6 +191,10 @@ Private Sub archiveFolder(inbox As Outlook.folder, folderName As String, _
                     modDebugLog.DInfo MOD_NAME, "Remonte '" & subFolder.name & _
                         "' vers " & folderName & " (derniere activite " & _
                         Format(latestMailDate, "yyyy-mm-dd") & ")"
+                Else
+                    ' v6.2 (F3-17) : echec trace (avant : efface en silence).
+                    modDebugLog.DError MOD_NAME, "MoveTo refuse '" & subFolder.name & _
+                        "' vers " & folderName & " : err " & Err.Number & " - " & Err.Description
                 End If
                 Err.Clear
                 On Error GoTo 0
@@ -289,6 +312,18 @@ ErrHandler:
         "') err " & Err.Number & " - " & Err.Description & _
         " => retour Now (preservation)"
     GetLastActivityDate = Now
+End Function
+
+'=============================================================================
+' IsEmptyFolder (v6.2, F3-17) : ni element ni sous-dossier. En cas d'erreur
+' de lecture : False (le dossier suit alors la regle normale).
+'=============================================================================
+Private Function IsEmptyFolder(ByVal fld As Outlook.folder) As Boolean
+    On Error GoTo Fail
+    IsEmptyFolder = (fld.items.count = 0 And fld.Folders.count = 0)
+    Exit Function
+Fail:
+    IsEmptyFolder = False
 End Function
 
 '=============================================================================

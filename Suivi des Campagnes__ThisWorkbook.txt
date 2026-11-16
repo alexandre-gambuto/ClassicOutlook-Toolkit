@@ -1,0 +1,51 @@
+Option Explicit
+
+'=============================================================================
+' Code du module "ThisWorkbook" (Ce classeur) - Suivi des Campagnes.xlsm - v1.1
+' A coller dans ThisWorkbook : VBE Excel (Alt+F11) -> double-clic sur
+' "ThisWorkbook" (ou "Ce classeur") sous VBAProject(Suivi des Campagnes.xlsm)
+' -> tout remplacer par ce code. Prerequis : le module standard
+' modCampaignBook (v1.1 ou plus recent) existe (Insertion > Module, nomme
+' modCampaignBook).
+'
+' v1.1 (2026-11-16) : audit 11/2026 - F5-11 : fermeture du classeur ->
+'   effacement differe de la barre d'etat annule (une echeance
+'   Application.OnTime en attente faisait rouvrir le classeur ferme).
+'   Nom du classeur et de l'onglet ("Campagnes") a jour (F5-15).
+' v1 (2026-10-24) : tous les evenements sont delegues a modCampaignBook :
+'   - ouverture            : index des campagnes, compteurs du ruban
+'   - activation           : onglet "Campagnes" re-selectionne
+'   - changement de feuille: compteurs (index recalcule sur "Campagnes")
+'   - modification         : compteurs d'une feuille de campagne
+'   - double-clic (index)  : ouvre la campagne de la ligne
+'   - fermeture (v1.1)     : echeance de la barre d'etat annulee
+'=============================================================================
+Private Sub Workbook_Open()
+    On Error Resume Next
+    modCampaignBook.OnWorkbookOpen
+End Sub
+
+Private Sub Workbook_BeforeClose(Cancel As Boolean)
+    On Error Resume Next
+    modCampaignBook.CancelStatusClear
+End Sub
+
+Private Sub Workbook_Activate()
+    On Error Resume Next
+    modCampaignBook.ActivateRibbonTab
+End Sub
+
+Private Sub Workbook_SheetActivate(ByVal Sh As Object)
+    On Error Resume Next
+    modCampaignBook.OnSheetActivated Sh
+End Sub
+
+Private Sub Workbook_SheetChange(ByVal Sh As Object, ByVal Target As Range)
+    On Error Resume Next
+    modCampaignBook.OnSheetChanged Sh, Target
+End Sub
+
+Private Sub Workbook_SheetBeforeDoubleClick(ByVal Sh As Object, ByVal Target As Range, Cancel As Boolean)
+    On Error Resume Next
+    modCampaignBook.OnBeforeDoubleClick Sh, Target, Cancel
+End Sub

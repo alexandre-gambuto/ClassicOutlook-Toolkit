@@ -1,0 +1,2570 @@
+Option Explicit
+
+'=============================================================================
+' modContactEnrich v1.1  (2026-11-16)
+' v1.1 (2026-11-16) : audit 11/2026 - F7-01, F7-08, F7-13, F7-14, F7-15 :
+'   fiche sans adresse + adresse trouvee par le seul nom = "a trancher",
+'   sauf si le domaine de l'adresse correspond a la societe de la fiche ;
+'   autres traitements lourds reportes pendant la recherche
+'   (modDefer.BeginHeavy / EndHeavy) ; fichier d'annulation des fiches
+'   ecrites (modContactCommon.ContactUndoLastRun) ; cle de nom, adresse,
+'   numeros, journal, identite et ecriture UTF-8 repris de modContactCommon.
+'   integration : marque MSGLOOP-OK sur AskAmbiguous (6 lignes au plus).
+' Purpose (EN): fill in the missing details of contact cards (e-mail address
+'   and/or phone numbers) from the user's own mail. Selected cards or all
+'   cards; one mailbox or all. Every mail folder is read folder by folder in
+'   LIST mode (Outlook Table: sender, recipients, date - no mail opened);
+'   only the few mails needed to read a signature are opened afterwards. A
+'   recap is shown BEFORE anything is written; ambiguous cases are validated
+'   one by one or written with the default rule. No UserForm.
+'
+' Complete les coordonnees des fiches contact (adresse e-mail et/ou
+' telephones) a partir des mails. Ruban : Contacts > Avance > "Completer les
+' coordonnees des contacts" (Sub ContactEnrichFromMail).
+'
+' PARCOURS
+'   1. Quels contacts : 1 = tous (dossiers de contacts de toutes les boites,
+'      ContactSkipFolders exclus), 2 = la selection (ou la fiche ouverte).
+'   2. Que chercher   : 1 = e-mail, 2 = telephone, 3 = les deux.
+'   3. Ou chercher    : 0 = toutes les boites, ou une boite precise.
+'      Les choix 2 et 3 sont memorises (HKCU Toolkit\ContactEnrich).
+'   4. Recherche : tous les dossiers de mails des boites retenues, dossier
+'      par dossier, en mode LISTE. Exclus : Elements supprimes, Courrier
+'      indesirable, Brouillons, Boite d'envoi, Problemes de synchronisation,
+'      flux RSS, dossiers masques. Outlook n'a pas de barre d'etat
+'      pilotable : un toast au depart, puis toutes les
+'      ContactEnrichProgressSec secondes.
+'   5. Recapitulatif AVANT toute ecriture : A completer / A trancher / Rien
+'      trouve / A jour / Ignorees ; detail complet dans un fichier texte,
+'      ouvert dans le Bloc-notes quand la liste ne tient pas a l'ecran.
+'      Boutons : [Un par un] (cas a trancher montres un a un),
+'      [Tout ecrire] (regle par defaut), [Annuler].
+'
+' REGLES
+'   - PERSONNE reconnue par son NOM : prenom + nom, ordre, accents, casse,
+'     civilites et complements ignores ("DUPONT Jean (ACME)" = "Jean
+'     Dupont" = "Dupont, Jean" = jean.dupont@...). Sources : expediteur des
+'     mails, destinataires A / Cc. Un destinataire sans adresse visible
+'     n'est resolu (mail ouvert) que pour une fiche sans aucun e-mail.
+'   - E-MAIL : une NOUVELLE adresse professionnelle plus recente que celles
+'     de la fiche devient l'e-mail 1 ; les adresses de la fiche suivent, dans
+'     leur ordre (jamais permutees entre elles). Les adresses grand public
+'     (ContactEnrichGenericDomains : gmail, outlook, orange...) ne comptent
+'     pas pour "la plus recente" et vont en e-mail secondaire. Une adresse
+'     qui sortirait des 3 emplacements est notee dans le journal de la fiche
+'     et dans le rapport. Rien de nouveau = fiche inchangee.
+'   - A TRANCHER : une nouvelle adresse pro passerait devant une adresse pro
+'     de la fiche, plusieurs adresses pour le meme nom (homonymes ou
+'     changement d'employeur), plus de 3 adresses ; v1.1 (F7-01, choix B) :
+'     fiche SANS AUCUNE adresse dont l'adresse proposee n'a ete vue que sous
+'     ce nom, sauf si son domaine porte un mot significatif de la societe de
+'     la fiche ("univ-rennes.fr" pour "Universite de Rennes") - une adresse
+'     grand public ne correspond jamais. [Tout ecrire] applique la
+'     regle ci-dessus. [Un par un] : Entree = proposition ; vide = garder les
+'     adresses de la fiche (telephone alors relu sur ces seules adresses).
+'   - TELEPHONE : signature des mails RECUS de la personne, du plus recent au
+'     plus ancien (ContactEnrichMaxMailsPerContact mails au plus) ; la
+'     premiere signature qui porte un numero ET le nom de famille fait foi.
+'     Champs vides uniquement : mobile ; bureau, ou bureau 2 si le bureau est
+'     deja rempli. Lecture par modContactFromMail.SenderSignaturePhones (meme
+'     moteur que "Creer un contact depuis la signature").
+'   - EXCLUS : tes adresses, no-reply / notifications / adresses techniques
+'     (ContactEnrichSkipAddresses), noms "X via Y" ; fiches sans prenom ou
+'     sans nom, ta propre fiche ; e-mail non traite sur une fiche a adresse
+'     Exchange interne (EX).
+'   - ECRITURE : fiche relue juste avant (adresses changees entre-temps = non
+'     touchee), telephones dans les champs vides uniquement, ligne datee dans
+'     le journal de la fiche (meme section "=== JOURNAL ===" que
+'     modContactNote ; comme lui, les notes repassent en texte simple ;
+'     desactivable par ContactEnrichJournal=0), Save.
+'   - Rapport texte UTF-8 : <outil>\Sorties\ (modConfig.MacroVBADir)
+'     ContactEnrich-AAAAMMJJ-HHMMSS.txt (recherche, puis resultat ecriture).
+'     v1.1 : a cote, ContactEnrich-...-undo.tsv (champs ecrits, ancienne et
+'     nouvelle valeur) : modContactCommon.ContactUndoLastRun annule la passe.
+'   - v1.1 (F7-08) : pendant la recherche, la lecture des signatures et
+'     l'ecriture, les traitements lourds differes (rattrapages, archivage,
+'     reindexation, sauvegarde) sont reportes (modDefer.BeginHeavy).
+'   - Delai maximum ContactEnrichMaxMinutes : au-dela, la recherche s'arrete
+'     et le recapitulatif le signale (resultats partiels).
+'   - Expediteur interne sans adresse SMTP dans la liste : adresse Exchange
+'     traduite une fois (CreateRecipient), resultat mis en cache.
+'
+' SUB PUBLIQUE (ruban Contacts > Avance) : ContactEnrichFromMail
+'
+' Dependances : modConfig (Cfg/CfgL/CfgB, T, MacroVBADir), modDebugLog,
+'   modUi (AskText, Inform, Fail, Toast), modMsgBoxCustom (Confirm3,
+'   MsgBoxC), modContactCommon v1.1+, modStoreContext (CurrentStore),
+'   modContactFromMail v1.7+ (SenderSignaturePhones), modDefer
+'   (BeginHeavy / EndHeavy).
+' Cles config.ini (toutes optionnelles) :
+'   ContactEnrichMaxMailsPerContact=10   mails ouverts au plus par contact (tel.)
+'   ContactEnrichGenericDomains=          domaines grand public (gmail|orange.fr ; vide = liste du code)
+'   ContactEnrichSkipAddresses=           morceaux d'adresse ignores (a|b ; vide = liste du code)
+'   ContactEnrichMaxMinutes=20            delai maximum de la recherche (0 = sans limite)
+'   ContactEnrichProgressSec=30           toast d'avancement (0 = aucun)
+'   ContactEnrichJournal=1                ligne datee dans le journal de la fiche
+'   ContactSkipFolders (partagee) : dossiers de contacts exclus.
+'=============================================================================
+
+Private Const MOD_NAME As String = "ContEnrich"
+Private Const MOD_VERSION As String = "v1.1 - 2026-11-16"
+
+' Memorisation des choix (HKCU, application "Toolkit" : sauvegardee par
+' modBackupAuto).
+Private Const REG_APP As String = "Toolkit"
+Private Const REG_SECTION As String = "ContactEnrich"
+
+' Proprietes MAPI lues en mode liste (fonctionnelles, hors T()).
+Private Const PR_SENT_REP_NAME As String = "http://schemas.microsoft.com/mapi/proptag/0x0042001F"
+Private Const PR_SENT_REP_SMTP As String = "http://schemas.microsoft.com/mapi/proptag/0x5D02001F"
+Private Const PR_SENT_REP_EMAIL As String = "http://schemas.microsoft.com/mapi/proptag/0x0065001F"
+Private Const PR_SENDER_SMTP As String = "http://schemas.microsoft.com/mapi/proptag/0x5D01001F"
+Private Const PR_DISPLAY_TO As String = "http://schemas.microsoft.com/mapi/proptag/0x0E04001F"
+Private Const PR_DISPLAY_CC As String = "http://schemas.microsoft.com/mapi/proptag/0x0E03001F"
+Private Const PR_RECIP_SMTP As String = "http://schemas.microsoft.com/mapi/proptag/0x39FE001F"
+
+' Ordre des colonnes de la table (Row.GetValues).
+Private Const COL_ENTRYID As Long = 0
+Private Const COL_CLASS As Long = 1
+Private Const COL_DATE As Long = 2
+Private Const COL_REPNAME As Long = 3
+Private Const COL_REPSMTP As Long = 4
+Private Const COL_REPEMAIL As Long = 5
+Private Const COL_SNDSMTP As Long = 6
+Private Const COL_SNDNAME As Long = 7
+Private Const COL_TO As Long = 8
+Private Const COL_CC As Long = 9
+
+Private Const OL_MAIL_ITEM As Long = 0           ' olMailItem (DefaultItemType)
+Private Const OL_CONTACT_ITEM As Long = 2        ' olContactItem
+Private Const STORE_PUBLIC As Long = 2           ' olExchangePublicFolder
+
+' v1.1 (F7-14) : section du journal, liste par defaut des dossiers de
+' contacts exclus, civilites et cle de nom : modContactCommon.
+' Domaines grand public : nom principal du domaine, sans extension.
+Private Const DEFAULT_GENERIC As String = "gmail|googlemail|outlook|hotmail|live|msn|passport|yahoo|ymail|rocketmail|aol|orange|wanadoo|free|sfr|neuf|cegetel|club-internet|noos|numericable|bbox|laposte|icloud|me|mac|protonmail|proton|pm|tutanota|gmx|web|t-online|bluewin|libero|tiscali|alice|virgilio|yandex|mail|zoho|hey|fastmail"
+' Morceaux d'adresse qui signent un envoi automatique (jamais retenus).
+Private Const DEFAULT_SKIP_ADDR As String = "noreply|no-reply|no_reply|donotreply|do-not-reply|do_not_reply|ne-pas-repondre|nepasrepondre|ne_pas_repondre|mailer-daemon|postmaster|bounce|notification|newsletter|unsubscribe|invitations@|calendar-server"
+' v1.1 (F7-01) : mots de societe trop generaux pour rapprocher un domaine
+' d'une societe (mots entiers apres NormKey, minuscules).
+Private Const COMPANY_STOP_WORDS As String = "|les|des|and|the|sas|sarl|eurl|sasu|scop|snc|groupe|group|france|inc|ltd|llc|gmbh|corp|company|societe|ste|cie|international|services|service|solutions|consulting|conseil|holding|europe|associes|partners|"
+
+' Une fiche contact, et ce que la recherche propose pour elle.
+Private Type TContact
+    EntryID As String
+    StoreIdx As Long
+    Folder As String
+    Disp As String
+    First As String
+    Last As String
+    Company As String       ' v1.1 (F7-01) : societe de la fiche
+    Key1 As String          ' cle de nom : prenom + nom, mots tries
+    Key2 As String          ' idem avec le deuxieme prenom
+    Mail1 As String         ' adresses de la fiche a la lecture
+    Mail2 As String
+    Mail3 As String
+    MailEx As Boolean       ' au moins une adresse Exchange interne (EX)
+    Mobile As String
+    Business As String
+    Business2 As String
+    PhoneDigits As String   ' "|9 derniers chiffres|..." de tous les numeros
+    NeedMail As Boolean
+    NeedPhone As Boolean
+    Skip As String          ' motif d'exclusion ("" = fiche traitee)
+    New1 As String          ' adresses proposees (= fiche si rien ne change)
+    New2 As String
+    New3 As String
+    Dropped As String       ' adresses sorties des 3 emplacements (journal)
+    MailState As Long       ' 0 rien trouve, 1 a jour, 2 sur, 3 a trancher
+    Why As String           ' motif "a trancher"
+    NewMobile As String
+    NewBusiness As String
+    NewBusiness2 As String
+    PhoneSrc As String      ' "signature du mail du jj/mm/aaaa"
+    Cat As Long             ' 0 ignoree, 1 a jour, 2 rien trouve, 3 a completer, 4 a trancher
+    Outcome As Long         ' 0 -, 1 ecrite, 2 laissee, 3 echec, 4 modifiee entre-temps
+End Type
+
+' --- Fiches ---
+Private mC() As TContact
+Private mCand() As Object          ' par fiche : Dictionary adresse -> True (vue sous ce nom)
+Private mN As Long
+
+' --- Boites du profil ---
+Private mStoreIds() As String
+Private mStoreNames() As String
+Private mStoreOk() As Boolean
+Private mScan() As Boolean
+Private mStoreCount As Long
+
+' --- Index de recherche ---
+Private mKeyIdx As Object          ' cle de nom -> "|i|j|"
+Private mWatch As Object           ' adresse suivie -> True
+Private mPhoneKey As Object        ' cle de nom d'une fiche qui cherche un telephone
+Private mPhoneAddr As Object       ' adresse dont on garde les mails recus
+Private mCount As Object           ' adresse -> nombre de mails
+Private mLast As Object            ' adresse -> date du mail le plus recent
+Private mRefs As Object            ' adresse -> mails recus les plus recents
+Private mRecipRefs As Object       ' cle de nom -> mails ou ce nom est destinataire sans adresse
+Private mNameCache As Object       ' nom affiche -> cle de nom
+Private mExCache As Object         ' adresse Exchange (EX) -> SMTP
+Private mFolderIds As Collection   ' "boite|EntryID" des dossiers de mails a lire
+Private mOwnAddr As String         ' "|adresse|..." : les tiennes
+Private mOwnKeys As String         ' "|cle|..." : tes noms
+
+' --- Reglages ---
+Private mGeneric As String
+Private mSkipAddr() As String
+Private mMaxMails As Long
+Private mMaxMinutes As Long
+Private mProgressSec As Long
+Private mJournal As Boolean
+Private mContactSkip As String
+
+' --- Demande ---
+Private mWantMail As Boolean
+Private mWantPhone As Boolean
+Private mScopeLabel As String
+Private mWhereLabel As String
+
+' --- Avancement et compteurs ---
+Private mBusy As Boolean
+Private mColsFull As Boolean       ' colonnes A / Cc acceptees par Outlook
+Private mStopped As Boolean        ' delai maximum atteint
+Private mFirstSig As Boolean       ' 1er appel SenderSignaturePhones de la serie
+Private mT0 As Double
+Private mLastToast As Double
+Private mScanSec As Double
+Private mCurFolder As Long
+Private mTotFolders As Long
+Private mFoldersRead As Long
+Private mRows As Long
+Private mMailsOpened As Long
+Private mTableErrors As Long
+Private mReportPath As String
+Private mUndo As String            ' v1.1 (F7-13) : lignes d'annulation des fiches ecrites
+
+'=============================================================================
+' ModVersion - version REELLEMENT chargee dans le VBE.
+'=============================================================================
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
+
+'=============================================================================
+' ContactEnrichFromMail  (ruban Contacts > Avance)
+' "Completer les coordonnees des contacts".
+'=============================================================================
+Public Sub ContactEnrichFromMail()
+    Dim errNo As Long, errDesc As String, useSel As Boolean, nSel As Long, choice As Long
+    Dim heavyOn As Boolean
+    If mBusy Then
+        modUi.Inform T("Une recherche de coordonn~ees est d~ej~a en cours.", _
+                       "A contact details search is already running."), UiTitle()
+        Exit Sub
+    End If
+    mBusy = True
+    On Error GoTo ErrH
+
+    LoadSettings
+    ResetState
+    LoadStores
+    If mStoreCount = 0 Then GoTo Done
+
+    ' 1) Quels contacts, 2) quoi, 3) ou
+    nSel = CountSelection()
+    If Not AskWhichContacts(nSel, useSel) Then GoTo Done
+    If Not AskWhat() Then GoTo Done
+    If Not AskWhere() Then GoTo Done
+
+    ' 4) Fiches et index
+    If useSel Then
+        LoadSelectedContacts
+        mScopeLabel = T("s~election, ", "selection, ") & FmtInt(mN) & T(" fiche(s)", " card(s)")
+    Else
+        LoadAllContacts
+        mScopeLabel = T("tous les contacts, ", "all contacts, ") & FmtInt(mN) & T(" fiche(s)", " card(s)")
+    End If
+    BuildIndexes
+    If CountTargets() = 0 Then
+        ClassifyAll
+        WriteReport False
+        modUi.Inform T("Rien ~a chercher : aucune des fiches lues n'a besoin de ce qui est demand~e, " & _
+                       "ou elles n'ont pas de pr~enom et de nom.", _
+                       "Nothing to look for: none of the cards read needs what was asked, " & _
+                       "or they have no first and last name.") & vbCrLf & vbCrLf & _
+                     T("Rapport : ", "Report: ") & mReportPath, UiTitle()
+        GoTo Done
+    End If
+
+    ' 5) Dossiers de mails des boites retenues
+    CollectMailFolders
+    mTotFolders = mFolderIds.Count
+    If mTotFolders = 0 Then
+        modUi.Inform T("Aucun dossier de mails dans la ou les bo~ites choisies.", _
+                       "No mail folder in the chosen mailbox(es)."), UiTitle()
+        GoTo Done
+    End If
+
+    ' 6) Parcours dossier par dossier, en mode liste
+    modDebugLog.DInfo MOD_NAME, "Debut : fiches=" & mN & " cibles=" & CountTargets() & " dossiers=" & mTotFolders & _
+        " email=" & mWantMail & " tel=" & mWantPhone
+    mT0 = Timer
+    mLastToast = mT0
+    modUi.Toast T("Recherche des coordonn~ees lanc~ee", "Contact details search started") & vbLf & _
+                FmtInt(mTotFolders) & T(" dossiers ~a lire, Outlook occup~e", " folders to read, Outlook busy"), uiInfo, True
+    ' v1.1 (F7-08) : les DoEvents de la recherche ne laissent plus partir un
+    ' traitement lourd differe (reporte de 5 s en 5 s jusqu'a la fin).
+    modDefer.BeginHeavy
+    heavyOn = True
+    ScanAllFolders
+
+    ' 7) Destinataires sans adresse visible, 8) e-mails, 9) telephones
+    If mWantMail Then ResolveRecipientFallback
+    DecideAllMails
+    If mWantPhone Then FindAllPhones
+    mScanSec = Elapsed(mT0)
+    ClassifyAll
+    modDebugLog.DInfo MOD_NAME, "Recherche terminee : dossiers=" & mFoldersRead & " mails=" & mRows & _
+        " ouverts=" & mMailsOpened & " tables refusees=" & mTableErrors & " duree=" & CLng(mScanSec) & "s" & _
+        IIf(mStopped, " (ARRETEE : delai maximum)", "")
+
+    ' 10) Recapitulatif et choix
+    WriteReport False
+    choice = AskRecap()
+    If choice = 0 Then
+        modUi.Toast T("Aucune fiche modifi~ee", "No card changed") & vbLf & ReportFileName(), uiInfo, True
+        GoTo Done
+    End If
+    If choice < 0 Then GoTo Done
+
+    ' 11) Ecriture
+    ApplyAll (choice = 1)
+    WriteReport True
+    ' v1.1 (F7-13) : fichier d'annulation a cote du rapport.
+    modContactCommon.UndoSave modContactCommon.UndoPathFor(mReportPath), "ContactEnrich", mUndo
+    ShowFinal
+
+Done:
+    If heavyOn Then modDefer.EndHeavy
+    heavyOn = False
+    ReleaseState
+    mBusy = False
+    Exit Sub
+ErrH:
+    errNo = Err.Number
+    errDesc = Err.Description
+    On Error Resume Next
+    modDebugLog.DError MOD_NAME, "ContactEnrichFromMail err " & errNo & " - " & errDesc
+    If heavyOn Then modDefer.EndHeavy
+    heavyOn = False
+    ' Fiches deja ecrites avant l'erreur : restent annulables.
+    If Len(mUndo) > 0 And Len(mReportPath) > 0 Then
+        modContactCommon.UndoSave modContactCommon.UndoPathFor(mReportPath), "ContactEnrich", mUndo
+    End If
+    ReleaseState
+    mBusy = False
+    modUi.Fail T("Erreur : ", "Error: ") & errNo & " - " & errDesc, UiTitle()
+End Sub
+
+'=============================================================================
+' Reglages et etat
+'=============================================================================
+Private Sub LoadSettings()
+    Dim s As String
+    modConfig.EnsureLoaded
+    s = LCase$(Replace(modConfig.Cfg("ContactEnrichGenericDomains", ""), " ", ""))
+    If Len(s) = 0 Then s = DEFAULT_GENERIC
+    mGeneric = "|" & GenericLabels(s) & "|"
+    s = LCase$(Replace(modConfig.Cfg("ContactEnrichSkipAddresses", ""), " ", ""))
+    If Len(s) = 0 Then s = DEFAULT_SKIP_ADDR
+    mSkipAddr = Split(s, "|")
+    mMaxMails = modConfig.CfgL("ContactEnrichMaxMailsPerContact", 10)
+    If mMaxMails < 1 Then mMaxMails = 1
+    If mMaxMails > 50 Then mMaxMails = 50
+    mMaxMinutes = modConfig.CfgL("ContactEnrichMaxMinutes", 20)
+    If mMaxMinutes < 0 Then mMaxMinutes = 0
+    mProgressSec = modConfig.CfgL("ContactEnrichProgressSec", 30)
+    If mProgressSec < 0 Then mProgressSec = 0
+    If mProgressSec > 0 And mProgressSec < 10 Then mProgressSec = 10
+    mJournal = modConfig.CfgB("ContactEnrichJournal", True)
+    mContactSkip = modConfig.Cfg("ContactSkipFolders", "")
+    If Len(Trim$(mContactSkip)) = 0 Then mContactSkip = modContactCommon.ContactSkipDefault()
+End Sub
+
+' "gmail.com|@orange.fr|yahoo" -> "gmail|orange|yahoo" : IsGeneric compare
+' le nom principal du domaine, extension ecartee.
+Private Function GenericLabels(ByVal s As String) As String
+    Dim parts() As String, k As Long, p As Long, w As String, res As String
+    parts = Split(s, "|")
+    For k = LBound(parts) To UBound(parts)
+        w = parts(k)
+        If Left$(w, 1) = "@" Then w = Mid$(w, 2)
+        p = InStr(w, ".")
+        If p > 0 Then w = Left$(w, p - 1)
+        If Len(w) > 0 Then res = res & IIf(Len(res) > 0, "|", "") & w
+    Next k
+    GenericLabels = res
+End Function
+
+Private Sub ResetState()
+    mN = 0
+    ReDim mC(1 To 64)
+    ReDim mCand(1 To 64)
+    Set mKeyIdx = NewDict()
+    Set mWatch = NewDict()
+    Set mPhoneKey = NewDict()
+    Set mPhoneAddr = NewDict()
+    Set mCount = NewDict()
+    Set mLast = NewDict()
+    Set mRefs = NewDict()
+    Set mRecipRefs = NewDict()
+    Set mNameCache = NewDict()
+    Set mExCache = NewDict()
+    Set mFolderIds = New Collection
+    mWantMail = False
+    mWantPhone = False
+    mScopeLabel = ""
+    mWhereLabel = ""
+    mColsFull = True
+    mStopped = False
+    mFirstSig = True
+    mT0 = Timer
+    mLastToast = mT0
+    mScanSec = 0
+    mCurFolder = 0
+    mTotFolders = 0
+    mFoldersRead = 0
+    mRows = 0
+    mMailsOpened = 0
+    mTableErrors = 0
+    mReportPath = ""
+    mUndo = ""
+    BuildOwnIdentity
+End Sub
+
+Private Sub ReleaseState()
+    On Error Resume Next
+    Erase mC
+    Erase mCand
+    mN = 0
+    Set mKeyIdx = Nothing
+    Set mWatch = Nothing
+    Set mPhoneKey = Nothing
+    Set mPhoneAddr = Nothing
+    Set mCount = Nothing
+    Set mLast = Nothing
+    Set mRefs = Nothing
+    Set mRecipRefs = Nothing
+    Set mNameCache = Nothing
+    Set mExCache = Nothing
+    Set mFolderIds = Nothing
+    mUndo = ""
+    Err.Clear
+End Sub
+
+Private Function NewDict() As Object
+    Set NewDict = CreateObject("Scripting.Dictionary")
+End Function
+
+' Tes adresses (comptes du profil + utilisateur Exchange) et tes noms :
+' jamais retenus comme coordonnees d'un contact. v1.1 (F7-14) : calcul
+' partage avec modContactRelation (modContactCommon.OwnIdentity).
+Private Sub BuildOwnIdentity()
+    modContactCommon.OwnIdentity mOwnAddr, mOwnKeys
+End Sub
+
+'=============================================================================
+' Boites du profil
+'=============================================================================
+Private Sub LoadStores()
+    On Error Resume Next
+    Dim sts As Object, st As Object, i As Long, typ As Long
+    mStoreCount = 0
+    Set sts = Application.Session.Stores
+    mStoreCount = sts.Count
+    If mStoreCount < 1 Then
+        mStoreCount = 0
+        Exit Sub
+    End If
+    ReDim mStoreIds(1 To mStoreCount)
+    ReDim mStoreNames(1 To mStoreCount)
+    ReDim mStoreOk(1 To mStoreCount)
+    ReDim mScan(1 To mStoreCount)
+    For i = 1 To mStoreCount
+        Set st = Nothing
+        Set st = sts.Item(i)
+        If Not st Is Nothing Then
+            mStoreIds(i) = modContactCommon.SafeStr(st.StoreID)
+            mStoreNames(i) = modContactCommon.SafeStr(st.DisplayName)
+            typ = -1
+            typ = st.ExchangeStoreType
+            mStoreOk(i) = (Len(mStoreIds(i)) > 0 And typ <> STORE_PUBLIC)
+        End If
+    Next i
+    Err.Clear
+End Sub
+
+' Boite d'indice i, verifiee par son StoreID (l'ordre de Stores peut bouger).
+Private Function StoreAt(ByVal i As Long) As Object
+    On Error Resume Next
+    Dim sts As Object, st As Object, k As Long, n As Long
+    Set sts = Application.Session.Stores
+    Set st = sts.Item(i)
+    If Not st Is Nothing Then
+        If st.StoreID = mStoreIds(i) Then
+            Set StoreAt = st
+            Exit Function
+        End If
+    End If
+    n = sts.Count
+    For k = 1 To n
+        Set st = Nothing
+        Set st = sts.Item(k)
+        If Not st Is Nothing Then
+            If st.StoreID = mStoreIds(i) Then
+                Set StoreAt = st
+                Exit Function
+            End If
+        End If
+    Next k
+    Err.Clear
+End Function
+
+Private Function StoreIndexOf(ByVal storeId As String) As Long
+    Dim i As Long
+    For i = 1 To mStoreCount
+        If mStoreIds(i) = storeId Then
+            StoreIndexOf = i
+            Exit Function
+        End If
+    Next i
+End Function
+
+'=============================================================================
+' Les trois questions
+'=============================================================================
+Private Function AskWhichContacts(ByVal nSel As Long, ByRef useSel As Boolean) As Boolean
+    Dim ans As String, errLine As String, defAns As String
+    If nSel > 0 Then defAns = "2" Else defAns = "1"
+    Do
+        ans = Trim$(modUi.AskText(errLine & _
+              T("Quels contacts compl~eter ?", "Which contacts should be completed?") & vbCrLf & vbCrLf & _
+              "   1 - " & T("Tous les contacts (toutes les bo~ites)", "All contacts (all mailboxes)") & vbCrLf & _
+              "   2 - " & T("Les contacts s~electionn~es (", "The selected contacts (") & FmtInt(nSel) & ")" & vbCrLf & vbCrLf & _
+              T("Num~ero :", "Number:"), UiTitle(), defAns))
+        Select Case ans
+            Case ""
+                Exit Function
+            Case "1"
+                useSel = False
+                AskWhichContacts = True
+                Exit Function
+            Case "2"
+                If nSel > 0 Then
+                    useSel = True
+                    AskWhichContacts = True
+                    Exit Function
+                End If
+                errLine = T("Aucune fiche contact n'est s~electionn~ee.", "No contact card is selected.") & vbCrLf & vbCrLf
+            Case Else
+                errLine = T("R~eponse non comprise : ", "Answer not understood: ") & Shorten(ans, 20) & vbCrLf & vbCrLf
+        End Select
+    Loop
+End Function
+
+Private Function AskWhat() As Boolean
+    Dim ans As String, errLine As String, defAns As String
+    defAns = GetSetting(REG_APP, REG_SECTION, "What", "3")
+    If defAns <> "1" And defAns <> "2" And defAns <> "3" Then defAns = "3"
+    Do
+        ans = Trim$(modUi.AskText(errLine & _
+              T("Que chercher ?", "What should be looked for?") & vbCrLf & vbCrLf & _
+              "   1 - " & T("E-mail", "E-mail") & vbCrLf & _
+              "   2 - " & T("T~el~ephone", "Phone") & vbCrLf & _
+              "   3 - " & T("E-mail et t~el~ephone", "E-mail and phone") & vbCrLf & vbCrLf & _
+              T("Num~ero :", "Number:"), UiTitle(), defAns))
+        Select Case ans
+            Case ""
+                Exit Function
+            Case "1", "2", "3"
+                mWantMail = (ans <> "2")
+                mWantPhone = (ans <> "1")
+                SaveSetting REG_APP, REG_SECTION, "What", ans
+                AskWhat = True
+                Exit Function
+            Case Else
+                errLine = T("R~eponse non comprise : ", "Answer not understood: ") & Shorten(ans, 20) & vbCrLf & vbCrLf
+        End Select
+    Loop
+End Function
+
+Private Function AskWhere() As Boolean
+    Dim ans As String, errLine As String, defAns As String, lst As String, saved As String
+    Dim map() As Long, n As Long, i As Long, k As Long, curIdx As Long, cur As Object
+    ReDim map(0 To mStoreCount)
+    On Error Resume Next
+    Set cur = modStoreContext.CurrentStore()
+    If Not cur Is Nothing Then curIdx = StoreIndexOf(cur.StoreID)
+    Err.Clear
+    On Error GoTo 0
+    saved = GetSetting(REG_APP, REG_SECTION, "Where", "")
+    For i = 1 To mStoreCount
+        If mStoreOk(i) Then
+            n = n + 1
+            map(n) = i
+            lst = lst & "   " & n & " - " & AnsiOnly(mStoreNames(i))
+            If i = curIdx Then lst = lst & "   " & T("[bo~ite courante]", "[current mailbox]")
+            lst = lst & vbCrLf
+            If Len(defAns) = 0 And Len(saved) > 0 And saved <> "*" Then
+                If StrComp(saved, mStoreNames(i), vbTextCompare) = 0 Then defAns = CStr(n)
+            End If
+        End If
+    Next i
+    If n = 0 Then Exit Function
+    If saved = "*" Then defAns = "0"
+    If Len(defAns) = 0 Then
+        For k = 1 To n
+            If map(k) = curIdx Then defAns = CStr(k)
+        Next k
+    End If
+    If Len(defAns) = 0 Then defAns = "1"
+    Do
+        ans = Trim$(modUi.AskText(errLine & _
+              T("O~U chercher ?", "Where should the search run?") & vbCrLf & vbCrLf & _
+              "   0 - " & T("Toutes les bo~ites", "All mailboxes") & vbCrLf & lst & vbCrLf & _
+              T("Num~ero :", "Number:"), UiTitle(), defAns))
+        If Len(ans) = 0 Then Exit Function
+        k = -1
+        If ans Like "#" Or ans Like "##" Then k = CLng(ans)
+        If k = 0 Then
+            For i = 1 To n
+                mScan(map(i)) = True
+            Next i
+            SaveSetting REG_APP, REG_SECTION, "Where", "*"
+            mWhereLabel = T("toutes les bo~ites (", "all mailboxes (") & n & ")"
+            AskWhere = True
+            Exit Function
+        ElseIf k >= 1 And k <= n Then
+            mScan(map(k)) = True
+            SaveSetting REG_APP, REG_SECTION, "Where", mStoreNames(map(k))
+            mWhereLabel = mStoreNames(map(k))
+            AskWhere = True
+            Exit Function
+        End If
+        errLine = T("R~eponse non comprise : ", "Answer not understood: ") & Shorten(ans, 20) & vbCrLf & vbCrLf
+    Loop
+End Function
+
+'=============================================================================
+' Fiches contact : selection ou toutes
+'=============================================================================
+' Fiches de la selection de l'explorateur, sinon la fiche ouverte.
+Private Function CountSelection() As Long
+    On Error Resume Next
+    Dim sel As Object, itm As Object, insp As Object, i As Long, n As Long, tot As Long
+    Set sel = Application.ActiveExplorer.Selection
+    If Not sel Is Nothing Then
+        tot = sel.Count
+        For i = 1 To tot
+            Set itm = Nothing
+            Set itm = sel.Item(i)
+            If TypeName(itm) = "ContactItem" Then n = n + 1
+            If (i Mod 200) = 0 Then DoEvents
+        Next i
+    End If
+    Set itm = Nothing
+    If n = 0 Then
+        Set insp = Application.ActiveInspector
+        If Not insp Is Nothing Then
+            If TypeName(insp.CurrentItem) = "ContactItem" Then n = 1
+        End If
+    End If
+    Err.Clear
+    CountSelection = n
+End Function
+
+Private Sub LoadSelectedContacts()
+    On Error Resume Next
+    Dim sel As Object, itm As Object, insp As Object, i As Long, n As Long, tot As Long
+    Set sel = Application.ActiveExplorer.Selection
+    If Not sel Is Nothing Then
+        tot = sel.Count
+        For i = 1 To tot
+            Set itm = Nothing
+            Set itm = sel.Item(i)
+            If TypeName(itm) = "ContactItem" Then
+                AddContactFromItem itm
+                n = n + 1
+            End If
+            If (i Mod 100) = 0 Then DoEvents
+        Next i
+    End If
+    Set itm = Nothing
+    If n = 0 Then
+        Set insp = Application.ActiveInspector
+        If Not insp Is Nothing Then
+            If TypeName(insp.CurrentItem) = "ContactItem" Then AddContactFromItem insp.CurrentItem
+        End If
+    End If
+    Err.Clear
+End Sub
+
+Private Sub AddContactFromItem(ByVal itm As Object)
+    On Error Resume Next
+    Dim fld As Object, sid As String, path As String
+    Set fld = itm.Parent
+    sid = modContactCommon.SafeStr(fld.StoreID)
+    path = modContactCommon.SafeStr(fld.FolderPath)
+    AddContact itm, StoreIndexOf(sid), path
+    Err.Clear
+End Sub
+
+Private Sub LoadAllContacts()
+    On Error Resume Next
+    Dim i As Long, st As Object
+    For i = 1 To mStoreCount
+        If mStoreOk(i) Then
+            Set st = Nothing
+            Set st = StoreAt(i)
+            If Not st Is Nothing Then LoadContactTree st.GetRootFolder, i
+        End If
+    Next i
+    Err.Clear
+End Sub
+
+Private Sub LoadContactTree(ByVal fld As Object, ByVal sIdx As Long)
+    On Error Resume Next
+    Dim itemType As Long, itms As Object, itm As Object, path As String, cnt As Long
+    Dim subs As Object, child As Object
+    If fld Is Nothing Then Exit Sub
+    itemType = -1
+    itemType = fld.DefaultItemType
+    If itemType = OL_CONTACT_ITEM Then
+        If Not modContactCommon.IsSkippedFolder(fld, mContactSkip) Then
+            path = modContactCommon.SafeStr(fld.FolderPath)
+            Set itms = fld.Items
+            Set itm = Nothing
+            Set itm = itms.GetFirst
+            Do While Not itm Is Nothing
+                If TypeName(itm) = "ContactItem" Then AddContact itm, sIdx, path
+                cnt = cnt + 1
+                If (cnt Mod 200) = 0 Then DoEvents
+                Set itm = Nothing
+                Set itm = itms.GetNext
+            Loop
+            Set itms = Nothing
+        End If
+    End If
+    ' Sous-dossiers illisibles : sortir (sous On Error Resume Next, un For Each
+    ' sur Nothing executerait le corps une fois -> recursion sans fin).
+    Set subs = fld.Folders
+    If subs Is Nothing Then
+        Err.Clear
+        Exit Sub
+    End If
+    For Each child In subs
+        If Not child Is Nothing Then LoadContactTree child, sIdx
+    Next child
+    Err.Clear
+End Sub
+
+Private Sub AddContact(ByVal ct As Object, ByVal sIdx As Long, ByVal folderPath As String)
+    On Error Resume Next
+    Dim midName As String, k As Long, adr As String, typ As String, ub As Long
+    mN = mN + 1
+    ub = UBound(mC)
+    If mN > ub Then
+        ReDim Preserve mC(1 To ub * 2)
+        ReDim Preserve mCand(1 To ub * 2)
+    End If
+    With mC(mN)
+        .EntryID = modContactCommon.SafeStr(ct.EntryID)
+        .StoreIdx = sIdx
+        .Folder = folderPath
+        .First = Trim$(modContactCommon.SafeStr(ct.FirstName))
+        .Last = Trim$(modContactCommon.SafeStr(ct.LastName))
+        .Company = Trim$(modContactCommon.SafeStr(ct.CompanyName))
+        midName = Trim$(modContactCommon.SafeStr(ct.MiddleName))
+        .Disp = Trim$(modContactCommon.SafeStr(ct.FullName))
+        If Len(.Disp) = 0 Then .Disp = Trim$(.First & " " & .Last)
+        If Len(.Disp) = 0 Then .Disp = Trim$(modContactCommon.SafeStr(ct.CompanyName))
+        If Len(.Disp) = 0 Then .Disp = "(?)"
+        .Key1 = NameKeyOf(.First & " " & .Last)
+        .Key2 = ""
+        If Len(midName) > 0 Then .Key2 = NameKeyOf(.First & " " & midName & " " & .Last)
+        If .Key2 = .Key1 Then .Key2 = ""
+        For k = 1 To 3
+            adr = Trim$(modContactCommon.SafeStr(CallByName(ct, "Email" & k & "Address", VbGet)))
+            typ = UCase$(Trim$(modContactCommon.SafeStr(CallByName(ct, "Email" & k & "AddressType", VbGet))))
+            If typ = "EX" And Len(adr) > 0 Then .MailEx = True
+            Select Case k
+                Case 1: .Mail1 = adr
+                Case 2: .Mail2 = adr
+                Case 3: .Mail3 = adr
+            End Select
+        Next k
+        .New1 = .Mail1
+        .New2 = .Mail2
+        .New3 = .Mail3
+        .Mobile = Trim$(modContactCommon.SafeStr(ct.MobileTelephoneNumber))
+        .Business = Trim$(modContactCommon.SafeStr(ct.BusinessTelephoneNumber))
+        .Business2 = Trim$(modContactCommon.SafeStr(ct.Business2TelephoneNumber))
+        .PhoneDigits = PhoneDigitsOf(ct)
+        If sIdx < 1 Then
+            .Skip = T("bo~ite introuvable", "mailbox not found")
+        ElseIf Len(.First) = 0 Or Len(.Last) = 0 Or Len(.Key1) = 0 Then
+            .Skip = T("pas de pr~enom ou pas de nom", "no first name or no last name")
+        ElseIf InStr(mOwnKeys, "|" & .Key1 & "|") > 0 Then
+            .Skip = T("ta propre fiche", "your own card")
+        Else
+            .NeedMail = mWantMail And Not .MailEx
+            .NeedPhone = mWantPhone And (Len(.Mobile) = 0 Or Len(.Business) = 0)
+            If mWantMail And .MailEx And Not .NeedPhone Then
+                .Skip = T("adresse Exchange interne : e-mail non trait~e", "internal Exchange address: e-mail not processed")
+            End If
+        End If
+    End With
+    Err.Clear
+End Sub
+
+' "|9 derniers chiffres|..." de tous les numeros de la fiche.
+Private Function PhoneDigitsOf(ByVal ct As Object) As String
+    On Error Resume Next
+    Dim props As Variant, i As Long, res As String, tl As String
+    props = Array("MobileTelephoneNumber", "BusinessTelephoneNumber", "Business2TelephoneNumber", _
+                  "HomeTelephoneNumber", "Home2TelephoneNumber", "CompanyMainTelephoneNumber", _
+                  "OtherTelephoneNumber", "PrimaryTelephoneNumber", "CarTelephoneNumber", _
+                  "AssistantTelephoneNumber", "CallbackTelephoneNumber", "RadioTelephoneNumber")
+    res = "|"
+    For i = LBound(props) To UBound(props)
+        tl = PhoneTail(modContactCommon.SafeStr(CallByName(ct, CStr(props(i)), VbGet)))
+        If Len(tl) > 0 Then res = res & tl & "|"
+    Next i
+    PhoneDigitsOf = res
+    Err.Clear
+End Function
+
+' 9 derniers chiffres (06 12 34 56 78 = +33 6 12 34 56 78) ; "" si illisible.
+Private Function PhoneTail(ByVal s As String) As String
+    ' v1.1 (F7-14) : delegation modContactCommon (helper partage).
+    PhoneTail = modContactCommon.PhoneTail(s)
+End Function
+
+Private Function MailSlot(ByVal i As Long, ByVal k As Long) As String
+    Select Case k
+        Case 1: MailSlot = mC(i).Mail1
+        Case 2: MailSlot = mC(i).Mail2
+        Case 3: MailSlot = mC(i).Mail3
+    End Select
+End Function
+
+Private Function NewSlot(ByVal i As Long, ByVal k As Long) As String
+    Select Case k
+        Case 1: NewSlot = mC(i).New1
+        Case 2: NewSlot = mC(i).New2
+        Case 3: NewSlot = mC(i).New3
+    End Select
+End Function
+
+'=============================================================================
+' Index : noms et adresses a guetter pendant le parcours
+'=============================================================================
+Private Sub BuildIndexes()
+    Dim i As Long, k As Long, adr As String
+    For i = 1 To mN
+        If Len(mC(i).Skip) = 0 And (mC(i).NeedMail Or mC(i).NeedPhone) Then
+            AddIdx mKeyIdx, mC(i).Key1, i
+            If Len(mC(i).Key2) > 0 Then AddIdx mKeyIdx, mC(i).Key2, i
+            If mC(i).NeedPhone Then
+                mPhoneKey(mC(i).Key1) = True
+                If Len(mC(i).Key2) > 0 Then mPhoneKey(mC(i).Key2) = True
+            End If
+            For k = 1 To 3
+                adr = LCase$(Trim$(MailSlot(i, k)))
+                If Len(adr) > 0 Then
+                    mWatch(adr) = True
+                    If mC(i).NeedPhone Then mPhoneAddr(adr) = True
+                End If
+            Next k
+        End If
+    Next i
+End Sub
+
+Private Sub AddIdx(ByVal d As Object, ByVal k As String, ByVal i As Long)
+    If Len(k) = 0 Then Exit Sub
+    If d.Exists(k) Then
+        d(k) = d(k) & CStr(i) & "|"
+    Else
+        d.Add k, "|" & CStr(i) & "|"
+    End If
+End Sub
+
+Private Function CountTargets() As Long
+    Dim i As Long, n As Long
+    For i = 1 To mN
+        If Len(mC(i).Skip) = 0 And (mC(i).NeedMail Or mC(i).NeedPhone) Then n = n + 1
+    Next i
+    CountTargets = n
+End Function
+
+'=============================================================================
+' Dossiers de mails des boites retenues (hors dossiers systeme et masques)
+'=============================================================================
+Private Sub CollectMailFolders()
+    On Error Resume Next
+    Dim i As Long, st As Object
+    For i = 1 To mStoreCount
+        If mScan(i) Then
+            Set st = Nothing
+            Set st = StoreAt(i)
+            If Not st Is Nothing Then WalkMail st.GetRootFolder, i, SpecialFolderIds(st)
+        End If
+    Next i
+    Err.Clear
+End Sub
+
+Private Sub WalkMail(ByVal fld As Object, ByVal sIdx As Long, ByVal skipIds As String)
+    On Error Resume Next
+    Dim fid As String, itemType As Long, subs As Object, child As Object
+    fid = modContactCommon.SafeStr(fld.EntryID)
+    If Len(fid) = 0 Then Exit Sub
+    If InStr(skipIds, "|" & fid & "|") > 0 Then Exit Sub
+    If modContactCommon.IsHiddenFolder(fld) Then Exit Sub
+    itemType = -1
+    itemType = fld.DefaultItemType
+    If itemType = OL_MAIL_ITEM Then mFolderIds.Add CStr(sIdx) & "|" & fid
+    Set subs = fld.Folders
+    If subs Is Nothing Then
+        Err.Clear
+        Exit Sub
+    End If
+    For Each child In subs
+        If Not child Is Nothing Then WalkMail child, sIdx, skipIds
+    Next child
+    Err.Clear
+End Sub
+
+' Elements supprimes, Boite d'envoi, Brouillons, Conflits, Problemes de
+' synchronisation (+ echecs locaux / serveur), Courrier indesirable, RSS.
+Private Function SpecialFolderIds(ByVal st As Object) As String
+    On Error Resume Next
+    Dim ids As Variant, k As Long, fld As Object, res As String
+    ids = Array(3, 4, 16, 19, 20, 21, 22, 23, 25)
+    res = "|"
+    For k = LBound(ids) To UBound(ids)
+        Set fld = Nothing
+        Set fld = st.GetDefaultFolder(CLng(ids(k)))
+        If Not fld Is Nothing Then res = res & modContactCommon.SafeStr(fld.EntryID) & "|"
+        Err.Clear
+    Next k
+    SpecialFolderIds = res
+End Function
+
+'=============================================================================
+' Parcours : chaque dossier lu en mode LISTE (Table Outlook), aucun mail ouvert
+'=============================================================================
+Private Sub ScanAllFolders()
+    On Error Resume Next
+    Dim f As Variant, parts() As String, fld As Object, sIdx As Long, ns As Object
+    Set ns = Application.Session
+    mCurFolder = 0
+    For Each f In mFolderIds
+        If TimeUp() Then
+            mStopped = True
+            Exit For
+        End If
+        mCurFolder = mCurFolder + 1
+        parts = Split(CStr(f), "|")
+        If UBound(parts) >= 1 Then
+            sIdx = CLng(parts(0))
+            Set fld = Nothing
+            Err.Clear
+            Set fld = ns.GetFolderFromID(parts(1), mStoreIds(sIdx))
+            If Err.Number = 0 And Not fld Is Nothing Then ScanFolder fld, sIdx
+            Err.Clear
+        End If
+        mFoldersRead = mFoldersRead + 1
+        DoEvents
+        MaybeProgress
+    Next f
+    Set fld = Nothing
+End Sub
+
+Private Sub ScanFolder(ByVal fld As Object, ByVal sIdx As Long)
+    On Error Resume Next
+    Dim tbl As Object, rw As Object, v As Variant, n As Long
+    Set tbl = Nothing
+    Err.Clear
+    Set tbl = fld.GetTable()
+    If Err.Number <> 0 Or tbl Is Nothing Then
+        mTableErrors = mTableErrors + 1
+        If mTableErrors <= 3 Then
+            modDebugLog.DError MOD_NAME, "Table refusee (" & Err.Number & ") : " & modContactCommon.SafeStr(fld.FolderPath)
+        End If
+        Err.Clear
+        Exit Sub
+    End If
+    tbl.Columns.RemoveAll
+    AddBaseColumns tbl
+    If mColsFull And Err.Number = 0 Then
+        tbl.Columns.Add PR_DISPLAY_TO
+        tbl.Columns.Add PR_DISPLAY_CC
+        If Err.Number <> 0 Then
+            ' Repli : sans les colonnes A / Cc, les destinataires sont ignores.
+            modDebugLog.DError MOD_NAME, "Colonnes A/Cc refusees (" & Err.Number & ") : destinataires ignores"
+            Err.Clear
+            mColsFull = False
+            tbl.Columns.RemoveAll
+            AddBaseColumns tbl
+        End If
+    End If
+    If Err.Number <> 0 Then
+        mTableErrors = mTableErrors + 1
+        If mTableErrors <= 3 Then
+            modDebugLog.DError MOD_NAME, "Colonnes refusees (" & Err.Number & " - " & Err.Description & ") : " & _
+                modContactCommon.SafeStr(fld.FolderPath)
+        End If
+        Err.Clear
+        Exit Sub
+    End If
+    Do Until tbl.EndOfTable
+        Set rw = Nothing
+        Set rw = tbl.GetNextRow
+        If rw Is Nothing Then Exit Do
+        v = Empty
+        v = rw.GetValues()
+        If IsArray(v) Then ProcessRow v, sIdx
+        Err.Clear
+        n = n + 1
+        If (n Mod 250) = 0 Then
+            DoEvents
+            If (n Mod 2000) = 0 Then
+                MaybeProgress
+                If TimeUp() Then
+                    mStopped = True
+                    Exit Do
+                End If
+            End If
+        End If
+    Loop
+    Set rw = Nothing
+    Set tbl = Nothing
+End Sub
+
+' Pas de gestionnaire d'erreur : une colonne refusee remonte a ScanFolder.
+Private Sub AddBaseColumns(ByVal tbl As Object)
+    tbl.Columns.Add "EntryID"
+    tbl.Columns.Add "MessageClass"
+    tbl.Columns.Add "ReceivedTime"
+    tbl.Columns.Add PR_SENT_REP_NAME
+    tbl.Columns.Add PR_SENT_REP_SMTP
+    tbl.Columns.Add PR_SENT_REP_EMAIL
+    tbl.Columns.Add PR_SENDER_SMTP
+    tbl.Columns.Add "SenderName"
+End Sub
+
+' Une ligne de table = un mail (ou une invitation). Expediteur reconnu par
+' son nom ou son adresse ; destinataires reconnus par leur nom.
+Private Sub ProcessRow(ByRef v As Variant, ByVal sIdx As Long)
+    Dim b As Long, cls As String, plain As Boolean, dt As Date, eid As String
+    Dim nm As String, smtp As String, raw As String, key As String
+    Dim hitKey As Boolean, hitAddr As Boolean, lst As String, cc As String
+    b = LBound(v)
+    cls = LCase$(VStr(v(b + COL_CLASS)))
+    If Left$(cls, 8) = "ipm.note" Then
+        ' Mail lisible (signature) : simple ou signe ; pas chiffre.
+        plain = (cls = "ipm.note" Or Left$(cls, 30) = "ipm.note.smime.multipartsigned")
+    ElseIf Left$(cls, 20) = "ipm.schedule.meeting" Then
+        plain = False
+    Else
+        Exit Sub
+    End If
+    mRows = mRows + 1
+    dt = VDate(v(b + COL_DATE))
+    eid = VStr(v(b + COL_ENTRYID))
+
+    ' --- Expediteur ---
+    nm = VStr(v(b + COL_REPNAME))
+    If Len(nm) = 0 Then nm = VStr(v(b + COL_SNDNAME))
+    smtp = LCase$(Trim$(VStr(v(b + COL_REPSMTP))))
+    raw = LCase$(Trim$(VStr(v(b + COL_REPEMAIL))))
+    If InStr(smtp, "@") = 0 Then
+        smtp = ""
+        If InStr(raw, "@") > 0 And Left$(raw, 1) <> "/" Then
+            smtp = raw
+        Else
+            smtp = LCase$(Trim$(VStr(v(b + COL_SNDSMTP))))
+            If InStr(smtp, "@") = 0 Then smtp = ""
+        End If
+    End If
+    key = NameKeyCached(nm)
+    If Len(key) > 0 Then hitKey = mKeyIdx.Exists(key)
+    If Len(smtp) > 0 Then hitAddr = mWatch.Exists(smtp)
+    If Not hitAddr And Len(raw) > 0 Then hitAddr = mWatch.Exists(raw)
+    If hitKey Or hitAddr Then
+        If Len(smtp) = 0 And Left$(raw, 1) = "/" Then smtp = ResolveEx(raw)
+        ' Fiche enregistree avec une adresse Exchange (EX) : suivie telle quelle.
+        If Len(raw) > 0 And raw <> smtp Then
+            If mWatch.Exists(raw) Then
+                NoteSeen raw, dt
+                If plain And mPhoneAddr.Exists(raw) Then AddRef mRefs, raw, dt, eid, sIdx, mMaxMails
+            End If
+        End If
+        If Len(smtp) > 0 Then
+            If Not IsOwnAddr(smtp) And Not IsSkippedAddr(smtp) Then
+                NoteSeen smtp, dt
+                If hitKey Then AddCandidate key, smtp
+                If plain And mPhoneAddr.Exists(smtp) Then AddRef mRefs, smtp, dt, eid, sIdx, mMaxMails
+            End If
+        End If
+    End If
+
+    ' --- Destinataires (recherche d'e-mail uniquement) ---
+    If mWantMail And mColsFull Then
+        lst = VStr(v(b + COL_TO))
+        cc = VStr(v(b + COL_CC))
+        If Len(cc) > 0 Then lst = lst & ";" & cc
+        If Len(lst) > 0 Then ScanRecipients lst, dt, eid, sIdx
+    End If
+End Sub
+
+' "Jean Dupont; Dupont, Marie (marie.dupont@x.fr); 'paul@y.fr'" : un nom
+' reconnu avec son adresse visible devient candidat ; sans adresse visible,
+' le mail est note pour le repli (ResolveRecipientFallback).
+Private Sub ScanRecipients(ByVal lst As String, ByVal dt As Date, ByVal eid As String, ByVal sIdx As Long)
+    Dim parts() As String, k As Long, p As String, key As String, adr As String
+    parts = Split(lst, ";")
+    For k = LBound(parts) To UBound(parts)
+        p = Trim$(parts(k))
+        If Len(p) > 2 Then
+            key = NameKeyCached(p)
+            If Len(key) > 0 Then
+                If mKeyIdx.Exists(key) Then
+                    adr = ""
+                    If InStr(p, "@") > 0 Then adr = MailIn(p)
+                    If Len(adr) > 0 Then
+                        If Not IsOwnAddr(adr) And Not IsSkippedAddr(adr) Then
+                            NoteSeen adr, dt
+                            AddCandidate key, adr
+                        End If
+                    Else
+                        AddRef mRecipRefs, key, dt, eid, sIdx, 3
+                    End If
+                End If
+            End If
+        End If
+    Next k
+End Sub
+
+' Adresse vue sous le nom des fiches de cette cle : candidate pour chacune,
+' puis suivie (mails comptes meme sous un autre nom affiche).
+Private Sub AddCandidate(ByVal key As String, ByVal adr As String)
+    Dim parts() As String, k As Long, i As Long
+    parts = Split(mKeyIdx(key), "|")
+    For k = LBound(parts) To UBound(parts)
+        If Len(parts(k)) > 0 Then
+            i = CLng(parts(k))
+            If mCand(i) Is Nothing Then Set mCand(i) = NewDict()
+            If Not mCand(i).Exists(adr) Then mCand(i).Add adr, True
+        End If
+    Next k
+    mWatch(adr) = True
+    If mPhoneKey.Exists(key) Then mPhoneAddr(adr) = True
+End Sub
+
+Private Sub NoteSeen(ByVal adr As String, ByVal dt As Date)
+    If mCount.Exists(adr) Then
+        mCount(adr) = mCount(adr) + 1
+    Else
+        mCount.Add adr, 1
+    End If
+    If dt > 0 Then
+        If mLast.Exists(adr) Then
+            If dt > mLast(adr) Then mLast(adr) = dt
+        Else
+            mLast.Add adr, dt
+        End If
+    End If
+End Sub
+
+' Garde les "cap" mails les plus recents par cle : "date<TAB>EntryID<TAB>boite"
+' separes par Chr(30), du plus recent au plus ancien.
+Private Sub AddRef(ByVal d As Object, ByVal k As String, ByVal dt As Date, ByVal eid As String, _
+                   ByVal sIdx As Long, ByVal cap As Long)
+    Dim ref As String, cur As String, arr() As String, n As Long, i As Long, stamp As String
+    Dim out As String, cnt As Long, placed As Boolean
+    If Len(eid) = 0 Or Len(k) = 0 Then Exit Sub
+    stamp = Format$(dt, "yyyymmddhhnnss")
+    ref = stamp & Chr$(9) & eid & Chr$(9) & CStr(sIdx)
+    If Not d.Exists(k) Then
+        d.Add k, ref
+        Exit Sub
+    End If
+    cur = d(k)
+    If InStr(cur, Chr$(9) & eid & Chr$(9)) > 0 Then Exit Sub
+    arr = Split(cur, Chr$(30))
+    n = UBound(arr) + 1
+    If n >= cap Then
+        If stamp <= Left$(arr(n - 1), 14) Then Exit Sub
+    End If
+    For i = 0 To n - 1
+        If Not placed Then
+            If stamp > Left$(arr(i), 14) Then
+                out = out & IIf(cnt > 0, Chr$(30), "") & ref
+                cnt = cnt + 1
+                placed = True
+            End If
+        End If
+        If cnt >= cap Then Exit For
+        out = out & IIf(cnt > 0, Chr$(30), "") & arr(i)
+        cnt = cnt + 1
+        If cnt >= cap Then Exit For
+    Next i
+    If Not placed And cnt < cap Then out = out & IIf(cnt > 0, Chr$(30), "") & ref
+    d(k) = out
+End Sub
+
+' Adresse Exchange (EX) d'un expediteur interne -> SMTP (cache).
+Private Function ResolveEx(ByVal raw As String) As String
+    On Error Resume Next
+    Dim rcp As Object, ex As Object, s As String
+    If mExCache.Exists(raw) Then
+        ResolveEx = mExCache(raw)
+        Exit Function
+    End If
+    Set rcp = Application.Session.CreateRecipient(raw)
+    If Not rcp Is Nothing Then
+        rcp.Resolve
+        If rcp.Resolved Then
+            Set ex = rcp.AddressEntry.GetExchangeUser
+            If Not ex Is Nothing Then s = LCase$(Trim$(modContactCommon.SafeStr(ex.PrimarySmtpAddress)))
+        End If
+    End If
+    If InStr(s, "@") = 0 Then s = ""
+    mExCache(raw) = s
+    ResolveEx = s
+    Err.Clear
+End Function
+
+'=============================================================================
+' Repli : fiche sans aucun e-mail et sans candidat -> mails ou son nom est
+' destinataire sans adresse visible ; on en ouvre 3 au plus.
+'=============================================================================
+Private Sub ResolveRecipientFallback()
+    Dim i As Long
+    For i = 1 To mN
+        If mC(i).NeedMail And Len(mC(i).Skip) = 0 Then
+            If Len(mC(i).Mail1 & mC(i).Mail2 & mC(i).Mail3) = 0 And CandCount(i) = 0 Then
+                If TimeUp() Then
+                    mStopped = True
+                    Exit For
+                End If
+                FallbackForKey mC(i).Key1
+                If CandCount(i) = 0 And Len(mC(i).Key2) > 0 Then FallbackForKey mC(i).Key2
+            End If
+        End If
+    Next i
+End Sub
+
+Private Sub FallbackForKey(ByVal key As String)
+    On Error Resume Next
+    Dim refs() As String, parts() As String, k As Long, r As Long, nR As Long
+    Dim itm As Object, rcps As Object, rcp As Object, adr As String, dt As Date
+    If Not mRecipRefs.Exists(key) Then Exit Sub
+    refs = Split(mRecipRefs(key), Chr$(30))
+    For k = LBound(refs) To UBound(refs)
+        parts = Split(refs(k), Chr$(9))
+        If UBound(parts) >= 2 Then
+            Set itm = Nothing
+            Err.Clear
+            Set itm = Application.Session.GetItemFromID(parts(1), mStoreIds(CLng(parts(2))))
+            mMailsOpened = mMailsOpened + 1
+            If Err.Number = 0 And Not itm Is Nothing Then
+                dt = StampDate(parts(0))
+                Set rcps = Nothing
+                Set rcps = itm.Recipients
+                nR = 0
+                If Not rcps Is Nothing Then nR = rcps.Count
+                For r = 1 To nR
+                    Set rcp = Nothing
+                    Set rcp = rcps.Item(r)
+                    If Not rcp Is Nothing Then
+                        If NameKeyOf(modContactCommon.SafeStr(rcp.Name)) = key Then
+                            adr = RecipientSmtp(rcp)
+                            If Len(adr) > 0 Then
+                                If Not IsOwnAddr(adr) And Not IsSkippedAddr(adr) Then
+                                    NoteSeen adr, dt
+                                    AddCandidate key, adr
+                                End If
+                            End If
+                        End If
+                    End If
+                Next r
+            End If
+            Err.Clear
+            DoEvents
+        End If
+    Next k
+    Set rcp = Nothing
+    Set rcps = Nothing
+    Set itm = Nothing
+End Sub
+
+' SMTP d'un destinataire (listes de diffusion ecartees).
+Private Function RecipientSmtp(ByVal rcp As Object) As String
+    On Error Resume Next
+    Dim s As String, ae As Object, ex As Object, typ As Long
+    s = LCase$(Trim$(modContactCommon.SafeStr(rcp.PropertyAccessor.GetProperty(PR_RECIP_SMTP))))
+    Err.Clear
+    If InStr(s, "@") = 0 Then
+        s = ""
+        Set ae = rcp.AddressEntry
+        If Not ae Is Nothing Then
+            typ = -1
+            typ = ae.AddressEntryUserType
+            If typ = 0 Or typ = 5 Then              ' utilisateur Exchange (local / distant)
+                Set ex = ae.GetExchangeUser
+                If Not ex Is Nothing Then s = LCase$(Trim$(modContactCommon.SafeStr(ex.PrimarySmtpAddress)))
+            ElseIf typ <> 1 Then                    ' 1 = liste de diffusion Exchange
+                s = LCase$(Trim$(modContactCommon.SafeStr(ae.Address)))
+            End If
+        End If
+        If InStr(s, "@") = 0 Then s = LCase$(Trim$(modContactCommon.SafeStr(rcp.Address)))
+        If InStr(s, "@") = 0 Then s = ""
+    End If
+    RecipientSmtp = s
+    Err.Clear
+End Function
+
+Private Function CandCount(ByVal i As Long) As Long
+    If Not mCand(i) Is Nothing Then CandCount = mCand(i).Count
+End Function
+
+'=============================================================================
+' E-mail : regle par defaut
+'   - une NOUVELLE adresse pro plus recemment vue que les adresses pro de la
+'     fiche passe en e-mail 1 ;
+'   - puis les adresses de la fiche, dans leur ordre (jamais permutees) ;
+'   - puis la plus recente adresse grand public vue (secondaire) ;
+'   - au-dela de 3 : notee dans le journal et le rapport ;
+'   - rien de nouveau dans les 3 emplacements : fiche inchangee.
+'=============================================================================
+Private Sub DecideAllMails()
+    Dim i As Long
+    For i = 1 To mN
+        If mC(i).NeedMail And Len(mC(i).Skip) = 0 Then DecideMail i
+    Next i
+End Sub
+
+Private Sub DecideMail(ByVal i As Long)
+    Dim exO(1 To 3) As String, exL(1 To 3) As String, s As Long
+    Dim best As String, bestD As Date, found As Boolean, bestNew As Boolean, cardPro As Boolean
+    Dim gen As String, genD As Date, genFound As Boolean, anyNew As Boolean
+    Dim nNewPro As Long, nNewGen As Long, adr As String, d As Date, kk As Variant
+    Dim fin(1 To 6) As String, nFin As Long, amb As Boolean, why As String
+
+    For s = 1 To 3
+        exO(s) = Trim$(MailSlot(i, s))
+        exL(s) = LCase$(exO(s))
+    Next s
+
+    ' 1) Adresses professionnelles deja sur la fiche : la plus recemment vue
+    For s = 1 To 3
+        If Len(exL(s)) > 0 Then
+            If Not IsGeneric(exL(s)) Then
+                d = SeenDate(exL(s))
+                If Not found Or d > bestD Then
+                    best = exL(s)
+                    bestD = d
+                    found = True
+                End If
+            End If
+        End If
+    Next s
+    cardPro = found
+
+    ' 2) Adresses vues sous ce nom dans les mails
+    If Not mCand(i) Is Nothing Then
+        For Each kk In mCand(i).Keys
+            adr = CStr(kk)
+            If adr <> exL(1) And adr <> exL(2) And adr <> exL(3) Then
+                d = SeenDate(adr)
+                If IsGeneric(adr) Then
+                    nNewGen = nNewGen + 1
+                    If Not genFound Then
+                        gen = adr
+                        genD = d
+                        genFound = True
+                    ElseIf d > genD Or (d = genD And SeenCount(adr) > SeenCount(gen)) Then
+                        gen = adr
+                        genD = d
+                    End If
+                Else
+                    nNewPro = nNewPro + 1
+                    If Not found Then
+                        best = adr
+                        bestD = d
+                        found = True
+                        bestNew = True
+                    ElseIf d > bestD Then
+                        best = adr
+                        bestD = d
+                        bestNew = True
+                    ElseIf d = bestD And bestNew Then
+                        If SeenCount(adr) > SeenCount(best) Then best = adr
+                    End If
+                End If
+            End If
+        Next kk
+    End If
+
+    ' 3) Liste finale : nouvelle adresse pro en tete si elle l'emporte, puis
+    '    la fiche dans SON ordre, puis l'adresse grand public.
+    If bestNew Then AddFin fin, nFin, best
+    For s = 1 To 3
+        If Len(exO(s)) > 0 Then AddFin fin, nFin, exO(s)
+    Next s
+    If genFound Then AddFin fin, nFin, gen
+    For s = 1 To nFin
+        If s <= 3 Then
+            adr = LCase$(fin(s))
+            If adr <> exL(1) And adr <> exL(2) And adr <> exL(3) Then anyNew = True
+        End If
+    Next s
+
+    With mC(i)
+        .New1 = exO(1)
+        .New2 = exO(2)
+        .New3 = exO(3)
+        .Dropped = ""
+        .Why = ""
+        If nFin = 0 Then
+            .MailState = 0
+        ElseIf Not anyNew Then
+            ' Rien de nouveau : fiche inchangee (ni permutation ni tassement).
+            .MailState = 1
+        Else
+            .New1 = fin(1)
+            .New2 = ""
+            .New3 = ""
+            If nFin >= 2 Then .New2 = fin(2)
+            If nFin >= 3 Then .New3 = fin(3)
+            For s = 4 To nFin
+                .Dropped = .Dropped & IIf(Len(.Dropped) > 0, ", ", "") & fin(s)
+            Next s
+            amb = False
+            If bestNew And cardPro Then
+                amb = True
+                why = T("adresse plus r~ecente que celle de la fiche", "newer address than the one on the card")
+            End If
+            If Not amb And bestNew And nNewPro > 1 Then
+                amb = True
+                why = T("plusieurs adresses pour ce nom", "several addresses for this name")
+            End If
+            If Not amb And genFound And nNewGen > 1 Then
+                amb = True
+                why = T("plusieurs adresses perso pour ce nom", "several personal addresses for this name")
+            End If
+            If Not amb And Len(.Dropped) > 0 Then
+                amb = True
+                why = T("plus de 3 adresses", "more than 3 addresses")
+            End If
+            ' v1.1 (F7-01, choix B) : fiche SANS AUCUNE adresse -> l'adresse
+            ' proposee n'a ete vue que sous ce nom (homonyme possible). Ecrite
+            ' sans question seulement si son domaine correspond a la societe
+            ' de la fiche ; une adresse grand public ne correspond jamais.
+            If Not amb And Len(exL(1) & exL(2) & exL(3)) = 0 Then
+                If bestNew Then
+                    amb = Not DomainMatchesCompany(i, best)
+                Else
+                    amb = True
+                End If
+                If amb Then why = T("trouv~ee par le nom seulement", "found by name only")
+            End If
+            .Why = why
+            If amb Then
+                .MailState = 3
+            Else
+                .MailState = 2
+            End If
+        End If
+    End With
+End Sub
+
+' v1.1 (F7-01) : le domaine de l'adresse porte-t-il un mot significatif de
+' la societe de la fiche ? "j.dupont@univ-rennes.fr" / "Universite de
+' Rennes" -> oui ("rennes") ; "acmecorp.com" / "Acme Corp" -> oui (mots
+' accoles). Societe vide, ou mots trop generaux seulement -> non.
+Private Function DomainMatchesCompany(ByVal i As Long, ByVal adr As String) As Boolean
+    Dim p As Long, dom As String, labels() As String, k As Long, flat As String
+    Dim words() As String, w As String, joined As String, mainLbl As String
+    If Len(mC(i).Company) = 0 Then Exit Function
+    p = InStr(adr, "@")
+    If p = 0 Then Exit Function
+    dom = LCase$(Mid$(adr, p + 1))
+    labels = Split(dom, ".")
+    If UBound(labels) < 1 Then Exit Function
+    ' Domaine sans son extension, sans separateurs : "mail.univ-rennes" -> "mailunivrennes".
+    For k = LBound(labels) To UBound(labels) - 1
+        flat = flat & Replace(labels(k), "-", "")
+    Next k
+    mainLbl = Replace(labels(UBound(labels) - 1), "-", "")
+    words = Split(LCase$(modContactCommon.NormKey(mC(i).Company)), " ")
+    For k = LBound(words) To UBound(words)
+        w = words(k)
+        If Len(w) >= 3 And InStr(COMPANY_STOP_WORDS, "|" & w & "|") = 0 Then
+            joined = joined & w
+            If Len(w) >= 4 Then
+                If InStr(flat, w) > 0 Then DomainMatchesCompany = True
+            ElseIf InStr("|" & Replace(Replace(dom, ".", "|"), "-", "|") & "|", "|" & w & "|") > 0 Then
+                DomainMatchesCompany = True          ' sigle de 3 lettres = libelle entier (cea.fr)
+            End If
+            If DomainMatchesCompany Then Exit Function
+        End If
+    Next k
+    ' Sigle ou nom accole : "acmecorp" contenu dans "acmecorp" (mots accoles).
+    If Len(mainLbl) >= 3 And Len(joined) > 0 Then DomainMatchesCompany = (InStr(joined, mainLbl) > 0)
+End Function
+
+' Ajoute une adresse a la liste finale (sans doublon, casse ignoree).
+Private Sub AddFin(ByRef fin() As String, ByRef nFin As Long, ByVal adr As String)
+    Dim k As Long
+    If Len(adr) = 0 Then Exit Sub
+    For k = 1 To nFin
+        If LCase$(fin(k)) = LCase$(adr) Then Exit Sub
+    Next k
+    If nFin >= UBound(fin) Then Exit Sub
+    nFin = nFin + 1
+    fin(nFin) = adr
+End Sub
+
+Private Function SeenDate(ByVal adr As String) As Date
+    If mLast.Exists(adr) Then SeenDate = mLast(adr)
+End Function
+
+Private Function SeenCount(ByVal adr As String) As Long
+    If mCount.Exists(adr) Then SeenCount = mCount(adr)
+End Function
+
+'=============================================================================
+' Telephones : signature des mails recus, du plus recent au plus ancien
+'=============================================================================
+Private Sub FindAllPhones()
+    Dim i As Long, tot As Long, done As Long
+    For i = 1 To mN
+        If mC(i).NeedPhone And Len(mC(i).Skip) = 0 Then tot = tot + 1
+    Next i
+    If tot = 0 Then Exit Sub
+    For i = 1 To mN
+        If mC(i).NeedPhone And Len(mC(i).Skip) = 0 Then
+            If TimeUp() Then
+                mStopped = True
+                Exit For
+            End If
+            FindPhone i
+            done = done + 1
+            MaybeProgressPhones done, tot
+        End If
+    Next i
+End Sub
+
+' Adresses dont on lit les mails : celles retenues pour la fiche ; en
+' recherche de telephone seule, a defaut, l'unique adresse vue sous ce nom.
+Private Function PhoneAddrList(ByVal i As Long) As String
+    Dim res As String, k As Long, adr As String, kk As Variant
+    res = "|"
+    For k = 1 To 3
+        adr = LCase$(Trim$(NewSlot(i, k)))
+        If Len(adr) > 0 Then
+            If InStr(res, "|" & adr & "|") = 0 Then res = res & adr & "|"
+        End If
+    Next k
+    If Len(res) = 1 And Not mWantMail Then
+        If CandCount(i) = 1 Then
+            For Each kk In mCand(i).Keys
+                res = res & CStr(kk) & "|"
+            Next kk
+        End If
+    End If
+    PhoneAddrList = res
+End Function
+
+Private Sub FindPhone(ByVal i As Long)
+    On Error Resume Next
+    Dim lst As String, adrs() As String, refs() As String, parts() As String, pool As String, seen As String
+    Dim k As Long, tried As Long, ok As Boolean, itm As Object
+    Dim mob As String, ph As String, ph2 As String, sig As String
+    mC(i).NewMobile = ""
+    mC(i).NewBusiness = ""
+    mC(i).NewBusiness2 = ""
+    mC(i).PhoneSrc = ""
+    lst = PhoneAddrList(i)
+    If Len(lst) < 3 Then Exit Sub
+    adrs = Split(Mid$(lst, 2, Len(lst) - 2), "|")
+    For k = LBound(adrs) To UBound(adrs)
+        If Len(adrs(k)) > 0 Then
+            If mRefs.Exists(adrs(k)) Then pool = pool & Chr$(30) & mRefs(adrs(k))
+        End If
+    Next k
+    If Len(pool) = 0 Then Exit Sub
+    refs = Split(Mid$(pool, 2), Chr$(30))
+    SortDesc refs
+    seen = "|"
+    For k = LBound(refs) To UBound(refs)
+        If tried >= mMaxMails Then Exit For
+        parts = Split(refs(k), Chr$(9))
+        If UBound(parts) >= 2 Then
+            If InStr(seen, "|" & parts(1) & "|") = 0 Then
+                seen = seen & parts(1) & "|"
+                tried = tried + 1
+                Set itm = Nothing
+                Err.Clear
+                Set itm = Application.Session.GetItemFromID(parts(1), mStoreIds(CLng(parts(2))))
+                mMailsOpened = mMailsOpened + 1
+                If Err.Number = 0 And TypeName(itm) = "MailItem" Then
+                    mob = ""
+                    ph = ""
+                    ph2 = ""
+                    sig = ""
+                    ok = modContactFromMail.SenderSignaturePhones(itm, mob, ph, ph2, sig, mFirstSig)
+                    mFirstSig = False
+                    If ok Then
+                        ' Premiere signature qui porte un numero ET le nom : elle fait foi.
+                        If SigHasName(sig, i) Then
+                            PlacePhones i, mob, ph, ph2
+                            mC(i).PhoneSrc = T("signature du mail du ", "signature of the e-mail of ") & _
+                                             FmtDate(StampDate(parts(0)))
+                            Exit For
+                        End If
+                    End If
+                End If
+                Err.Clear
+                DoEvents
+            End If
+        End If
+    Next k
+    Set itm = Nothing
+End Sub
+
+' La signature porte-t-elle le nom de famille de la fiche (mot entier) ?
+Private Function SigHasName(ByVal sig As String, ByVal i As Long) As Boolean
+    Dim hay As String, ln As String
+    ln = modContactCommon.NormKey(mC(i).Last)
+    If Len(ln) < 2 Then Exit Function
+    hay = " " & modContactCommon.NormKey(sig) & " "
+    SigHasName = (InStr(hay, " " & ln & " ") > 0)
+End Function
+
+' Champs vides uniquement ; un numero deja porte par la fiche n'est pas repris.
+Private Sub PlacePhones(ByVal i As Long, ByVal mob As String, ByVal ph As String, ByVal ph2 As String)
+    If Len(mob) > 0 Then
+        If Len(mC(i).Mobile) = 0 And Not PhoneKnown(i, mob) Then mC(i).NewMobile = mob
+    End If
+    PlaceBusiness i, ph
+    PlaceBusiness i, ph2
+End Sub
+
+' Bureau s'il est vide, sinon bureau 2 s'il est vide ; jamais d'ecrasement.
+Private Sub PlaceBusiness(ByVal i As Long, ByVal num As String)
+    If Len(num) = 0 Then Exit Sub
+    If PhoneKnown(i, num) Then Exit Sub
+    If Len(mC(i).Business) = 0 And Len(mC(i).NewBusiness) = 0 Then
+        mC(i).NewBusiness = num
+    ElseIf Len(mC(i).Business2) = 0 And Len(mC(i).NewBusiness2) = 0 Then
+        mC(i).NewBusiness2 = num
+    End If
+End Sub
+
+Private Function PhoneKnown(ByVal i As Long, ByVal num As String) As Boolean
+    Dim tl As String
+    tl = PhoneTail(num)
+    If Len(tl) = 0 Then
+        PhoneKnown = True                     ' illisible : jamais ecrit
+        Exit Function
+    End If
+    If InStr(mC(i).PhoneDigits, "|" & tl & "|") > 0 Then
+        PhoneKnown = True
+    ElseIf tl = PhoneTail(mC(i).NewMobile) Or tl = PhoneTail(mC(i).NewBusiness) Or tl = PhoneTail(mC(i).NewBusiness2) Then
+        PhoneKnown = True
+    End If
+End Function
+
+'=============================================================================
+' Classement : 0 ignoree, 1 a jour, 2 rien trouve, 3 a completer, 4 a trancher
+'=============================================================================
+Private Sub ClassifyAll()
+    Dim i As Long
+    For i = 1 To mN
+        mC(i).Cat = Category(i)
+    Next i
+End Sub
+
+Private Function Category(ByVal i As Long) As Long
+    If Len(mC(i).Skip) > 0 Then
+        Category = 0
+    ElseIf Not (mC(i).NeedMail Or mC(i).NeedPhone) Then
+        Category = 1
+    ElseIf mC(i).MailState = 3 Then
+        Category = 4
+    ElseIf mC(i).MailState = 2 Or Len(mC(i).NewMobile & mC(i).NewBusiness & mC(i).NewBusiness2) > 0 Then
+        Category = 3
+    ElseIf (mC(i).NeedMail And mC(i).MailState = 0) Or mC(i).NeedPhone Then
+        ' Telephone cherche (mobile ou bureau vide) et rien trouve.
+        Category = 2
+    Else
+        Category = 1
+    End If
+End Function
+
+'=============================================================================
+' Recapitulatif : -1 = rien a ecrire (deja dit), 0 = annuler,
+' 1 = un par un, 2 = tout ecrire
+'=============================================================================
+Private Function AskRecap() As Long
+    Dim order() As Long, cnt(0 To 4) As Long, k As Long, i As Long, pass As Long, room As Long
+    Dim head As String, counts As String, detail As String, choiceTxt As String, opened As String
+    Dim body3 As String, body4 As String, ln As String, msg As String, more As Boolean, r As VbMsgBoxResult
+    order = NameOrder()
+    For i = 1 To mN
+        cnt(mC(i).Cat) = cnt(mC(i).Cat) + 1
+    Next i
+
+    head = T("Recherche termin~ee en ", "Search finished in ") & FmtDuration(mScanSec) & " : " & _
+           FmtInt(mFoldersRead) & T(" dossiers, ", " folders, ") & FmtInt(mRows) & T(" mails lus.", " e-mails read.") & vbCrLf
+    If mStopped Then
+        head = head & T("Recherche arr~xt~ee au d~elai maximum : r~esultats partiels.", _
+                        "Search stopped at the time limit: partial results.") & vbCrLf
+    End If
+    If mTableErrors > 0 Then head = head & mTableErrors & T(" dossier(s) illisible(s).", " unreadable folder(s).") & vbCrLf
+    counts = T("Rien trouv~e : ", "Nothing found: ") & cnt(2) & "   " & CapA(T("{A} jour : ", "Up to date: ")) & cnt(1) & _
+             "   " & T("Ignor~ees : ", "Skipped: ") & cnt(0) & vbCrLf
+    detail = T("D~etail complet : ", "Full details: ") & ReportFileName()
+    opened = " " & T("(ouvert dans le Bloc-notes)", "(opened in Notepad)")
+    If cnt(4) > 0 Then
+        choiceTxt = vbCrLf & vbCrLf & _
+            T("Les fiches ~a compl~eter seront ~ecrites. Pour les cas ~a trancher :", _
+              "Cards to complete will be written. For the cases to decide:") & vbCrLf & _
+            T("   Un par un = chaque cas t'est montr~e", "   One by one = each case is shown to you") & vbCrLf & _
+            T("   Tout ~ecrire = adresse la plus r~ecente, perso en secondaire", _
+              "   Write all = most recent address, personal ones as secondary")
+    End If
+
+    ' Listes dans la place restante (une MsgBox affiche environ 1 000 caracteres).
+    room = 960 - Len(head) - Len(counts) - Len(detail) - Len(opened) - Len(choiceTxt) - 70
+    For pass = 1 To 2
+        For k = 1 To mN
+            i = order(k)
+            ln = ""
+            If pass = 1 And mC(i).Cat = 4 Then
+                ln = "   - " & Shorten(mC(i).Disp & " : " & mC(i).Why, 76) & vbCrLf
+            ElseIf pass = 2 And mC(i).Cat = 3 Then
+                ln = "   - " & Shorten(mC(i).Disp & " : " & ChangeSummary(i, False), 76) & vbCrLf
+            End If
+            If Len(ln) > 0 Then
+                If Len(ln) <= room And (pass = 2 Or Len(body4) < 400) Then
+                    If pass = 1 Then
+                        body4 = body4 & ln
+                    Else
+                        body3 = body3 & ln
+                    End If
+                    room = room - Len(ln)
+                Else
+                    more = True
+                End If
+            End If
+        Next k
+    Next pass
+    If cnt(3) > 0 And Len(body3) = 0 Then more = True
+    If more Then
+        OpenReport
+        detail = detail & opened
+    End If
+
+    msg = head & vbCrLf & _
+          CapA(T("{A} compl~eter : ", "To complete: ")) & cnt(3) & vbCrLf & body3 & _
+          CapA(T("{A} trancher : ", "To decide: ")) & cnt(4) & vbCrLf & body4 & _
+          counts & vbCrLf & detail & choiceTxt
+
+    If cnt(3) + cnt(4) = 0 Then
+        modUi.Inform msg & vbCrLf & vbCrLf & T("Aucune fiche ~a modifier.", "No card to change."), UiTitle()
+        AskRecap = -1
+        Exit Function
+    End If
+    If cnt(4) > 0 Then
+        r = modMsgBoxCustom.Confirm3(msg, UiTitle(), T("&Un par un", "&One by one"), _
+                                     T("&Tout ~ecrire", "&Write all"), T("&Annuler", "&Cancel"))
+        If r = vbYes Then
+            AskRecap = 1
+        ElseIf r = vbNo Then
+            AskRecap = 2
+        End If
+    Else
+        r = modMsgBoxCustom.MsgBoxC(msg & vbCrLf & vbCrLf & T("~Ecrire ces fiches ?", "Write these cards?"), _
+                                    vbOKCancel + vbQuestion, UiTitle(), T("&~Ecrire", "&Write"), T("&Annuler", "&Cancel"))
+        If r = vbOK Then AskRecap = 2
+    End If
+End Function
+
+' Changements d'une fiche, sur une ligne. detailed : avec les sources.
+Private Function ChangeSummary(ByVal i As Long, ByVal detailed As Boolean) As String
+    Dim res As String, k As Long, oldV As String, newV As String
+    If mC(i).MailState = 2 Or mC(i).MailState = 3 Then
+        For k = 1 To 3
+            oldV = Trim$(MailSlot(i, k))
+            newV = Trim$(NewSlot(i, k))
+            If LCase$(oldV) <> LCase$(newV) Then
+                If Len(oldV) = 0 Then
+                    res = res & SepIf(res) & T("e-mail ", "e-mail ") & k & T(" : ", ": ") & newV
+                    If detailed Then res = res & SeenText(newV)
+                ElseIf Len(newV) = 0 Then
+                    res = res & SepIf(res) & T("e-mail ", "e-mail ") & k & T(" retir~e : ", " removed: ") & oldV
+                Else
+                    res = res & SepIf(res) & T("e-mail ", "e-mail ") & k & T(" : ", ": ") & newV & _
+                          " (" & T("avant : ", "was: ") & oldV & ")"
+                    If detailed Then res = res & SeenText(newV)
+                End If
+            End If
+        Next k
+        If Len(mC(i).Dropped) > 0 Then
+            res = res & SepIf(res) & T("hors des 3 emplacements : ", "beyond the 3 slots: ") & mC(i).Dropped
+        End If
+    End If
+    If Len(mC(i).NewMobile) > 0 Then res = res & SepIf(res) & T("mobile : ", "mobile: ") & mC(i).NewMobile
+    If Len(mC(i).NewBusiness) > 0 Then res = res & SepIf(res) & T("bureau : ", "business: ") & mC(i).NewBusiness
+    If Len(mC(i).NewBusiness2) > 0 Then res = res & SepIf(res) & T("bureau 2 : ", "business 2: ") & mC(i).NewBusiness2
+    If detailed And Len(mC(i).PhoneSrc) > 0 Then
+        If Len(mC(i).NewMobile & mC(i).NewBusiness & mC(i).NewBusiness2) > 0 Then res = res & " (" & mC(i).PhoneSrc & ")"
+    End If
+    ChangeSummary = res
+End Function
+
+Private Function SepIf(ByVal s As String) As String
+    If Len(s) > 0 Then SepIf = " ; "
+End Function
+
+' " (14 mails, dernier le 12/10/2026)" ou " (jamais vue dans les mails)".
+Private Function SeenText(ByVal adr As String) As String
+    Dim n As Long, low As String
+    low = LCase$(adr)
+    n = SeenCount(low)
+    If n = 0 Then
+        SeenText = " " & T("(jamais vue dans les mails)", "(never seen in e-mails)")
+    Else
+        SeenText = " (" & n & T(" mail(s), dernier le ", " e-mail(s), last on ") & FmtDate(SeenDate(low)) & ")"
+    End If
+End Function
+
+'=============================================================================
+' Ecriture
+'=============================================================================
+Private Sub ApplyAll(ByVal oneByOne As Boolean)
+    Dim order() As Long, k As Long, i As Long, nAmb As Long, pos As Long, r As Long, stopAsk As Boolean
+    order = NameOrder()
+    For k = 1 To mN
+        i = order(k)
+        If mC(i).Cat = 3 Then WriteContact i
+    Next k
+    For k = 1 To mN
+        If mC(order(k)).Cat = 4 Then nAmb = nAmb + 1
+    Next k
+    For k = 1 To mN
+        i = order(k)
+        If mC(i).Cat = 4 Then
+            pos = pos + 1
+            If Not oneByOne Then
+                WriteContact i
+            ElseIf stopAsk Then
+                KeepCardMails i
+            Else
+                r = AskAmbiguous(i, pos, nAmb)
+                If r = 1 Then
+                    WriteContact i
+                Else
+                    If r = -1 Then stopAsk = True
+                    KeepCardMails i
+                End If
+            End If
+        End If
+    Next k
+End Sub
+
+' Cas a trancher laisse : adresses de la fiche conservees telles quelles ;
+' telephone relu sur ces seules adresses (jamais sur celle d'un homonyme
+' possible) et ecrit s'il comble un champ vide.
+Private Sub KeepCardMails(ByVal i As Long)
+    With mC(i)
+        .New1 = .Mail1
+        .New2 = .Mail2
+        .New3 = .Mail3
+        .Dropped = ""
+        .MailState = 1
+    End With
+    If mC(i).NeedPhone Then FindPhone i
+    If Len(mC(i).NewMobile & mC(i).NewBusiness & mC(i).NewBusiness2) > 0 Then
+        WriteContact i
+    Else
+        mC(i).Outcome = 2
+    End If
+End Sub
+
+' Cas a trancher : 1 = choix applique (New1..3), 0 = garder les adresses de
+' la fiche, -1 = idem pour celle-ci et les suivantes. Une InputBox affiche
+' 1 024 caracteres au plus : 6 adresses, lignes raccourcies.
+Private Function AskAmbiguous(ByVal i As Long, ByVal pos As Long, ByVal tot As Long) As Long
+    Dim adrs(1 To 6) As String, chosen(1 To 3) As String, n As Long, nCh As Long, k As Long, idx As Long
+    Dim lst As String, defAns As String, ans As String, errLine As String
+    n = AmbiguousChoices(i, adrs)
+    If n = 0 Then Exit Function
+    For k = 1 To 3
+        idx = IndexOfAddr(adrs, n, NewSlot(i, k))
+        If idx > 0 Then defAns = defAns & IIf(Len(defAns) > 0, "+", "") & idx
+    Next k
+    For k = 1 To n
+        lst = lst & "   " & k & " - " & Shorten(adrs(k) & SeenText(adrs(k)) & AddrTags(i, adrs(k)), 72) & vbCrLf
+    Next k
+    Do
+        ' MSGLOOP-OK : au plus 6 adresses, lignes raccourcies a 72 caracteres.
+        ans = Trim$(modUi.AskText(errLine & Shorten(mC(i).Disp, 60) & "   (" & pos & "/" & tot & ")" & vbCrLf & _
+              T("Fiche : ", "Card: ") & Shorten(mC(i).Folder, 60) & vbCrLf & _
+              T("Motif : ", "Reason: ") & mC(i).Why & vbCrLf & vbCrLf & lst & vbCrLf & _
+              T("Num~eros ~a garder, dans l'ordre (ex. 1+3) : le premier devient l'e-mail 1.", _
+                "Numbers to keep, in order (e.g. 1+3): the first one becomes e-mail 1.") & vbCrLf & _
+              T("Entr~ee = proposition ; vide = garder les adresses de la fiche ; 0 = idem pour celle-ci et les suivantes.", _
+                "Enter = proposal; empty = keep the card's addresses; 0 = same for this one and the next ones."), UiTitle(), defAns))
+        If Len(ans) = 0 Then
+            AskAmbiguous = 0
+            Exit Function
+        End If
+        If ans = "0" Then
+            AskAmbiguous = -1
+            Exit Function
+        End If
+        If ParseChoice(ans, n, adrs, chosen, nCh) Then Exit Do
+        errLine = T("R~eponse non comprise : ", "Answer not understood: ") & Shorten(ans, 20) & vbCrLf & vbCrLf
+    Loop
+    mC(i).New1 = chosen(1)
+    mC(i).New2 = ""
+    mC(i).New3 = ""
+    If nCh >= 2 Then mC(i).New2 = chosen(2)
+    If nCh >= 3 Then mC(i).New3 = chosen(3)
+    mC(i).Dropped = ""
+    mC(i).MailState = 2
+    ' Telephone relu sur les adresses choisies (le choix a pu ecarter un homonyme).
+    If mC(i).NeedPhone Then FindPhone i
+    AskAmbiguous = 1
+End Function
+
+' Adresses proposees au choix (autant que adrs() en contient) : TOUJOURS la
+' proposition et les adresses de la fiche (jamais coupees : la reponse par
+' defaut doit pouvoir les garder), puis les autres adresses vues sous ce
+' nom, les plus recentes d'abord. Affichage : la plus recemment vue d'abord.
+Private Function AmbiguousChoices(ByVal i As Long, ByRef adrs() As String) As Long
+    Dim pool(1 To 40) As String, nPool As Long, n As Long, k As Long, kk As Variant
+    For k = 1 To 3
+        AddUnique adrs, n, Trim$(NewSlot(i, k))
+    Next k
+    For k = 1 To 3
+        AddUnique adrs, n, Trim$(MailSlot(i, k))
+    Next k
+    If Not mCand(i) Is Nothing Then
+        For Each kk In mCand(i).Keys
+            AddUnique pool, nPool, CStr(kk)
+        Next kk
+    End If
+    SortBySeen pool, nPool
+    For k = 1 To nPool
+        AddUnique adrs, n, pool(k)
+    Next k
+    SortBySeen adrs, n
+    AmbiguousChoices = n
+End Function
+
+' Tri par date du dernier mail, la plus recente d'abord (insertion, stable).
+Private Sub SortBySeen(ByRef arr() As String, ByVal n As Long)
+    Dim k As Long, j As Long, tmp As String
+    For k = 2 To n
+        tmp = arr(k)
+        j = k - 1
+        Do While j >= 1
+            If SeenDate(LCase$(arr(j))) < SeenDate(LCase$(tmp)) Then
+                arr(j + 1) = arr(j)
+                j = j - 1
+            Else
+                Exit Do
+            End If
+        Loop
+        arr(j + 1) = tmp
+    Next k
+End Sub
+
+Private Sub AddUnique(ByRef pool() As String, ByRef n As Long, ByVal adr As String)
+    Dim k As Long
+    If Len(adr) = 0 Then Exit Sub
+    For k = 1 To n
+        If LCase$(pool(k)) = LCase$(adr) Then Exit Sub
+    Next k
+    If n >= UBound(pool) Then Exit Sub
+    n = n + 1
+    pool(n) = adr
+End Sub
+
+Private Function IndexOfAddr(ByRef adrs() As String, ByVal n As Long, ByVal adr As String) As Long
+    Dim k As Long
+    If Len(adr) = 0 Then Exit Function
+    For k = 1 To n
+        If LCase$(adrs(k)) = LCase$(adr) Then
+            IndexOfAddr = k
+            Exit Function
+        End If
+    Next k
+End Function
+
+Private Function AddrTags(ByVal i As Long, ByVal adr As String) As String
+    Dim low As String, res As String
+    low = LCase$(adr)
+    If low = LCase$(mC(i).Mail1) Or low = LCase$(mC(i).Mail2) Or low = LCase$(mC(i).Mail3) Then
+        res = " " & T("[sur la fiche]", "[on the card]")
+    End If
+    If IsGeneric(low) Then res = res & " " & T("[perso]", "[personal]")
+    AddrTags = res
+End Function
+
+' "1+3", "1,3", "1 3" -> adresses choisies (3 au plus, dans l'ordre donne).
+Private Function ParseChoice(ByVal ans As String, ByVal n As Long, ByRef adrs() As String, _
+                             ByRef chosen() As String, ByRef nCh As Long) As Boolean
+    Dim s As String, parts() As String, k As Long, j As Long, num As Long, dup As Boolean
+    s = Replace(Replace(Replace(ans, "+", " "), ",", " "), ";", " ")
+    s = modContactCommon.CollapseSpaces(Trim$(s))
+    nCh = 0
+    If Len(s) = 0 Then Exit Function
+    parts = Split(s, " ")
+    For k = LBound(parts) To UBound(parts)
+        If Not (parts(k) Like "#" Or parts(k) Like "##") Then Exit Function
+        num = CLng(parts(k))
+        If num < 1 Or num > n Then Exit Function
+        dup = False
+        For j = 1 To nCh
+            If chosen(j) = adrs(num) Then dup = True
+        Next j
+        If Not dup Then
+            If nCh >= 3 Then Exit Function
+            nCh = nCh + 1
+            chosen(nCh) = adrs(num)
+        End If
+    Next k
+    ParseChoice = (nCh >= 1)
+End Function
+
+Private Function WriteContact(ByVal i As Long) As Boolean
+    Dim ct As Object, k As Long, cur As String, changed As Boolean, errNo As Long, errDesc As String
+    Dim undo As String, oldV As String, newV As String
+    On Error GoTo ErrH
+    Set ct = Application.Session.GetItemFromID(mC(i).EntryID, mStoreIds(mC(i).StoreIdx))
+    If TypeName(ct) <> "ContactItem" Then
+        mC(i).Outcome = 3
+        Exit Function
+    End If
+    ' Adresses changees depuis la lecture : on ne touche a rien.
+    For k = 1 To 3
+        cur = LCase$(Trim$(modContactCommon.SafeStr(CallByName(ct, "Email" & k & "Address", VbGet))))
+        If cur <> LCase$(Trim$(MailSlot(i, k))) Then
+            mC(i).Outcome = 4
+            Exit Function
+        End If
+    Next k
+    ' v1.1 (F7-13) : chaque champ ecrit -> une ligne d'annulation (gardee
+    ' seulement si le Save reussit).
+    If mC(i).MailState = 2 Or mC(i).MailState = 3 Then
+        For k = 1 To 3
+            If LCase$(Trim$(NewSlot(i, k))) <> LCase$(Trim$(MailSlot(i, k))) Then
+                oldV = modContactCommon.SafeStr(CallByName(ct, "Email" & k & "Address", VbGet))
+                cur = modContactCommon.SafeStr(CallByName(ct, "Email" & k & "DisplayName", VbGet))
+                SetEmailSlot ct, k, Trim$(NewSlot(i, k)), mC(i).Disp
+                undo = undo & modContactCommon.UndoLine(ct, "Email" & k & "Address", oldV, _
+                              modContactCommon.SafeStr(CallByName(ct, "Email" & k & "Address", VbGet)))
+                newV = modContactCommon.SafeStr(CallByName(ct, "Email" & k & "DisplayName", VbGet))
+                If newV <> cur Then undo = undo & modContactCommon.UndoLine(ct, "Email" & k & "DisplayName", cur, newV)
+                changed = True
+            End If
+        Next k
+    End If
+    If Len(mC(i).NewMobile) > 0 Then
+        If Len(Trim$(modContactCommon.SafeStr(ct.MobileTelephoneNumber))) = 0 Then
+            undo = undo & modContactCommon.UndoLine(ct, "MobileTelephoneNumber", _
+                          modContactCommon.SafeStr(ct.MobileTelephoneNumber), mC(i).NewMobile)
+            ct.MobileTelephoneNumber = mC(i).NewMobile
+            changed = True
+        End If
+    End If
+    If Len(mC(i).NewBusiness) > 0 Then
+        If Len(Trim$(modContactCommon.SafeStr(ct.BusinessTelephoneNumber))) = 0 Then
+            undo = undo & modContactCommon.UndoLine(ct, "BusinessTelephoneNumber", _
+                          modContactCommon.SafeStr(ct.BusinessTelephoneNumber), mC(i).NewBusiness)
+            ct.BusinessTelephoneNumber = mC(i).NewBusiness
+            changed = True
+        End If
+    End If
+    If Len(mC(i).NewBusiness2) > 0 Then
+        If Len(Trim$(modContactCommon.SafeStr(ct.Business2TelephoneNumber))) = 0 Then
+            undo = undo & modContactCommon.UndoLine(ct, "Business2TelephoneNumber", _
+                          modContactCommon.SafeStr(ct.Business2TelephoneNumber), mC(i).NewBusiness2)
+            ct.Business2TelephoneNumber = mC(i).NewBusiness2
+            changed = True
+        End If
+    End If
+    If Not changed Then
+        mC(i).Outcome = 2
+        Exit Function
+    End If
+    If mJournal Then
+        oldV = modContactCommon.SafeStr(ct.Body)
+        AddJournal ct, JournalLine(i)
+        undo = undo & modContactCommon.UndoLine(ct, "Body", oldV, modContactCommon.SafeStr(ct.Body))
+    End If
+    ct.Save
+    mUndo = mUndo & undo
+    mC(i).Outcome = 1
+    WriteContact = True
+    modDebugLog.DDebug MOD_NAME, "Fiche completee : " & mC(i).Disp
+    Exit Function
+ErrH:
+    errNo = Err.Number
+    errDesc = Err.Description
+    On Error Resume Next
+    mC(i).Outcome = 3
+    modDebugLog.DError MOD_NAME, "Ecriture fiche '" & mC(i).Disp & "' err " & errNo & " - " & errDesc
+End Function
+
+Private Sub SetEmailSlot(ByVal ct As Object, ByVal k As Long, ByVal adr As String, ByVal disp As String)
+    CallByName ct, "Email" & k & "Address", VbLet, adr
+    If Len(adr) > 0 Then CallByName ct, "Email" & k & "DisplayName", VbLet, disp & " (" & adr & ")"
+End Sub
+
+' Entree datee en tete de la section "=== JOURNAL ===" (meme format que
+' modContactNote) ; la section est creee si besoin, le reste est conserve.
+' v1.1 (F7-14) : insertion partagee (modContactCommon.JournalInsert).
+Private Sub AddJournal(ByVal ct As Object, ByVal entry As String)
+    ct.Body = modContactCommon.JournalInsert(modContactCommon.SafeStr(ct.Body), entry)
+End Sub
+
+Private Function JournalLine(ByVal i As Long) As String
+    JournalLine = "[" & Format$(Date, "dd/mm/yyyy") & "] " & _
+                  T("Coordonn~ees compl~et~ees depuis les mails : ", "Details completed from e-mails: ") & _
+                  ChangeSummary(i, True)
+End Function
+
+Private Sub ShowFinal()
+    Dim i As Long, o(0 To 4) As Long, msg As String
+    For i = 1 To mN
+        o(mC(i).Outcome) = o(mC(i).Outcome) + 1
+    Next i
+    modDebugLog.DInfo MOD_NAME, "Ecriture : ecrites=" & o(1) & " laissees=" & o(2) & " echecs=" & o(3) & _
+        " modifiees entre-temps=" & o(4)
+    If o(3) + o(4) = 0 Then
+        modUi.Toast T("Coordonn~ees compl~et~ees : ", "Details completed: ") & o(1) & T(" fiche(s)", " card(s)") & _
+                    IIf(o(2) > 0, ", " & o(2) & T(" laiss~ee(s) telle(s) quelle(s)", " left as is"), "") & vbLf & _
+                    ReportFileName(), uiSuccess, True
+    Else
+        msg = T("Termin~e.", "Done.") & vbCrLf & vbCrLf & _
+              o(1) & T(" fiche(s) compl~et~ee(s)", " card(s) completed") & vbCrLf
+        If o(2) > 0 Then msg = msg & o(2) & T(" fiche(s) laiss~ee(s) telle(s) quelle(s)", " card(s) left as is") & vbCrLf
+        If o(4) > 0 Then msg = msg & o(4) & T(" fiche(s) modifi~ee(s) entre-temps, non touch~ee(s)", _
+                                             " card(s) changed meanwhile, not touched") & vbCrLf
+        If o(3) > 0 Then msg = msg & o(3) & T(" ~echec(s) d'enregistrement (voir debug.log)", _
+                                             " save failure(s) (see debug.log)") & vbCrLf
+        msg = msg & vbCrLf & T("Rapport : ", "Report: ") & mReportPath
+        modUi.Inform msg, UiTitle(), vbExclamation
+    End If
+End Sub
+
+'=============================================================================
+' Rapport texte (UTF-8)
+'=============================================================================
+Private Sub WriteReport(ByVal afterWrite As Boolean)
+    On Error GoTo ErrH
+    Dim rpt As String, order() As Long, k As Long, i As Long, cnt(0 To 4) As Long, o(0 To 4) As Long
+    If Len(mReportPath) = 0 Then
+        mReportPath = modConfig.MacroVBADir() & "\ContactEnrich-" & Format$(Now, "yyyymmdd-hhnnss") & ".txt"
+    End If
+    order = NameOrder()
+    For i = 1 To mN
+        cnt(mC(i).Cat) = cnt(mC(i).Cat) + 1
+        o(mC(i).Outcome) = o(mC(i).Outcome) + 1
+    Next i
+
+    rpt = UiTitle() & " - " & Format$(Now, "dd/mm/yyyy hh:nn") & " - modContactEnrich " & MOD_VERSION & vbCrLf & _
+          String$(78, "=") & vbCrLf & _
+          T("Contacts : ", "Contacts: ") & mScopeLabel & vbCrLf & _
+          T("Recherche : ", "Search: ") & WhatLabel() & " - " & T("bo~ite(s) : ", "mailbox(es): ") & mWhereLabel & vbCrLf & _
+          T("Dossiers lus : ", "Folders read: ") & FmtInt(mFoldersRead) & " - " & T("mails lus : ", "e-mails read: ") & _
+          FmtInt(mRows) & " - " & T("mails ouverts : ", "e-mails opened: ") & FmtInt(mMailsOpened) & " - " & _
+          T("dur~ee : ", "duration: ") & FmtDuration(mScanSec) & vbCrLf
+    If mTableErrors > 0 Then
+        rpt = rpt & T("Dossiers illisibles : ", "Unreadable folders: ") & mTableErrors & T(" (voir debug.log)", " (see debug.log)") & vbCrLf
+    End If
+    If mStopped Then
+        rpt = rpt & T("Recherche arr~xt~ee au d~elai maximum (ContactEnrichMaxMinutes) : r~esultats partiels.", _
+                      "Search stopped at the time limit (ContactEnrichMaxMinutes): partial results.") & vbCrLf
+    End If
+
+    rpt = rpt & vbCrLf & "=== " & UCase$(CapA(T("{A} compl~eter", "To complete"))) & " (" & cnt(3) & ") ===" & vbCrLf
+    For k = 1 To mN
+        i = order(k)
+        If mC(i).Cat = 3 Then rpt = rpt & ReportBlock(i, afterWrite)
+    Next k
+    rpt = rpt & vbCrLf & "=== " & UCase$(CapA(T("{A} trancher", "To decide"))) & " (" & cnt(4) & ") ===" & vbCrLf
+    For k = 1 To mN
+        i = order(k)
+        If mC(i).Cat = 4 Then rpt = rpt & ReportBlock(i, afterWrite)
+    Next k
+    rpt = rpt & vbCrLf & "=== " & UCase$(T("Rien trouv~e", "Nothing found")) & " (" & cnt(2) & ") ===" & vbCrLf
+    For k = 1 To mN
+        i = order(k)
+        If mC(i).Cat = 2 Then rpt = rpt & mC(i).Disp & "   [" & mC(i).Folder & "]   " & MissingText(i) & vbCrLf
+    Next k
+    rpt = rpt & vbCrLf & "=== " & UCase$(T("Ignor~ees", "Skipped")) & " (" & cnt(0) & ") ===" & vbCrLf
+    For k = 1 To mN
+        i = order(k)
+        If mC(i).Cat = 0 Then rpt = rpt & mC(i).Disp & "   [" & mC(i).Folder & "]   " & mC(i).Skip & vbCrLf
+    Next k
+    rpt = rpt & vbCrLf & "=== " & UCase$(CapA(T("{A} jour", "Up to date"))) & " : " & cnt(1) & " ===" & vbCrLf
+
+    If afterWrite Then
+        rpt = rpt & vbCrLf & "=== " & T("R~ESULTAT DE L'~ECRITURE", "WRITE RESULT") & " ===" & vbCrLf & _
+              T("~Ecrites : ", "Written: ") & o(1) & " - " & T("laiss~ees telles quelles : ", "left as is: ") & o(2) & _
+              " - " & T("modifi~ees entre-temps : ", "changed meanwhile: ") & o(4) & " - " & _
+              T("~echecs : ", "failures: ") & o(3) & vbCrLf
+    End If
+    WriteUtf8 mReportPath, rpt
+    Exit Sub
+ErrH:
+    modDebugLog.DError MOD_NAME, "WriteReport err " & Err.Number & " - " & Err.Description
+End Sub
+
+Private Function ReportBlock(ByVal i As Long, ByVal afterWrite As Boolean) As String
+    Dim s As String, cs As String
+    s = mC(i).Disp & "   [" & mC(i).Folder & "]"
+    If mC(i).Cat = 4 Then s = s & "   " & mC(i).Why
+    s = s & vbCrLf
+    If mC(i).Cat = 4 Then
+        cs = ChangeSummary(i, False)
+        If Len(cs) = 0 Then cs = "-"
+        s = s & "   " & T("adresses vues : ", "addresses seen: ") & CandidatesText(i) & vbCrLf & "   "
+        If afterWrite Then
+            s = s & T("retenu : ", "applied: ") & cs & vbCrLf
+        Else
+            s = s & T("proposition : ", "proposal: ") & cs & vbCrLf
+        End If
+    Else
+        s = s & "   " & ChangeSummary(i, True) & vbCrLf
+    End If
+    If afterWrite Then s = s & "   -> " & OutcomeText(mC(i).Outcome) & vbCrLf
+    ReportBlock = s
+End Function
+
+Private Function CandidatesText(ByVal i As Long) As String
+    Dim adrs(1 To 12) As String, n As Long, k As Long, res As String
+    n = AmbiguousChoices(i, adrs)
+    For k = 1 To n
+        res = res & IIf(k > 1, " ; ", "") & adrs(k) & SeenText(adrs(k))
+    Next k
+    CandidatesText = res
+End Function
+
+Private Function MissingText(ByVal i As Long) As String
+    Dim res As String
+    If mC(i).NeedMail And mC(i).MailState = 0 Then res = T("e-mail", "e-mail")
+    If mC(i).NeedPhone And Len(mC(i).NewMobile & mC(i).NewBusiness & mC(i).NewBusiness2) = 0 Then
+        If Len(res) > 0 Then res = res & " + "
+        If Len(mC(i).Mobile) = 0 And Len(mC(i).Business) = 0 Then
+            res = res & T("t~el~ephone", "phone")
+        ElseIf Len(mC(i).Mobile) = 0 Then
+            res = res & T("mobile", "mobile")
+        Else
+            res = res & T("t~el~ephone de bureau", "business phone")
+        End If
+    End If
+    MissingText = T("rien trouv~e : ", "nothing found: ") & res
+End Function
+
+Private Function OutcomeText(ByVal o As Long) As String
+    Select Case o
+        Case 1: OutcomeText = T("~ecrite", "written")
+        Case 2: OutcomeText = T("laiss~ee telle quelle", "left as is")
+        Case 3: OutcomeText = T("~echec d'enregistrement (voir debug.log)", "save failed (see debug.log)")
+        Case 4: OutcomeText = T("modifi~ee entre-temps : non touch~ee", "changed meanwhile: not touched")
+        Case Else: OutcomeText = "-"
+    End Select
+End Function
+
+Private Sub WriteUtf8(ByVal path As String, ByVal txt As String)
+    ' v1.1 (F7-14) : delegation modContactCommon (erreur journalisee par elle).
+    modContactCommon.WriteUtf8 path, txt
+End Sub
+
+Private Sub OpenReport()
+    On Error Resume Next
+    If Len(mReportPath) = 0 Then Exit Sub
+    If Len(Dir$(mReportPath)) = 0 Then Exit Sub
+    Shell "notepad.exe " & Chr$(34) & mReportPath & Chr$(34), vbNormalNoFocus
+    Err.Clear
+End Sub
+
+Private Function ReportFileName() As String
+    If Len(mReportPath) > 0 Then ReportFileName = Mid$(mReportPath, InStrRev(mReportPath, "\") + 1)
+End Function
+
+'=============================================================================
+' Avancement : toasts (Outlook n'a pas de barre d'etat pilotable)
+'=============================================================================
+Private Sub MaybeProgress()
+    Dim pct As Long
+    If mProgressSec <= 0 Then Exit Sub
+    If Elapsed(mLastToast) < mProgressSec Then Exit Sub
+    mLastToast = Timer
+    If mTotFolders > 0 Then pct = CLng((mCurFolder * 100#) / mTotFolders)
+    modUi.Toast T("Recherche des coordonn~ees : ", "Contact details search: ") & pct & " %" & vbLf & _
+                FmtInt(mCurFolder) & " / " & FmtInt(mTotFolders) & T(" dossiers, ", " folders, ") & _
+                FmtInt(mRows) & T(" mails", " e-mails"), uiInfo, True
+End Sub
+
+Private Sub MaybeProgressPhones(ByVal done As Long, ByVal tot As Long)
+    If mProgressSec <= 0 Then Exit Sub
+    If Elapsed(mLastToast) < mProgressSec Then Exit Sub
+    mLastToast = Timer
+    modUi.Toast T("Lecture des signatures", "Reading signatures") & vbLf & _
+                FmtInt(done) & " / " & FmtInt(tot) & T(" contacts", " contacts"), uiInfo, True
+End Sub
+
+Private Function Elapsed(ByVal t0 As Double) As Double
+    Dim d As Double
+    d = CDbl(Timer) - t0
+    If d < 0 Then d = d + 86400#
+    Elapsed = d
+End Function
+
+Private Function TimeUp() As Boolean
+    If mMaxMinutes <= 0 Then Exit Function
+    TimeUp = (Elapsed(mT0) > mMaxMinutes * 60#)
+End Function
+
+'=============================================================================
+' Noms et adresses
+'=============================================================================
+' Cle de nom : "DUPONT Jean (ACME)" / "Jean Dupont" / "Dupont, Jean" /
+' jean.dupont@x.fr -> "DUPONT JEAN" (majuscules, sans accents, civilites et
+' initiales retirees, mots tries). "" si moins de 2 mots ou plus de 5.
+Private Function NameKeyOf(ByVal s As String) As String
+    ' v1.1 (F7-14) : delegation modContactCommon (meme regle pour
+    ' modContactRelation).
+    NameKeyOf = modContactCommon.NameKeySorted(s)
+End Function
+
+Private Function NameKeyCached(ByVal s As String) As String
+    Dim k As String
+    If Len(s) = 0 Then Exit Function
+    If mNameCache.Exists(s) Then
+        NameKeyCached = mNameCache(s)
+        Exit Function
+    End If
+    k = NameKeyOf(s)
+    If mNameCache.Count > 60000 Then mNameCache.RemoveAll
+    mNameCache(s) = k
+    NameKeyCached = k
+End Function
+
+' Premiere adresse e-mail d'un texte (sans expression reguliere : appele
+' sur chaque destinataire).
+Private Function MailIn(ByVal s As String) As String
+    ' v1.1 (F7-14) : delegation modContactCommon (helper partage).
+    MailIn = modContactCommon.MailIn(s)
+End Function
+
+Private Function IsOwnAddr(ByVal adr As String) As Boolean
+    IsOwnAddr = (InStr(mOwnAddr, "|" & adr & "|") > 0)
+End Function
+
+' Envoi automatique (no-reply, notification...) ou adresse technique (=).
+Private Function IsSkippedAddr(ByVal adr As String) As Boolean
+    Dim k As Long
+    If InStr(adr, "=") > 0 Then
+        IsSkippedAddr = True
+        Exit Function
+    End If
+    For k = LBound(mSkipAddr) To UBound(mSkipAddr)
+        If Len(mSkipAddr(k)) > 0 Then
+            If InStr(adr, mSkipAddr(k)) > 0 Then
+                IsSkippedAddr = True
+                Exit Function
+            End If
+        End If
+    Next k
+End Function
+
+' Adresse grand public : nom principal du domaine dans la liste
+' (gmail.com, orange.fr, yahoo.co.uk...). mail.cnrs.fr n'en est pas une.
+Private Function IsGeneric(ByVal adr As String) As Boolean
+    Dim p As Long, labels() As String, n As Long, reg As String
+    p = InStr(adr, "@")
+    If p = 0 Then Exit Function
+    labels = Split(LCase$(Mid$(adr, p + 1)), ".")
+    n = UBound(labels)
+    If n < 1 Then Exit Function
+    reg = labels(n - 1)
+    If n >= 2 Then
+        Select Case reg
+            Case "co", "com", "net", "org", "ac", "gouv", "gov", "edu", "ne", "or"
+                reg = labels(n - 2)
+        End Select
+    End If
+    IsGeneric = (InStr(mGeneric, "|" & reg & "|") > 0)
+End Function
+
+'=============================================================================
+' Petits outils
+'=============================================================================
+Private Function VStr(ByVal x As Variant) As String
+    On Error Resume Next
+    If IsNull(x) Or IsEmpty(x) Or IsArray(x) Then Exit Function
+    VStr = CStr(x)
+End Function
+
+Private Function VDate(ByVal x As Variant) As Date
+    On Error Resume Next
+    Dim d As Date
+    If IsDate(x) Then
+        d = CDate(x)
+        If d > #1/1/4000# Then d = 0          ' "aucune date" d'Outlook (4501)
+    End If
+    VDate = d
+End Function
+
+' "yyyymmddhhnnss" -> Date.
+Private Function StampDate(ByVal stamp As String) As Date
+    On Error Resume Next
+    If Len(stamp) < 14 Then Exit Function
+    StampDate = DateSerial(CInt(Left$(stamp, 4)), CInt(Mid$(stamp, 5, 2)), CInt(Mid$(stamp, 7, 2))) + _
+                TimeSerial(CInt(Mid$(stamp, 9, 2)), CInt(Mid$(stamp, 11, 2)), CInt(Mid$(stamp, 13, 2)))
+End Function
+
+' Tri decroissant (references de mails : la date est en tete de chaine).
+Private Sub SortDesc(ByRef arr() As String)
+    Dim i As Long, j As Long, tmp As String
+    For i = LBound(arr) + 1 To UBound(arr)
+        tmp = arr(i)
+        j = i - 1
+        Do While j >= LBound(arr)
+            If arr(j) < tmp Then
+                arr(j + 1) = arr(j)
+                j = j - 1
+            Else
+                Exit Do
+            End If
+        Loop
+        arr(j + 1) = tmp
+    Next i
+End Sub
+
+' Indices des fiches tries par nom affiche (tri de Shell).
+Private Function NameOrder() As Long()
+    Dim idx() As Long, keys() As String, i As Long, j As Long, gap As Long, tmpI As Long, tmpK As String
+    If mN < 1 Then
+        ReDim idx(0 To 0)
+        NameOrder = idx
+        Exit Function
+    End If
+    ReDim idx(1 To mN)
+    ReDim keys(1 To mN)
+    For i = 1 To mN
+        idx(i) = i
+        keys(i) = LCase$(mC(i).Disp)
+    Next i
+    gap = mN \ 2
+    Do While gap > 0
+        For i = gap + 1 To mN
+            tmpI = idx(i)
+            tmpK = keys(i)
+            j = i
+            Do While j > gap
+                If keys(j - gap) > tmpK Then
+                    idx(j) = idx(j - gap)
+                    keys(j) = keys(j - gap)
+                    j = j - gap
+                Else
+                    Exit Do
+                End If
+            Loop
+            idx(j) = tmpI
+            keys(j) = tmpK
+        Next i
+        gap = gap \ 2
+    Loop
+    NameOrder = idx
+End Function
+
+' Entier avec espace des milliers (le separateur du poste peut etre une
+' espace fine, que MsgBox afficherait "?").
+Private Function FmtInt(ByVal n As Long) As String
+    Dim s As String, res As String, k As Long, c As Long
+    s = CStr(Abs(n))
+    For k = Len(s) To 1 Step -1
+        res = Mid$(s, k, 1) & res
+        c = c + 1
+        If (c Mod 3) = 0 And k > 1 Then res = " " & res
+    Next k
+    If n < 0 Then res = "-" & res
+    FmtInt = res
+End Function
+
+Private Function FmtDuration(ByVal sec As Double) As String
+    Dim s As Long
+    s = CLng(sec)
+    If s < 60 Then
+        FmtDuration = s & " s"
+    Else
+        FmtDuration = (s \ 60) & " min " & Format$(s Mod 60, "00") & " s"
+    End If
+End Function
+
+Private Function FmtDate(ByVal d As Date) As String
+    If d <= 0 Then
+        FmtDate = "?"
+    Else
+        FmtDate = Format$(d, "dd/mm/yyyy")
+    End If
+End Function
+
+Private Function Shorten(ByVal s As String, ByVal n As Long) As String
+    If Len(s) > n Then
+        Shorten = Left$(s, n - 3) & "..."
+    Else
+        Shorten = s
+    End If
+End Function
+
+' "{A}" -> A majuscule accent grave (absent de la table des marqueurs de A()).
+Private Function CapA(ByVal s As String) As String
+    CapA = Replace(s, "{A}", ChrW$(192))
+End Function
+
+' InputBox / MsgBox n'affichent que la page de code ANSI : emojis retires
+' des noms de boites affiches (le nom reel n'est pas touche).
+Private Function AnsiOnly(ByVal s As String) As String
+    ' v1.1 (F7-14) : delegation modContactCommon (helper partage).
+    AnsiOnly = modContactCommon.AnsiOnly(s)
+End Function
+
+Private Function WhatLabel() As String
+    If mWantMail And mWantPhone Then
+        WhatLabel = T("e-mail et t~el~ephone", "e-mail and phone")
+    ElseIf mWantMail Then
+        WhatLabel = T("e-mail", "e-mail")
+    Else
+        WhatLabel = T("t~el~ephone", "phone")
+    End If
+End Function
+
+Private Function UiTitle() As String
+    UiTitle = T("Compl~eter les coordonn~ees des contacts", "Complete contact details")
+End Function

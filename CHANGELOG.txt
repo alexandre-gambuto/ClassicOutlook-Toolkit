@@ -1,3 +1,312 @@
+[2026-11-16] Audit 11/2026 - campagne de correctifs : 172 constats valides, corriges par lots ; detail par module ci-dessous.
+
+[2026-11-16] modCommon v1.4 - TickMs / ElapsedMs (compteur 64 bits GetTickCount64, ne reboucle jamais) et SleepMs (attente par tranches Sleep + DoEvents) pour remplacer toute comparaison de GetTickCount brut (constat F10-05)
+
+[2026-11-16] modConfig v3.18 - CfgL / CfgB : une valeur illisible ou hors limites prend son defaut et est signalee une fois au journal au lieu de couper la suite du chargement ; un seul essai de lecture si config.ini manque ; defauts "Suivi des mails.xlsm" et "Suivi des Campagnes.xlsm" ; nouvelles cles ToastOnManualFiling (0), BirthdayCalendarFocusFirst (0), OutlookDefaultSlot (30) et getters ; DueCachePath ; ConfiguredLogLevel (constats F2-08, F2-02, F5-15, F10-12, F10-02, F6-04, F4-07, F10-03) ; complement : complement d'integration : constante MOD_VERSION alignee sur l'en-tete (elle annoncait v3.17) ; commentaire du defaut de CampaignWorkbookFilename corrige (constats F2-08, F5-15)
+
+[2026-11-16] modDebugLog v2.2 - le niveau du journal se relit tout seul dans config.ini apres une remise a zero du projet VBA (lignes INFO dont "SESSION END" plus perdues) ; rotation sur deux generations (debug.log.old, debug.log.old2) ; LastLineTime et LogClip ; en-tete aligne sur le code (constats F10-03, F10-13, F1-10)
+
+[2026-11-16] modDefer v1.18 - BirthdayView et SentPrompt deviennent des traitements lourds ; report d'un traitement lourd journalise en INFO une fois par serie ; cle CleanFlags retiree (purge des drapeaux supprimee) ; en-tete aligne sur les delais reels (constats F10-01, F10-13, F1-06, F1-10) ; complement : complement d'integration : cles legeres CalReplay (rejeu calendrier), SnoozeCatchUp (retour des mails reportes) et StartupConfirm (demarrage confirme) ; cle SentPrompt retiree avec la fenetre automatique des envoyes (constats F6-05, F3-16, F10-14, F3-06)
+
+[2026-11-16] modExcelBridge v1.1 - classeur deja ouvert reconnu par son nom quand Excel le presente par son adresse web OneDrive (FindOpenWorkbookByRef), autre copie du meme nom refusee ; DataLastRow insensible aux filtres ; ClearSheetFilter ; PauseMs = vraie attente (constats F2-04, F4-01, F5-04, F8-01)
+
+[2026-11-16] modInboxAlert v1.5 - alertes de nouveau mail muettes apres 25 jours d'allumage du PC : echeance du toast en millisecondes 64 bits (modCommon.TickMs) et bornee ; sonde son sans boucle Timer ; "Son confie au toast" en DEBUG, nom de fichier seul (constats F10-05, F10-13)
+
+[2026-11-16] modNotify v4.6 - le fichier d'un toast n'est plus efface avant que mshta l'ait lu (purge des seuls toasts fermes depuis plus d'une minute) ; script du toast en JavaScript au lieu de VBScript ; IsRectVisibleOnScreen pour la fenetre calendrier ; "Toast affiche" en DEBUG (constats F2-09, F1-11, F10-13)
+
+[2026-11-16] modSmtp v1.1 - regles communes de lecture d'un fil : MessageClassKind (reponse, absence, accuse, non-remise), IsAutoReplyItem (classe, en-tetes Auto-Submitted / X-Autoreply, objet), MyAddresses / IsMyAddress / IsFromMe, HasExternalRecipient ; en-tete ClearCache corrige (constats F4-02, F5-08, F5-22, F6-19, F1-10)
+
+[2026-11-16] modUi v1.4 - AskTextEx : saisie qui distingue Annuler d'un champ vide ; AskText inchange, delegue a AskTextEx (constats F2-10, F3-11) ; complement : complement d'integration : coquille "appara~ytre" corrigee dans UiSelfTest (controle ITREMA)
+
+[2026-11-16] config_ini.example - fausses cles et cles sans numero retirees, cles a liste par defaut mises en commentaire, valeur ViewPreview tronquee retiree, cles ajoutees (NewFolderParentProject / NewFolderParentContract, ContactEnrich*, SearchScope, BirthdayCalendarFocusFirst, OutlookDefaultSlot, ToastOnManualFiling), noms de classeurs corriges (constats F2-02, F5-15)
+
+[2026-11-16] modMailResponseTracker v6.7 - suivi des mails : derniere ligne trouvee sous les lignes filtrees et filtre leve avant ajout (plus d'ecrasement d'une ligne masquee) ; reponses automatiques, accuses et rapports ecartes, "soi" = toutes ses adresses ; fil deja suivi non rajoute, chaque ligne d'un meme fil garde ses destinataires et sa date ; re-identification bornee a chaque dossier, Elements envoyes et dossiers recents d'abord, reprise apres interruption ; ecritures en bloc (statuts par colonnes, ligne en une affectation, tri, formule), couleurs de statut par mise en forme conditionnelle, Excel muet pendant l'actualisation, mail relu une fois ; rappel du matin sans Excel (fichier Sorties\suivi-echeances.txt) et recalcul leger quotidien au premier moment calme ; reparation ecrite en bloc, rien d'enregistre si interrompue, 5 copies gardees ; Excel occupe : essais repetes, suivi urgent et relance envoyee gardes puis re-essayes (3 fois) avant alerte ; en retard le lendemain de la date limite ; "Relancer retardataires" = tableau de bord avec retards coches, ancien moteur retire (envoi automatique, suppression, recherche mail par mail) avec FollowUpSelected, RecordSentMail, DiagConversationLookup ; classeur absent : message ; Actualiser/Reparer en double ignores, accuse de reception dans la note ; en-tetes a la charte commune (constats F4-01, F4-02, F4-03, F4-05, F4-06, F4-07, F4-08, F4-09, F4-10, F4-11, F4-12, F4-15, F4-16, F4-17, F4-19, F8-22, F10-09, F10-11) ; complement : complement d'integration : objet du mail raccourci au journal (RecordSentMailQuick, EnqueueUrgentTracking) (constat F10-13)
+
+[2026-11-16] modReplyGreeting v1.3 - plus de second "Bonjour" sur les relances : brouillon de relance du suivi des mails (propriete FollowupConvID) exclu, et rien d'insere quand le texte commence deja par la salutation (constat F5-16)
+
+[2026-11-16] modMailTracker v1.4 (classeur Suivi des mails) - derniere ligne trouvee sous les lignes filtrees ; Archiver/Restaurer sans presse-papiers, ligne d'origine supprimee seulement si la copie est arrivee, sans confirmation (compte rendu dans la barre d'etat) ; Relancer sur les lignes cochees (3 brouillons affiches, les suivants dans Brouillons, 10 au plus, lignes repondues ou traitees ignorees, reponse a tous sur le mail suivi) et bouton Cocher les retards ; mail deplace : actualisation demandee puis action reprise seule ; accuse de reception des commandes (message si Outlook ne repond pas) ; rendez-vous OnTime annules (le classeur ne se rouvre plus seul) ; coche au clic de souris seulement ; en retard le lendemain de la date limite, compteur du ruban sur la date limite ; fichier des echeances ecrit apres chaque enregistrement ; ruban : boutons grises hors de leur feuille, bouton Aide, identifiants anglais (anciens reconnus) (constats F4-01, F4-07, F4-08, F4-09, F4-13, F4-14, F4-15, F4-16, F4-18, F4-19, F8-20, F8-21, F8-22)
+
+[2026-11-16] ThisWorkbook v7.1 (classeur Suivi des mails) - fermeture : rendez-vous OnTime annules ; apres enregistrement : fichier des echeances ecrit pour le rappel du matin d'Outlook (constats F4-14, F4-07)
+
+[2026-11-16] modMailCampaign v12.1 - envoi cadence : ligne retrouvee par sa cle (destinataire + objet) apres un tri ou une insertion, ligne dont le statut n'est plus vide sautee, brouillons / second envoi / relances refuses sur une feuille en cours d'envoi ; statut "Envoye (en cours) le" pose et relu avant chaque depart (Excel occupe : meme ligne retentee 10 s plus tard, arret apres 6 refus), "Envoye le" ensuite, classeur enregistre toutes les 10 lignes et a chaque pause, ecriture refusee journalisee ; purge des brouillons limitee aux lignes visees et brouillon precedent de la meme ligne remplace (plus de doublon), "Relance en brouillon" conserve par l'actualisation ; colonnes reconnues par nom exact ; accuses de lecture / remise ignores, reponse prioritaire sur une non-remise, reponses automatiques hors Exchange reconnues (modSmtp) ; mail range ou archive apres l'envoi retrouve (Envoyes, dossier de classement, dossier du code de l'objet) ; Elements envoyes d'un compte d'envoi secondaire releves ; ecritures des envois manuels groupees par feuille (differe 10 s) ; "Reinitialiser les statuts" du ruban Outlook ne touche plus les lignes envoyees ; dossier de classement verifie au pre-vol ; piece jointe impossible a joindre = ligne en echec ; CampaignHelp (bouton Aide de l'onglet Emaileur) ; code de l'objet par correspondance bornee (modQuickMove.FindCodeMatches) ; FindOpenWorkbook / IsAutoReply / FromOwner / OwnerAddresses remplacees par modExcelBridge / modSmtp ; journal sans adresse de destinataire (constats F5-01, F5-02, F5-05, F5-06, F5-07, F5-08, F5-09, F5-10, F5-12, F5-13, F5-15, F5-21, F5-22, F5-23)
+
+[2026-11-16] Suivi des Campagnes__modCampaignBook v1.1 - relance des lignes selectionnees : lignes masquees par un filtre ignorees, lignes qui ne sont pas "Sans reponse" signalees dans la question ; derniere ligne de la table calculee lignes masquees comprises et import qui reaffiche toutes les lignes (plus d'ecrasement de contacts caches) ; colonnes reconnues par nom exact (copie identique de modMailCampaign) ; effacement differe de la barre d'etat memorise, remplace et annulable (CancelStatusClear) ; charte des classeurs appliquee a la creation d'une campagne (en-tete 1F4E79 blanc gras centre, hauteur 24, police Arial, volets figes sous l'en-tete) et macro FormatCampaignSheet ; nom du classeur et de l'onglet, message "Mail introuvable", prerequis Outlook (constats F5-03, F5-04, F5-07, F5-11, F5-15, F5-23, F8-20, F8-21, F8-22)
+
+[2026-11-16] Suivi des Campagnes__ThisWorkbook v1.1 - Workbook_BeforeClose annule l'effacement differe de la barre d'etat : le classeur ferme ne se rouvre plus tout seul quelques minutes apres une action ; nom du classeur (constats F5-11, F5-15)
+
+[2026-11-16] GUIDE-Campagnes.md v12.1 - nom "Suivi des Campagnes.xlsm", onglet "Campagnes", macro Projet.CampaignOpenWorkbook et bouton Aide (CampaignHelp), bloc campagnes de config.ini a ne reporter qu'une fois ; comportements v12.1 decrits : statut "Envoye (en cours)", tri pendant l'envoi, dossier de classement verifie, piece jointe en echec, compte d'envoi secondaire, mail deplace retrouve, colonnes par nom exact, lignes filtrees, FormatCampaignSheet (constat F5-15)
+
+[2026-11-16] modFolderSort v3.2 - "Trier les dossiers AZ" trie de nouveau : algorithme v3.1 du 18/08 reconstruit (rang alphabetique ecrit dans PR_SORT_POSITION, fratrie par fratrie, PR_SORT_PARENTID recopie ; Exchange refuse la suppression des proprietes que faisait la v2) ; fratries comptees en simulation ; recapitulatif en toast conserve (constat F3-01)
+
+[2026-11-16] modFolderMerge v2.1 - la fusion deplace tous les elements du premier coup : identifiants releves d'abord (table), puis deplacement element par element, au lieu de relire la collection pendant les deplacements (un element sur deux restait) ; dossier A relie des son choix ; en-tete corrige (constats F3-02, F10-08, F3-05, F3-18) ; complement : complement d'integration : echec de suppression du dossier B, la boite affiche le vrai numero d'erreur (elle affichait "err 0")
+
+[2026-11-16] modQuickMove v12.2 - "Aller au dossier" vise une fenetre courrier et verifie par identifiant, sans re-scan inutile ; recents remappes a chaque parcours complet ; numero tape refuse si l'index a change pendant la saisie (liste refaite) ; annulation du dernier classement (MoveItemTo, QuickMoveUndo) ; code a 4 chiffres tape dans une liste = recherche ; listes bornees a ~780 caracteres ; nombres du corps sans dossier ignores ; code detecte classe sans question seulement s'il n'est colle a aucun autre chiffre ; debut de contrat ignore ; Annuler a la creation de dossier n'ecrit rien ; toast des classements manuels selon ToastOnManualFiling ; ResolveFromCache supprimee (constats F3-03, F10-15, F3-04, F3-05, F3-08, F3-09, F3-10, F3-11, F3-12, F3-13, F3-18, F3-21, F10-12) ; complement : complement d'integration : commande QuickMoveSentPending ("Classer les envoyes en attente", relais vers ThisOutlookSession.FileSentPending) ; FormatMatchList accepte une place maximale facultative ; liste des recents marquee bornee ; "Cache sauvegarde" en DEBUG (constats F3-06, F3-21, F10-13)
+
+[2026-11-16] modReplySuspicion v5.1 - la proposition de suivi retrouve le mail range automatiquement (NoteMoved : nouvel identifiant, sinon recherche dans le dossier cible) ; seul le texte ecrit par l'utilisateur est analyse (historique et signature exclus) ; comparaison sans accents ; choix du pop-up journalise ; mot-cle vide ignore (constats F10-06, F1-04, F4-04, F4-20) ; complement : complement d'integration : objet du mail raccourci au journal (LogClip) (constat F10-13)
+
+[2026-11-16] modReplyInPlace v12.1 - un index de conversation illisible n'empeche plus le repli "dossier du fil" (envois non classes du 05/10) ; deplacement par modQuickMove.MoveItemTo (suivi de l'identifiant, annulable) ; cache systeme de l'ancienne boite unique supprime (code mort) (constats F10-10, F3-20, F10-06, F3-08, F3-18) ; complement : complement d'integration : "SysCache invalide", "Memorise parentCI" et "Cible via fil" au journal en DEBUG (constat F10-13)
+
+[2026-11-16] modFolderScan v6.2 - un dossier tout neuf (vide, sans sous-dossier) n'est plus archive des le lendemain ; un deplacement refuse est ecrit au journal dans les deux sens (constat F3-17)
+
+[2026-11-16] modSnooze v4.2 - SnoozeCatchUp ramene les mails reportes dont le rappel a ete rate ; dossier d'origine memorise aussi par identifiant ; mail revenu marque non lu ; confirmation de SnoozeList seulement si le deplacement a reussi (constat F3-16) ; complement : complement d'integration : liste de SnoozeList bornee a ~650 caracteres ; SnoozeCatchUp branche au demarrage (constats F3-16, F2-01)
+
+[2026-11-16] modMarkAllRead v4.1 - "Marquer tout en lu" agit sur la boite du dossier affiche ; comptage sans requete (UnReadItemCount) et dossiers sans non-lu sautes ; Outlook reste reactif pendant le marquage (constats F3-15, F3-18)
+
+[2026-11-16] modMailExport v3.2 - le fichier temporaire de chaque mail exporte est efface apres la fermeture du document Word, restes purges en fin de lot ; toast de depart au-dela de 20 mails ; en-tete corrige (constats F3-14, F3-18)
+
+[2026-11-16] modSearch v4.1 - attente apres la recherche par modCommon.SleepMs (plus de boucle Timer bloquee si elle chevauche minuit) ; ResetSearch conservee pour le bouton Retour (signale par le lot Fondations ; F3-19)
+
+[2026-11-16] modFolderRename v1.3 - apres renommage, reindexation QuickMove par paquets sans fenetre au lieu d'une seconde boite de confirmation (constat F3-18)
+
+[2026-11-16] clsApptWatcher v2.3 - le bloc Teams n'est plus retire d'une reunion recue ou annulee, ni d'un rendez-vous simple : seulement d'une reunion a moi sans invite tiers (etat lu a l'ouverture de la fenetre ou au passage en reunion) ; toast "creneau personnel" decide au Write, une fois par fenetre (lien retire, lien a retirer, simple conversion) (constats F6-01, F6-09) ; complement : complement d'integration : "Write sur ... WordEditor dispo" et "Nettoyage corps non effectue" sans lien restant au journal en DEBUG (constat F10-13)
+
+[2026-11-16] modAntiOverlap v7.2 - le decalage de 15 min ne touche plus les reunions (envoyees ou recues) ; la recherche du creneau voit les reunions periodiques et les elements commences la veille (series developpees, Restrict sur le chevauchement, GetFirst/GetNext) ; MarkAsUserPlaced : un rendez-vous place a la main n'est plus deplace ; variable "a" renommee (constats F6-02, F6-03, F6-08, F6-17) ; complement : complement d'integration : "Non decale (creneau aussi occupe)" au journal en DEBUG (constat F10-13)
+
+[2026-11-16] modShiftAppointment v3.2 - les boutons -15/+15 min et "Duree reelle" marquent le rendez-vous comme place a la main : l'anti-chevauchement ne l'annule plus et ne le double plus (constat F6-08)
+
+[2026-11-16] modNewMeetingDefault v7.1 - la duree par defaut de 15 min ne remplace plus que la duree donnee d'office par Outlook (OutlookDefaultSlot, 30 min) : une plage choisie a la souris ou un evenement importe garde sa duree (constat F6-04) ; complement : complement d'integration : "clsAppEvents instancie" au journal en DEBUG (constat F10-13)
+
+[2026-11-16] modProjectTag v9.3 - reunion periodique : choix "toute la serie / ce jour seulement" (serie etiquetee et coloree sur le maitre) ; plus de question "Affecter un projet ?" ni de confirmation du resultat unique, toast de l'etiquette posee ; lot : Annuler = passer, STOP = arreter ; marche/arret de la question auto memorise (registre) et annonce par toast ; texte tape dans la liste des resultats = affinage ; opportunite sans DV etiquetee avec son code ; "Creer dossier depuis un rendez-vous" etiquette comme la fenetre de choix ; StripProjectTag pour les invites externes (constats F6-07, F6-10, F6-11, F6-12, F6-13, F6-14, F6-19) ; complement : complement d'integration : chargement des projets silencieux quand il est automatique (parametre silent de LoadProjects / LoadProjectsFromFile, passe par InitProjectTag : journal au lieu de 4 MsgBox) ; liste des taches internes bornee en caracteres ; commentaires remis d'accord avec le code (constats F1-12, F6-18)
+
+[2026-11-16] modMeetingColor v13.4 - "Taguer RDV recents" : la recherche s'ouvre directement pour chaque RDV, Annuler passe au suivant, STOP arrete le lot ; variables "a" renommees dans les procedures qui affichent des textes traduits (constats F6-10, F6-17) ; complement : complement d'integration : commentaire du rattrapage des couleurs (differe modDefer CatchUpColor, plus Application.OnTime) ; boite de CleanSelectedItem marquee bornee (constat F6-18)
+
+[2026-11-16] modMeetingToAppointment v6.4 - InspectorHasTeamsLink pour le toast "lien Teams a retirer" ; trace de la sortie "pas une reunion" de DemoteIfEmptyMeeting ; variables "a" / "t" renommees (constats F6-09, F6-17) ; complement : complement d'integration : commentaire de DemoteIfEmptyMeeting aligne sur le code (aucun invite autre que moi) (constat F6-18)
+
+[2026-11-16] modPurgeCategories v8.1 - la purge ne retire plus que les categories automatiques (reunion interne / externe) ; categories posees par l'etiquetage et categorie personnelle configuree conservees (constat F6-16, choix B)
+
+[2026-11-16] modMigrateTags v2.1 - une paire dont l'ancien nom est encore utilise par le code (cle UpTag ou UpShift) n'est plus migree et la boite de confirmation l'explique (constat F6-15)
+
+[2026-11-16] modContactBirthday v1.11 - vue calendrier des anniversaires en un seul parcours du volet (calendriers decoches non ouverts, rien d'ecrit si deja en place, duree par etape au journal au-dela de 2 s) ; mise au premier plan coupee par defaut (getter BirthdayCalendarFocusFirst) ; fetes et anniversaires sans annee plus supprimes puis recrees chaque annee ; purge des orphelins jamais proposee apres une erreur de lecture et limitee aux evenements du compte parcouru (UserProperty BirthdayStore) ; champs differents nommes dans les lignes [MAJ] et comptes dans le journal ; [Appliquer maintenant] apres une simulation ; rapport via modContactCommon (constats F10-01, F1-01, F10-02, F7-02, F7-03, F7-04, F7-14, F7-15, F7-16) ; complement : complement d'integration : mention "(Boutons natifs : ...)" retiree du choix Simulation / Appliquer, ajoutee par modMsgBoxCustom en repli (constat F7-16)
+
+[2026-11-16] modContactCommon v1.1 - fichier d'annulation des modifications en masse des fiches (UndoLine, UndoPathFor, UndoSave) et nouvelle commande ContactUndoLastRun (simulation puis retablissement des seuls champs non modifies depuis) ; outils partages repris des modules contacts : NameKeySorted, MailIn, PhoneTail, AnsiOnly, JournalInsert, SafeSave, WriteUtf8, OwnIdentity, ContactSkipDefault (constats F7-13, F7-14) ; complement : complement d'integration : mention "(Boutons natifs : ...)" retiree du choix Simulation / Retablir de ContactUndoLastRun (constat F7-16)
+
+[2026-11-16] modContactEnrich v1.1 - fiche sans adresse : une adresse vue sous le seul nom passe "a trancher" sauf si son domaine correspond a la societe de la fiche ; traitements lourds differes reportes pendant la recherche (BeginHeavy / EndHeavy) ; fichier d'annulation des fiches ecrites ; cle de nom, adresse, numeros, journal, identite et ecriture UTF-8 delegues a modContactCommon ; en-tete : dossier Sorties (constats F7-01, F7-08, F7-13, F7-14, F7-15) ; complement : complement d'integration : boite AskAmbiguous marquee bornee (6 lignes au plus) (controle MSGLOOP)
+
+[2026-11-16] modContactExport v1.4 - README : ouverture du CSV dans Excel par Donnees > A partir d'un fichier texte/CSV, colonnes telephone et code postal en Texte, regle _Photo precisee ; code mort retire, ecriture UTF-8 et dossiers exclus par modContactCommon (constats F7-07, F7-17, F7-14)
+
+[2026-11-16] modContactFromMail v1.8 - numero francais classe par son prefixe (06/07 = mobile) et libelles lus en mots entiers ; anti-doublon insensible a l'ordre prenom / nom ; formules de politesse completees (lignes courtes) et, sans formule, signature lue a partir de la ligne du nom de l'expediteur pour SenderSignaturePhones ; numero deja connu compare sur 9 chiffres ; AnsiOnly et dossiers exclus par modContactCommon ; en-tete : dossier Sorties (constats F7-09, F7-10, F7-11, F7-14, F7-15)
+
+[2026-11-16] modContactImport v1.5 - CSV repasse par Excel : telephone sans "+" ou sans 0 initial et code postal sans 0 initial gardes tels quels, notation scientifique, lettres changees en "?" et notes coupees refusees avec une note ; photo d'un autre fichier que celui de l'export posee quelle que soit sa date ; fichier d'annulation ; [Appliquer maintenant] apres une simulation ; code mort retire, outils communs ; en-tete : dossier Sorties (constats F7-07, F7-17, F7-13, F7-16, F7-14, F7-15) ; complement : complement d'integration : mention "(Boutons natifs : ...)" retiree du choix Simulation / Appliquer (constat F7-16)
+
+[2026-11-16] modContactNormalize v1.6 - numero national d'un contact dont l'adresse est a l'etranger laisse tel quel (plus de faux +33) ; fichier d'annulation de chaque passe Appliquer, purge des categories comprise ; [Appliquer maintenant] apres une simulation ; code mort retire, outils communs ; en-tete : dossier Sorties (constats F7-12, F7-13, F7-16, F7-14, F7-15) ; complement : complement d'integration : mention "(Boutons natifs : ...)" retiree du choix Simulation / Appliquer (constat F7-16)
+
+[2026-11-16] modContactNote v1.1 - insertion dans la section "=== JOURNAL ===" partagee avec modContactEnrich (modContactCommon.JournalInsert), comportement inchange (constat F7-14)
+
+[2026-11-16] modContactRelation v1.2 - Rapport de relance : mails envoyes cherches dans tous les dossiers de mails (envois ranges par ReplyInPlace / QuickMove compris), en mode liste, destinataire reconnu par son adresse visible sinon par son nom ("(nom)" au rapport) ; DoEvents, toast d'avancement toutes les 30 s, traitements lourds differes reportes, une seule passe a la fois, plus de promesse de barre d'etat ; code mort retire ; en-tete : dossier Sorties (constats F7-05, F7-06, F7-14, F7-15)
+
+[2026-11-16] modMailAnalytics V25.3 - mise a jour delta reparee (dernier rapport repris sans boite de choix, _ETAT lu par modExcelBridge) et exacte (fin horodatee, plus de double comptage) ; filtre de date pour une periode ou un delta ; echecs signales, rapport non enregistre laisse ouvert ; une seule analyse a la fois + BeginHeavy ; dossiers systeme par identite ; adresses et "moi" par modSmtp, domaines internes de config.ini ; longueur non coupee au premier "Le" ; Evolution sans borne 2017 ; fin sans attente active ; taux et delai de reponse (feuille Reponses) ; MOD_NAME/ModVersion, modDebugLog, T() (constats F9-01 a F9-11, F9-13, F9-15, partie code de F9-12)
+
+[2026-11-16] frmConfig V23.8 - date de fin sans heure = journee entiere ; libelle delta qui nomme le rapport repris ; case Resolution Exchange masquee ; test de resolution sans "mode recommande" ; modDebugLog, T() ; frmConfig.frm resynchronise (constats F9-01, F9-02, F9-07, F9-08, F9-13, partie code de F9-12)
+
+[2026-11-16] frmProgress V23.7 - bouton Pause qui change d'intitule, pause sans coeur a 100 % (modCommon.SleepMs), libelles T(), modDebugLog, Option Explicit en ligne 1 ; frmProgress.frm resynchronise (constats F9-11, F9-04, F9-13, partie code de F9-12)
+
+[2026-11-16] modOneNote v1.1 - en-tete ARCHIVE : a retirer du projet installe, garde dans le depot ; code inchange (constat F9-14, choix A)
+
+[2026-11-16] modOneNoteProbe v1.1 - en-tete ARCHIVE : a retirer du projet installe, garde dans le depot ; code inchange (constat F9-14, choix A)
+
+[2026-11-16] modMailAnalytics__README - notice reecrite pour le module du projet Outlook (commandes, config.ini, reperage par adresse, Sorties, journal, delta, feuille Reponses, durees mesurees) (constat F9-13)
+
+[2026-11-16] modMaintenance v4.6 - repart de la v4.5 du 25/10 effacee par la livraison du 02/11 (diagnostic du dossier de l'outil en deux fenetres, chemins relatifs, MaintOpenVBAFolder sur Code) en gardant ContEnrich ; versions des modules ecrites dans Sorties\versions-modules.txt ouvert dans le Bloc-notes (boite resumee) ; filtre du journal par pages de 30 sur deux colonnes ; Ouvrir config sans fichier lance le guide de demarrage (modele perime supprime) ; aide du niveau de journal juste (INFO par defaut, jusqu'au prochain demarrage) ; 6 bindings ; menu Configuration renumerote ; Case OneNote / ONProbe retires, Case Analytics et SendLLM ajoutes (constats F0-01, F2-01, F2-11, F9-14, F9-12, F5-19)
+
+[2026-11-16] modBackupAuto v3.4 - reprend la v3.3 du 26/10 jamais arrivee : rubans exportes lus dans Code\Interface\Rubans (repli Code, Bureau), classeur des campagnes sauvegarde, sections de registre du dossier de l'outil et des modules recents ajoutees ; nombre de fichiers par section, erreur au journal pour une section vide, projet VBA introuvable = echec ; taille du projet VBA et alerte au-dela de 25 Mo (journal + toast) ; recapitulatif journalise sur une ligne ; retention lue dans config.ini dans le texte de Sauvegarde complete (constats F0-04, F0-05, F1-10)
+
+[2026-11-16] modBackupVBA v3.1 - BackupVBASilent supprimee (aucun appelant ni bouton) ; en-tete a jour (dossier Sorties de l'outil) (constat F1-10)
+
+[2026-11-16] modDevTools v8.1 - la reparation automatique des liaisons refait d'abord les liaisons puis recharge les projets en differe (+10 s, tache TagPreload) au lieu d'ouvrir Excel au milieu d'un envoi ou d'une reception ; etat memorise de la question d'etiquetage respecte (constat F1-12)
+
+[2026-11-16] modMailConfidentiality v11.2 - correctif du 17/08 restaure : frontiere de l'historique cite reconnue aussi par la bordure grise d'Outlook (si un libelle De : / From: la suit) et par un libelle De : enrobe d'un span, ancre retenue au journal ; le bouton Confidentiel vise la fenetre active (reponse du volet de lecture ou fenetre de message) et jamais un mail deja envoye ou recu ; niveau Prive plus jamais pose, bip retire ; OwnZoneEnd publique (constats F5-17, F5-18, F5-24, F5-20) ; complement : complement d'integration : SetSensitivity, ToggleSensitivity et SensitivityToken supprimees avec leurs seuls appelants de ThisOutlookSession (constat F5-24)
+
+[2026-11-16] modQuickStart v1.2 - le guide de premier demarrage fait deposer le classeur Suivi de temps dans <outil>\Classeurs (cree, affiche, ouvert par le bouton) et non dans Sorties ; textes et renvois a jour ; accueil automatique : Echap ou la croix = Plus tard (plus Ne plus proposer) ; Annuler aux questions 1 a 4 propose d'abandonner, un champ vide n'est plus pris pour Annuler (constats F2-03, F2-10)
+
+[2026-11-16] modSendToLLM v3.1 - module degele : plus aucune invite de commandes lancee (presse-papiers par l'API Windows, navigateur par Shell.Application), echec du presse-papiers signale au lieu de coller l'ancien contenu ; texte coupe au debut de l'historique cite ; mail marque confidentiel : confirmation demandee, collage sans Entree ; vraie attente (SleepMs) ; MOD_VERSION / ModVersion (constats F5-19, F5-20)
+
+[2026-11-16] validate.py - controles VERSION (numero du module inferieur au changelog) et RECUL (--against / --installe : historique d'en-tete perdu ou contenu change sans nouveau numero) ; --config : CFGDUP et CFGEMPTY, cles lues seulement sur les appels Cfg a deux arguments ; MSGLOOP (texte construit en boucle pour une boite) ; ITREMA ; guillemets doubles dans A() ; modules archives ignores et references vers eux signalees ; modMailAnalytics et ses formulaires plus dispenses (formulaires dispenses de MOD_VERSION seulement) ; code de Suivi de temps exempte de MOD_NAME ; --gen-config : cles a defaut non vide en commentaire, defauts construits ou constantes signales ; --gen-versions inclut modMailAnalytics (constats F0-02, F9-12, F2-02, F8-13, F9-14)
+
+[2026-11-16] ThisOutlookSession v10.20 - integration de l'audit : garde anti-rebond des fenetres sur modCommon.TickMs (plus de garde bloquee apres 24,9 jours d'allumage) ; envoi de reunion : seules les demandes recopient l'objet, etiquette projet retiree pour un destinataire externe, annulations et reponses gardent leur prefixe ; detection "attente de reponse" sautee pour un mail Urgent ou une relance ; envoi de campagne depuis un compte secondaire signale a modMailCampaign ; envoyes non classes : plus de fenetre automatique, toast + commande FileSentPending (recherche d'office, 3 recents r1-r3, liste bornee, numeros refuses apres renumerotation de l'index, Annuler = arreter la serie) ; deplacements par modQuickMove.MoveItemTo (suivi retrouve, annulable, toast manuel selon ToastOnManualFiling) ; classement automatique par code borne au dernier segment (FindCodeMatches) ; evenements calendrier recus pendant la question d'etiquetage rejoues (cle CalReplay) ; plus de reenregistrement inutile a la creation ; roles des fenetres selon leur contenu au demarrage et apres reparation, premiere fenetre d'une session sans fenetre prise en charge (OnFirstExplorer), controle des liaisons reporte sans fenetre courrier ; position du calendrier appliquee a la creation seulement et ignoree hors ecran, memorisation par toast ; fermeture precedente diagnostiquee au journal, marque LastEnd consommee ; demarrage prudent apres 3 arrets anormaux (ResumeStartupTasks, cle StartupConfirm) ; purge mensuelle des drapeaux supprimee, rattrapage des mails reportes au demarrage (cle SnoozeCatchUp) ; etat de la question d'etiquetage lu dans le registre ; canal de commandes : derniere commande memorisee dans le registre, commande trop ancienne journalisee et annoncee ; Sensitivity_Normal / _Personal / _Private supprimees ; code mort et en-tetes perimes retires ; journal allege (constats F10-05, F6-19, F1-05, F10-06, F1-04, F4-03, F5-09, F3-06, F1-02, F10-04, F3-05, F3-07, F3-12, F3-08, F3-21, F10-12, F6-05, F1-09, F6-06, F1-03, F1-06, F1-07, F1-08, F1-10, F1-11, F1-12, F1-13, F10-03, F3-16, F5-24, F6-11, F10-13, F10-14)
+
+[2026-11-16] clsAppEvents v4.3 - ecoute de Application.Explorers (NewExplorer) relayee a ThisOutlookSession.OnFirstExplorer : une session lancee sans fenetre recoit ses liaisons de fenetre courrier a l'ouverture de la fenetre, sans Reinit ; numero de version de l'en-tete aligne sur la constante (constats F1-07, F1-10)
+
+[2026-11-16] modMsgBoxCustom v2.1 - repli sur des boutons natifs : ligne de correspondance "(Oui = ..., Non = ...)" ajoutee automatiquement au texte (NativeMap) (constat F7-16)
+
+[2026-11-16] Accueil_Tous_les_onglets_principaux.exportedUI - ruban de la fenetre principale reorganise selon le tableau valide (aucune macro renommee, identifiants gardes) : barre d'acces rapide (libelles en clair "Mails reportes", "Trier les dossiers A-Z", bouton "Annuler le dernier classement" -> QuickMoveUndo) ; Accueil : groupe "Classer" (QuickMove, "Classer les envoyes en attente" -> QuickMoveSentPending, Aller au dossier, "Reporter"), "Suivi des reponses" (action, vue, "Retards a relancer"), "Cette semaine" avec bouton "Retour" -> ResetSearch, "Avance" (libelles explicites) ; Calendrier : groupe "Toolkit" et bouton "Question projet auto" -> ToggleAutoAsk ; rendez-vous selectionne : groupe "Projet" (+ "Creer le dossier du projet" -> CreateFolderFromAppointment) et groupe "Horaire" ; Contacts : "Annuler la derniere modification des fiches" -> ContactUndoLastRun, icones d'import / export distinctes ; Dossier : icones distinctes ; Affichage : bouton "Memoriser la position du calendrier" -> RememberCalendarPosition ; Emaileur : rien retire, Aide gardee (CampaignHelp existe), "Ouvrir le classeur" et "Arreter l'envoi" ajoutes, libelles et icones corriges ; Statistiques : "Mettre a jour" -> RunEmailAnalysisDelta ; Maintenance : groupes Depannage (Menu maintenance, Maintenance rapide, Reinitialiser, Recharger l'index QuickMove), Journal, Configuration (+ Dossier de l'outil, Guide de demarrage), Sauvegardes, Diagnostic, libelles en francais, plus d'icone "Fermer" pour ouvrir un dossier ; onglet OneNote retire (constats F2-06, F3-19, F9-14, F3-08, F3-06, F6-11, F6-14, F7-13, F9-01, F5-15, F4-16, F1-11)
+
+[2026-11-16] Onglets_principaux_Message.exportedUI - groupe "Classer" (ex-"Deplacer", comme l'Accueil) ; "Creer un contact depuis la signature" (meme libelle partout) (constat F2-06)
+
+[2026-11-16] Onglets_principaux_Nouveau_courrier.exportedUI - bouton "Confidentiel" (meme libelle partout) ; "PJ du fil" (libelle de la commande AddThreadAttachments, icone de piece jointe) (constat F2-06)
+
+[2026-11-16] Onglets_principaux_Nouveau_rendez-vous.exportedUI - groupe "Projet" (ex-"Tempo") ; onglet OneNote retire (boutons sans module) (constats F2-06, F9-14)
+
+[2026-11-16] Onglets_Acces_rapide.exportedUI - fichier supprime : ancien export complet du ruban principal (51 commandes, bouton "Marquer tout en lu" mort), son import apres le bon fichier retirait 14 boutons (constat F2-05)
+
+[2026-11-16] ARCHITECTURE.md - remis d'accord avec le code : contraintes (processus lances, formulaires), un paragraphe par famille de modules (modMailAnalytics dans le projet Outlook, modules OneNote archives, code des classeurs), demarrage (immediat, differe avec delais, redemarrage rapide, demarrage prudent), flux d'evenements (envoyes, ItemSend, calendrier, fenetres a role, canal de commandes), table des cles modDefer avec leur cible, macros des rubans par fenetre, fichiers ecrits dans Sorties, sections de registre, proprietes des elements, modules a coller ensemble (constats F2-07, F9-13, F4-05, F4-20, F5-24, F1-06)
+
+[2026-11-16] README.md - chiffres du projet recalcules, processus lances (plus d'invite de commandes), statistiques dans le projet Outlook (mise a jour, taux de reponse), classeurs compagnons, modules manquants ajoutes (clsFolderWatcher, modContactEnrich, modThreadAttachments, modViewGuard), modules OneNote archives, rubans (un fichier par fenetre, import unique), installation (collage d'ensemble, formulaires), arborescence alignee sur Code\ (constats F2-07, F2-05, F9-13, F9-14)
+
+[2026-11-16] CHANGELOG.txt - entrees manquantes du 20/10 au 02/11 reconstituees a leur date depuis les en-tetes des modules (20/10, 23/10, 24/10, 25/10, 26/10, 29/10, 02/11) (constat F0-03)
+
+[2026-11-02] Completer les coordonnees des contacts (nouvelle commande).
+             Fichiers : modContactEnrich v1.0 (nouveau), modContactFromMail
+             v1.7, modMaintenance v4.5 (livraison du 02/11),
+             Accueil_Tous_les_onglets_principaux.exportedUI. Entree
+             reconstituee le 16/11 depuis les en-tetes (audit 11/2026,
+             F0-03).
+  * modContactEnrich v1.0 (NOUVEAU) - Contacts > Avance > "Completer les
+    coordonnees des contacts" (Sub ContactEnrichFromMail) : complete
+    l'adresse e-mail et/ou les telephones des fiches a partir des mails
+    (fiches selectionnees ou toutes ; une boite ou toutes ; choix memorises
+    dans HKCU Toolkit\ContactEnrich). Dossiers lus en mode liste (Table :
+    expediteur, destinataires, date ; aucun mail ouvert) ; seuls les mails
+    utiles a la lecture d'une signature sont ouverts ; toast d'avancement.
+    Recapitulatif AVANT toute ecriture (a completer, a trancher, rien
+    trouve, a jour, ignorees ; detail dans un rapport texte), puis
+    [Un par un] / [Tout ecrire] / [Annuler]. Personne reconnue par son nom
+    (ordre, accents, casse et civilites ignores) ; nouvelle adresse
+    professionnelle plus recente = e-mail 1, adresses grand public en
+    secondaire ; telephones lus dans la signature des mails recus, ecrits
+    dans les champs vides seulement ; fiche relue juste avant l'ecriture ;
+    ligne datee dans le journal de la fiche. Cles config.ini optionnelles :
+    ContactEnrichMaxMailsPerContact, ContactEnrichGenericDomains,
+    ContactEnrichSkipAddresses, ContactEnrichMaxMinutes,
+    ContactEnrichProgressSec, ContactEnrichJournal.
+  * modContactFromMail v1.7 - fonction publique SenderSignaturePhones
+    (telephones de la signature de l'expediteur, haut du mail), utilisee
+    par modContactEnrich ; meme moteur que la creation de fiche ; aucun
+    changement des commandes existantes.
+  * modMaintenance v4.5 (02/11) - ContEnrich ajoute a MODULES_DEFAULT et a
+    ModuleVersionOf. Livraison refaite sur la v4.4 : elle a efface la v4.5
+    du 25/10 (diagnostic des chemins), retablie par la v4.6 (11/2026).
+  * Ruban de la fenetre principale : bouton "Completer les coordonnees des
+    contacts" (onglet Contacts, groupe Avance, Projet.ContactEnrichFromMail).
+
+[2026-10-29] modReplyGreeting v1.2 - REPONDRE A TOUS. Entree reconstituee
+             le 16/11 depuis l'en-tete du module (audit 11/2026, F0-03).
+  * Avec plusieurs personnes dans le champ A, deux lignes sont inserees :
+    "Bonjour Prenom," (premier destinataire A qui n'est pas soi, en
+    pratique l'expediteur du mail d'origine) puis "Bonjour a tous," ; on
+    supprime celle qui ne sert pas. Prenom introuvable : "Bonjour a tous,"
+    seul. Deja salue aujourd'hui dans le fil : "Prenom," et "A tous,".
+  * Nouvelle cle GreetingReplyAll (defaut 1 ; 0 = comportement v1.1 :
+    reponses a plusieurs exclues).
+
+[2026-10-26] modBackupAuto v3.3 - livree en zip, JAMAIS ARRIVEE dans Code\
+             ni dans Outlook : la v3.2 du 22/08 est restee en service.
+             Entree reconstituee le 16/11 depuis l'en-tete de la v3.4
+             (audit 11/2026, F0-03).
+  * Contenu prevu : rubans .exportedUI sauvegardes depuis
+    <outil>\Code\Interface\Rubans (repli Bureau), classeur des campagnes
+    ajoute aux classeurs copies, section de registre
+    ClassicOutlookToolkit\Paths ajoutee. Dependait de modConfig v3.17.
+  * Repris par modBackupAuto v3.4 (audit 11/2026) ; le numero 3.3 n'est
+    pas reutilise.
+
+[2026-10-25] RANGEMENT DU DOSSIER DE L'OUTIL - un seul dossier
+             "ClassicOutlook-Toolkit" : config.ini, Classeurs\, Sorties\
+             (debug.log, exports, Sauvegardes\), Ressources\, Code\ range
+             par application (Outlook\, Excel\<classeur>\,
+             Interface\Rubans\ et Formulaires\, Docs\, Outils\).
+             Fichiers : modConfig v3.17, modMaintenance v4.5 (livraison du
+             25/10), modMailConfidentiality v11.1, modMeetingToAppointment
+             v6.3, modMailAnalytics V25.2, validate.py, README.md,
+             Docs/ARCHITECTURE.md. Entree reconstituee le 16/11 depuis les
+             en-tetes (audit 11/2026, F0-03).
+  * modConfig v3.17 - fin du chemin fixe <Bureau>\Macro VBA\Outlook.
+    ToolkitDir() : dossier memorise (HKCU
+    ClassicOutlookToolkit\Paths\ToolkitDir) s'il contient config.ini ;
+    sinon dossier "ClassicOutlook-Toolkit" contenant config.ini a la racine
+    ou un niveau sous la racine de OneDrive (Entreprise, perso) ou du
+    Bureau, memorise des qu'il est trouve ; sinon ancien emplacement
+    <Bureau>\Macro VBA\Outlook (reconnu tel quel, jamais memorise) ; a
+    defaut <Bureau>\ClassicOutlook-Toolkit. Getters ToolkitDir,
+    WorkbooksDir (Classeurs\), IsLegacyLayout, ToolkitDirRemembered ;
+    MacroVBADir() = Sorties\ (nom conserve pour ses appelants), VBADir() =
+    Code\ par defaut. Macro SetToolkitFolder. Jetons %TOOLKIT% (dossier de
+    l'outil) et %NOM% (variable d'environnement) dans les valeurs de
+    config.ini. Le dossier memorise est relu par les classeurs Excel.
+  * modMaintenance v4.5 (25/10) - MaintDiagnosePaths : dossier de l'outil
+    (ancien emplacement ou non), dossier memorise, Sorties, Classeurs,
+    Code, classeur des campagnes, test d'ecriture sur Sorties ; deux
+    fenetres et chemins relatifs <outil>\... (une MsgBox est coupee vers
+    1 024 caracteres). MaintOpenVBAFolder ouvre <outil>\Code. Prerequis de
+    compilation : modConfig v3.17.
+  * modMailConfidentiality v11.1 (numero deja employe le 17/08) - DumpHTML
+    ecrit confid_html.html dans Sorties (modConfig.MacroVBADir).
+  * modMeetingToAppointment v6.3 - DumpAppointmentHTML et DiagWordBody
+    ecrivent dans Sorties.
+  * modMailAnalytics V25.2 - config.ini (modConfig.ConfigPath), journal
+    EmailAnalytics_trace.log et rapports Stats_Emails_*.xlsx suivent le
+    dossier de l'outil (Sorties) ; repli : racine du Bureau. Le module
+    tourne dans le projet VBA d'Outlook.
+  * validate.py - sans argument, controle tout Code\ (sous-dossiers
+    compris), lance depuis Code\Outils, Code\ ou le dossier de l'outil ;
+    erreur DOUBLON si un meme fichier existe a deux endroits.
+  * README.md (installation, etape 3) et Docs/ARCHITECTURE.md (section 6) :
+    dossier de l'outil.
+
+[2026-10-24] CAMPAGNES v12 - les campagnes se pilotent depuis le classeur
+             des campagnes (alors "Campagnes.xlsm", onglet de ruban Excel) ;
+             Outlook reste le moteur. Fichiers : modMailCampaign v12.0,
+             ThisOutlookSession v10.19, modDefer v1.17, modConfig v3.16,
+             classeur des campagnes (modCampaignBook v1.0, ThisWorkbook v1,
+             customUI14.xml), Docs/GUIDE-Campagnes.md v12,
+             config_ini.example, validate.py. Entree reconstituee le 16/11
+             depuis les en-tetes (audit 11/2026, F0-03).
+  * modMailCampaign v12.0 - REFONTE. (a) Bloc de parametres en tete de
+    feuille (Campagne, Creee le, Compte d'envoi, Modele, Objet, Pieces
+    jointes, Dossier de classement, Message, Message de relance) ; ligne
+    d'en-tete de la table cherchee (une feuille ancienne reste acceptee).
+    (b) Compte d'envoi par campagne (SendUsingAccount, ou
+    SentOnBehalfOfName pour une boite partagee ; vide =
+    CampaignDefaultAccount, sinon compte par defaut). (c) Commandes
+    distantes CAMPAIGN_CHECK / TEST / DRAFTS / SEND / STOP / REFRESH /
+    FOLLOWUP / CLEANDRAFTS recues par le canal de commandes, executees en
+    differe (cle "CampaignCmd") ; resultats ecrits dans la feuille, puis
+    rappel du classeur (AfterOutlookCampaign). (d) Pre-vol par ligne
+    (colonne Controle) : depuis le classeur, une anomalie bloque. (e) Suivi
+    des reponses par l'index de conversations (reponses d'absence
+    ignorees, non-remise -> "Non remis"). (f) Relances en "Repondre a tous"
+    sur le mail d'origine. (g) Elements envoyes : un mail de campagne n'est
+    jamais propose au classement (HandleSentItem, avant QuickMove :
+    dossier de classement, sinon code de l'objet, sinon dossier du mail
+    d'origine) ; identifiants ecrits dans la feuille (cle "CampaignSent").
+    (h) Modele .msg : pieces jointes et images incorporees reportees.
+    (i) Identifiants en anglais, construction de mail unique, dialogues
+    par modUi, purge des brouillons limitee a la feuille en cours.
+    (j) Modele facultatif (mail neuf avec la signature par defaut).
+    Noms des Subs publiques v11 conserves (ruban).
+  * ThisOutlookSession v10.19 - (a) commandes CAMPAIGN_xxx du canal
+    transmises a modMailCampaign.CampaignRemote (rien n'est execute dans
+    l'evenement) ; (b) mSentItems_ItemAdd : mail de campagne confie a
+    modMailCampaign.HandleSentItem avant toute chaine de classement ;
+    (c) Application_ItemSend : un mail de campagne saute la detection
+    "attente de reponse", le suivi Urgent et la relance personnalisee ;
+    CampaignOnItemSend n'est plus appele.
+  * modDefer v1.17 - cle "CampaignCmd" (lourde) ->
+    modMailCampaign.CampaignRunPending ; "CampaignNext" et "CampaignSent"
+    restent legeres.
+  * modConfig v3.16 - cles CampaignWorkbookFilename (defaut
+    "Campagnes.xlsm" a cette date), CampaignWorkbookPath et
+    CampaignDefaultAccount, avec leurs getters.
+  * Classeur des campagnes : modCampaignBook v1.0 (onglet de ruban
+    "Campagne", une feuille par campagne copiee de "_Modele", index
+    "Campagnes", import de contacts Excel ou CSV, generation des messages,
+    actions Outlook par le canal de commandes) et ThisWorkbook v1
+    (evenements delegues a modCampaignBook).
+  * validate.py - code du classeur des campagnes exempte de MOD_NAME /
+    MOD_VERSION (projet VBA Excel distinct).
+  * Docs/GUIDE-Campagnes.md v12 (nouveau guide).
+
+[2026-10-23] modMailAnalytics V25.1 - FIX ERREUR 9 EN GENERATION DU
+             RAPPORT. Entree reconstituee le 16/11 depuis l'en-tete du
+             module (audit 11/2026, F0-03).
+  * GetTopN sur un dictionnaire vide faisait ReDim result(0 To 1, 0 To -1)
+    : VBA refuse un tableau a borne inversee (erreur 9) et tout le rapport
+    tombait (aucun fichier ecrit). GetTopN renvoie desormais Empty,
+    WriteTopN laisse la colonne vide. Meme garde dans
+    CreateSheetNbRecipients (aucun mail envoye -> maxRecip = 0).
+  * Chaque feuille est construite par BuildSheet, qui isole ses erreurs :
+    une feuille en echec est tracee dans EmailAnalytics_trace.log et le
+    rapport est enregistre quand meme.
+
 [2026-10-22] Relecture de confidentialite du depot public - exemples remplaces
              par des valeurs fictives. Fichiers : modProjectTag v9.2,
              modQuickMove v12.1, modMailCampaign v11.2, modContactFromMail
@@ -14,6 +323,23 @@
   * README : badges, section Auteur, chiffres du projet a jour (5 classes,
     57 modules, environ 47 000 lignes), fichiers du suivi des mails et
     formulaires de l'outil de statistiques dans la liste du depot.
+
+[2026-10-20] modViewGuard v1.1 + modMaintenance v4.4. Entree reconstituee
+             le 16/11 depuis les en-tetes (audit 11/2026, F0-03).
+  * modViewGuard v1.1 - les sous-dossiers des Elements envoyes, a toute
+    profondeur, sont des dossiers "A" (avant : "De") ; ils sont parcourus
+    avant le reste de la boite, pour que leurs vues partagees soient
+    connues avant de corriger un dossier "De" et que le garde-fou VUE
+    PARTAGEE les protege comme les Elements envoyes. Sous-dossiers des
+    Brouillons et de la Boite d'envoi : toujours "De". Compte rendu des
+    vues partagees valable dans les deux sens. TA(fr, en) remplace par
+    AccentA(T(fr, en)) (faux positifs de validate.py). Relecture : Elements
+    envoyes d'identifiant illisible = sous-dossiers non parcourus en
+    premier et dossier jamais modifie ; second clic pendant un passage
+    refuse (il remettait l'etat a zero au milieu du parcours).
+  * modMaintenance v4.4 - ViewGuard ajoute a MODULES_DEFAULT et a
+    ModuleVersionOf (oubli de la livraison du 09/10 : filtre du journal par
+    module et version du module).
 
 [2026-10-09] Suivi des mails - bouton REPARER dans le ruban du classeur.
              Fichiers : modMailResponseTracker v6.5, ThisOutlookSession

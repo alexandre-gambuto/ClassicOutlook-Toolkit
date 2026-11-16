@@ -1,14 +1,31 @@
 Option Explicit
 
 '=============================================================================
-' modQuickStart  (v1.1 - 2026-10-22)
+' modQuickStart  (v1.2 - 2026-11-16)
+' v1.2 (2026-11-16) : audit 11/2026 - F2-03, F2-10 :
+'   (1) F2-03 : le guide suit le dossier de l'outil (modConfig v3.17) :
+'       classeur de suivi du temps attendu dans <outil>\Classeurs
+'       (modConfig.WorkbooksDir, cree a l'etape C3 ; question 4 et message
+'       final le disent et l'affichent ; "Ouvrir le dossier" ouvre
+'       Classeurs) ; config.ini ecrit a la racine du dossier de l'outil ;
+'       renvois a des documents absents remplaces (SetToolkitFolder,
+'       Code\Docs\config_ini.example).
+'   (2) F2-03 : boite d'accueil automatique : Configurer / Ne plus proposer /
+'       Plus tard ; Echap, la croix et la fermeture automatique = Plus tard
+'       (avant : Echap enregistrait "Ne plus proposer" pour toujours).
+'   (3) F2-10 : questions 1 a 4 par modUi.AskTextEx : Annuler propose
+'       d'abandonner le guide ; un champ vide valide n'est plus pris pour
+'       Annuler (questions 1 a 3 : reponse invalide ; question 4 : pas de
+'       classeur).
+'   (4) Coquille "reconna~yt" (i trema) corrigee en "reconna~it".
 ' v1.1 (2026-10-22) : exemples de codes remplaces par des valeurs fictives (relecture de confidentialite du depot public). Aucun changement de comportement.
 ' Purpose (EN): first-run quick start guide. When no config.ini exists, offers
 '   (8 s after startup, through modDefer) to check the environment, ask five
-'   questions and write a minimal config.ini in the working folder. Can be run
-'   by hand at any time (Maintenance > Configuration); with an existing file
-'   it only performs the environment check. Never overwrites a file, never
-'   writes outside the working folder and the toolkit registry branch.
+'   questions and write a minimal config.ini at the root of the toolkit
+'   folder (modConfig.ConfigPath). Can be run by hand at any time
+'   (Maintenance > Configuration); with an existing file it only performs
+'   the environment check. Never overwrites a file, never writes outside the
+'   toolkit folder and the toolkit registry branch.
 '
 ' Guide de demarrage rapide. Specification : QuickStart-deroule.md (sections
 ' numerotees reprises dans les commentaires ci-dessous).
@@ -21,7 +38,7 @@ Option Explicit
 '                       rien ecrire ni toucher au registre.
 '
 ' Etapes : 0 accueil (Confirm3) - 1 verification d'environnement (7 controles,
-' un seul bloquant) - 2 cinq questions (AskText, defaut pre-rempli) - 3 recap
+' un seul bloquant) - 2 cinq questions (AskTextEx, defaut pre-rempli) - 3 recap
 ' et ecriture - 4 rechargement de la config et message final.
 '
 ' REGLES : aucune boite depuis Application_Startup ; chaque etape protegee ;
@@ -34,7 +51,7 @@ Option Explicit
 '=============================================================================
 
 Private Const MOD_NAME As String = "QuickStart"
-Private Const MOD_VERSION As String = "v1.1 - 2026-10-22"
+Private Const MOD_VERSION As String = "v1.2 - 2026-11-16"
 
 ' Declenchement automatique (une ligne a passer a False pour le couper).
 Private Const AUTO_ENABLED As Boolean = True
@@ -143,20 +160,18 @@ Private Sub Run(ByVal manual As Boolean)
         ", fichier " & IIf(fileExists, "present", "absent") & ")"
 
     ' --- Etape 0 : accueil -------------------------------------------------
+    ' v1.2 (F2-03) : boutons de l'accueil automatique dans l'ordre
+    ' Configurer / Ne plus proposer / Plus tard : Echap, la croix et la
+    ' fermeture automatique renvoient le 3e bouton, l'issue inoffensive.
+    ' Manuel : Configurer / Plus tard / Quitter (inchange).
     Dim welcome As VbMsgBoxResult
     welcome = ShowWelcome(manual, fileExists)
-    Select Case welcome
-        Case vbYes
-            ' continuer
-        Case vbNo
-            ' Plus tard (ou fermeture automatique) - cas A1
+    If welcome <> vbYes Then
+        If (manual And welcome = vbNo) Or ((Not manual) And welcome <> vbNo) Then
+            ' Plus tard (ou fermeture automatique, Echap) - cas A1
             StatusSet "later:" & Today()
             modDebugLog.DInfo MOD_NAME, "Reporte (plus tard)"
-            GoTo Fin
-        Case Else
-            If manual Then
-                GoTo Fin                                   ' Quitter
-            End If
+        ElseIf Not manual Then
             ' Ne plus proposer - cas N1
             StatusSet "never"
             modDebugLog.DInfo MOD_NAME, "Refuse definitivement (never)"
@@ -164,8 +179,9 @@ Private Sub Run(ByVal manual As Boolean)
                            "Maintenance > Configuration.", _
                            "Understood. The QuickStart command stays available under " & _
                            "Maintenance > Configuration."), Title()
-            GoTo Fin
-    End Select
+        End If
+        GoTo Fin                                           ' manuel : Quitter
+    End If
 
     ' --- Etape 1 : verification d'environnement ----------------------------
     Dim report As String, blocking As Boolean, warnings As Long
@@ -173,14 +189,17 @@ Private Sub Run(ByVal manual As Boolean)
 
     If blocking Then
         ' cas E1 : pas de marqueur, le probleme est a corriger
+        ' v1.2 (F2-03) : plus de renvoi a un document absent ; la commande
+        ' qui permet de choisir un autre dossier est nommee.
         modUi.Inform report & vbCrLf & vbCrLf & _
-            T("Le dossier de travail n'est pas accessible en ~ecriture. Le fichier de " & _
-              "configuration ne peut pas ~xtre cr~e~e ici. Voir docs/TROUBLESHOOTING.md " & _
-              "(chemin du Bureau).", _
-              "The working folder is not writable. The configuration file cannot be " & _
-              "created there. See docs/TROUBLESHOOTING.md (desktop path)."), _
+            T("Le dossier Sorties de l'outil n'est pas accessible en ~ecriture : le fichier " & _
+              "de configuration ne peut pas ~xtre cr~e~e. Choisissez un autre dossier de " & _
+              "l'outil avec la macro SetToolkitFolder (Alt+F8), puis relancez le guide.", _
+              "The toolkit Output folder is not writable: the configuration file cannot " & _
+              "be created. Choose another toolkit folder with the SetToolkitFolder macro " & _
+              "(Alt+F8), then run the guide again."), _
             Title(), vbExclamation
-        modDebugLog.DError MOD_NAME, "Bloquant : dossier de travail non inscriptible"
+        modDebugLog.DError MOD_NAME, "Bloquant : dossier Sorties de l'outil non inscriptible"
         GoTo Fin
     End If
 
@@ -291,11 +310,12 @@ Private Function ShowWelcome(ByVal manual As Boolean, ByVal fileExists As Boolea
             T("&Configurer", "&Set up"), T("&Plus tard", "&Later"), T("&Quitter", "&Quit"), _
             vbInformation, 0, 1)
     Else
-        ' Fermeture automatique = bouton 2 (Plus tard).
+        ' v1.2 (F2-03) : "Plus tard" en 3e position (Echap, croix et
+        ' fermeture automatique = bouton 3) ; "Ne plus proposer" en 2e.
         ShowWelcome = modMsgBoxCustom.Confirm3(body, Title(), _
-            T("&Configurer", "&Set up"), T("&Plus tard", "&Later"), _
-            T("&Ne plus proposer", "&Don't ask again"), _
-            vbInformation, WELCOME_AUTOCLOSE_MS, 2)
+            T("&Configurer", "&Set up"), T("&Ne plus proposer", "&Don't ask again"), _
+            T("&Plus tard", "&Later"), _
+            vbInformation, WELCOME_AUTOCLOSE_MS, 3)
     End If
 End Function
 
@@ -339,6 +359,13 @@ Private Function EnvironmentCheck(ByRef blocking As Boolean, ByRef warnings As L
     If EnsureFolderRec(work) And ProbeWrite(work) Then
         lines = lines & Prefix(0) & T("Dossier de travail : ", "Working folder: ") & work & _
                 T(" (accessible en ~ecriture)", " (writable)") & vbCrLf
+        ' v1.2 (F2-03) : dossier des classeurs cree aussi (c'est la que
+        ' l'outil cherche Suivi de temps), sans ligne de plus au rapport.
+        If EnsureFolderRec(modConfig.WorkbooksDir()) Then
+            modDebugLog.DDebug MOD_NAME, "Dossier Classeurs pret"
+        Else
+            modDebugLog.DError MOD_NAME, "Dossier Classeurs non cree"
+        End If
     Else
         blocking = True
         lines = lines & Prefix(2) & T("Dossier de travail inaccessible : ", "Working folder not accessible: ") & work & vbCrLf
@@ -484,15 +511,17 @@ Private Function AskQuestions() As Boolean
     SetDefaultAnswers
 
     ' --- Q1 : langue ---
-    Dim ans As String, tries As Long, ok As Boolean
+    ' v1.2 (F2-10) : AskTextEx distingue Annuler (proposer d'abandonner) d'un
+    ' champ vide valide (reponse invalide, comme une saisie erronee).
+    Dim ans As String, tries As Long, ok As Boolean, cancelled As Boolean
     tries = 0
     Do
-        ans = modUi.AskText( _
+        ans = modUi.AskTextEx( _
             T("1/5 - Langue de l'interface", "1/5 - Interface language") & vbCrLf & vbCrLf & _
             T("FR = fran~cais, EN = anglais.", "FR = French, EN = English.") & vbCrLf & _
             T("Toutes les fen~xtres du toolkit suivent ce choix.", "Every toolkit dialog follows this choice."), _
-            QTitle(1), mLang)
-        If Len(Trim$(ans)) = 0 Then
+            QTitle(1), cancelled, mLang)
+        If cancelled Then
             If ConfirmQuit(1) Then Exit Function
             GoTo NextQ1
         End If
@@ -515,15 +544,15 @@ NextQ1:
     ' --- Q2 : prefixe des codes projet ---
     tries = 0: ok = False
     Do
-        ans = modUi.AskText( _
+        ans = modUi.AskTextEx( _
             T("2/5 - Pr~efixe des codes projet", "2/5 - Project code prefix") & vbCrLf & vbCrLf & _
-            T("Le toolkit reconna~yt vos projets par un pr~efixe suivi de chiffres " & _
+            T("Le toolkit reconna~it vos projets par un pr~efixe suivi de chiffres " & _
               "(exemple : DV1234). Indiquez le pr~efixe seul, lettres uniquement.", _
               "The toolkit recognises your projects by a prefix followed by digits " & _
               "(example: DV1234). Enter the prefix only, letters only.") & vbCrLf & _
             T("Laissez DV si vous n'en avez pas.", "Leave DV if you do not have one."), _
-            QTitle(2), mPrefix)
-        If Len(Trim$(ans)) = 0 Then
+            QTitle(2), cancelled, mPrefix)
+        If cancelled Then
             If ConfirmQuit(2) Then Exit Function
             GoTo NextQ2
         End If
@@ -545,7 +574,7 @@ NextQ2:
     ' --- Q3 : domaines internes ---
     tries = 0: ok = False
     Do
-        ans = modUi.AskText( _
+        ans = modUi.AskTextEx( _
             T("3/5 - Domaines de messagerie internes", "3/5 - Internal mail domains") & vbCrLf & vbCrLf & _
             T("Les adresses de ces domaines sont consid~er~ees comme internes " & _
               "(coloration des r~eunions, d~etection des mails en attente).", _
@@ -553,13 +582,13 @@ NextQ2:
               "awaiting-reply detection).") & vbCrLf & _
             T("Plusieurs domaines : s~eparez-les par | (exemple : societe.fr|filiale.com).", _
               "Several domains: separate them with | (example: company.com|subsidiary.com)."), _
-            QTitle(3), mDomains)
-        If Len(Trim$(ans)) = 0 Then
+            QTitle(3), cancelled, mDomains)
+        If cancelled Then
             If ConfirmQuit(3) Then Exit Function
             GoTo NextQ3
         End If
         ans = LCase$(Trim$(ans))
-        ok = DomainsValid(ans)
+        ok = (Len(ans) > 0) And DomainsValid(ans)        ' v1.2 : vide = invalide
         If ok Then
             mDomains = ans
         Else
@@ -574,22 +603,27 @@ NextQ2:
 NextQ3:
     Loop Until ok
 
-    ' --- Q4 : classeur de suivi du temps (vide accepte, 0 = abandon) ---
+    ' --- Q4 : classeur de suivi du temps (vide accepte, Annuler = abandon) ---
+    ' v1.2 (F2-03) : le classeur va dans <outil>\Classeurs (WorkbooksDir),
+    ' pas dans Sorties. v1.2 (F2-10) : Annuler propose d'abandonner ; "0"
+    ' reste accepte comme avant.
     tries = 0: ok = False
     Do
-        ans = modUi.AskText( _
+        ans = modUi.AskTextEx( _
             T("4/5 - Classeur de suivi du temps (optionnel)", "4/5 - Time-tracking workbook (optional)") & vbCrLf & vbCrLf & _
             T("Nom du fichier Excel qui liste vos projets et contrats, ~a placer dans " & _
-              "le dossier de travail. Il alimente l'~etiquetage des rendez-vous.", _
+              "le dossier Classeurs de l'outil :", _
               "Name of the Excel file listing your projects and contracts, to be placed " & _
-              "in the working folder. It feeds appointment tagging.") & vbCrLf & _
+              "in the toolkit Workbooks folder:") & vbCrLf & _
+            modConfig.WorkbooksDir() & vbCrLf & _
+            T("Il alimente l'~etiquetage des rendez-vous.", "It feeds appointment tagging.") & vbCrLf & vbCrLf & _
             T("Laissez vide si vous n'en avez pas encore : la fonction restera inactive. " & _
-              "Tapez 0 pour abandonner le guide.", _
+              "Annuler pour abandonner le guide.", _
               "Leave empty if you do not have one yet: the feature stays inactive. " & _
-              "Type 0 to quit the guide."), _
-            QTitle(4), mTimeFile)
+              "Cancel to quit the guide."), _
+            QTitle(4), cancelled, mTimeFile)
         ans = Trim$(ans)
-        If ans = "0" Then
+        If cancelled Or ans = "0" Then
             If ConfirmQuit(4) Then Exit Function
             GoTo NextQ4
         End If
@@ -719,8 +753,8 @@ Private Function BuildIniText() As String
     Dim s As String
     s = s & "; config.ini - ClassicOutlook-Toolkit, created by the quick start guide on " & _
             Format$(Now, "yyyy-mm-dd hh:nn") & "." & vbCrLf
-    s = s & "; Other keys keep the defaults coded in modConfig; full list: config.ini.example" & vbCrLf
-    s = s & "; (docs/CONFIGURATION.md). After editing: Maintenance > Configuration > Reload." & vbCrLf
+    s = s & "; Other keys keep the defaults coded in modConfig; full list: Code\Docs\config_ini.example" & vbCrLf
+    s = s & "; in the toolkit folder. After editing: Maintenance > Configuration > Reload." & vbCrLf
     s = s & vbCrLf
     s = s & "[ClassicOutlookToolkit]" & vbCrLf
     s = s & "; Language of every dialog: FR or EN" & vbCrLf
@@ -729,7 +763,7 @@ Private Function BuildIniText() As String
     s = s & "ProjectPrefix=" & mPrefix & vbCrLf
     s = s & "; Internal mail domains, pipe-separated" & vbCrLf
     s = s & "InternalDomains=" & mDomains & vbCrLf
-    s = s & "; Referential workbook in the working folder; empty = tagging inactive" & vbCrLf
+    s = s & "; Referential workbook in <toolkit>\Classeurs; empty = tagging inactive" & vbCrLf
     s = s & "TimeTrackingFilename=" & mTimeFile & vbCrLf
     s = s & "; New-mail alerts (per mailbox: InboxAlertStore1, InboxAlertStore2...)" & vbCrLf
     If mAlerts Then
@@ -796,11 +830,12 @@ Private Sub ShowFinal()
           "coloration des r~eunions, formule de politesse, confidentialit~e, alertes.", _
           "Active now: QuickMove filing, reply filing, meeting colouring, greeting " & _
           "line, confidentiality banners, alerts.") & vbCrLf & vbCrLf & _
-        T("En attente d'un classeur dans le dossier de travail : ~etiquetage des " & _
+        T("En attente d'un classeur dans le dossier Classeurs de l'outil : ~etiquetage des " & _
           "rendez-vous (Suivi de temps), suivi des r~eponses (cr~e~e ~a la premi~fre " & _
           "utilisation), campagnes.", _
-          "Waiting for a workbook in the working folder: appointment tagging (time " & _
-          "tracking), response tracking (created at first use), campaigns.") & vbCrLf & vbCrLf & _
+          "Waiting for a workbook in the toolkit Workbooks folder: appointment tagging (time " & _
+          "tracking), response tracking (created at first use), campaigns.") & vbCrLf & _
+        modConfig.WorkbooksDir() & vbCrLf & vbCrLf & _
         T("Les modules charg~es au d~emarrage (alertes, fen~xtres ~a r~ole) prennent " & _
           "la nouvelle configuration au prochain red~emarrage d'Outlook.", _
           "Modules bound at startup (alerts, role windows) pick up the new " & _
@@ -819,10 +854,14 @@ Private Sub ShowFinal()
     If r = vbYes Then OpenWorkingFolder
 End Sub
 
+' v1.2 (F2-03) : ouvre le dossier ou deposer les classeurs (<outil>\Classeurs,
+' modConfig.WorkbooksDir), cree au besoin ; avant : Sorties (MacroVBADir),
+' ou l'outil ne cherche pas les classeurs.
 Private Sub OpenWorkingFolder()
     On Error Resume Next
     Dim p As String
-    p = modConfig.MacroVBADir()
+    p = modConfig.WorkbooksDir()
+    EnsureFolderRec p
     Shell "explorer.exe """ & p & """", vbNormalFocus
     If Err.Number <> 0 Then modDebugLog.DError MOD_NAME, "Ouverture dossier err " & Err.Number
 End Sub

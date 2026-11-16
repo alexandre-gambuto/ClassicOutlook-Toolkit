@@ -1,17 +1,29 @@
 Option Explicit
 
 ' =====================================================================
-' modPurgeCategories v8  (2026-08-22)
-' Purpose (EN): removes all categories from non-recurring appointments
-'   between Jan 1st and today (exclusive), EXCEPT "Personnel". Calendar
-'   events are suspended during the loop so auto-coloring does not re-apply
-'   the categories being removed (each Save would otherwise fire ItemChange
-'   -> modMeetingColor.ApplyCategory). The flag is restored even on error.
+' modPurgeCategories v8.1  (2026-11-16)
+' Purpose (EN): removes the AUTOMATIC categories (internal / external
+'   meeting, see modMeetingColor) from non-recurring appointments between
+'   Jan 1st and today (exclusive); every other category (project tagging
+'   categories, Personnel...) is kept. Calendar events are suspended during
+'   the loop so auto-coloring does not re-apply the categories being removed
+'   (each Save would otherwise fire ItemChange ->
+'   modMeetingColor.ApplyCategory). The flag is restored even on error.
 '
-' Retire toutes les categories sur les RDV entre le 1er janvier et
-' aujourd'hui (exclu), SAUF "Personnel". Les events calendar sont
-' suspendus pendant la boucle (cf. ThisOutlookSession) pour empecher la
-' re-coloration auto de reposer les categories qu'on vient de retirer.
+' Retire les categories AUTOMATIQUES (reunion interne / externe) sur les
+' RDV entre le 1er janvier et aujourd'hui (exclu) ; toutes les autres
+' categories (projet, Commercial, Tache interne, Personnel...) sont
+' conservees. Les events calendar sont suspendus pendant la boucle (cf.
+' ThisOutlookSession) pour empecher la re-coloration auto de reposer les
+' categories qu'on vient de retirer.
+'
+' v8.1 (2026-11-16) : audit 11/2026 - F6-16 (choix B) : ne retire plus que
+'   les categories automatiques (ExternalMeetingCategory /
+'   InternalMeetingCategory). Avant : tout sauf "Personnel" / "Perso" ecrits
+'   en dur, donc aussi les categories posees par l'etiquetage projet
+'   (Commercial, Tache interne, contrat special), qu'aucun automatisme ne
+'   remet. Categorie personnelle reconnue par modConfig.IsPersonalCategoryName
+'   (jamais retiree). Doublons d'une meme categorie fusionnes au passage.
 '
 ' v8 (2026-08-22) : revue UX pop-ups + un piege projet corrige.
 '   (a) Le RECAPITULATIF de fin passe en toast (modUi.Toast). La decision a
@@ -43,7 +55,7 @@ Option Explicit
 ' =====================================================================
 
 Private Const MOD_NAME As String = "PurgeCat"
-Private Const MOD_VERSION As String = "v8 - 2026-08-22"
+Private Const MOD_VERSION As String = "v8.1 - 2026-11-16"
 
 '=============================================================================
 ' ModVersion - version REELLEMENT chargee dans le VBE.
@@ -56,7 +68,7 @@ End Function
 ' UiTitle - titre de fenetre localise (etait repete 3 fois en clair).
 '=============================================================================
 Private Function UiTitle() As String
-    UiTitle = T("Purger cat~egories RDV passes", "Purge past appointment categories")
+    UiTitle = T("Purger les cat~egories auto des RDV pass~es", "Purge auto categories of past appointments")
 End Function
 
 ' SetStatus (v7 - fix B5) : progression -> log DEBUG via modCommon.SetStatus.
@@ -75,13 +87,17 @@ Public Sub PurgePastCategories()
     ' v8 : confirmation CONSERVEE (action de masse, non annulable), mais
     ' via modUi.Ask et avec le bouton par defaut sur "Non".
     Dim confirmation As VbMsgBoxResult
+    ' v8.1 (F6-16) : seules les categories automatiques sont visees. Les
+    ' noms de categories viennent de la config : hors de T().
     confirmation = modUi.Ask( _
-        T("Retirer toutes les cat~egories sur les RDV entre le ", _
-          "Remove all categories from appointments between ") & _
+        T("Retirer les cat~egories automatiques (", _
+          "Remove the automatic categories (") & _
+        modConfig.ExternalMeetingCategory() & " / " & modConfig.InternalMeetingCategory() & _
+        T(") des RDV entre le ", ") from appointments between ") & _
         Format(startDate, "dd/mm/yyyy") & T(" et le ", " and ") & _
         Format(endDate, "dd/mm/yyyy") & T(" (exclu) ?", " (exclusive)?") & vbCrLf & vbCrLf & _
-        T("La cat~egorie 'Personnel' est pr~eserv~ee.", _
-          "The 'Personnel' category is preserved.") & vbCrLf & _
+        T("Les autres cat~egories (projet, Personnel...) sont conserv~ees.", _
+          "Other categories (project, Personnel...) are kept.") & vbCrLf & _
         T("Les RDV r~ecurrents ne sont pas modifi~es.", _
           "Recurring appointments are not modified.") & vbCrLf & vbCrLf & _
         T("Note : la coloration auto sera RE-APPLIQUEE au prochain", _
@@ -151,7 +167,7 @@ Public Sub PurgePastCategories()
         currentCats = appt.Categories
         If Len(currentCats) = 0 Then GoTo Continue
 
-        newCats = KeepOnlyPersonal(currentCats)
+        newCats = KeepNonAutoCategories(currentCats)
 
         If StrComp(currentCats, newCats, vbTextCompare) <> 0 Then
             On Error Resume Next
@@ -238,27 +254,42 @@ Private Function SplitCategories(ByVal cats As String) As Variant
     End If
 End Function
 
-' NOTE : "Personnel" et "Perso" sont des CATEGORIES OUTLOOK comparees, donc
-' des chaines fonctionnelles - jamais traduites, jamais wrappees dans T().
-Private Function KeepOnlyPersonal(ByVal cats As String) As String
-    KeepOnlyPersonal = ""
+' v8.1 (F6-16, choix B) : garde toutes les categories SAUF les categories
+' automatiques (reunion externe / interne : modConfig.ExternalMeetingCategory
+' / InternalMeetingCategory, posees par modMeetingColor). Une categorie
+' personnelle (modConfig.IsPersonalCategoryName, nom configurable) n'est
+' jamais retiree. Les noms de categories sont des chaines fonctionnelles
+' comparees : jamais traduites, jamais dans T().
+Private Function KeepNonAutoCategories(ByVal cats As String) As String
+    KeepNonAutoCategories = ""
     If Len(cats) = 0 Then Exit Function
 
     Dim arr As Variant
     arr = SplitCategories(cats)
+
+    Dim extCat As String, intCat As String
+    extCat = modConfig.ExternalMeetingCategory()
+    intCat = modConfig.InternalMeetingCategory()
 
     Dim result As String
     Dim seen As Object
     Set seen = CreateObject("Scripting.Dictionary")
     seen.CompareMode = 1  ' vbTextCompare
 
-    Dim i As Long, c As String
+    Dim i As Long, c As String, isAuto As Boolean
     result = ""
     For i = LBound(arr) To UBound(arr)
         c = CStr(arr(i))
         If Len(c) > 0 Then
-            If StrComp(c, "Personnel", vbTextCompare) = 0 Or _
-               StrComp(c, "Perso", vbTextCompare) = 0 Then
+            isAuto = False
+            If Len(extCat) > 0 Then
+                If StrComp(c, extCat, vbTextCompare) = 0 Then isAuto = True
+            End If
+            If Len(intCat) > 0 Then
+                If StrComp(c, intCat, vbTextCompare) = 0 Then isAuto = True
+            End If
+            If modConfig.IsPersonalCategoryName(c) Then isAuto = False
+            If Not isAuto Then
                 ' Deduplication : une seule occurrence meme en cas de pollution
                 If Not seen.Exists(c) Then
                     seen.Add c, True
@@ -268,7 +299,7 @@ Private Function KeepOnlyPersonal(ByVal cats As String) As String
             End If
         End If
     Next i
-    KeepOnlyPersonal = result
+    KeepNonAutoCategories = result
 End Function
 
 Private Function IsTechnical(ByVal appt As Outlook.AppointmentItem) As Boolean

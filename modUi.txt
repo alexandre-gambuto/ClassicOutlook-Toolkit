@@ -1,7 +1,15 @@
 Option Explicit
 
-' modUi v1.3  (2026-08-22)
+' modUi v1.4  (2026-11-16)
 '=============================================================================
+' v1.4 (2026-11-16) : audit 11/2026 - F2-10 (F3-11) : AskTextEx, saisie qui
+'   DISTINGUE Annuler / Echap d'un champ vide (parametre ByRef cancelled).
+'   AskText garde sa semantique ("" = vide OU Annuler) et delegue a
+'   AskTextEx. A utiliser partout ou "vide" a un sens (champ facultatif) :
+'   Annuler doit alors abandonner l'action, pas la poursuivre.
+'   integration : coquille "appara~ytre" (i trema) corrigee en
+'   "appara~itre" dans UiSelfTest.
+'
 ' Purpose (EN): single entry point for user-facing dialogs (MsgBox / InputBox)
 '   with a FOREGROUND GUARANTEE. Fixes the class of bugs where a dialog opened
 '   from an event handler or a deferred timer appears BEHIND Outlook (or on
@@ -122,7 +130,7 @@ Private Const MOD_NAME As String = "Ui"
 ' par module s'aligne sur le nom du module sans le prefixe "mod" (comme
 ' Campaign, Notify, Defer). "UiCore" aurait desynchronise les deux.
 
-Private Const MOD_VERSION As String = "v1.3 - 2026-08-22"
+Private Const MOD_VERSION As String = "v1.4 - 2026-11-16"
 
 ' Classe de fenetre des fenetres principales Outlook (explorers/inspectors).
 Private Const OUTLOOK_WND_CLASS As String = "rctrl_renwnd32"
@@ -257,10 +265,39 @@ End Sub
 '
 ' Retour : la saisie ; "" = vide OU Annuler (semantique InputBox native,
 ' identique aux usages existants du projet : vide/Annuler -> abandon).
+' v1.4 : delegue a AskTextEx (comportement inchange). Quand le vide a un
+' sens (champ facultatif), appeler AskTextEx pour reconnaitre Annuler.
 '=============================================================================
 Public Function AskText(ByVal prompt As String, ByVal title As String, _
                         Optional ByVal defaultValue As String = "", _
                         Optional ByVal announceIfHidden As Boolean = True) As String
+    Dim wasCancelled As Boolean
+    AskText = AskTextEx(prompt, title, wasCancelled, defaultValue, announceIfHidden)
+End Function
+
+'=============================================================================
+' AskTextEx (v1.4 - audit 11/2026, F2-10 / F3-11) - comme AskText, mais
+' distingue Annuler (ou Echap, ou la croix) d'un champ valide vide.
+'
+'   cancelled (ByRef) : True si l'utilisateur a annule ; False s'il a
+'                       valide (OK / Entree), meme avec un champ vide.
+' Retour : la saisie ("" si annule).
+'
+' Principe : InputBox renvoie une chaine de pointeur NUL sur Annuler,
+' detectee par StrPtr (meme test que modConfig.SetToolkitFolder).
+' Exemple :
+'     Dim nm As String, cancelled As Boolean
+'     nm = modUi.AskTextEx(T("Nom (facultatif) :", "Name (optional):"), _
+'                          T("Cr~eer un dossier", "Create a folder"), cancelled, defName)
+'     If cancelled Then Exit Function      ' Annuler = on abandonne tout
+'     If Len(nm) = 0 Then ...              ' vide = champ ignore
+'=============================================================================
+Public Function AskTextEx(ByVal prompt As String, ByVal title As String, _
+                          ByRef cancelled As Boolean, _
+                          Optional ByVal defaultValue As String = "", _
+                          Optional ByVal announceIfHidden As Boolean = True) As String
+    Dim answer As String
+    cancelled = False
     On Error GoTo Fallback
 
     Dim gotFront As Boolean
@@ -274,16 +311,32 @@ Public Function AskText(ByVal prompt As String, ByVal title As String, _
         modDebugLog.DDebug MOD_NAME, "AskText '" & title & "' (fg OK)"
     End If
 
-    AskText = InputBox(prompt, title, defaultValue)
-    modDebugLog.DDebug MOD_NAME, "AskText '" & title & "' -> " & _
-        Len(AskText) & " char(s)"
+    answer = InputBox(prompt, title, defaultValue)
+    cancelled = (StrPtr(answer) = 0)
+    AskTextEx = answer
+    If cancelled Then
+        modDebugLog.DDebug MOD_NAME, "AskText '" & title & "' -> Annuler"
+    Else
+        modDebugLog.DDebug MOD_NAME, "AskText '" & title & "' -> " & _
+            Len(answer) & " char(s)"
+    End If
     Exit Function
 
 Fallback:
     modDebugLog.DError MOD_NAME, "AskText err " & Err.Number & " - " & _
         Err.Description & " -> repli InputBox natif"
+    AskTextEx = NativeInput(prompt, title, defaultValue, cancelled)
+End Function
+
+' Repli de AskTextEx : InputBox natif, sous sa propre garde d'erreur (un
+' gestionnaire d'erreur deja actif ne peut pas en intercepter une seconde).
+Private Function NativeInput(ByVal prompt As String, ByVal title As String, _
+                             ByVal defaultValue As String, ByRef cancelled As Boolean) As String
     On Error Resume Next
-    AskText = InputBox(prompt, title, defaultValue)
+    Dim answer As String
+    answer = InputBox(prompt, title, defaultValue)
+    cancelled = (StrPtr(answer) = 0)
+    NativeInput = answer
 End Function
 
 '=============================================================================
@@ -513,7 +566,7 @@ Public Sub UiSelfTest()
     modDebugLog.DInfo MOD_NAME, "SelfTest : fg initial=" & OutlookIsForeground()
 
     Inform T("Boite d'information topMost." & vbCrLf & _
-             "Elle doit appara~ytre AU-DESSUS de toutes les fen~xtres.", _
+             "Elle doit appara~itre AU-DESSUS de toutes les fen~xtres.", _
              "TopMost information box." & vbCrLf & _
              "It must appear ON TOP of every window."), _
            "modUi - SelfTest 1/3"

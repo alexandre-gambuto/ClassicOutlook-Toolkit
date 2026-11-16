@@ -1,9 +1,17 @@
 ; ============================================================
 ; config.ini.example - modele de configuration (ClassicOutlook-Toolkit)
 ;
-; COPIER ce fichier en  config.ini  dans :
-;   <Bureau>\Macro VBA\Outlook\config.ini
-; puis adapter les valeurs. Le fichier config.ini lui-meme N'EST PAS
+; COPIER ce fichier en  config.ini  a la racine du dossier de l'outil :
+;   ...\ClassicOutlook-Toolkit\config.ini
+; (sur le Bureau, a la racine d'un OneDrive, ou un niveau en dessous,
+; ex. OneDrive\Atelier VBA\ClassicOutlook-Toolkit). Outlook le trouve au
+; demarrage et le memorise ; macro SetToolkitFolder pour en designer un
+; autre. Ancien emplacement <Bureau>\Macro VBA\Outlook encore reconnu.
+; Sous-dossiers : Classeurs\ (classeurs Excel), Sorties\ (journal,
+; exports, Sauvegardes\), Ressources\, Code\.
+; Jetons utilisables dans les valeurs : %TOOLKIT% = dossier de l'outil,
+; %NOM% = variable d'environnement Windows (ex. %OneDriveConsumer%).
+; Puis adapter les valeurs. Le fichier config.ini lui-meme N'EST PAS
 ; versionne (voir .gitignore) : il peut contenir des donnees propres a
 ; votre environnement (domaines, adresses) et la cle API.
 ;
@@ -33,14 +41,18 @@ Language=FR
 ; SALUTATION AUTO DES REPONSES (modReplyGreeting)
 ;   GreetingEnabled : 1 (defaut) = insere "Bonjour Prenom," en tete des
 ;     reponses quand le champ A ne contient qu'une seule personne.
-;     0 = desactive. Le prenom est extrait de l'adresse SMTP
-;     (prenom.nom@domaine) ; transferts et reponses a plusieurs exclus.
+;     0 = desactive. Le prenom vient de l'annuaire Exchange, sinon de
+;     l'adresse SMTP (prenom.nom@domaine) ; transferts exclus.
+;   GreetingReplyAll : 1 (defaut) = Repondre a tous (plusieurs personnes
+;     dans A) : insere "Bonjour Prenom," (expediteur) ET "Bonjour a tous,",
+;     on supprime la ligne inutile. 0 = reponses a plusieurs exclues.
 ;   GreetingWord : mot de salutation. Vide = suit la langue de
 ;     l'interface (Bonjour si FR, Hello si EN). Si un mail du meme fil
 ;     a deja ete envoye le meme jour avec ce mot, seul le prenom est
 ;     insere.
 ; ------------------------------------------------------------
 GreetingEnabled=1
+GreetingReplyAll=1
 GreetingWord=
 
 ; ------------------------------------------------------------
@@ -57,9 +69,10 @@ GreetingWord=
 ThreadAttachWarnMB=20
 
 ; ------------------------------------------------------------
-; CHEMINS (laisser vide = calcul auto depuis le Bureau, qui suit
-; la redirection OneDrive). Ne renseigner que pour forcer un
-; emplacement non standard (chemin absolu complet).
+; CHEMINS (laisser vide = calcul auto : classeurs dans Classeurs\,
+; sources dans Code\ du dossier de l'outil). Ne renseigner que pour
+; forcer un emplacement non standard (chemin absolu complet, ou
+; %TOOLKIT%\...).
 ; ------------------------------------------------------------
 VBADir=
 TimeTrackingPath=
@@ -72,7 +85,7 @@ MailTrackingPath=
 ; ------------------------------------------------------------
 TimeTrackingFilename=Suivi de temps.xlsm
 TimeTrackingSheet=Temps par mois
-MailTrackingFilename=Suivi des mails.xlsx
+MailTrackingFilename=Suivi des mails.xlsm
 MailTrackingSheet=Suivi
 
 ; ------------------------------------------------------------
@@ -110,10 +123,16 @@ SpecialContractCategory=
 ;   DefaultAppointmentDuration  : duree posee sur un nouveau RDV/reunion
 ;   MeetingDuration    : duree consideree par l'anti-chevauchement
 ;   ShiftMinutes : pas de decalage applique en cas de collision
+;   OutlookDefaultSlot : duree (minutes) qu'Outlook donne a une fiche
+;     neuve (double-clic sur une case, Nouveau rendez-vous). Seule cette
+;     duree est remplacee par DefaultAppointmentDuration ; une plage
+;     choisie a la souris ou un evenement importe garde la sienne.
+;     A adapter si Outlook propose une autre duree (Options > Calendrier).
 ; ------------------------------------------------------------
 DefaultAppointmentDuration=15
 MeetingDuration=15
 ShiftMinutes=15
+OutlookDefaultSlot=30
 
 ; ------------------------------------------------------------
 ; SUIVI DES MAILS / SUSPICION DE REPONSE
@@ -154,13 +173,26 @@ UpShift=AntiChevDecale
 BackupRetentionMonths=12
 
 ; ------------------------------------------------------------
-; CAMPAGNE MAIL (envoi cadence - modMailCampaign)
-;   CampaignStepSec       : delai REEL entre 2 envois (secondes).
-;                          ATTENTION : Outlook est fige pendant l'envoi.
-;   CampaignBatchSize : nb d'envois avant une pause longue
-;   CampaignPauseSec     : pause longue tous les TaillePaquet (secondes)
-;   CampaignCap      : plafond DUR d'envois par lancement (securite)
+; CAMPAGNES MAIL (modMailCampaign v12 + classeur Suivi des Campagnes.xlsm)
+; Les campagnes se pilotent depuis le classeur Suivi des Campagnes.xlsm (onglet de
+; ruban "Campagne") ; Outlook fait le travail en arriere-plan et reste
+; utilisable pendant l'envoi.
+;   CampaignWorkbookFilename : nom du classeur, dans Classeurs\ du dossier
+;                              de l'outil (comme Suivi des mails)
+;   CampaignWorkbookPath     : chemin COMPLET si le classeur est ailleurs
+;                              (prioritaire sur le nom ; vide = Classeurs\)
+;   CampaignDefaultAccount   : compte d'envoi quand une campagne n'en
+;                              precise pas (adresse d'un compte du profil
+;                              ou nom d'une boite partagee) ; vide = compte
+;                              par defaut d'Outlook
+;   CampaignStepSec          : delai entre 2 envois (secondes)
+;   CampaignBatchSize        : nb d'envois avant une pause longue
+;   CampaignPauseSec         : pause longue tous les CampaignBatchSize (s)
+;   CampaignCap              : plafond DUR d'envois par lancement (securite)
 ; ------------------------------------------------------------
+CampaignWorkbookFilename=Suivi des Campagnes.xlsm
+CampaignWorkbookPath=
+CampaignDefaultAccount=
 CampaignStepSec=20
 CampaignBatchSize=50
 CampaignPauseSec=180
@@ -202,10 +234,15 @@ ConfidBandColorUrgent=#D13438
 ;   ToastColorFiled : bordure gauche, classement reussi
 ;   ToastColorKept : bordure gauche, reste dans les envoyes
 ;   ToastColorText : couleur du texte
+;   ToastOnManualFiling : 1 = toast "Range dans" aussi apres un classement
+;     fait a la main (QuickMove) ; 0 (defaut) = seulement pour les
+;     classements faits sans vous (reponse rangee a sa place, envoye classe
+;     tout seul). Le mail classe a la main quitte deja la liste.
 ; (Couleurs ci-dessous = exemple ; mettez vos couleurs si souhaite.)
 ; ------------------------------------------------------------
 ToastEnabled=1
 ToastKeptInSent=0
+ToastOnManualFiling=0
 ToastDurationMs=3000
 ToastColorFiled=#2E7D32
 ToastColorKept=#1565C0
@@ -358,8 +395,12 @@ TagMigrationMap=TempoTag>ProjectTag;TempoDemande>ProjectAsk
 
 ; ============================================================
 ; CLES LUES PAR LE CODE MAIS ABSENTES DE CE MODELE JUSQU'AU PACK v3
-; (generees par validate.py --gen-config ; valeur = defaut du code ;
-;  les cles numerotees XxxN se declinent en 1, 2, 3...)
+; (generees par validate.py --gen-config, revues a la main le
+;  2026-11-16 ; valeur = defaut du code). Une cle presente mais VIDE
+; remplace le defaut du code par du vide : les cles dont le code a une
+; liste ou une valeur par defaut sont donc laissees EN COMMENTAIRE
+; (";Cle=") - ne les decommenter que pour les remplacer par une vraie
+; valeur. Les cles numerotees XxxN se declinent en 1, 2, 3...
 ; ============================================================
 
 ; --- modAppointmentPrivacy ---
@@ -389,6 +430,10 @@ AnniversaryReminderDaysBefore=
 BirthdayBodyDetails=1
 ;   BirthdayCalendarAutoShow : Vue Anniversaires appliquee au demarrage (1 = oui ; defaut du code 0, ce modele force 1)
 BirthdayCalendarAutoShow=1
+;   BirthdayCalendarFocusFirst : 1 = apres la vue anniversaires, remettre le premier calendrier coche au premier plan ; 0 (defaut) = non (etape suivie d'arrets brutaux d'Outlook : a ne reactiver qu'a l'essai)
+BirthdayCalendarFocusFirst=0
+;   BirthdayCalendarFocusPath : calendrier a remettre au premier plan si FocusFirst=1 (chemin Outlook complet ; vide = premier calendrier coche)
+BirthdayCalendarFocusPath=
 BirthdayCalendarKeepDefaultOf=
 BirthdayCalendarKeepPaths=
 BirthdayCalendarName=
@@ -404,13 +449,28 @@ BirthdayPrivate=0
 BirthdayReminderDaysBefore=1
 BirthdayReminderHour=9
 BirthdaySubjectFormat={name} - {label} - {date}
-ContactSkipFolders=
+;   ContactSkipFolders : dossiers de contacts exclus (motifs Like separes par |) ; en commentaire = liste du code (dossiers systeme d'Exchange : contacts suggeres, cache des destinataires...)
+;ContactSkipFolders=
 NameDayEnabled=1
 NameDayFolders=*Amis*|*Famille*
 NameDayLabel=
 NameDayReminderDaysBefore=
 UnknownBirthYear=1604
 UnknownBirthYearMax=
+
+; --- modContactEnrich (Completer les coordonnees des contacts) ---
+;   ContactEnrichMaxMailsPerContact : mails ouverts au plus par contact pour lire une signature (1 a 50)
+ContactEnrichMaxMailsPerContact=10
+;   ContactEnrichGenericDomains : domaines grand public (gmail|orange.fr|...) ; en commentaire = liste du code
+;ContactEnrichGenericDomains=
+;   ContactEnrichSkipAddresses : morceaux d'adresse jamais retenus (noreply|...) ; en commentaire = liste du code
+;ContactEnrichSkipAddresses=
+;   ContactEnrichMaxMinutes : delai maximum de la recherche, en minutes (0 = sans limite)
+ContactEnrichMaxMinutes=20
+;   ContactEnrichProgressSec : toast d'avancement toutes les N secondes (0 = aucun)
+ContactEnrichProgressSec=30
+;   ContactEnrichJournal : ligne datee dans le journal de la fiche (1/0)
+ContactEnrichJournal=1
 
 ; --- modContactExport ---
 ContactCsvSeparator=;
@@ -430,12 +490,15 @@ ContactImportCreateFolders=1
 AddressCityUppercase=1
 AddressCountryUppercase=1
 AddressDefaultCountry=
-AddressLowercaseWords=
-AddressUppercaseWords=
+;   AddressLowercaseWords : mots-outils de la rue laisses en minuscules (de|du|la...) ; en commentaire = liste du code
+;AddressLowercaseWords=
+;   AddressUppercaseWords : sigles forces en majuscules (BP|CS|CEDEX...) ; en commentaire = liste du code
+;AddressUppercaseWords=
 ClearCategoriesPrompt=1
 ContactFileAsFormat=LastFirst
 NameDayExtra=
-NameParticles=
+;   NameParticles : mots du nom laisses en minuscules (de|du|van|von...) ; en commentaire = liste du code
+;NameParticles=
 NormalizeAddresses=1
 NormalizeEmails=1
 NormalizeNameDay=1
@@ -457,36 +520,46 @@ FolderRenameRoot=DV
 HideBccOnCompose=1
 
 ; --- modInboxAlert ---
-InboxAlertColor=
-InboxAlertSound=
-InboxAlertSound1=
-InboxAlertStore=
-
-; --- modMailAnalytics__frmConfig_Code ---
-AddressMode=
-ColorIndex=
-ColorRGB=
-DateMin=
-DateMinEnabled=
-Domain=
-EmailUser=
-Keyword=
+;   Cles numerotees, une serie par boite surveillee (N = 1, 2, 3... ; la
+;   premiere cle InboxAlertStoreN absente arrete la lecture) :
+;     InboxAlertStoreN : nom EXACT de la boite tel qu'affiche dans le volet
+;                        de navigation (macro InboxAlertListStores), ou
+;                        * = toutes les boites du profil
+;     InboxAlertColorN : couleur de bordure du toast (#RRGGBB ; vide =
+;                        InboxAlertDefaultColor)
+;     InboxAlertSoundN : son .wav (vide = InboxAlertDefaultSound ; none =
+;                        silence ; %TOOLKIT%\Ressources\son.wav accepte)
+;   Aucune cle InboxAlertStoreN : la boite par defaut du profil est surveillee.
+;InboxAlertStore1=
+;InboxAlertColor1=#1565C0
+;InboxAlertSound1=
 
 ; --- modMaintenance ---
-KnownModules=
+;   KnownModules : voir la section MAINTENANCE plus haut (vide = liste du code)
+;KnownModules=
 
 ; --- modMeetingToAppointment ---
 ;   PersonalSlotToast : Toast quand une reunion est reconvertie en creneau personnel (1/0)
 PersonalSlotToast=1
 
 ; --- modQuickMove ---
+;   NewFolderParentProject / NewFolderParentContract : OBLIGATOIRES pour la
+;     commande "Creer le dossier" de QuickMove (recherche sans resultat).
+;     Dossier parent des nouveaux dossiers projet / contrat, chemin RELATIF
+;     a la Boite de reception de la boite par defaut, niveaux separes par
+;     " > " (ex. Projets > En cours). Vide = la creation est refusee avec
+;     un message qui nomme la cle.
+NewFolderParentProject=
+NewFolderParentContract=
+;   NewFolderCreateMissingParents : 1 = creer les dossiers parents manquants ; 0 = les exiger
 NewFolderCreateMissingParents=0
 ;   QuickMoveExcludeStores : Boites exclues de l'index QuickMove (noms affiches, separes par |)
 QuickMoveExcludeStores=
 
 ; --- modSearch ---
-ViewCompact=Compacter
-ViewPreview=Aper
+;   SearchScope : portee des boutons de recherche : currentstore (defaut : la boite du dossier affiche) | currentfolder | subfolders | allfolders | allitems
+SearchScope=currentstore
+;   ViewCompact / ViewPreview : voir la section RECHERCHE plus haut (laisser en commentaire : le defaut du code porte la cedille d'Apercu)
 
 ; --- modSendToLLM ---
 LLM_AutoEnter=1

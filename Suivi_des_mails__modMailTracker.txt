@@ -1,7 +1,37 @@
 Option Explicit
 
 '=============================================================================
-' modMailTracker v1.3  (2026-10-09) - classeur "Suivi des mails.xlsm"
+' modMailTracker v1.4  (2026-11-16) - classeur "Suivi des mails.xlsm"
+'
+' v1.4 (2026-11-16) : audit 11/2026 - F4-01, F4-07 a F4-09, F4-13 a F4-16,
+'   F4-18, F4-19, F8-20 a F8-22 :
+'   (a) derniere ligne trouvee AUSSI sous les lignes masquees par un filtre
+'       (LastDataRow) : Archiver / Restaurer n'ecrivent plus par-dessus une
+'       ligne cachee ;
+'   (b) Archiver / Restaurer : copie SANS presse-papiers, ligne d'origine
+'       supprimee seulement si sa copie est arrivee ; plus de confirmation
+'       (l'action se defait par le bouton voisin), compte rendu dans la
+'       barre d'etat ;
+'   (c) RELANCER travaille sur les lignes cochees (sinon la ligne active) :
+'       un brouillon par ligne, 3 affiches, les suivants dans Brouillons
+'       (10 par clic au plus) ; lignes deja repondues, a valider ou
+'       traitees ignorees ; reponse a tous sur LE mail suivi (envoye par
+'       soi) quand il est retrouve ; nouveau bouton "Cocher les retards" ;
+'   (d) mail deplace (Ouvrir, Ouvrir le dossier, Relancer) : Outlook est
+'       prie d'actualiser et l'action reprend seule a la fin ;
+'   (e) accuse de reception des commandes : sans reponse d'Outlook, un
+'       message le dit (avant : "en cours" pendant 2 min, puis rien) ;
+'   (f) rendez-vous OnTime (barre d'etat, accuse, reprise) annules avant
+'       d'en poser un autre et a la fermeture : le classeur ne se rouvre
+'       plus tout seul ;
+'   (g) coche basculee seulement par un clic de souris (plus au clavier) ;
+'   (h) "En retard" le lendemain de la date limite ; compteur "en retard"
+'       du ruban calcule sur la date limite (comme la colonne Echeance) ;
+'   (i) fichier des echeances ecrit apres chaque enregistrement (rappel
+'       du matin d'Outlook sans Excel) ;
+'   (j) ruban (charte commune, XML livre a part) : boutons grises hors de
+'       leur feuille (Rbn_GetEnabled), bouton Aide, identifiants anglais
+'       (anciens identifiants toujours reconnus).
 '
 ' v1.3 (2026-10-09) : bouton REPARER du ruban (tag REPAIR). Apres
 '   confirmation, demande a Outlook (canal de commandes, commande REPAIR,
@@ -38,19 +68,22 @@ Option Explicit
 ' A creer une fois : Excel, Alt+F11 -> VBAProject (Suivi des mails.xlsm) ->
 ' Insertion > Module -> F4 : nommer le module "modMailTracker" -> coller.
 ' Le module de la feuille "Suivi" doit etre VIDE (ses anciens liens
-' cliquables n'existent plus) ; ThisWorkbook v7 branche les evenements.
+' cliquables n'existent plus) ; ThisWorkbook v7.1 branche les evenements.
 '
 ' Toute la logique du classeur :
 '   - onglet de ruban "Suivi des mails" (customUI14.xml du fichier) :
 '     Rbn_OnLoad, Rbn_Action, Rbn_GetLabel (compteurs, Archiver/Restaurer),
-'     Rbn_GetImage ;
-'   - colonne A "coche" : un clic coche ou decoche la ligne, un clic sur
-'     l'en-tete decoche tout (OnSelectionChanged, via ThisWorkbook) ;
-'   - actions : Relancer (pieces jointes du mail suivi remises d'office,
-'     texte FR ou EN selon la langue du mail suivi), Ouvrir le mail, Ouvrir
-'     le dossier, Prolonger / Valider la reponse / Archiver (lignes cochees,
+'     Rbn_GetImage, Rbn_GetEnabled (v1.4) ;
+'   - colonne A "coche" : un clic de souris coche ou decoche la ligne, un
+'     clic sur l'en-tete decoche tout (OnSelectionChanged, via ThisWorkbook) ;
+'   - actions : Relancer (v1.4 : lignes cochees, sinon ligne active ; pieces
+'     jointes du mail suivi remises d'office, texte FR ou EN selon la langue
+'     du mail suivi), Cocher les retards (v1.4), Ouvrir le mail, Ouvrir le
+'     dossier, Prolonger / Valider la reponse / Archiver (lignes cochees,
 '     sinon ligne active), Restaurer (feuille Archives), Actualiser (demande
-'     le recalcul a Outlook, qui rappelle AfterOutlookRefresh) ;
+'     le recalcul a Outlook, qui rappelle AfterOutlookRefresh), Reparer,
+'     Aide (v1.4) ;
+'   - fichier des echeances pour le rappel du matin d'Outlook (v1.4) ;
 '   - ligne active surlignee (mise en forme conditionnelle), echeance par
 '     formule, compteurs du ruban.
 '
@@ -75,12 +108,13 @@ Option Explicit
 ' une variable AVANT le test.
 '=============================================================================
 
-Private Const MOD_VERSION As String = "v1.3 - 2026-10-09"
+Private Const MOD_VERSION As String = "v1.4 - 2026-11-16"
 
 Private Const SH_TRACK As String = "Suivi"
 Private Const SH_ARCHIVE As String = "Archives"
 Private Const SH_SCHEMA As String = "_Schema"
-Private Const TAB_ID As String = "tabSuiviMails"
+Private Const TAB_ID As String = "tabMailTracking"      ' v1.4 (F8-20) : identifiant anglais
+Private Const TAB_ID_OLD As String = "tabSuiviMails"    ' ruban d'avant la v1.4, encore reconnu
 Private Const APP_TITLE As String = "Suivi des mails"
 Private Const FOLLOWUP_PROP As String = "FollowupConvID"
 Private Const OL_MAIL_CLASS As Long = 43
@@ -98,6 +132,17 @@ Private Const PR_ATTACH_METHOD As String = "http://schemas.microsoft.com/mapi/pr
 Private Const CMD_FOLDER_NAME As String = "ClassicOutlook-Toolkit"
 Private Const OL_FOLDER_NOTES As Long = 12
 Private Const OL_NOTE_ITEM As Long = 5
+
+' v1.4 (audit 11/2026)
+Private Const FOLLOWUP_MAX As Long = 10          ' F4-16 : brouillons de relance par clic, au plus
+Private Const FOLLOWUP_SHOWN As Long = 3         ' F4-16 : affiches ; les suivants vont dans Brouillons
+Private Const ACK_FIRST_SEC As Long = 8          ' F4-19 : accuse de reception attendu apres...
+Private Const ACK_SECOND_SEC As Long = 25        ' ... puis encore (Outlook occupe) avant de prevenir
+Private Const REPLAY_DELAY_SEC As Long = 2       ' F4-19 : action reprise apres l'actualisation
+Private Const DUE_CACHE_FILE As String = "suivi-echeances.txt"   ' F4-07 (cf. modConfig.DueCachePath)
+Private Const VK_LBUTTON As Long = 1             ' F4-18 : boutons de la souris
+Private Const VK_RBUTTON As Long = 2
+Private Const SM_SWAPBUTTON As Long = 23
 
 ' Detection de la langue du mail suivi (mots entoures d'espaces).
 Private Const FR_WORDS As String = " bonjour vous nous merci cordialement pour avec dans est une des les votre notre pas sur que qui bien salutations suite concernant veuillez madame monsieur bonne "
@@ -130,6 +175,29 @@ Private mSchemaVer As String
 Private mRibbon As Object
 Private mBusy As Boolean            ' selection deplacee par le code (anti-reentree)
 Private mStatusSet As Boolean       ' barre d'etat ecrite par ce module
+
+' v1.4 (F4-14) : rendez-vous Application.OnTime en attente (0 = aucun),
+' annules avant d'en poser un autre et a la fermeture du classeur.
+Private mClearAt As Date            ' effacement de la barre d'etat
+Private mAckAt As Date              ' controle de l'accuse de reception
+Private mReplayAt As Date           ' reprise de l'action apres actualisation
+' v1.4 (F4-19) : derniere commande envoyee par la note, en attente d'accuse.
+Private mCmdBody As String
+Private mCmdName As String
+Private mAckTries As Long
+' v1.4 (F4-19) : action a reprendre apres l'actualisation demandee parce
+' que le mail d'une ligne n'etait plus joignable.
+Private mPendingAct As String       ' OPEN, OPEN_FOLDER, FOLLOWUP ("" = aucune)
+Private mPendingIds As String       ' ";ID1;ID2;" identifiants de suivi
+Private mPendingSheet As String
+Private mPendingAt As Date
+Private mReplaying As Boolean       ' reprise en cours : pas de nouvelle demande
+Private mLastFollowErr As String
+
+' v1.4 (F4-18) : la coche ne bascule qu'au clic de souris (bouton principal
+' enfonce au moment du changement de selection), jamais au clavier.
+Private Declare PtrSafe Function GetAsyncKeyState Lib "user32" (ByVal vKey As Long) As Integer
+Private Declare PtrSafe Function GetSystemMetrics Lib "user32" (ByVal nIndex As Long) As Long
 
 '=============================================================================
 ' ModVersion - version reellement collee dans le classeur.
@@ -170,7 +238,10 @@ Public Sub Rbn_GetLabel(control As Object, ByRef returnedVal)
             n = CountStatus(TrackSheet(), "R" & ChrW$(233) & "pondu ?")
             returnedVal = n & A(" ~a valider")
         Case "lblLate"
-            n = CountStatus(TrackSheet(), "En retard")
+            ' v1.4 (F4-08) : suivis en cours dont la date limite est passee
+            ' (comme la colonne Echeance), et non le libelle de statut, fige
+            ' depuis le dernier recalcul d'Outlook.
+            n = CountLate(TrackSheet())
             returnedVal = n & " en retard"
         Case "lblChecked"
             n = CountMarks(ListSheet())
@@ -179,10 +250,29 @@ Public Sub Rbn_GetLabel(control As Object, ByRef returnedVal)
             Else
                 returnedVal = n & A(" coch~ee")
             End If
-        Case "btnArchiver"
+        Case "btnArchive", "btnArchiver"         ' v1.4 : nouvel et ancien identifiant
             If OnArchiveSheet() Then returnedVal = "Restaurer" Else returnedVal = "Archiver"
         Case Else
             returnedVal = ""
+    End Select
+End Sub
+
+' v1.4 (F8-21) - Boutons grises hors de leur feuille (avant : une boite de
+' message apres le clic) : Ouvrir le mail, Ouvrir le dossier et Archiver /
+' Restaurer sur Suivi et Archives ; Relancer, Cocher les retards, Prolonger
+' et Valider sur Suivi seulement ; Actualiser, Reparer et Aide toujours.
+Public Sub Rbn_GetEnabled(control As Object, ByRef returnedVal)
+    On Error Resume Next
+    Dim act As String
+    act = ""
+    act = UCase$(CStr(control.Tag))
+    Select Case act
+        Case "", "REFRESH", "REPAIR", "HELP"
+            returnedVal = True
+        Case "OPEN", "OPEN_FOLDER", "ARCHIVE"
+            returnedVal = (OnTrackSheet() Or OnArchiveSheet())
+        Case Else                                ' FOLLOWUP, CHECK_LATE, EXTEND, VALIDATE
+            returnedVal = OnTrackSheet()
     End Select
 End Sub
 
@@ -196,10 +286,14 @@ Public Sub Rbn_GetImage(control As Object, ByRef returnedVal)
 End Sub
 
 ' Re-selectionne l'onglet (ouverture du classeur, retour sur sa fenetre).
+' v1.4 : nouvel identifiant d'onglet, puis l'ancien (ruban du classeur pas
+' encore remplace) ; un seul des deux existe, l'autre est sans effet.
 Public Sub ActivateRibbonTab()
     On Error Resume Next
     If mRibbon Is Nothing Then Exit Sub
     mRibbon.ActivateTab TAB_ID
+    Err.Clear
+    mRibbon.ActivateTab TAB_ID_OLD
 End Sub
 
 ' Compteurs et libelles recalcules (apres une action, un cochage, un
@@ -230,6 +324,10 @@ End Sub
 ' Colonne coche : un clic coche/decoche la ligne (la cellule active passe
 ' sur l'objet), un clic sur l'en-tete decoche tout. Puis recalcul de la
 ' feuille : le surlignage de la ligne active (CELL("row")) suit la selection.
+' v1.4 (F4-18) : seulement au CLIC DE SOURIS. Arriver au clavier sur la
+' colonne A (touche Origine, fleche gauche) ne coche plus rien : la ligne
+' cochee par accident etait ensuite prise par Prolonger, Valider ou
+' Archiver a la place de la ligne active.
 Public Sub OnSelectionChanged(ByVal sh As Object, ByVal Target As Range)
     If mBusy Then Exit Sub
     On Error GoTo Fin
@@ -241,7 +339,7 @@ Public Sub OnSelectionChanged(ByVal sh As Object, ByVal Target As Range)
 
     If COL_MARK >= 1 And COL_SUBJECT >= 1 Then
         If Target.CountLarge = 1 Then
-            If Target.Column = COL_MARK Then
+            If Target.Column = COL_MARK And PrimaryButtonDown() Then
                 Dim r As Long
                 r = Target.Row
                 mBusy = True
@@ -267,6 +365,18 @@ Fin:
     Application.EnableEvents = True
     mBusy = False
 End Sub
+
+' v1.4 (F4-18) - Bouton principal de la souris enfonce en ce moment ? (Le
+' changement de selection arrive pendant l'appui.) Boutons inverses
+' (gaucher) pris en compte. En cas de doute : non.
+Private Function PrimaryButtonDown() As Boolean
+    On Error Resume Next
+    PrimaryButtonDown = False
+    Dim vk As Long
+    vk = VK_LBUTTON
+    If GetSystemMetrics(SM_SWAPBUTTON) <> 0 Then vk = VK_RBUTTON
+    PrimaryButtonDown = ((GetAsyncKeyState(vk) And &H8000) <> 0)
+End Function
 
 ' Edition du delai (feuille Suivi) -> recalcul instantane de la date limite
 ' et du statut, sans rouvrir le tableau de bord.
@@ -297,6 +407,8 @@ End Sub
 
 ' Appele par Outlook (Application.Run) a la fin d'une actualisation
 ' demandee par le bouton Actualiser.
+' v1.4 (F4-19) : une action en attente (mail qui n'etait plus joignable)
+' reprend 2 s plus tard, une fois Outlook libere (jamais pendant son appel).
 Public Sub AfterOutlookRefresh()
     On Error Resume Next
     mSchemaLoaded = False
@@ -304,16 +416,35 @@ Public Sub AfterOutlookRefresh()
     EnsureSetup TrackSheet()
     EnsureSetup ArchiveSheet()
     RefreshRibbon
+    mCmdBody = ""                        ' Outlook a repondu : plus d'accuse a attendre
+    CancelAckCheck
     SetStatus A("Suivi actualis~e ~a ") & Format$(Now, "hh:nn") & "."
     ScheduleStatusClear 20
+    If Len(mPendingAct) > 0 Then
+        CancelReplay
+        mReplayAt = Now + TimeSerial(0, 0, REPLAY_DELAY_SEC)
+        Application.OnTime mReplayAt, "'" & ThisWorkbook.Name & "'!ReplayPendingAction"
+    End If
 End Sub
 
 Public Sub ClearStatusBarSafe()
     On Error Resume Next
+    mClearAt = 0
     If mStatusSet Then
         Application.StatusBar = False
         mStatusSet = False
     End If
+End Sub
+
+' v1.4 (F4-14) - Fermeture du classeur (ThisWorkbook.Workbook_BeforeClose) :
+' rendez-vous OnTime annules (sinon Excel rouvre le classeur pour les
+' executer), barre d'etat rendue.
+Public Sub OnBeforeClose()
+    On Error Resume Next
+    CancelStatusClear
+    CancelAckCheck
+    CancelReplay
+    ClearStatusBarSafe
 End Sub
 
 '=============================================================================
@@ -327,6 +458,10 @@ Private Sub RunAction(ByVal act As String)
     End If
     If act = "REPAIR" Then
         DoRepair
+        Exit Sub
+    End If
+    If act = "HELP" Then                 ' v1.4 (F8-20) : bouton Aide
+        DoHelp
         Exit Sub
     End If
 
@@ -371,20 +506,29 @@ Private Sub RunAction(ByVal act As String)
 
     Dim rowList As Collection
     Select Case act
-        Case "FOLLOWUP", "OPEN", "OPEN_FOLDER"
-            If onArchive And act = "FOLLOWUP" Then
-                ShowInfo A("Ligne archiv~ee : restaurez-la d'abord pour la relancer.")
-                Exit Sub
-            End If
+        Case "OPEN", "OPEN_FOLDER"
             Dim r As Long
             r = ActiveCell.Row
             If r < 2 Or Not HasId(ws, r) Then
                 ShowInfo A("S~electionnez d'abord une ligne de suivi (une cellule de la ligne suffit).")
                 Exit Sub
             End If
-            If act = "FOLLOWUP" Then DoFollowUp ws, r
             If act = "OPEN" Then DoOpen ws, r
             If act = "OPEN_FOLDER" Then DoOpenFolder ws, r
+        Case "FOLLOWUP", "CHECK_LATE"
+            If onArchive Then
+                ShowInfo A("Ligne archiv~ee : restaurez-la d'abord pour la relancer.")
+                Exit Sub
+            End If
+            If act = "CHECK_LATE" Then
+                DoCheckLate ws
+                Exit Sub
+            End If
+            ' v1.4 (F4-16) : lignes cochees, sinon ligne active (comme
+            ' Prolonger, Valider et Archiver ; avant : ligne active seule).
+            Set rowList = TargetRows(ws)
+            If rowList.Count = 0 Then Exit Sub
+            DoFollowUpRows ws, rowList
         Case "EXTEND", "VALIDATE", "ARCHIVE"
             If onArchive And act <> "ARCHIVE" Then
                 ShowInfo A("Ligne archiv~ee : seuls Ouvrir le mail, Ouvrir le dossier et Restaurer sont disponibles ici.")
@@ -531,10 +675,47 @@ Private Function OnArchiveSheet() As Boolean
     If sh.Parent Is ThisWorkbook Then OnArchiveSheet = (sh.Name = SH_ARCHIVE)
 End Function
 
-Private Function LastDataRow(ByVal ws As Worksheet) As Long
+' v1.4 (F8-21) - La feuille active est-elle la feuille Suivi de ce classeur ?
+Private Function OnTrackSheet() As Boolean
     On Error Resume Next
+    OnTrackSheet = False
+    Dim sh As Object
+    Set sh = Nothing
+    Set sh = ActiveSheet
+    If sh Is Nothing Then Exit Function
+    If TypeName(sh) <> "Worksheet" Then Exit Function
+    If sh.Parent Is ThisWorkbook Then OnTrackSheet = (sh.Name = SH_TRACK)
+End Function
+
+' v1.4 (F4-01) : derniere ligne dont la colonne ID est remplie, lignes
+' masquees par un filtre COMPRISES. Avant : End(xlUp), qui s'arrete a la
+' derniere ligne VISIBLE : avec la feuille Archives (ou Suivi) filtree,
+' Archiver (ou Restaurer) ecrivait par-dessus une ligne cachee. La colonne
+' est lue d'un bloc jusqu'au bas de la zone utilisee (une lecture de
+' plage voit aussi les lignes masquees). Repli : ancienne methode.
+Private Function LastDataRow(ByVal ws As Worksheet) As Long
+    On Error GoTo Fallback
     LastDataRow = 1
     If COL_ID < 1 Then Exit Function
+    Dim usedLast As Long, v As Variant, r As Long
+    usedLast = ws.UsedRange.Row + ws.UsedRange.Rows.Count - 1
+    If usedLast < 2 Then Exit Function
+    v = ws.Range(ws.Cells(1, COL_ID), ws.Cells(usedLast, COL_ID)).Value
+    If Not IsArray(v) Then Exit Function
+    For r = UBound(v, 1) To 2 Step -1
+        If IsError(v(r, 1)) Then
+            LastDataRow = r
+            Exit Function
+        End If
+        If Len(CStr(v(r, 1))) > 0 Then
+            LastDataRow = r
+            Exit Function
+        End If
+    Next r
+    Exit Function
+Fallback:
+    On Error Resume Next
+    LastDataRow = 1
     LastDataRow = ws.Cells(ws.Rows.Count, COL_ID).End(xlUp).Row
 End Function
 
@@ -727,6 +908,78 @@ Private Function CountMarks(ByVal ws As Worksheet) As Long
     CountMarks = CheckedRows(ws).Count
 End Function
 
+' v1.4 (F4-08 / F4-15) - Suivis en retard : statut en cours (ni Repondu,
+' ni Repondu ?, ni Traite) et date limite passee en JOURS ENTIERS (en
+' retard le lendemain de la date limite, comme la colonne Echeance et le
+' rappel du matin d'Outlook).
+Private Function CountLate(ByVal ws As Worksheet) As Long
+    On Error Resume Next
+    CountLate = 0
+    If ws Is Nothing Or COL_STATUS < 1 Or COL_DUE < 1 Or COL_ID < 1 Then Exit Function
+    Dim lastRow As Long
+    lastRow = LastDataRow(ws)
+    If lastRow < 2 Then Exit Function
+    Dim ids As Variant, sts As Variant, dues As Variant, i As Long, n As Long
+    ids = ReadCol(ws, COL_ID, lastRow)
+    sts = ReadCol(ws, COL_STATUS, lastRow)
+    dues = ReadCol(ws, COL_DUE, lastRow)
+    For i = 1 To lastRow - 1
+        If Len(CellText(ids(i, 1))) > 0 Then
+            If IsLate(CellText(sts(i, 1)), dues(i, 1)) Then n = n + 1
+        End If
+    Next i
+    CountLate = n
+End Function
+
+Private Function IsLate(ByVal st As String, ByVal dueV As Variant) As Boolean
+    IsLate = False
+    If IsTerminalStatus(st) Then Exit Function
+    Dim due As Date
+    due = CellDate(dueV)
+    If due <= 0 Then Exit Function
+    IsLate = (Date > Int(CDbl(due)))
+End Function
+
+' Statut termine : ni recalcule ni relance (contrat de donnees, jamais traduit).
+Private Function IsTerminalStatus(ByVal st As String) As Boolean
+    st = Trim$(st)
+    IsTerminalStatus = (st = "R" & ChrW$(233) & "pondu" Or st = "R" & ChrW$(233) & "pondu ?" Or _
+                        st = "Trait" & ChrW$(233))
+End Function
+
+' Colonne col, lignes 2..lastRow : tableau 2D (1..n, 1..1), meme pour une
+' seule ligne (une plage d'une cellule renvoie une valeur simple).
+Private Function ReadCol(ByVal ws As Worksheet, ByVal col As Long, ByVal lastRow As Long) As Variant
+    Dim v As Variant
+    v = ws.Range(ws.Cells(2, col), ws.Cells(lastRow, col)).Value
+    If Not IsArray(v) Then
+        Dim one(1 To 1, 1 To 1) As Variant
+        one(1, 1) = v
+        v = one
+    End If
+    ReadCol = v
+End Function
+
+' Texte d'une valeur de cellule ("" pour une erreur).
+Private Function CellText(ByVal v As Variant) As String
+    CellText = ""
+    If IsError(v) Then Exit Function
+    CellText = CStr(v)
+End Function
+
+' Date d'une valeur de cellule (0 si vide, illisible ou erreur ; une date
+' sans format de date est lue comme un nombre : acceptee).
+Private Function CellDate(ByVal v As Variant) As Date
+    On Error Resume Next
+    CellDate = 0
+    If IsEmpty(v) Or IsError(v) Then Exit Function
+    If VarType(v) = vbString Then
+        If Len(Trim$(CStr(v))) = 0 Then Exit Function
+        If Not IsDate(v) Then Exit Function
+    End If
+    CellDate = CDate(v)
+End Function
+
 Private Function CountStatus(ByVal ws As Worksheet, ByVal st As String) As Long
     On Error Resume Next
     CountStatus = 0
@@ -760,7 +1013,10 @@ Private Sub DoOpen(ByVal ws As Worksheet, ByVal r As Long)
 
     Dim itm As Object
     Set itm = ResolveMail(ol, ws, r)
-    If itm Is Nothing Then Exit Sub
+    If itm Is Nothing Then
+        MailNotFound "OPEN", ws, r          ' v1.4 (F4-19)
+        Exit Sub
+    End If
     SyncFolderCell ws, r, itm
 
     itm.Display
@@ -785,7 +1041,10 @@ Private Sub DoOpenFolder(ByVal ws As Worksheet, ByVal r As Long)
 
     Dim itm As Object
     Set itm = ResolveMail(ol, ws, r)
-    If itm Is Nothing Then Exit Sub
+    If itm Is Nothing Then
+        MailNotFound "OPEN_FOLDER", ws, r   ' v1.4 (F4-19)
+        Exit Sub
+    End If
 
     Dim fld As Object
     Set fld = itm.Parent
@@ -832,26 +1091,130 @@ End Sub
 ' retire. Texte en francais ou en anglais selon la langue de ce mail. La
 ' ligne n'est mise a jour qu'a l'ENVOI reel (Outlook : Application_ItemSend
 ' -> RegisterFollowupSent, grace a la propriete FollowupConvID).
+' v1.4 (F4-16, choix A) : seul moteur de relance, sur les lignes COCHEES
+' (sinon la ligne active). Un brouillon par ligne : les FOLLOWUP_SHOWN
+' premiers affiches, les suivants enregistres dans Brouillons (avec la meme
+' propriete : leur envoi depuis Brouillons met aussi la ligne a jour),
+' FOLLOWUP_MAX par clic au plus. Lignes "Repondu", "Repondu ?" et "Traite"
+' ignorees (F4-09 : jamais de relance a qui a deja repondu). Mail
+' introuvable (deplace) : Outlook est prie d'actualiser et la relance de
+' ces lignes reprend seule ensuite (F4-19). Compte rendu dans la barre
+' d'etat ; fenetre seulement si rien n'a pu etre prepare ou en cas d'erreur.
 '=============================================================================
-Private Sub DoFollowUp(ByVal ws As Worksheet, ByVal r As Long)
-    Dim tmpDir As String
-    tmpDir = ""
+Private Sub DoFollowUpRows(ByVal ws As Worksheet, ByVal rowList As Collection)
     On Error GoTo Fin
-
     Dim ol As Object
     Set ol = GetOutlook()
     If ol Is Nothing Then Exit Sub
 
+    Dim v As Variant, r As Long, st As String, res As Long
+    Dim nShown As Long, nSaved As Long, nSkipped As Long, nOver As Long, nFail As Long
+    Dim missing As Collection, done As Collection
+    Set missing = New Collection
+    Set done = New Collection
+    mLastFollowErr = ""
+    For Each v In rowList
+        r = CLng(v)
+        st = Trim$(CellText(ws.Cells(r, COL_STATUS).Value))
+        If IsTerminalStatus(st) Then
+            nSkipped = nSkipped + 1
+        ElseIf nShown + nSaved >= FOLLOWUP_MAX Then
+            nOver = nOver + 1
+        Else
+            res = PrepareFollowUp(ol, ws, r, (nShown < FOLLOWUP_SHOWN))
+            Select Case res
+                Case 1
+                    nShown = nShown + 1
+                    done.Add r
+                Case 2
+                    nSaved = nSaved + 1
+                    done.Add r
+                Case 0
+                    missing.Add r
+                Case Else
+                    nFail = nFail + 1
+            End Select
+        End If
+    Next v
+
+    If done.Count > 0 Then
+        Application.EnableEvents = False
+        ClearMarks ws, done
+        Application.EnableEvents = True
+        RefreshRibbon
+    End If
+
+    Dim queued As Boolean
+    queued = False
+    If missing.Count > 0 Then queued = QueueRetry("FOLLOWUP", ws, missing)
+
+    If done.Count = 0 And missing.Count = 0 And nFail = 0 Then
+        If nSkipped > 0 Then
+            ShowInfo A("Aucune relance pr~epar~ee : ") & nSkipped & _
+                     A(" ligne(s) d~ej~a r~epondue(s), ~a valider ou trait~ee(s).")
+        End If
+        Exit Sub
+    End If
+    If missing.Count > 0 And Not queued And done.Count = 0 And nFail = 0 Then
+        ShowMissingMail
+        Exit Sub
+    End If
+
+    Dim msg As String
+    msg = A("Relances : ") & nShown & A(" affich~ee(s)")
+    If nSaved > 0 Then msg = msg & ", " & nSaved & A(" dans Brouillons")
+    If nSkipped > 0 Then msg = msg & ", " & nSkipped & A(" ignor~ee(s) (r~eponse re~cue ou trait~ee)")
+    If nOver > 0 Then msg = msg & ", " & nOver & A(" au-del~a de ") & FOLLOWUP_MAX & A(" (cliquez de nouveau)")
+    If missing.Count > 0 Then
+        If queued Then
+            msg = msg & ", " & missing.Count & A(" mail(s) d~eplac~e(s) : recherche dans Outlook, reprise ensuite")
+        Else
+            msg = msg & ", " & missing.Count & A(" mail(s) introuvable(s)")
+        End If
+    End If
+    If nFail > 0 Then msg = msg & ", " & nFail & A(" en erreur")
+    SetStatus msg & "."
+    ScheduleStatusClear STATUS_TIMEOUT_SEC
+    If nFail > 0 Then
+        MsgBox A("Relance impossible pour ") & nFail & A(" ligne(s) : ") & mLastFollowErr, vbExclamation, "Relancer"
+    End If
+    Exit Sub
+Fin:
+    Application.EnableEvents = True
+    MsgBox A("Relance impossible : ") & Err.Number & " - " & Err.Description, vbExclamation, "Relancer"
+End Sub
+
+' Un brouillon de relance pour la ligne r. Retour : 1 = affiche, 2 =
+' enregistre dans Brouillons, 0 = mail de la ligne introuvable, -1 = erreur
+' (mLastFollowErr).
+Private Function PrepareFollowUp(ByVal ol As Object, ByVal ws As Worksheet, ByVal r As Long, _
+                                 ByVal showIt As Boolean) As Long
+    Dim tmpDir As String
+    tmpDir = ""
+    PrepareFollowUp = -1
+    On Error GoTo Fin
+
     Dim src As Object
     Set src = ResolveMail(ol, ws, r)
-    If src Is Nothing Then Exit Sub
+    If src Is Nothing Then
+        PrepareFollowUp = 0
+        Exit Function
+    End If
     SyncFolderCell ws, r, src
 
     Dim orig As Object
     Set orig = FindTrackedSentMail(ol, src, RowSentDate(ws, r))
 
+    ' v1.4 (F4-09) : "Repondre a tous" sur LE mail suivi (envoye par soi)
+    ' quand il est retrouve : ses destinataires sont ceux du suivi. La
+    ' reference d'une ligne peut etre un autre message du fil (apres une
+    ' reparation d'ancrage cote Outlook) : repondre a celui-la ecrirait a
+    ' son expediteur et a ses destinataires, pas a ceux du mail suivi.
+    Dim base As Object
+    If orig Is Nothing Then Set base = src Else Set base = orig
+
     Dim lang As String
-    If orig Is Nothing Then lang = DetectLanguage(src) Else lang = DetectLanguage(orig)
+    lang = DetectLanguage(base)
 
     Dim attPaths As Collection
     Set attPaths = New Collection
@@ -861,7 +1224,7 @@ Private Sub DoFollowUp(ByVal ws As Worksheet, ByVal r As Long)
     End If
 
     Dim fu As Object
-    Set fu = src.ReplyAll
+    Set fu = base.ReplyAll
     fu.htmlBody = InsertAfterBody(fu.htmlBody, BuildRelanceHtml(attPaths.Count, lang))
     Dim v As Variant
     For Each v In attPaths
@@ -875,18 +1238,83 @@ Private Sub DoFollowUp(ByVal ws As Worksheet, ByVal r As Long)
     up.Value = CStr(ws.Cells(r, COL_CONV).Value)
     On Error GoTo Fin
 
-    fu.Display
+    If showIt Then
+        fu.Display
+        PrepareFollowUp = 1
+    Else
+        fu.Save
+        PrepareFollowUp = 2
+    End If
     On Error Resume Next
-    ol.ActiveWindow.Activate
+    If showIt Then ol.ActiveWindow.Activate
     RemoveTempDir tmpDir
+    Exit Function
+Fin:
+    mLastFollowErr = Err.Number & " - " & Err.Description
+    On Error Resume Next
+    RemoveTempDir tmpDir
+    PrepareFollowUp = -1
+End Function
+
+'=============================================================================
+' COCHER LES RETARDS (v1.4 - F4-16) : coche les suivis en cours dont la date
+' limite est passee (lendemain de la date limite, comme la colonne
+' Echeance), decoche les autres ; Relancer prepare ensuite leurs brouillons.
+' Une affectation pour toute la colonne.
+'=============================================================================
+Private Sub DoCheckLate(ByVal ws As Worksheet)
+    On Error GoTo Fin
+    If COL_MARK < 1 Or COL_ID < 1 Or COL_STATUS < 1 Or COL_DUE < 1 Then Exit Sub
+    Dim lastRow As Long
+    lastRow = LastDataRow(ws)
+    If lastRow < 2 Then Exit Sub
+    Dim ids As Variant, sts As Variant, dues As Variant, marks() As Variant
+    Dim i As Long, n As Long, nLate As Long
+    n = lastRow - 1
+    ids = ReadCol(ws, COL_ID, lastRow)
+    sts = ReadCol(ws, COL_STATUS, lastRow)
+    dues = ReadCol(ws, COL_DUE, lastRow)
+    ReDim marks(1 To n, 1 To 1)
+    For i = 1 To n
+        marks(i, 1) = ""
+        If Len(CellText(ids(i, 1))) > 0 Then
+            If IsLate(CellText(sts(i, 1)), dues(i, 1)) Then
+                marks(i, 1) = ChrW$(MARK_GLYPH)
+                nLate = nLate + 1
+            End If
+        End If
+    Next i
+    Application.EnableEvents = False
+    ws.Range(ws.Cells(2, COL_MARK), ws.Cells(lastRow, COL_MARK)).Value = marks
+    Application.EnableEvents = True
+    RefreshRibbon
+    If nLate = 0 Then
+        SetStatus A("Aucun suivi en retard.")
+    Else
+        SetStatus nLate & A(" suivi(s) en retard coch~e(s) : Relancer pr~epare leurs brouillons.")
+    End If
+    ScheduleStatusClear 20
     Exit Sub
 Fin:
-    Dim errNo As Long, errDesc As String
-    errNo = Err.Number
-    errDesc = Err.Description
-    On Error Resume Next
-    RemoveTempDir tmpDir
-    MsgBox A("Relance impossible : ") & errNo & " - " & errDesc, vbExclamation, "Relancer"
+    Application.EnableEvents = True
+    MsgBox A("Cocher les retards impossible : ") & Err.Number & " - " & Err.Description, vbExclamation, APP_TITLE
+End Sub
+
+'=============================================================================
+' AIDE (v1.4 - F8-20 : groupe Aide de la charte commune des classeurs).
+'=============================================================================
+Private Sub DoHelp()
+    MsgBox A("Relancer : un brouillon de relance par ligne coch~ee (sinon la ligne active), ~a relire ") & _
+           A("avant envoi ; 3 affich~es, les suivants dans Brouillons (10 au plus). Lignes d~ej~a ") & _
+           A("r~epondues ou trait~ees ignor~ees.") & vbCrLf & _
+           A("Cocher les retards : coche les suivis dont la date limite est pass~ee.") & vbCrLf & vbCrLf & _
+           A("Ouvrir le mail, Ouvrir le dossier : ligne active.") & vbCrLf & _
+           A("Prolonger, Valider la r~eponse, Archiver : lignes coch~ees, sinon ligne active. ") & _
+           A("Restaurer : depuis la feuille Archives.") & vbCrLf & vbCrLf & _
+           A("Actualiser : Outlook recalcule les statuts (Outlook doit ~xtre ouvert).") & vbCrLf & _
+           A("R~eparer : remet chaque ligne en face de son mail, apr~fs une copie de sauvegarde.") & vbCrLf & vbCrLf & _
+           A("Colonne A : un clic coche ou d~ecoche la ligne ; un clic sur l'en-t~xte d~ecoche tout."), _
+           vbInformation, A("Suivi des mails - aide")
 End Sub
 
 '=============================================================================
@@ -1005,40 +1433,46 @@ End Sub
 ' restent possibles depuis les archives. Cote Outlook, FindRowByConv ne
 ' cherche que dans Suivi : un nouveau mail sur une conversation archivee
 ' cree une ligne NEUVE (voulu).
+' v1.4 : plus de confirmation (F4-19 : l'action se defait par Restaurer),
+' compte rendu dans la barre d'etat ; ligne d'origine supprimee SEULEMENT
+' si sa copie est bien arrivee (F4-13) ; ligne de destination calculee sous
+' les lignes masquees par un filtre (F4-01).
 '=============================================================================
 Private Sub DoArchive(ByVal ws As Worksheet, ByVal rowList As Collection)
     On Error GoTo Fin
-    Dim question As String
-    If rowList.Count = 1 Then
-        question = A("Archiver ce suivi ?")
-    Else
-        question = A("Archiver ces ") & rowList.Count & A(" suivis ?")
-    End If
-    If MsgBox(question & vbCrLf & vbCrLf & SubjectList(ws, rowList) & vbCrLf & _
-              A("Les lignes quittent le suivi courant et rejoignent la feuille ") & SH_ARCHIVE & ".", _
-              vbQuestion + vbYesNo, "Archiver") <> vbYes Then Exit Sub
-
     Dim wsA As Worksheet
     Set wsA = EnsureArchiveSheet(ws)
     If wsA Is Nothing Then Exit Sub
 
     Application.EnableEvents = False
     Application.ScreenUpdating = False
-    Dim i As Long, r As Long, destRow As Long
+    Dim i As Long, r As Long, destRow As Long, nDone As Long, nFail As Long
     For i = rowList.Count To 1 Step -1
         r = CLng(rowList(i))
         destRow = LastDataRow(wsA) + 1
         If destRow < 2 Then destRow = 2
-        CopyRowTo ws, r, wsA, destRow
-        If COL_ARCHIVED_AT > 0 Then wsA.Cells(destRow, COL_ARCHIVED_AT).Value = Format$(Now, "dd/mm/yyyy hh:nn")
-        ws.Rows(r).Delete
+        If CopyRowTo(ws, r, wsA, destRow) Then
+            If COL_ARCHIVED_AT > 0 Then wsA.Cells(destRow, COL_ARCHIVED_AT).Value = Format$(Now, "dd/mm/yyyy hh:nn")
+            ws.Rows(r).Delete
+            nDone = nDone + 1
+        Else
+            ClearRowSafe wsA, destRow
+            nFail = nFail + 1
+        End If
     Next i
     Application.ScreenUpdating = True
     Application.EnableEvents = True
     RefreshRibbon
+    If nDone > 0 Then
+        SetStatus nDone & A(" suivi(s) archiv~e(s) - Restaurer depuis la feuille ") & SH_ARCHIVE & "."
+        ScheduleStatusClear 20
+    End If
+    If nFail > 0 Then
+        MsgBox nFail & A(" ligne(s) non archiv~ee(s) : la copie vers la feuille ") & SH_ARCHIVE & _
+               A(" a ~echou~e, elles restent dans ") & SH_TRACK & ".", vbExclamation, "Archiver"
+    End If
     Exit Sub
 Fin:
-    Application.CutCopyMode = False
     Application.ScreenUpdating = True
     Application.EnableEvents = True
     MsgBox A("Archivage impossible : ") & Err.Description, vbExclamation, "Archiver"
@@ -1047,58 +1481,121 @@ End Sub
 '=============================================================================
 ' RESTAURER (feuille Archives, une ou plusieurs lignes) : la ligne revient
 ' dans Suivi ; son statut est recalcule a l'actualisation suivante.
+' v1.4 : memes regles qu'Archiver (pas de confirmation, copie verifiee
+' avant suppression, ligne de destination sous les lignes filtrees).
 '=============================================================================
 Private Sub DoRestore(ByVal wsA As Worksheet, ByVal rowList As Collection)
     On Error GoTo Fin
-    Dim question As String
-    If rowList.Count = 1 Then
-        question = A("Restaurer ce suivi dans ") & SH_TRACK & " ?"
-    Else
-        question = A("Restaurer ces ") & rowList.Count & A(" suivis dans ") & SH_TRACK & " ?"
-    End If
-    If MsgBox(question & vbCrLf & vbCrLf & SubjectList(wsA, rowList), vbQuestion + vbYesNo, "Restaurer") <> vbYes Then Exit Sub
-
     Dim wsT As Worksheet
     Set wsT = TrackSheet()
     If wsT Is Nothing Then Exit Sub
 
     Application.EnableEvents = False
     Application.ScreenUpdating = False
-    Dim i As Long, r As Long, destRow As Long
+    Dim i As Long, r As Long, destRow As Long, nDone As Long, nFail As Long
     For i = rowList.Count To 1 Step -1
         r = CLng(rowList(i))
         destRow = LastDataRow(wsT) + 1
         If destRow < 2 Then destRow = 2
-        CopyRowTo wsA, r, wsT, destRow
-        If COL_ARCHIVED_AT > 0 Then wsT.Cells(destRow, COL_ARCHIVED_AT).ClearContents
-        EnsureDeadlineFormula wsT, destRow
-        wsA.Rows(r).Delete
+        If CopyRowTo(wsA, r, wsT, destRow) Then
+            If COL_ARCHIVED_AT > 0 Then wsT.Cells(destRow, COL_ARCHIVED_AT).ClearContents
+            EnsureDeadlineFormula wsT, destRow
+            wsA.Rows(r).Delete
+            nDone = nDone + 1
+        Else
+            ClearRowSafe wsT, destRow
+            nFail = nFail + 1
+        End If
     Next i
     Application.ScreenUpdating = True
     Application.EnableEvents = True
     RefreshRibbon
+    If nDone > 0 Then
+        SetStatus nDone & A(" suivi(s) restaur~e(s) dans la feuille ") & SH_TRACK & "."
+        ScheduleStatusClear 20
+    End If
+    If nFail > 0 Then
+        MsgBox nFail & A(" ligne(s) non restaur~ee(s) : la copie vers la feuille ") & SH_TRACK & _
+               A(" a ~echou~e, elles restent dans ") & SH_ARCHIVE & ".", vbExclamation, "Restaurer"
+    End If
     Exit Sub
 Fin:
-    Application.CutCopyMode = False
     Application.ScreenUpdating = True
     Application.EnableEvents = True
     MsgBox A("Restauration impossible : ") & Err.Description, vbExclamation, "Restaurer"
 End Sub
 
-' Copie une ligne (valeurs + formats de nombre, couleur du statut), coche
-' effacee. Pas de copie des mises en forme conditionnelles.
-Private Sub CopyRowTo(ByVal src As Worksheet, ByVal r As Long, ByVal dst As Worksheet, ByVal destRow As Long)
-    On Error Resume Next
-    src.Rows(r).Copy
-    dst.Rows(destRow).PasteSpecial Paste:=xlPasteValuesAndNumberFormats
-    Application.CutCopyMode = False
+' Copie une ligne : valeurs et formats de date, coche effacee, couleur du
+' statut ; pas de copie des mises en forme conditionnelles.
+' v1.4 (F4-13) : SANS presse-papiers (avant : Copy / PasteSpecial sous On
+' Error Resume Next, sans resultat rendu : un collage rate - presse-papiers
+' pris par une autre application - laissait la destination vide et
+' l'appelant supprimait quand meme la ligne d'origine ; le contenu copie
+' par l'utilisateur etait en outre perdu a chaque archivage). Les textes
+' gardent leur nature de texte (prefixe ', comme le collage de valeurs :
+' un objet "12/03" n'est pas transforme en date). True seulement si la
+' ligne est bien arrivee (meme identifiant de suivi).
+Private Function CopyRowTo(ByVal src As Worksheet, ByVal r As Long, ByVal dst As Worksheet, _
+                           ByVal destRow As Long) As Boolean
+    CopyRowTo = False
+    On Error GoTo Fin
+    If COL_ID < 1 Then Exit Function
+    Dim n As Long, c As Long
+    n = LastKnownCol()
+    Dim vals As Variant
+    vals = src.Range(src.Cells(r, 1), src.Cells(r, n)).Value
+    For c = 1 To n
+        If VarType(vals(1, c)) = vbString Then
+            If Len(vals(1, c)) > 0 Then vals(1, c) = "'" & vals(1, c)
+        End If
+    Next c
+    dst.Range(dst.Cells(destRow, 1), dst.Cells(destRow, n)).Value = vals
+    CopyNumberFormat src, r, dst, destRow, COL_SENT
+    CopyNumberFormat src, r, dst, destRow, COL_DUE
+    CopyNumberFormat src, r, dst, destRow, COL_LASTFU
     If COL_MARK > 0 Then dst.Cells(destRow, COL_MARK).ClearContents
-    StyleStatus dst, destRow, Trim$(CStr(dst.Cells(destRow, COL_STATUS).Value))
+    StyleStatus dst, destRow, Trim$(CellText(dst.Cells(destRow, COL_STATUS).Value))
+
+    Dim idS As String, idD As String
+    idS = CellText(src.Cells(r, COL_ID).Value)
+    idD = CellText(dst.Cells(destRow, COL_ID).Value)
+    CopyRowTo = (Len(idS) > 0 And idS = idD)
+    Exit Function
+Fin:
+    CopyRowTo = False
+End Function
+
+' Derniere colonne utile d'une ligne de suivi (colonne "Archive le" comprise).
+Private Function LastKnownCol() As Long
+    Dim m As Long
+    m = COL_ARCHIVED_AT
+    If COL_ACK > m Then m = COL_ACK
+    If COL_ENTRY > m Then m = COL_ENTRY
+    If COL_CONV > m Then m = COL_CONV
+    If COL_ID > m Then m = COL_ID
+    If COL_NBFU > m Then m = COL_NBFU
+    LastKnownCol = m
+End Function
+
+Private Sub CopyNumberFormat(ByVal src As Worksheet, ByVal r As Long, ByVal dst As Worksheet, _
+                             ByVal destRow As Long, ByVal col As Long)
+    On Error Resume Next
+    If col < 1 Then Exit Sub
+    dst.Cells(destRow, col).NumberFormat = src.Cells(r, col).NumberFormat
+End Sub
+
+' Copie ratee : la ligne de destination (vide avant la copie) est videe.
+Private Sub ClearRowSafe(ByVal ws As Worksheet, ByVal r As Long)
+    On Error Resume Next
+    If r < 2 Then Exit Sub
+    ws.Range(ws.Cells(r, 1), ws.Cells(r, LastKnownCol())).ClearContents
 End Sub
 
 '=============================================================================
 ' EnsureArchiveSheet - cree la feuille "Archives" a la premiere utilisation,
 ' avec la meme ligne d'en-tete que le suivi et les memes colonnes masquees.
+' v1.4 : en-tete copie SANS presse-papiers (Copy Destination : valeurs et
+' formats, donc le bandeau de la charte commune, F8-22).
 '=============================================================================
 Private Function EnsureArchiveSheet(ByVal ws As Worksheet) As Worksheet
     On Error Resume Next
@@ -1117,12 +1614,12 @@ Private Function EnsureArchiveSheet(ByVal ws As Worksheet) As Worksheet
     If wsA Is Nothing Then Exit Function
     wsA.Name = SH_ARCHIVE
 
-    ws.Rows(1).Copy
-    wsA.Rows(1).PasteSpecial Paste:=xlPasteValues
-    wsA.Rows(1).PasteSpecial Paste:=xlPasteFormats
-    Application.CutCopyMode = False
+    ws.Rows(1).Copy Destination:=wsA.Rows(1)
+    wsA.Rows(1).RowHeight = ws.Rows(1).RowHeight
     If COL_ARCHIVED_AT > 0 Then
         wsA.Cells(1, COL_ARCHIVED_AT).Value = A("Archiv~e le")
+        wsA.Cells(1, COL_ARCHIVED_AT).Interior.Color = ws.Cells(1, COL_SUBJECT).Interior.Color
+        wsA.Cells(1, COL_ARCHIVED_AT).Font.Color = ws.Cells(1, COL_SUBJECT).Font.Color
         wsA.Columns(COL_ARCHIVED_AT).ColumnWidth = 16
     End If
 
@@ -1149,12 +1646,23 @@ End Function
 ' v1.2 : 1) appel direct RefreshMailTracking (ThisOutlookSession) ;
 ' 2) s'il echoue, quelle que soit l'erreur : canal de commandes
 ' (SendOutlookCommand). Message seulement si les deux echouent.
+' v1.4 (F4-19) : demande par la note -> accuse de reception attendu
+' (ScheduleAckCheck).
 '=============================================================================
 Private Sub DoRefresh()
     Dim ol As Object
     Set ol = GetOutlook()
     If ol Is Nothing Then Exit Sub
+    If Not RequestOutlookRefresh(ol, True) Then Exit Sub
+    SetStatus A("Actualisation en cours dans Outlook...")
+    ScheduleStatusClear STATUS_TIMEOUT_SEC
+End Sub
 
+' v1.4 - Demande d'actualisation a Outlook (appel direct, sinon note de
+' commande + accuse attendu). False si elle n'a pas pu partir (message si
+' showErrors).
+Private Function RequestOutlookRefresh(ByVal ol As Object, ByVal showErrors As Boolean) As Boolean
+    RequestOutlookRefresh = False
     Dim errNo As Long
     On Error Resume Next
     Err.Clear
@@ -1162,24 +1670,28 @@ Private Sub DoRefresh()
     errNo = Err.Number
     Err.Clear
     On Error GoTo 0
-
-    If errNo <> 0 Then
-        Dim why As String
-        If Not SendOutlookCommand(ol, "REFRESH", why) Then
-            MsgBox A("Outlook n'a pas re~cu la demande d'actualisation : ") & why & vbCrLf & vbCrLf & _
-                   A("En attendant : bouton Suivi Mails du ruban Outlook."), vbExclamation, "Actualiser"
-            Exit Sub
-        End If
+    If errNo = 0 Then
+        RequestOutlookRefresh = True
+        Exit Function
     End If
 
-    SetStatus A("Actualisation en cours dans Outlook...")
-    ScheduleStatusClear STATUS_TIMEOUT_SEC
-End Sub
+    Dim why As String
+    If Not SendOutlookCommand(ol, "REFRESH", why) Then
+        If showErrors Then
+            MsgBox A("Outlook n'a pas re~cu la demande d'actualisation : ") & why & vbCrLf & vbCrLf & _
+                   A("En attendant : bouton Suivi Mails du ruban Outlook."), vbExclamation, "Actualiser"
+        End If
+        Exit Function
+    End If
+    ScheduleAckCheck
+    RequestOutlookRefresh = True
+End Function
 
 ' v1.2 - Ecrit une commande pour Outlook dans la note unique du dossier
 ' Notes\ClassicOutlook-Toolkit (creee si le dossier est vide). Outlook
 ' (ThisOutlookSession v10.16) surveille ce dossier et execute la commande.
 ' False + raison dans why si impossible.
+' v1.4 (F4-19) : texte envoye memorise pour le controle de l'accuse.
 Private Function SendOutlookCommand(ByVal ol As Object, ByVal cmd As String, ByRef why As String) As Boolean
     SendOutlookCommand = False
     why = ""
@@ -1214,16 +1726,100 @@ Private Function SendOutlookCommand(ByVal ol As Object, ByVal cmd As String, ByR
         Exit Function
     End If
 
+    Dim body As String
+    body = "TOOLKIT|" & cmd & "|" & Format$(Now, "yyyymmddhhnnss") & "-" & _
+           Format$(Int(Timer * 1000) Mod 1000, "000")
     Err.Clear
-    itm.Body = "TOOLKIT|" & cmd & "|" & Format$(Now, "yyyymmddhhnnss") & "-" & _
-               Format$(Int(Timer * 1000) Mod 1000, "000")
+    itm.Body = body
     itm.Save
     If Err.Number <> 0 Then
         why = A("~ecriture de la note de commande impossible (erreur ") & Err.Number & ")."
         Err.Clear
         Exit Function
     End If
+    mCmdBody = body
+    mCmdName = cmd
+    mAckTries = 0
     SendOutlookCommand = True
+End Function
+
+'=============================================================================
+' ACCUSE DE RECEPTION (v1.4 - F4-19). Outlook (modMailResponseTracker v6.7)
+' reecrit la note "TOOLKIT|..." en "ACK|horodatage|commande|etat" des qu'il
+' prend la demande (etat BUSY : une actualisation tournait deja). Controle
+' ACK_FIRST_SEC s apres l'envoi, puis encore ACK_SECOND_SEC s plus tard
+' (Outlook occupe) ; note toujours inchangee : Outlook n'ecoute plus le
+' canal de commandes, et l'utilisateur le sait (avant : "Actualisation en
+' cours..." pendant 2 min, puis rien).
+'=============================================================================
+Private Sub ScheduleAckCheck()
+    On Error Resume Next
+    CancelAckCheck
+    mAckAt = Now + TimeSerial(0, 0, ACK_FIRST_SEC)
+    Application.OnTime mAckAt, "'" & ThisWorkbook.Name & "'!CheckCommandAck"
+End Sub
+
+Private Sub CancelAckCheck()
+    On Error Resume Next
+    If mAckAt <> 0 Then Application.OnTime mAckAt, "'" & ThisWorkbook.Name & "'!CheckCommandAck", , False
+    mAckAt = 0
+End Sub
+
+Public Sub CheckCommandAck()
+    On Error Resume Next
+    mAckAt = 0
+    If Len(mCmdBody) = 0 Then Exit Sub
+    Dim ol As Object
+    Set ol = Nothing
+    Set ol = GetObject(, "Outlook.Application")
+    If ol Is Nothing Then Exit Sub                    ' Outlook ferme entre-temps : rien a dire
+
+    Dim itm As Object, body As String
+    Set itm = CommandNote(ol)
+    If itm Is Nothing Then Exit Sub
+    body = ""
+    body = Trim$(Replace(Replace(CStr(itm.Body), vbCr, ""), vbLf, ""))
+    If Left$(body, 4) = "ACK|" Then
+        mCmdBody = ""
+        If InStr(1, body, "|BUSY", vbTextCompare) > 0 Then
+            SetStatus A("Outlook ~etait d~ej~a en train de traiter le suivi : r~esultat dans un instant.")
+            ScheduleStatusClear STATUS_TIMEOUT_SEC
+        End If
+        Exit Sub
+    End If
+    If body <> mCmdBody Then                          ' autre commande depuis : rien a conclure
+        mCmdBody = ""
+        Exit Sub
+    End If
+
+    mAckTries = mAckTries + 1
+    If mAckTries < 2 Then
+        mAckAt = Now + TimeSerial(0, 0, ACK_SECOND_SEC)
+        Application.OnTime mAckAt, "'" & ThisWorkbook.Name & "'!CheckCommandAck"
+        Exit Sub
+    End If
+
+    ' Aucun accuse : Outlook n'a pas pris la demande.
+    Dim cmd As String
+    cmd = mCmdName
+    mCmdBody = ""
+    mPendingAct = ""
+    ClearStatusBarSafe
+    MsgBox A("Outlook n'a pas pris la demande (") & cmd & A(") : il n'~ecoute plus le canal de commandes.") & _
+           vbCrLf & vbCrLf & _
+           A("Dans Outlook : onglet Maintenance, R~einitialisation Projet (Reinit) ; sinon red~emarrez Outlook. ") & _
+           A("Puis recommencez."), vbExclamation, APP_TITLE
+End Sub
+
+' Note du canal de commandes (Nothing si absente).
+Private Function CommandNote(ByVal ol As Object) As Object
+    On Error Resume Next
+    Set CommandNote = Nothing
+    Dim fld As Object
+    Set fld = Nothing
+    Set fld = ol.Session.GetDefaultFolder(OL_FOLDER_NOTES).Folders(CMD_FOLDER_NAME)
+    If fld Is Nothing Then Exit Function
+    Set CommandNote = fld.Items.GetFirst
 End Function
 
 '=============================================================================
@@ -1232,6 +1828,7 @@ End Function
 ' remet chaque ligne en face de son mail (objet + date d'envoi), apres une
 ' copie de sauvegarde du classeur, puis recalcule tout et rappelle
 ' AfterOutlookRefresh. Confirmation : l'action reecrit des colonnes.
+' v1.4 (F4-19) : accuse de reception attendu.
 '=============================================================================
 Private Sub DoRepair()
     If MsgBox(A("R~eparer le suivi : chaque ligne est remise en face de son mail (m~xme objet, m~xme date d'envoi), ") & _
@@ -1249,6 +1846,7 @@ Private Sub DoRepair()
                A("En attendant : macro RepairTrackerRows dans Outlook (Alt+F8)."), vbExclamation, A("R~eparer")
         Exit Sub
     End If
+    ScheduleAckCheck
     SetStatus A("R~eparation en cours dans Outlook...")
     ScheduleStatusClear STATUS_TIMEOUT_SEC
 End Sub
@@ -1259,9 +1857,27 @@ Private Sub SetStatus(ByVal msg As String)
     mStatusSet = True
 End Sub
 
+' v1.4 (F4-14) : un seul rendez-vous d'effacement a la fois (le precedent
+' est annule) ; annule aussi a la fermeture du classeur (OnBeforeClose).
+' Avant : chaque appel en empilait un nouveau, et un rendez-vous echu apres
+' la fermeture faisait rouvrir le classeur par Excel.
 Private Sub ScheduleStatusClear(ByVal seconds As Long)
     On Error Resume Next
-    Application.OnTime Now + TimeSerial(0, 0, seconds), "'" & ThisWorkbook.Name & "'!ClearStatusBarSafe"
+    CancelStatusClear
+    mClearAt = Now + TimeSerial(0, 0, seconds)
+    Application.OnTime mClearAt, "'" & ThisWorkbook.Name & "'!ClearStatusBarSafe"
+End Sub
+
+Private Sub CancelStatusClear()
+    On Error Resume Next
+    If mClearAt <> 0 Then Application.OnTime mClearAt, "'" & ThisWorkbook.Name & "'!ClearStatusBarSafe", , False
+    mClearAt = 0
+End Sub
+
+Private Sub CancelReplay()
+    On Error Resume Next
+    If mReplayAt <> 0 Then Application.OnTime mReplayAt, "'" & ThisWorkbook.Name & "'!ReplayPendingAction", , False
+    mReplayAt = 0
 End Sub
 
 '=============================================================================
@@ -1292,8 +1908,11 @@ Private Sub RecomputeRow(ByVal ws As Worksheet, ByVal r As Long)
     fc = 0
     fc = CLng(ws.Cells(r, COL_NBFU).Value)
 
+    ' v1.4 (F4-15) : en retard le LENDEMAIN de la date limite (jours
+    ' entiers, comme la colonne Echeance) ; avant : des l'heure d'envoi +
+    ' delai, et un suivi urgent du jour etait en retard des sa creation.
     Dim ns As String
-    If Now > due Then
+    If Date > Int(CDbl(due)) Then
         ns = "En retard"
     ElseIf fc > 0 Then
         ns = "Relanc" & ChrW$(233)
@@ -1375,7 +1994,9 @@ Private Function GetOutlook() As Object
     End If
 End Function
 
-' Mail de reference de la ligne (EntryID). Nothing + message si introuvable.
+' Mail de reference de la ligne (EntryID). Nothing si introuvable.
+' v1.4 (F4-19) : plus de message ici ; l'appelant demande l'actualisation
+' et reprend l'action ensuite (MailNotFound, QueueRetry).
 Private Function ResolveMail(ByVal ol As Object, ByVal ws As Worksheet, ByVal r As Long) As Object
     On Error Resume Next
     Set ResolveMail = Nothing
@@ -1383,12 +2004,206 @@ Private Function ResolveMail(ByVal ol As Object, ByVal ws As Worksheet, ByVal r 
     entryID = ""
     entryID = CStr(ws.Cells(r, COL_ENTRY).Value)
     If Len(entryID) > 0 Then Set ResolveMail = ol.Session.GetItemFromID(entryID)
-    On Error GoTo 0
-    If ResolveMail Is Nothing Then
-        MsgBox A("Mail introuvable : son identifiant n'est plus valable (mail d~eplac~e ou supprim~e).") & _
-               vbCrLf & A("Cliquez Actualiser (ou ouvrez le tableau de bord depuis Outlook), ") & _
-               A("puis recommencez."), vbExclamation, APP_TITLE
+End Function
+
+'=============================================================================
+' MAIL DEPLACE (v1.4 - F4-19). L'identifiant du mail d'une ligne n'est plus
+' valable (mail range ailleurs depuis) : avant, "Cliquez Actualiser, puis
+' recommencez". Maintenant Outlook est prie d'actualiser (il re-identifie la
+' ligne par objet et date d'envoi) et l'action reprend seule a la fin
+' (AfterOutlookRefresh -> ReplayPendingAction). Message seulement si la
+' demande ne peut pas partir, ou si le mail reste introuvable apres.
+'=============================================================================
+Private Sub MailNotFound(ByVal act As String, ByVal ws As Worksheet, ByVal r As Long)
+    Dim rowSet As Collection
+    Set rowSet = New Collection
+    rowSet.Add r
+    If QueueRetry(act, ws, rowSet) Then Exit Sub
+    ShowMissingMail
+End Sub
+
+Private Sub ShowMissingMail()
+    If mReplaying Then
+        MsgBox A("Mail introuvable, m~xme apr~fs l'actualisation : supprim~e, ou rang~e dans une autre bo~ite.") & _
+               vbCrLf & A("Bouton R~eparer pour une recherche plus longue."), vbExclamation, APP_TITLE
+    Else
+        MsgBox A("Mail introuvable : son identifiant n'est plus valable (mail d~eplac~e ou supprim~e), ") & _
+               A("et Outlook n'a pas pu ~xtre pr~evenu."), vbExclamation, APP_TITLE
     End If
+End Sub
+
+' Memorise l'action et ses lignes (par identifiant de suivi : le tri
+' d'Outlook deplace les lignes), puis demande l'actualisation. False si
+' deja en reprise (pas de boucle), ligne sans identifiant ou demande
+' impossible.
+Private Function QueueRetry(ByVal act As String, ByVal ws As Worksheet, ByVal rowSet As Collection) As Boolean
+    QueueRetry = False
+    On Error GoTo Fin
+    If mReplaying Then Exit Function
+    Dim ids As String, v As Variant, idv As String
+    ids = ";"
+    For Each v In rowSet
+        idv = CellText(ws.Cells(CLng(v), COL_ID).Value)
+        If Len(idv) = 0 Then Exit Function
+        ids = ids & idv & ";"
+    Next v
+    Dim ol As Object
+    Set ol = Nothing
+    On Error Resume Next
+    Set ol = GetObject(, "Outlook.Application")
+    On Error GoTo Fin
+    If ol Is Nothing Then Exit Function
+    If Not RequestOutlookRefresh(ol, False) Then Exit Function
+    mPendingAct = act
+    mPendingIds = ids
+    mPendingSheet = ws.Name
+    mPendingAt = Now
+    SetStatus A("Mail d~eplac~e : Outlook le recherche, l'action reprendra seule ~a la fin de l'actualisation...")
+    ScheduleStatusClear STATUS_TIMEOUT_SEC
+    QueueRetry = True
+    Exit Function
+Fin:
+    QueueRetry = False
+End Function
+
+' Reprise de l'action en attente (rendez-vous pose par AfterOutlookRefresh).
+' Demande de plus de 10 min : oubliee.
+Public Sub ReplayPendingAction()
+    On Error GoTo Fin
+    mReplayAt = 0
+    If Len(mPendingAct) = 0 Then Exit Sub
+    Dim act As String, ids As String, shName As String, askedAt As Date
+    act = mPendingAct
+    ids = mPendingIds
+    shName = mPendingSheet
+    askedAt = mPendingAt
+    mPendingAct = ""
+    mPendingIds = ""
+    mPendingSheet = ""
+    If Now - askedAt > TimeSerial(0, 10, 0) Then Exit Sub
+
+    Dim ws As Worksheet
+    Set ws = Nothing
+    On Error Resume Next
+    Set ws = ThisWorkbook.Worksheets(shName)
+    On Error GoTo Fin
+    If ws Is Nothing Then Exit Sub
+    EnsureSchema ThisWorkbook
+    If Not LayoutMatches(ws) Then Exit Sub
+    Dim rowSet As Collection
+    Set rowSet = RowsByIds(ws, ids)
+    If rowSet.Count = 0 Then Exit Sub
+
+    mReplaying = True
+    Select Case act
+        Case "OPEN"
+            DoOpen ws, CLng(rowSet(1))
+        Case "OPEN_FOLDER"
+            DoOpenFolder ws, CLng(rowSet(1))
+        Case "FOLLOWUP"
+            DoFollowUpRows ws, rowSet
+    End Select
+    mReplaying = False
+    Exit Sub
+Fin:
+    mReplaying = False
+End Sub
+
+' Lignes (ordre croissant) dont l'identifiant de suivi figure dans ids
+' (";ID1;ID2;").
+Private Function RowsByIds(ByVal ws As Worksheet, ByVal ids As String) As Collection
+    Dim res As Collection
+    Set res = New Collection
+    Set RowsByIds = res
+    On Error Resume Next
+    If COL_ID < 1 Then Exit Function
+    Dim lastRow As Long, v As Variant, i As Long, idv As String
+    lastRow = LastDataRow(ws)
+    If lastRow < 2 Then Exit Function
+    v = ReadCol(ws, COL_ID, lastRow)
+    For i = 1 To lastRow - 1
+        idv = CellText(v(i, 1))
+        If Len(idv) > 0 Then
+            If InStr(1, ids, ";" & idv & ";", vbBinaryCompare) > 0 Then res.Add i + 1
+        End If
+    Next i
+End Function
+
+'=============================================================================
+' FICHIER DES ECHEANCES (v1.4 - F4-07) : apres chaque enregistrement du
+' classeur (ThisWorkbook.Workbook_AfterSave), une ligne par suivi de la
+' feuille Suivi qui n'est ni "Repondu" ni "Traite" : "date limite
+' aaaa-mm-jj <TAB> statut <TAB> objet", dans <dossier de l'outil>\Sorties\
+' suivi-echeances.txt (dossier de l'outil lu dans le registre, ou Outlook
+' le memorise). Meme format que modMailResponseTracker.WriteDueCache
+' (Outlook) : le rappel du matin d'Outlook le lit sans ouvrir Excel, et
+' voit ainsi les Prolonger / Valider / Archiver faits ici. Silencieux.
+'=============================================================================
+Public Sub WriteDueCache()
+    Dim f As Integer
+    f = 0
+    On Error GoTo Fin
+    Dim path As String
+    path = DueCachePath()
+    If Len(path) = 0 Then Exit Sub
+    EnsureSchema ThisWorkbook
+    Dim ws As Worksheet
+    Set ws = TrackSheet()
+    If ws Is Nothing Then Exit Sub
+    If Not LayoutMatches(ws) Then Exit Sub
+    If COL_ID < 1 Or COL_STATUS < 1 Or COL_DUE < 1 Or COL_SUBJECT < 1 Then Exit Sub
+
+    Dim lastRow As Long, i As Long
+    Dim txt As String, st As String, dueV As Date
+    txt = "# ClassicOutlook-Toolkit suivi-echeances v1 " & Format$(Now, "yyyy-mm-dd hh:nn:ss") & vbCrLf
+    lastRow = LastDataRow(ws)
+    If lastRow >= 2 Then
+        Dim ids As Variant, sts As Variant, dues As Variant, subs As Variant
+        ids = ReadCol(ws, COL_ID, lastRow)
+        sts = ReadCol(ws, COL_STATUS, lastRow)
+        dues = ReadCol(ws, COL_DUE, lastRow)
+        subs = ReadCol(ws, COL_SUBJECT, lastRow)
+        For i = 1 To lastRow - 1
+            If Len(CellText(ids(i, 1))) > 0 Then
+                st = Trim$(CellText(sts(i, 1)))
+                If st <> "R" & ChrW$(233) & "pondu" And st <> "Trait" & ChrW$(233) Then
+                    dueV = CellDate(dues(i, 1))
+                    If dueV > 0 Then txt = txt & Format$(dueV, "yyyy-mm-dd")
+                    txt = txt & vbTab & st & vbTab & OneLine(CellText(subs(i, 1))) & vbCrLf
+                End If
+            End If
+        Next i
+    End If
+    f = FreeFile
+    Open path For Output As #f
+    Print #f, txt;
+    Close #f
+    f = 0
+    Exit Sub
+Fin:
+    On Error Resume Next
+    If f > 0 Then Close #f
+End Sub
+
+' <dossier de l'outil>\Sorties\suivi-echeances.txt ("" si le dossier de
+' l'outil n'est pas memorise dans le registre, ou sans dossier Sorties :
+' ancien emplacement a plat, Outlook ecrit alors seul le fichier).
+Private Function DueCachePath() As String
+    On Error Resume Next
+    DueCachePath = ""
+    Dim d As String
+    d = Trim$(GetSetting("ClassicOutlookToolkit", "Paths", "ToolkitDir", ""))
+    If Len(d) = 0 Then Exit Function
+    If Right$(d, 1) = "\" Then d = Left$(d, Len(d) - 1)
+    If Len(Dir(d & "\Sorties", vbDirectory)) = 0 Then Exit Function
+    DueCachePath = d & "\Sorties\" & DUE_CACHE_FILE
+End Function
+
+' Texte sur une ligne, sans tabulation, 120 caracteres au plus.
+Private Function OneLine(ByVal s As String) As String
+    s = Replace(Replace(Replace(s, vbTab, " "), vbCr, " "), vbLf, " ")
+    If Len(s) > 120 Then s = Left$(s, 120)
+    OneLine = s
 End Function
 
 ' Colonne "Nom du dossier" mise a jour depuis le mail resolu (si changee).

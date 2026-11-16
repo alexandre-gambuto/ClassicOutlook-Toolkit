@@ -1,7 +1,14 @@
 Option Explicit
 
 '=============================================================================
-' modFolderRename (v1.2)
+' modFolderRename (v1.3)
+' v1.3 (2026-11-16) : audit 11/2026 - F3-18 : apres renommage, la liste de
+'   QuickMove est remise a jour par modQuickMove.BackgroundReindex
+'   (reindexation par paquets, sans fenetre) au lieu de QuickMoveReload, qui
+'   affichait sa propre boite "n dossiers reindexes" juste avant la boite
+'   "n dossiers renommes" : deux confirmations de suite. (Les renommages
+'   sont de toute facon suivis au fil de l'eau par la surveillance des
+'   dossiers de QuickMove et repares a la premiere utilisation.)
 ' v1.2 (2026-08-24) : le fichier d'export est prefixe par le nom du dossier
 '   parcouru (ex. "DV_folders_export.csv", "Contrats_folders_export.csv").
 '   Avant, le nom etait fixe : exporter une 2e racine ecrasait le 1er export.
@@ -44,12 +51,12 @@ Option Explicit
 '   " " entre blocs, " - " entre blocs et libelle. Ajustables ci-dessous.
 '
 ' Dependances : modConfig (Cfg, MacroVBADir, YearExclusionMin/Max, T),
-'   modCommon (GetFolderByPath), modDebugLog, modQuickMove (QuickMoveReload,
-'   optionnel, appele apres renommage).
+'   modCommon (GetFolderByPath), modDebugLog, modQuickMove (BackgroundReindex,
+'   appele apres renommage).
 '=============================================================================
 
 Private Const MOD_NAME As String = "FolderRen"
-Private Const MOD_VERSION As String = "1.2"
+Private Const MOD_VERSION As String = "1.3"
 
 ' v1.2 : suffixes ; le prefixe est le nom du dossier parcouru
 Private Const EXPORT_SUFFIX As String = "_folders_export.csv"
@@ -239,9 +246,11 @@ Public Sub RenameProjectFoldersFromCSV()
         End If
     Next i
 
-    ' Reindexation QuickMove (cache des chemins perime apres renommage)
+    ' Reindexation QuickMove (cache des chemins perime apres renommage).
+    ' v1.3 (F3-18) : par paquets et sans fenetre (BackgroundReindex) ; avant,
+    ' QuickMoveReload ajoutait sa propre boite avant celle du bilan.
     On Error Resume Next
-    modQuickMove.QuickMoveReload
+    modQuickMove.BackgroundReindex
     On Error GoTo ErrHandler
 
     msg = nDone & T(" dossiers renomm~es.", " folders renamed.")

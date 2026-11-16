@@ -7,16 +7,17 @@
 [![Last commit](https://img.shields.io/github/last-commit/alexandre-gambuto/ClassicOutlook-Toolkit)](https://github.com/alexandre-gambuto/ClassicOutlook-Toolkit/commits/main)
 
 A productivity automation suite for **Outlook Classic (desktop)** by **Alexandre Gambuto**,
-written entirely in VBA, plus a standalone **Excel email-analytics** tool. It grew out of daily
-knowledge-work needs: filing mail in two keystrokes, tagging appointments by project,
-filing replies automatically, colouring meetings by attendee type, running small mail
-campaigns, tracking which sent mails are still awaiting a reply, keeping the address
-book clean, and more.
+written entirely in VBA, with three companion Excel workbooks (mail tracking, mail
+campaigns, time tracking). It grew out of daily knowledge-work needs: filing mail in two
+keystrokes, tagging appointments by project, filing replies automatically, colouring
+meetings by attendee type, running small mail campaigns, tracking which sent mails are
+still awaiting a reply, keeping the address book clean, mail statistics, and more.
 
 Everything runs inside a single Outlook VBA project (`ThisOutlookSession`, five
-`WithEvents` classes and 57 standard modules, roughly 47,000 lines), with all
-business configuration externalized to a `config.ini` file. The UI is **bilingual**
-(French / English), switchable from one config key.
+`WithEvents` classes, 59 standard modules and the two UserForms of the mail
+statistics module, roughly 66,000 lines), with all business configuration externalized
+to a `config.ini` file. The UI is **bilingual** (French / English), switchable from one
+config key; the ribbon labels are in French.
 
 Version 3 (September 2026) is a full code review: multi-mailbox reply filing,
 asynchronous campaigns, a self-healing folder index, shared infrastructure modules and
@@ -31,11 +32,13 @@ https://alexandre-gambuto.com/classicoutlook-toolkit-en/, en français https://a
 
 - **Zero-install, locked-down friendly.** No admin rights, no installer, no registered
   COM, no `Tools > References` entries. Late binding everywhere; registry writes limited
-  to `HKCU`; no shell or PowerShell spawned. Designed to survive a managed M365 tenant
-  with an EDR agent.
-- **No UserForms in the Outlook project.** The VBA Project Object Model is assumed
-  blocked, so all interaction goes through ribbon-pinned macros, `MsgBox` / `InputBox`
-  and small toast notifications. (The separate Excel tool does use UserForms.)
+  to `HKCU`; no PowerShell and no command prompt: the only programs started are `mshta`
+  (toasts), `notepad` (log and reports) and `explorer` (open a folder), plus the default
+  browser or application through `Shell.Application`. Designed to survive a managed M365
+  tenant with an EDR agent.
+- **Almost no UserForms.** The VBA Project Object Model is assumed blocked, so
+  interaction goes through ribbon-pinned macros, `MsgBox` / `InputBox` and small toast
+  notifications. The only two forms are the windows of the mail statistics module.
 - **64-bit clean.** Every `Declare` uses `PtrSafe` and `LongPtr`.
 - **Config-driven.** Project codes, patterns, colours, paths, thresholds, vocabulary and
   feature toggles live in `config.ini`, loaded once at startup into typed globals.
@@ -48,7 +51,11 @@ https://alexandre-gambuto.com/classicoutlook-toolkit-en/, en français https://a
   cross-module references, config keys.
 - **Guided first run.** With no `config.ini`, a quick start guide offers, a few seconds
   after startup, to check the environment, ask five questions and write a minimal
-  configuration file. Re-run it any time from *Maintenance > Configuration*.
+  configuration file. Re-run it any time from the *Maintenance* ribbon tab
+  (*Guide de démarrage*).
+- **Self-protecting startup.** Startup work is deferred and run one heavy task at a time;
+  after three abnormal Outlook stops in a row, the startup tasks are suspended until
+  `ResumeStartupTasks` is run.
 
 ---
 
@@ -69,7 +76,9 @@ The time-tracking sheet (`docs/images/dashboard-time-tracking.png`) is shown in 
 | `docs/INSTALL.md` | Step-by-step installation and upgrade guide. |
 | `docs/CONFIGURATION.md` | `config.ini` key reference. |
 | `docs/TROUBLESHOOTING.md` | Known pitfalls of Outlook VBA in a locked-down environment. |
-| `ARCHITECTURE.md` | Module topology, startup flow, event routing, conventions. |
+| `ARCHITECTURE.md` | Module topology, startup flow, event routing, ribbon entry points, files written, conventions. |
+| `docs/GUIDE-Campagnes.md` | Mail campaigns guide (French). |
+| `modMailAnalytics__README.txt` | Mail statistics notice. |
 | `CONTRIBUTING.md` | Coding conventions and delivery rules. |
 | `RELEASE-NOTES-v3.md` | What changed in version 3. |
 | `CHANGELOG.txt` | Full change history, newest first. |
@@ -83,10 +92,11 @@ The time-tracking sheet (`docs/images/dashboard-time-tracking.png`) is shown in 
 | File | Role |
 |------|------|
 | `ThisOutlookSession` | Single entry point: `Application_Startup`, global Outlook events, ribbon shims. |
-| `clsAppEvents` | Central `WithEvents` listener on `Application.Inspectors` and the mail Explorer; routes events to the right modules. |
+| `clsAppEvents` | Central `WithEvents` listener on `Application.Inspectors`, the mail Explorer and `Application.Explorers` (first window of a session started without one); routes events to the right modules. |
 | `clsApptWatcher` | Per-appointment watcher (anti-overlap, colouring, Teams block cleanup). |
 | `clsExplorerWatcher` | Keeps one Explorer window pinned to the mail role and one to the calendar role (dual-monitor setup). |
 | `clsInboxWatcher` | Watches the Inbox of one mailbox for new-mail alerts. |
+| `clsFolderWatcher` | Watches folder creations, renames and deletions so the QuickMove list stays current without a rescan. |
 
 ### Configuration and infrastructure
 
@@ -104,41 +114,43 @@ The time-tracking sheet (`docs/images/dashboard-time-tracking.png`) is shown in 
 | `modInspectorQueue` | Keeps Inspector objects alive between `NewInspector` and a deferred pass. |
 | `modStoreContext` | Default store and mailbox context helpers. |
 | `modDevTools` | Dev helpers, including hot-reload (`Reinit`) without restarting Outlook. |
-| `modMaintenance` | Maintenance menu: logs, backups, config reload, bindings check, module versions, caches. |
+| `modMaintenance` | Maintenance menu: logs, backups, config reload, bindings check, paths diagnosis, module versions (full list written to `Sorties\versions-modules.txt`), caches. |
 | `modQuickStart` | First-run quick start guide: environment check, five questions, minimal `config.ini`. |
-| `modBackupVBA` / `modBackupAuto` | Manual and monthly automated backup of the VBA environment, caches and registry settings (exported in pure VBA). |
+| `modBackupVBA` / `modBackupAuto` | Manual and monthly automated backup of the VBA project, ribbon exports, workbooks, caches and registry settings (exported in pure VBA), with a size alert on the VBA project file. |
 
 ### Mail
 
 | Module | Role |
 |--------|------|
-| `modQuickMove` | Fast filing into the folder trees of all mailboxes: code detection, folder search, recent history, self-healing index. |
+| `modQuickMove` | Fast filing into the folder trees of all mailboxes: code detection, folder search, recent history, self-healing index, undo of the last filing, filing of the sent mails waiting in the queue. |
 | `modReplyInPlace` | Files sent replies and forwards into the folder of the parent message, in any mailbox. |
-| `modReplyGreeting` | Inserts a personalised greeting line at the top of single-recipient replies. |
+| `modReplyGreeting` | Inserts a personalised greeting line at the top of replies ("Hello all" variant for several recipients). |
 | `modProjectTag` | Project, contract and opportunity tagging; creates referential entries on the fly. |
 | `modMigrateTags` | One-shot migration of legacy tag properties. |
-| `modMailCampaign` | Mail-merge campaigns from an Excel sheet, asynchronous throttled send, per-row status, stop command. |
-| `modMailConfidentiality` | Cyclic confidentiality and urgency banner, subject prefix, sensitivity sync. |
-| `modMailResponseTracker` | Tracks sent mail awaiting a reply, with an Excel dashboard and reminders. |
+| `modMailCampaign` | Engine of the mail campaigns driven from the campaigns workbook: drafts, asynchronous throttled send, per-row status, reply tracking, follow-ups, stop command. |
+| `modMailConfidentiality` | Cyclic confidentiality and urgency banner (none, confidential, urgent, personal), subject prefix, sensitivity sync. |
+| `modMailResponseTracker` | Tracks sent mail awaiting a reply, with an Excel dashboard; morning reminder without opening Excel; follow-ups prepared from the workbook. |
 | `modReplySuspicion` | Post-send scoring to detect mails likely awaiting a reply (configurable vocabulary). |
 | `modInboxAlert` | Per-mailbox new-mail alerts with grouping, sound and colour. |
 | `modHideBcc` | Hides the Bcc field on every new compose window. |
-| `modSnooze` | Postpones selected mails to a chosen date and time. |
-| `modSearch` | Quick "received / sent this week" searches. |
-| `modMailExport` | Batch export of selected mails to PDF. |
-| `modMarkAllRead` | Marks every unread mail of the current mailbox as read. |
-| `modFolderScan` | Auto-archives inactive project subfolders at startup. |
-| `modFolderMerge` / `modFolderSort` / `modFolderRename` | Merge two folders, reset the manual folder order, mass-rename project folders after a CSV review. |
-| `modPurgeCategories` | Removes categories from non-recurring appointments. |
-| `modSendToLLM` | Sends the selected mail body to a browser-based writing assistant. |
+| `modSnooze` | Postpones selected mails to a chosen date and time; brings back at startup the mails whose reminder was missed. |
+| `modSearch` | Quick "received / sent this week" searches, and back to the Inbox. |
+| `modMailExport` | Batch export of selected mails to PDF and/or Word. |
+| `modMarkAllRead` | Marks every unread mail of the mailbox shown on screen as read. |
+| `modThreadAttachments` | Re-attaches, in one click, files that circulated earlier in the thread. |
+| `modFolderScan` | Auto-archives inactive project subfolders after startup. |
+| `modFolderMerge` / `modFolderSort` / `modFolderRename` | Merge two folders, put sibling folders back in A-Z order, mass-rename project folders after a CSV review. |
+| `modViewGuard` | "Standardize view": consistent From / To column in every mail folder (manual command). |
+| `modPurgeCategories` | Removes the automatic meeting categories from past appointments. |
+| `modSendToLLM` | Sends the text being written (quoted history excluded) to a browser-based writing assistant; asks first for a confidential mail. |
 
 ### Calendar
 
 | Module | Role |
 |--------|------|
 | `modMeetingColor` | Auto-colours meetings by attendee nature (internal, external, commercial). |
-| `modAntiOverlap` | Shifts a short appointment that collides with an existing one. |
-| `modNewMeetingDefault` | Default duration for new appointments. |
+| `modAntiOverlap` | Shifts a short plain appointment that collides with an existing one (meetings are never moved). |
+| `modNewMeetingDefault` | Default duration for new appointments (only when Outlook's own default slot is kept). |
 | `modMeetingToAppointment` | Turns a meeting with no third-party invitee back into a plain appointment and removes the Teams block. |
 | `modAppointmentPrivacy` | Sets appointments of configured organizers to private. |
 | `modShiftAppointment` / `modFlashAppointment` | Shift an appointment by 15 minutes; create a quick "flash" slot. |
@@ -149,33 +161,51 @@ The time-tracking sheet (`docs/images/dashboard-time-tracking.png`) is shown in 
 | Module | Role |
 |--------|------|
 | `modContactFromMail` | Creates a contact card from the signature of the selected mail. |
+| `modContactEnrich` | Fills in the missing e-mail addresses and phone numbers of contact cards from the user's mail. |
 | `modContactBirthday` | Yearly birthday and name-day events synchronised with contact cards. |
 | `modContactNormalize` | Harmonises cards across all contact folders (names, phones, addresses, duplicates). |
-| `modContactRelation` | "Cooling relationships" report from sent items. |
+| `modContactRelation` | "Cooling relationships" report from the mails sent, in every mail folder. |
 | `modContactNote` | Dated journal entries at the top of a contact card. |
 | `modContactExport` / `modContactImport` | CSV export and re-import of every contact folder, photos included. |
-| `modContactCommon` | Stateless helpers shared by the contact modules. |
+| `modContactCommon` | Helpers shared by the contact modules, and the undo file of bulk card changes (`ContactUndoLastRun`). |
 
-### Other
+### Mail statistics
+
+`modMailAnalytics` (with its `frmConfig` / `frmProgress` UserForms) is part of the
+Outlook project (*Statistiques* ribbon tab). It scans the mailboxes and writes a
+multi-sheet Excel report: volumes, sent and received, internal and external, To versus
+Cc share, weekday and hour distributions, monthly and yearly evolution, heatmaps, top
+contacts, reply rate and reply delay. Two commands: `RunEmailAnalysis` (full analysis)
+and `RunEmailAnalysisDelta` (adds only the mails received since the latest report). It
+has its own notice (`modMailAnalytics__README.txt`).
+
+### Companion workbooks
+
+Each workbook has its own VBA project and its own ribbon tab; it talks to Outlook through
+a note in a dedicated Notes folder (command channel), never by calling Outlook macros.
+
+| Workbook | Role |
+|----------|------|
+| Mail tracking (`Suivi des mails.xlsm`) | Dashboard of the tracked mails: refresh, follow-up drafts on ticked rows, archive. |
+| Campaigns (`Suivi des Campagnes.xlsm`) | One sheet per campaign: contacts import, messages, checks, drafts, send, replies, follow-ups. |
+| Time tracking | Projects and hours per month, filled from the tagged appointments. Its code is private and not published (only a template of its structure). |
+
+### Archived
 
 | Module | Role |
 |--------|------|
-| `modOneNote` | OneNote notebook inventory and reorganization (requires a working OneNote COM registration). |
-| `modOneNoteProbe` | Standalone diagnostic probe for the OneNote COM chain. |
-
-### Excel email-analytics (separate project)
-
-`modMailAnalytics` (plus its `frmConfig` / `frmProgress` UserForms) is a self-contained
-Excel/VBA tool that scans Outlook mailboxes and builds a multi-sheet statistics report:
-volumes, sent and received, internal and external, To versus Cc share, weekday and hour
-distributions, monthly and yearly evolution, heatmaps, top contacts, response times. It
-supports incremental updates. It has its own README.
+| `modOneNote` / `modOneNoteProbe` | OneNote reorganization and its diagnostic probe. Kept in the repository but no longer part of the installed project (OneNote COM blocked on the target workstation). |
 
 ### Ribbon
 
 The `*.exportedUI` files are exported Outlook ribbon customizations that bind the
-buttons to the public macros. Import them via *File > Options > Customize Ribbon >
-Import/Export*.
+buttons to the public macros, one file per Outlook window: main window
+(`Accueil_Tous_les_onglets_principaux`), read message (`Onglets_principaux_Message`),
+new message (`Onglets_principaux_Nouveau_courrier`) and appointment
+(`Onglets_principaux_Nouveau_rendez-vous`). Import each file once, from a window of
+the same kind (main window, an open message, a new message, an appointment), via *File >
+Options > Customize Ribbon > Import/Export*: an import replaces the whole customization
+of that window, so export the current one first as a backup.
 
 ---
 
@@ -185,7 +215,7 @@ Import/Export*.
 - **64-bit Office** (the `Declare` statements assume it).
 - Windows, with the usual scripting hosts available (`WScript.Shell`, `Scripting`,
   `MSXML`), all used through late binding.
-- For the Excel tool and the referential workbooks: Excel with VBA.
+- Excel with VBA, for the statistics report and the companion workbooks.
 - Python 3 (optional) to run `validate.py` before pasting.
 
 ---
@@ -200,11 +230,23 @@ Because the VBA Project Object Model is assumed blocked, modules are pasted in b
    `modInspectorQueue`, `modNotify`, `modMsgBoxCustom`, `modStoreContext`), then the
    others. Class modules (`clsAppEvents`, `clsApptWatcher`, `clsInboxWatcher`,
    `clsExplorerWatcher`, `clsFolderWatcher`) go into class modules; `ThisOutlookSession` into the existing
-   object of that name.
-3. Copy `config.ini.example` to `config.ini`, edit it for your environment.
-   `python validate.py --config config.ini` lists keys unknown to the code.
+   object of that name; `frmConfig` / `frmProgress` are imported from their `.frm` files
+   (or created and filled with the `*_Code.txt` code). Modules delivered together call
+   each other: paste the whole set before compiling (order in
+   `ARCHITECTURE.md`, section 8). `modOneNote` / `modOneNoteProbe` are not
+   installed (an existing project removes them with *File > Remove*, after the new
+   `modMaintenance`).
+3. Create the toolkit folder `ClassicOutlook-Toolkit` (on the Desktop, at the root of
+   a OneDrive, or one level below, e.g. `OneDrive\VBA\ClassicOutlook-Toolkit`), copy
+   `config.ini.example` into it as `config.ini` and edit it
+   for your environment.
+   Outlook finds the folder at startup and remembers it (macro `SetToolkitFolder` to
+   pick another one). Workbooks go in `Classeurs\`; logs, exports and backups are
+   written to `Sorties\`. The former location `<Desktop>\Macro VBA\Outlook\` still
+   works. `python validate.py --config config.ini` lists keys unknown to the code.
 4. *Debug > Compile*, close the VBE, restart Outlook.
-5. Import the `*.exportedUI` ribbon files if you want the buttons.
+5. Import the `*.exportedUI` ribbon files if you want the buttons: each file once,
+   one per window (see *Ribbon* above).
 
 The full procedure, including upgrades from earlier versions, is in `docs/INSTALL.md`.
 
@@ -220,24 +262,26 @@ environment-specific values); only `config.ini.example` is tracked.
 
 ## Repository layout
 
+All sources sit at the root of the repository; the author's working copy groups the same
+files by application (`Outlook\`, `Excel\`, `Interface\`, `Docs\`, `Outils\`).
+
 ```
-*.txt                      Outlook VBA modules / classes (paste into the VBE)
-modMailAnalytics*          Excel email-analytics project (+ its own README)
-Suivi_des_mails__*.txt     VBA of the mail-tracking workbook (module, ThisWorkbook, sheet)
-frmConfig.frm/.frx, frmProgress.frm/.frx   UserForms of the Excel email-analytics project
-*.exportedUI               Outlook ribbon customizations
-config.ini.example         Commented configuration template
-validate.py                Source validator and generators
-Mail-tracker-template.xlsm   Empty copy of the mail-tracking workbook (sample rows only)
-Time-tracking-template.xlsx   Structure of the time-tracking workbook (sheets, columns,
-                             sample rows), published without its internal macros
-docs/                      Features, installation, configuration, troubleshooting
-LICENSE                    GNU General Public License v3.0
-ARCHITECTURE.md            Module topology, event routing, conventions
-CONTRIBUTING.md            Conventions for contributors
-RELEASE-NOTES-v3.md        Version 3 summary
-CHANGELOG.txt              Change history
+ThisOutlookSession.txt, cls*.txt, mod*.txt   Outlook VBA (paste into the VBE);
+                                             modOneNote*.txt are archived, not installed
+modMailAnalytics__*.txt, frm*.frm / .frx     Mail statistics module and its two forms
+Suivi_des_mails__*.txt                       VBA of the mail-tracking workbook
+Suivi des Campagnes__*.txt                   VBA of the campaigns workbook
+*.exportedUI                                 Outlook ribbon customizations (one per window)
+config.ini.example                           Commented configuration template
+validate.py                                  Source validator and generators
+ARCHITECTURE.md, CHANGELOG.txt               Architecture notes, change history
+docs/                                        Features, installation, configuration,
+                                             troubleshooting, campaigns guide, screenshots
 ```
+
+The time-tracking workbook code stays private. The repository also contains `LICENSE`
+(GNU GPL v3.0), `CONTRIBUTING.md`, `RELEASE-NOTES-v3.md`, and templates of the
+mail-tracking and time-tracking workbooks (sample rows only, no private data).
 
 ---
 

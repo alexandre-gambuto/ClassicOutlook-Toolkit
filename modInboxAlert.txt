@@ -1,7 +1,17 @@
 Option Explicit
 
 '=============================================================================
-' modInboxAlert v1.4  (2026-08-22)
+' modInboxAlert v1.5  (2026-11-16)
+' v1.5 (2026-11-16) : audit 11/2026 - F10-05, F10-13 : PANNE DES ALERTES
+'   apres 25 jours d'allumage du PC. L'echeance "toast encore a l'ecran"
+'   etait calculee avec GetTickCount (32 bits), qui devient negatif apres
+'   24,9 jours : chaque mail croyait un toast encore affiche pour des jours
+'   et se reportait sans fin (plus aucune alerte depuis le 09/11).
+'   Echeance desormais en millisecondes 64 bits (modCommon.TickMs), et
+'   bornee : une attente plus longue que la duree d'un toast est ignoree
+'   (journal INFO). Sonde son : attente par modCommon.SleepMs (l'ancienne
+'   boucle Timer ne sortait jamais si elle chevauchait minuit). Journal :
+'   "Son confie au toast" en DEBUG avec le seul nom du fichier.
 ' v1.4 (2026-08-22) : revue traduction. InboxAlertSoundProbe etait
 '   INTEGRALEMENT en francais hors T() - libelles, verdicts OUI/NON,
 '   diagnostics de format WAV/MP3 - et son titre de fenetre en dur
@@ -91,12 +101,13 @@ Option Explicit
 '   InboxAlertStart       (re)armement, appele par ThisOutlookSession
 '
 ' DEPENDANCES : clsInboxWatcher, modNotify (NotifyEx, v4.4+), modDefer
-' (cle "InboxFlush", v1.13+), modConfig (getters InboxAlert*), modDebugLog.
+' (cle "InboxFlush", v1.13+), modConfig (getters InboxAlert*), modDebugLog,
+' modCommon (TickMs, SleepMs : v1.4+).
 '=============================================================================
 
 Private Const MOD_NAME As String = "InboxAlert"
 
-Private Const MOD_VERSION As String = "v1.4 - 2026-08-22"
+Private Const MOD_VERSION As String = "v1.5 - 2026-11-16"
 
 ' Cle modDefer (Dispatch) et cle registre de l'alerte native Outlook.
 Private Const DEFER_KEY As String = "InboxFlush"
@@ -130,12 +141,13 @@ Private Declare PtrSafe Function GetForegroundWindow Lib "user32" () As LongPtr
 Private Declare PtrSafe Function GetWindowThreadProcessId Lib "user32" ( _
     ByVal hWnd As LongPtr, ByRef lpdwProcessId As Long) As Long
 Private Declare PtrSafe Function GetCurrentProcessId Lib "kernel32" () As Long
-Private Declare PtrSafe Function GetTickCount Lib "kernel32" () As Long
 
 ' Etat module (perdu a chaque Ctrl+S VBE : InboxAlertStart le reconstruit).
 Private mWatchers As Collection        ' clsInboxWatcher (1 par boite surveillee)
 Private mPending As Collection         ' "idx|store|sender|subject" en attente
-Private mBusyUntilTick As Long         ' un toast est a l'ecran jusqu'a ce tick
+' v1.5 (F10-05) : un toast est a l'ecran jusqu'a cette echeance, en
+' millisecondes modCommon.TickMs() (64 bits, ne reboucle pas). 0 = aucun.
+Private mBusyUntilMs As Double
 Private mSoundWarned As Object         ' Scripting.Dictionary : chemins deja signales
 
 '=============================================================================
@@ -167,7 +179,7 @@ Public Sub InboxAlertStart()
 
     Set mWatchers = New Collection
     Set mPending = New Collection
-    mBusyUntilTick = 0
+    mBusyUntilMs = 0
 
     If Not modConfig.InboxAlertEnabled() Then
         modDebugLog.DInfo MOD_NAME, "Desactive (InboxAlertEnabled=0) : aucun watcher"
@@ -318,12 +330,24 @@ Public Sub InboxAlertFlush()
     If mPending.Count = 0 Then Exit Sub
 
     ' Toast precedent encore a l'ecran ? On attend sa fin (+ marge).
-    Dim remainMs As Long
-    remainMs = mBusyUntilTick - GetTickCount()
-    If remainMs > 0 Then
-        modDefer.ArmUniqueMs DEFER_KEY, remainMs + 200
-        modDebugLog.DTrace MOD_NAME, "Toast en cours : flush reporte de " & (remainMs + 200) & " ms"
-        Exit Sub
+    ' v1.5 (F10-05) : echeance en millisecondes 64 bits ; une attente plus
+    ' longue qu'un toast ne peut venir que d'un etat incoherent : ignoree.
+    Dim remainMs As Double, maxWaitMs As Double
+    If mBusyUntilMs > 0 Then
+        remainMs = mBusyUntilMs - modCommon.TickMs()
+        maxWaitMs = modConfig.InboxAlertDurationMs()
+        If maxWaitMs <= 0 Then maxWaitMs = 5000
+        maxWaitMs = maxWaitMs + 1000
+        If remainMs > maxWaitMs Then
+            modDebugLog.DInfo MOD_NAME, "Echeance du toast precedent incoherente (" & _
+                Format$(remainMs, "0") & " ms) : ignoree"
+            mBusyUntilMs = 0
+        ElseIf remainMs > 0 Then
+            modDefer.ArmUniqueMs DEFER_KEY, CLng(remainMs) + 200
+            modDebugLog.DDebug MOD_NAME, "Toast en cours : flush reporte de " & _
+                (CLng(remainMs) + 200) & " ms"
+            Exit Sub
+        End If
     End If
 
     ' Copie locale puis vidage : une arrivee pendant la construction
@@ -416,8 +440,10 @@ Public Sub InboxAlertFlush()
     wav = ResolveStoreSound(firstIdx)
 
     modNotify.NotifyEx msg, borderColor, durationMs, heightPx, True, TOAST_WIDTH_PX, wav
-    mBusyUntilTick = GetTickCount() + durationMs
-    If Len(wav) > 0 Then modDebugLog.DInfo MOD_NAME, "Son confie au toast : " & wav
+    mBusyUntilMs = modCommon.TickMs() + durationMs
+    ' v1.5 (F10-13) : DEBUG, nom du fichier seul (pas le chemin complet).
+    If Len(wav) > 0 Then modDebugLog.DDebug MOD_NAME, "Son confie au toast : " & _
+        Mid$(wav, InStrRev(wav, "\") + 1)
 
     modDebugLog.DInfo MOD_NAME, "Toast nouveau(x) mail(s) : " & total & " mail(s), " & _
         storeNames.Count & " boite(s)"
@@ -679,7 +705,7 @@ Public Sub InboxAlertTest()
     mPending.Add cfgIndex & "|" & CleanField(storeName) & "|" & _
                  modConfig.T("Exp~editeur de test", "Test sender") & "|" & _
                  modConfig.T("Sujet de test - alerte VBA", "Test subject - VBA alert")
-    mBusyUntilTick = 0
+    mBusyUntilMs = 0
     InboxAlertFlush
     Exit Sub
 ErrH:
@@ -800,11 +826,9 @@ Public Sub InboxAlertSoundProbe()
         wmp.settings.volume = 80
         wmp.URL = wav
         wmp.controls.play
-        Dim t0 As Single
-        t0 = Timer
-        Do While Timer - t0 < 4
-            DoEvents
-        Loop
+        ' v1.5 : vraie attente de 4 s (l'ancienne boucle Timer - t0 < 4 ne
+        ' sortait jamais si elle chevauchait minuit).
+        modCommon.SleepMs 4000
         txt = txt & "WMPlayer.OCX : etat " & wmp.playState & " (3=en lecture, 1=arrete, 8=fini, 10=pret)" & vbCrLf
         wmp.controls.stop
         wmp.close

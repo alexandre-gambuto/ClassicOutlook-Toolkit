@@ -1,7 +1,34 @@
 Option Explicit
 
 '=============================================================================
-' modBackupAuto (v3.2 - 2026-08-22)
+' modBackupAuto (v3.4 - 2026-11-16)
+'
+' v3.4 (2026-11-16) : audit 11/2026 - F0-04, F0-05 (choix A), F1-10 :
+'   reprend, a partir du fichier de Code\ (v3.2), la v3.3 du 26/10 livree
+'   en zip mais jamais arrivee dans Code\ ni dans Outlook (numero 3.3 non
+'   reutilise) :
+'   (1) rubans exportes (.exportedUI) lus dans <outil>\Code\Interface\Rubans
+'       (modConfig.VBADir), puis Code\ a plat, puis le Bureau (ancien
+'       emplacement) : premier dossier qui en contient ;
+'   (2) classeur des campagnes (modConfig.CampaignWorkbookPath) ajoute aux
+'       classeurs copies ;
+'   (3) registre : sections ClassicOutlookToolkit\Paths (dossier de l'outil)
+'       et \Options, Toolkit\QuickStart, \ContactEnrich, \CmdChannel,
+'       MailResponseTracker\Relink, \RepairFail ajoutees (toutes les sections
+'       ecrites par le code au 16/11) ;
+'   (4) recapitulatif : nombre de fichiers par section ; ligne d'ERREUR au
+'       journal pour une section vide ; classeur present mais non copie
+'       nomme dans le recapitulatif ; projet VBA introuvable = echec de la
+'       sauvegarde (mois non marque, nouvel essai au prochain demarrage),
+'       comme l'etait deja une copie ratee du projet ;
+'   (5) F0-05 : taille du projet VBA (VbaProject.OTM) dans le recapitulatif,
+'       alerte au-dela de OTM_ALERT_MB (journal + toast une fois par
+'       sauvegarde) : le fichier ne se nettoie jamais seul ;
+'   (6) F1-10 : recapitulatif mensuel journalise sur UNE ligne (avant :
+'       8 lignes sans date ni niveau) ; en-tete et texte de RunBackupNow a
+'       jour (dossier Sorties, 7 branches de registre, retention lue dans
+'       config.ini).
+'   PREREQUIS COMPILATION : modConfig v3.17 (VBADir, CampaignWorkbookPath).
 '
 ' v3.2 (2026-08-22) : revue UX pop-ups + traduction.
 '   (a) Le recapitulatif de SUCCES passe en toast : aucune decision a
@@ -23,7 +50,8 @@ Option Explicit
 ' (EnsureLoaded-safe) au lieu de la globale g_ en direct.
 ' Purpose (EN): monthly automatic backup of the whole Outlook VBA ecosystem
 '   (VbaProject.OTM, ribbon UI files, Excel referentials, a registry export and
-'   the QuickMove caches) into a YYYY-MM folder under the Desktop. Triggered
+'   the QuickMove caches) into a YYYY-MM folder under the toolkit Output
+'   folder (<toolkit>\Sorties\Sauvegardes\Auto). Triggered
 '   idempotently from Application_Startup via a registry "LastRunMonth" flag so
 '   it runs at most once per calendar month. Folders beyond the retention count
 '   (modConfig.BackupRetentionMonths()) are pruned.
@@ -39,13 +67,15 @@ Option Explicit
 ' different, elle lance le backup et met a jour le flag. Donc au plus
 ' une execution par mois civil, sur le premier demarrage du mois.
 '
-' Dossier racine : Bureau\Macro VBA\Outlook\Sauvegardes\Auto\YYYY-MM\
+' Dossier racine : <outil>\Sorties\Sauvegardes\Auto\YYYY-MM\
+' (modConfig.MacroVBADir ; ancien emplacement : Bureau\Macro VBA\Outlook).
 ' Avec sous-dossiers OTM, Ribbon_Active, Ribbon_Exported, Excel, Registry,
 ' QuickMove. Chaque sous-dossier contient les fichiers source COPIES tels
 ' quels (nom de fichier inchange).
 '
-' Retention : par defaut 12 dossiers Auto (12 mois) sont conserves, les
-' plus anciens sont supprimes. Modifiable via modConfig.BackupRetentionMonths().
+' Retention : modConfig.BackupRetentionMonths() dossiers Auto conserves
+' (cle BackupRetentionMonths de config.ini, 12 par defaut), les plus
+' anciens sont supprimes.
 '
 ' Points d'entree publics :
 '   - RunMonthlyBackupIfNeeded : appel idempotent depuis Application_Startup
@@ -59,7 +89,15 @@ Option Explicit
 '=============================================================================
 
 Private Const MOD_NAME As String = "BackupAuto"
-Private Const MOD_VERSION As String = "v3.2 - 2026-08-22"
+Private Const MOD_VERSION As String = "v3.4 - 2026-11-16"
+
+' v3.4 (F0-04) : rubans exportes, relatifs a modConfig.VBADir() (<outil>\Code).
+Private Const RIBBON_EXPORT_SUBDIR As String = "Interface\Rubans"
+
+' v3.4 (F0-05, choix A) : taille du projet VBA au-dela de laquelle la
+' sauvegarde alerte (Mo). Le fichier grossit de collage en collage et ne
+' se nettoie jamais seul (3,9 Mo en mai, 20,3 Mo en novembre 2026).
+Private Const OTM_ALERT_MB As Long = 25
 
 ' Sous-dossier de backup, relatif a modConfig.MacroVBADir() (pack v3 - D11 :
 ' le segment "Macro VBA\Outlook" n'est plus duplique ici).
@@ -81,6 +119,10 @@ Private Const OTM_NAME As String = "VbaProject.OTM"
 Private Const REG_APP As String = "BackupAuto"
 Private Const REG_SECTION As String = "Schedule"
 Private Const REG_KEY_LASTMONTH As String = "LastRunMonth"
+
+' v3.4 (F0-05) : taille (Mo) du VbaProject.OTM copie par la sauvegarde en
+' cours ; 0 si non copie.
+Private mOtmSizeMB As Double
 
 '=============================================================================
 ' RunMonthlyBackupIfNeeded
@@ -122,9 +164,10 @@ Public Sub RunMonthlyBackupIfNeeded()
     Dim summary As String
     If DoFullBackup(summary) Then
         SaveSetting REG_APP, REG_SECTION, REG_KEY_LASTMONTH, currentMonth
-        modDebugLog.DInfo MOD_NAME, "Backup mensuel termine: " & summary
+        ' v3.4 (F1-10) : une seule ligne (avant : 8 lignes sans date ni niveau).
+        modDebugLog.DInfo MOD_NAME, "Backup mensuel termine: " & Replace(summary, vbCrLf, " | ")
     Else
-        modDebugLog.DError MOD_NAME, "Backup mensuel echoue, flag non pose"
+        modDebugLog.DError MOD_NAME, "Backup mensuel echoue, flag non pose : " & Replace(summary, vbCrLf, " | ")
     End If
     Exit Sub
 
@@ -149,10 +192,11 @@ Public Sub RunBackupNow()
         T("Instantane global de tout l'ecosysteme :", "Global snapshot of the whole ecosystem:") & vbCrLf & _
         T(" - VbaProject.OTM (code VBA)", " - VbaProject.OTM (VBA code)") & vbCrLf & _
         T(" - fichiers UI du ruban", " - ribbon UI files") & vbCrLf & _
-        T(" - references Excel (referentiels, etc.)", " - Excel referentials (workbooks, etc.)") & vbCrLf & _
+        T(" - classeurs Excel (suivi de temps, suivi des mails, campagnes)", " - Excel workbooks (time tracking, mail tracking, campaigns)") & vbCrLf & _
         T(" - export registre", " - registry export") & vbCrLf & _
         T(" - cache QuickMove", " - QuickMove cache") & vbCrLf & vbCrLf & _
-        T("Structure YYYY-MM, retention 12 mois.", "YYYY-MM structure, 12-month retention.") & vbCrLf & vbCrLf & _
+        T("Structure YYYY-MM, r~etention ", "YYYY-MM structure, retention ") & modConfig.BackupRetentionMonths() & _
+        T(" mois.", " months.") & vbCrLf & vbCrLf & _
         T("Destination :", "Destination:") & vbCrLf & destRoot & vbCrLf & vbCrLf & _
         T("Lancer le backup complet ?", "Run the full backup?"), _
         vbQuestion + vbOKCancel + vbDefaultButton1, _
@@ -223,6 +267,7 @@ End Sub
 Private Function DoFullBackup(ByRef summary As String) As Boolean
     DoFullBackup = False
     summary = ""
+    mOtmSizeMB = 0
 
     ' --- Preparation du dossier mensuel ---
     Dim monthStamp As String
@@ -250,7 +295,7 @@ Private Function DoFullBackup(ByRef summary As String) As Boolean
     sectionLine = BackupRibbonActive(sessionDir, totalFiles, totalKb, fso)
     summary = summary & sectionLine & vbCrLf
 
-    ' === 3. Rubans exportes (.exportedUI sur le Bureau) ===============
+    ' === 3. Rubans exportes (.exportedUI de Code\Interface\Rubans) ====
     sectionLine = BackupRibbonExported(sessionDir, totalFiles, totalKb, fso)
     summary = summary & sectionLine & vbCrLf
 
@@ -275,6 +320,17 @@ Private Function DoFullBackup(ByRef summary As String) As Boolean
     ' === Retention ====================================================
     PurgeOldBackups fso
 
+    ' v3.4 (F0-05, choix A) : alerte de taille du projet VBA. Le toast est
+    ' une alerte utile (rien a decider tout de suite) : une fois par
+    ' sauvegarde, donc au plus une fois par mois en automatique.
+    If mOtmSizeMB > OTM_ALERT_MB Then
+        modUi.Toast T("Le projet VBA d'Outlook p~fse ", "The Outlook VBA project weighs ") & Format(mOtmSizeMB, "0.0") & _
+                    T(" Mo (seuil ", " MB (threshold ") & OTM_ALERT_MB & _
+                    T(" Mo) : envisager un nettoyage (repartir d'un fichier neuf et recoller le code).", _
+                      " MB): consider a clean-up (start from a fresh file and paste the code again)."), _
+                    uiWarn, False
+    End If
+
     ' v3.1 : retour honnete - la moindre section en ECHEC => False.
     DoFullBackup = (InStr(1, summary, "ECHEC", vbTextCompare) = 0)
 End Function
@@ -292,10 +348,12 @@ Private Function BackupOTM(ByVal sessionDir As String, _
         Exit Function
     End If
 
+    ' v3.4 (F0-04) : projet VBA introuvable = ECHEC (avant : sauvegarde
+    ' comptee reussie sans le code ; une copie ratee echouait deja).
     Dim srcPath As String
     srcPath = modConfig.AppDataOutlookPath() & "\" & OTM_NAME
     If Not fso.fileExists(srcPath) Then
-        BackupOTM = "[OTM] introuvable: " & srcPath
+        BackupOTM = "[OTM] ECHEC introuvable: " & srcPath
         modDebugLog.DError MOD_NAME, "OTM introuvable: " & srcPath
         Exit Function
     End If
@@ -307,7 +365,7 @@ Private Function BackupOTM(ByVal sessionDir As String, _
     fso.CopyFile srcPath, destPath, True
     If Err.Number <> 0 Then
         Dim msg As String
-        msg = "[OTM] echec copie: " & Err.Description
+        msg = "[OTM] ECHEC copie: " & Err.Description
         modDebugLog.DError MOD_NAME, msg
         Err.Clear
         On Error GoTo 0
@@ -321,7 +379,15 @@ Private Function BackupOTM(ByVal sessionDir As String, _
     totalFiles = totalFiles + 1
     totalKb = totalKb + szKb
 
-    BackupOTM = "[OTM] OK (" & Format(szKb, "#,##0") & " Ko)"
+    ' v3.4 (F0-05) : taille du projet et alerte au-dela du seuil.
+    mOtmSizeMB = szKb / 1024
+    BackupOTM = "[OTM] OK (1 fichier, " & Format(szKb, "#,##0") & " Ko = " & _
+                Format(mOtmSizeMB, "0.0") & " Mo)"
+    If mOtmSizeMB > OTM_ALERT_MB Then
+        BackupOTM = BackupOTM & " - ALERTE taille > " & OTM_ALERT_MB & " Mo"
+        modDebugLog.DError MOD_NAME, "Projet VBA volumineux : " & Format(mOtmSizeMB, "0.0") & _
+            " Mo (seuil " & OTM_ALERT_MB & " Mo) - nettoyage a envisager"
+    End If
 End Function
 
 '=============================================================================
@@ -385,6 +451,7 @@ Private Function BackupRibbonActive(ByVal sessionDir As String, _
 
     If count = 0 Then
         BackupRibbonActive = "[Ribbon_Active] aucun .officeUI trouve dans " & srcDir
+        modDebugLog.DError MOD_NAME, "Section Ribbon_Active vide : aucun .officeUI dans " & srcDir   ' v3.4 (F0-04)
     Else
         BackupRibbonActive = "[Ribbon_Active] OK (" & count & " fichier(s), " & _
                              Format(sumKb, "#,##0") & " Ko)"
@@ -392,7 +459,12 @@ Private Function BackupRibbonActive(ByVal sessionDir As String, _
 End Function
 
 '=============================================================================
-' Section 3 : Rubans exportes manuellement (.exportedUI sur le Bureau)
+' Section 3 : Rubans exportes manuellement (.exportedUI)
+' v3.4 (F0-04) : ranges depuis le 25/10 dans <outil>\Code\Interface\Rubans.
+' Ordre de recherche : Code\Interface\Rubans, Code\ (depot a plat), Bureau
+' (ancien emplacement) ; premier dossier qui contient au moins un
+' .exportedUI. Avant : le Bureau seul (dossier vide dans la sauvegarde de
+' novembre).
 '=============================================================================
 Private Function BackupRibbonExported(ByVal sessionDir As String, _
                                       ByRef totalFiles As Long, ByRef totalKb As Double, _
@@ -404,10 +476,22 @@ Private Function BackupRibbonExported(ByVal sessionDir As String, _
         Exit Function
     End If
 
+    Dim candidates(1 To 3) As String, k As Long
     Dim srcDir As String
-    srcDir = modConfig.DesktopPath()
-    If Not fso.FolderExists(srcDir) Then
-        BackupRibbonExported = "[Ribbon_Exported] Bureau introuvable"
+    candidates(1) = modConfig.VBADir() & "\" & RIBBON_EXPORT_SUBDIR
+    candidates(2) = modConfig.VBADir()
+    candidates(3) = modConfig.DesktopPath()
+    srcDir = ""
+    For k = 1 To 3
+        If HasFileWithExtension(fso, candidates(k), "exportedui") Then
+            srcDir = candidates(k)
+            Exit For
+        End If
+    Next k
+    If Len(srcDir) = 0 Then
+        BackupRibbonExported = "[Ribbon_Exported] aucun .exportedUI (Code\" & RIBBON_EXPORT_SUBDIR & ", Code, Bureau)"
+        modDebugLog.DError MOD_NAME, "Section Ribbon_Exported vide : aucun .exportedUI dans " & candidates(1) & _
+            ", " & candidates(2) & " ni sur le Bureau"
         Exit Function
     End If
 
@@ -439,15 +523,38 @@ Private Function BackupRibbonExported(ByVal sessionDir As String, _
     totalKb = totalKb + sumKb
 
     If count = 0 Then
-        BackupRibbonExported = "[Ribbon_Exported] aucun .exportedUI sur le Bureau"
+        BackupRibbonExported = "[Ribbon_Exported] aucun fichier copie depuis " & srcDir
+        modDebugLog.DError MOD_NAME, "Section Ribbon_Exported vide : copie impossible depuis " & srcDir
     Else
         BackupRibbonExported = "[Ribbon_Exported] OK (" & count & " fichier(s), " & _
-                               Format(sumKb, "#,##0") & " Ko)"
+                               Format(sumKb, "#,##0") & " Ko, depuis " & srcDir & ")"
     End If
 End Function
 
+' v3.4 : le dossier contient-il au moins un fichier de cette extension ?
+Private Function HasFileWithExtension(ByVal fso As Object, ByVal folderPath As String, _
+                                      ByVal ext As String) As Boolean
+    On Error Resume Next
+    HasFileWithExtension = False
+    If Len(folderPath) = 0 Then Exit Function
+    If Not fso.FolderExists(folderPath) Then Exit Function
+    Dim f As Object
+    For Each f In fso.GetFolder(folderPath).files
+        If LCase$(fso.GetExtensionName(f.name)) = ext Then
+            HasFileWithExtension = True
+            Exit Function
+        End If
+    Next f
+End Function
+
 '=============================================================================
-' Section 4 : Referentiels Excel (Suivi de temps, Suivi des mails)
+' Section 4 : Classeurs Excel (Suivi de temps, Suivi des mails et, v3.4,
+' Suivi des Campagnes)
+' v3.4 (F0-04) : un classeur present mais non copie est nomme dans le
+' recapitulatif ("copie ratee", erreur au journal) ; un classeur absent est
+' signale ("manquant"). Ni l'un ni l'autre ne fait echouer la sauvegarde
+' (comportement inchange : un classeur verrouille ne doit pas relancer la
+' sauvegarde complete a chaque demarrage).
 '=============================================================================
 Private Function BackupExcelRefs(ByVal sessionDir As String, _
                                  ByRef totalFiles As Long, ByRef totalKb As Double, _
@@ -461,26 +568,34 @@ Private Function BackupExcelRefs(ByVal sessionDir As String, _
 
     Dim count As Long
     Dim sumKb As Double
-    Dim missing As String
+    Dim missing As String, failed As String
 
     ' Suivi de temps.xlsm
-    sumKb = sumKb + CopyOneExcel(modConfig.TimeTrackingPath(), subDir, fso, count, missing)
-    ' Suivi des mails.xlsx
-    sumKb = sumKb + CopyOneExcel(modConfig.MailTrackingPath(), subDir, fso, count, missing)
+    sumKb = sumKb + CopyOneExcel(modConfig.TimeTrackingPath(), subDir, fso, count, missing, failed)
+    ' Suivi des mails.xlsm
+    sumKb = sumKb + CopyOneExcel(modConfig.MailTrackingPath(), subDir, fso, count, missing, failed)
+    ' v3.4 (F0-04) : Suivi des Campagnes.xlsm
+    sumKb = sumKb + CopyOneExcel(modConfig.CampaignWorkbookPath(), subDir, fso, count, missing, failed)
 
     totalFiles = totalFiles + count
     totalKb = totalKb + sumKb
 
     Dim res As String
     res = "[Excel] OK (" & count & " fichier(s), " & Format(sumKb, "#,##0") & " Ko)"
+    If Len(failed) > 0 Then res = res & " - copie ratee: " & failed     ' sans le mot qui fait echouer
     If Len(missing) > 0 Then res = res & " - manquant: " & missing
+    If count = 0 Then
+        modDebugLog.DError MOD_NAME, "Section Excel vide : aucun classeur copie"
+    End If
     BackupExcelRefs = res
 End Function
 
-' Helper pour Section 4
+' Helper pour Section 4. v3.4 : failed recoit les classeurs presents mais
+' non copies (fichier verrouille...).
 Private Function CopyOneExcel(ByVal srcPath As String, ByVal subDir As String, _
                               ByVal fso As Object, _
-                              ByRef count As Long, ByRef missing As String) As Double
+                              ByRef count As Long, ByRef missing As String, _
+                              ByRef failed As String) As Double
     CopyOneExcel = 0
     If Not fso.fileExists(srcPath) Then
         If Len(missing) > 0 Then missing = missing & ", "
@@ -498,6 +613,8 @@ Private Function CopyOneExcel(ByVal srcPath As String, ByVal subDir As String, _
         modDebugLog.DError MOD_NAME, "Excel copie err sur " & srcPath & ": " & Err.Description
         Err.Clear
         On Error GoTo 0
+        If Len(failed) > 0 Then failed = failed & ", "
+        failed = failed & fso.GetFileName(srcPath)
         Exit Function
     End If
     On Error GoTo 0
@@ -509,7 +626,8 @@ End Function
 '=============================================================================
 ' Section 5 : Settings registry (HKCU\Software\VB and VBA Program Settings\)
 ' On exporte les branches connues du stack au format .reg lisible.
-' Branches couvertes : QuickMove, Outlook_Calendrier, BackupAuto.
+' Branches couvertes : les 7 de REG_APPS, sections listees par
+' KnownSections (v3.4 : toutes les sections ecrites par le code au 16/11).
 ' Nom de fichier : VBSettings.reg (sans date - pas de renommage par horodatage,
 ' on s'appuie sur le dossier mensuel parent pour le contexte temporel).
 '=============================================================================
@@ -569,7 +687,10 @@ NextApp:
     totalFiles = totalFiles + 1
     totalKb = totalKb + szKb
 
-    BackupRegistrySettings = "[Registry] OK (" & nbKeys & " valeur(s), " & Format(szKb, "#,##0") & " Ko)"
+    BackupRegistrySettings = "[Registry] OK (1 fichier, " & nbKeys & " valeur(s), " & Format(szKb, "#,##0") & " Ko)"
+    If nbKeys = 0 Then
+        modDebugLog.DError MOD_NAME, "Section Registry vide : aucune valeur de registre exportee"   ' v3.4 (F0-04)
+    End If
     Exit Function
 
 ErrH:
@@ -578,15 +699,24 @@ ErrH:
 End Function
 
 ' Sections connues par branche (SaveSetting app/section utilises par le code).
+' v3.4 (F0-04) : liste completee d'apres tout le code au 16/11 :
+'   ClassicOutlookToolkit\Paths   dossier de l'outil (modConfig v3.17)
+'   ClassicOutlookToolkit\Options question d'etiquetage (modProjectTag)
+'   Toolkit\QuickStart            marqueur du guide (modQuickStart)
+'   Toolkit\ContactEnrich         reprise (modContactEnrich)
+'   Toolkit\CmdChannel            canal de commandes (ThisOutlookSession, F1-08)
+'   MailResponseTracker\Relink / \RepairFail (modMailResponseTracker)
+' Une section absente du registre est simplement ignoree. A COMPLETER a
+' chaque nouveau SaveSetting.
 Private Function KnownSections(ByVal appName As String) As String
     Select Case appName
         Case "QuickMove":             KnownSections = "Reindex|Flags"
         Case "Outlook_Calendrier":    KnownSections = "Position"
         Case "BackupAuto":            KnownSections = "Schedule"
-        Case "Toolkit":               KnownSections = "Session|InboxAlert"
+        Case "Toolkit":               KnownSections = "Session|InboxAlert|QuickStart|ContactEnrich|CmdChannel"
         Case "FolderScan":            KnownSections = "AutoArchive"
-        Case "MailResponseTracker":   KnownSections = "Rappel"
-        Case "ClassicOutlookToolkit": KnownSections = "Recents"
+        Case "MailResponseTracker":   KnownSections = "Rappel|Relink|RepairFail"
+        Case "ClassicOutlookToolkit": KnownSections = "Recents|Paths|Options"
         Case Else:                    KnownSections = ""
     End Select
 End Function
@@ -663,6 +793,9 @@ Private Function BackupQuickMoveCache(ByVal sessionDir As String, _
 
     BackupQuickMoveCache = "[QuickMove] OK (" & count & " fichier(s), " & _
                            Format(sumKb, "#,##0") & " Ko)"
+    If count = 0 Then
+        modDebugLog.DError MOD_NAME, "Section QuickMove vide : aucun cache dans " & baseDir   ' v3.4 (F0-04)
+    End If
 End Function
 
 '=============================================================================

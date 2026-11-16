@@ -1,6 +1,35 @@
 Option Explicit
 
-' modMailConfidentiality v11
+' modMailConfidentiality v11.2
+' v11.2 (2026-11-16) : audit 11/2026 - F5-17, F5-18, F5-24, F5-20 :
+'   (1) F5-17 : correctif du 17/08 (v11.1 de la serie d'aout, perdu vers le
+'       22/08 : le fichier du 25/10 avait ete refait sur la v11) RESTAURE.
+'       Frontiere zone propre / historique cite (OwnZoneEnd) : ancre
+'       border-top #E1E1E1 reintroduite (balise <div qui la porte), retenue
+'       seulement si un libelle "De :" / "From:" la suit de pres (une
+'       bordure de meme couleur dans une signature ne compte pas) ; libelle
+'       "De :" / "From:" reconnu aussi enrobe d'un <span> (FindFrenchSeparator
+'       remonte alors au <b qui l'ouvre). Ligne de journal : ancre retenue et
+'       taille de la zone propre (type d'ancre seulement, jamais le texte).
+'   (2) F5-18 : GetCurrentMail choisit selon la fenetre active : fenetre
+'       principale -> reponse dans le volet de lecture ; fenetre de message
+'       -> son element. Un mail deja envoye ou recu (Sent = Vrai) est refuse.
+'       Avant : la fenetre de message ouverte derriere etait marquee a la
+'       place de la reponse en cours dans le volet de lecture.
+'   (3) F5-24 : plus aucune pose du niveau PRIVE (retire du cycle en v8) :
+'       LevelText supprimee ; SetSensitivity / ToggleSensitivity (et leur
+'       aide SensitivityToken) supprimees avec leurs seuls appelants,
+'       ThisOutlookSession.Sensitivity_Normal / _Personal / _Private (sans
+'       bouton). Seule entree : ToggleSensitivityCycle (bouton Confidentiel).
+'       La DETECTION de "C2 - PRIVE" reste (retrait d'anciens bandeaux).
+'       Bip PlaySound supprime (sortie audio d'Outlook muette sur le poste).
+'   (4) F5-20 : OwnZoneEnd devient Public (modSendToLLM coupe le texte
+'       envoye a un assistant au debut de l'historique cite).
+' v11.1 (2026-10-25) : DumpHTML ecrit confid_html.html dans le dossier
+'   Sorties de l'outil (modConfig.MacroVBADir : <outil>\Sorties) au lieu du
+'   chemin fixe <Bureau>\Macro VBA\Outlook (modConfig v3.17).
+' v11.1 (2026-08-17, perdue vers le 22/08, restauree en v11.2) : ancre
+'   border-top #E1E1E1 reintroduite, libelle "De :" enrobe d'un <span>.
 ' v11 (2026-08-17) : la detection et le retrait des bandeaux ne regardent plus
 '   que la ZONE PROPRE du message (ce que l'on redige), jamais l'historique
 '   cite (Reply / Forward). Avant : un bandeau Urgent present dans le mail
@@ -43,7 +72,7 @@ Option Explicit
 ' (Historique des versions -> CHANGELOG.)
 
 Private Const MOD_NAME As String = "MailConfid"
-Private Const MOD_VERSION As String = "v11 - 2026-08-17"
+Private Const MOD_VERSION As String = "v11.2 - 2026-11-16"
 
 ' Prefixes poses dans l'objet du mail. Chaines FONCTIONNELLES (comparees pour
 ' idempotence) -> hors T()/A(). L'espace final fait partie du prefixe.
@@ -56,17 +85,17 @@ Private Const SUBJECT_PREFIX_URGENT As String = "[URGENT] "
 Private Const URG_MARK_FR As String = "Urgent - Avant le "
 Private Const URG_MARK_EN As String = "Urgent - Before "
 
-Private Declare PtrSafe Function PlaySound Lib "winmm.dll" Alias "PlaySoundA" _
-    (ByVal lpszName As String, ByVal hModule As LongPtr, ByVal dwFlags As Long) As Long
-Private Const SND_ALIAS = &H10000
-Private Const SND_ASYNC = &H1
+' v11.2 (F5-17) : derniere ligne de journal "OwnZoneEnd" ecrite (une meme
+' detection est demandee 2 a 3 fois par clic : une seule ligne).
+Private mLastZoneLog As String
 
 '=============================================================================
-' PALETTE COULEURS externalisee dans config.ini (modConfig.g_*) :
+' PALETTE COULEURS externalisee dans config.ini (getters modConfig) :
 '   ConfidTextColorPersonal / ConfidBandColorPersonal   (Personnel,   bleu)
-'   ConfidTextColorPrivate  / ConfidBandColorPrivate    (Prive,       bronze)
 '   ConfidTextColorConf     / ConfidBandColorConf       (Confidentiel, rouge)
 '   ConfidTextColorUrgent   / ConfidBandColorUrgent     (Urgent,       rouge vif)
+' (ConfidTextColorPrivate / ConfidBandColorPrivate ne servent plus depuis
+' v11.2 : le niveau Prive n'est plus jamais pose.)
 '=============================================================================
 
 '=============================================================================
@@ -77,7 +106,8 @@ Public Function ModVersion() As String
 End Function
 
 '=============================================================================
-' DumpHTML : outil de diagnostic ponctuel (ecrit le HTMLBody sur le Bureau).
+' DumpHTML : outil de diagnostic ponctuel (ecrit le HTMLBody dans le dossier
+' Sorties de l'outil, v11.1).
 '=============================================================================
 Public Sub DumpHTML()
     On Error GoTo ErrH
@@ -90,7 +120,8 @@ Public Sub DumpHTML()
     End If
 
     Dim outPath As String
-    outPath = modConfig.DesktopPath() & "\Macro VBA\Outlook\confid_html.html"
+    If Len(Dir$(modConfig.MacroVBADir(), vbDirectory)) = 0 Then MkDir modConfig.MacroVBADir()
+    outPath = modConfig.MacroVBADir() & "\confid_html.html"
 
     Dim f As Integer
     f = FreeFile
@@ -113,67 +144,83 @@ End Sub
 '=============================================================================
 ' GetCurrentMail : mail en cours de redaction (Inspector ouvert ou volet de
 ' reponse rapide ActiveInlineResponse).
+' v11.2 (F5-18) : la source suit la fenetre ACTIVE. ActiveInspector renvoie
+' la fenetre de message la plus en avant meme quand la fenetre principale a
+' le focus : une reponse redigee dans le volet de lecture marquait alors le
+' mail ouvert derriere. Fenetre principale -> reponse du volet de lecture
+' seulement ; fenetre de message -> son element seulement ; fenetre active
+' inconnue (macro lancee depuis l'editeur VBA) -> ancien ordre. Un element
+' deja envoye ou recu (Sent = Vrai) n'est jamais marque.
 '=============================================================================
 Private Function GetCurrentMail() As MailItem
     On Error Resume Next
     Set GetCurrentMail = Nothing
 
-    If Not Application.ActiveInspector Is Nothing Then
-        Dim itm As Object
-        Set itm = Application.ActiveInspector.CurrentItem
-        If Not itm Is Nothing Then
-            If TypeOf itm Is MailItem Then
-                Set GetCurrentMail = itm
-                modDebugLog.DTrace MOD_NAME, "GetCurrentMail : Inspector"
-                Exit Function
+    Dim winType As String
+    winType = ""
+    winType = TypeName(Application.ActiveWindow)
+
+    Dim itm As Object
+    Set itm = Nothing
+    Select Case winType
+        Case "Explorer"
+            Set itm = InlineMail()
+            If itm Is Nothing Then
+                modDebugLog.DDebug MOD_NAME, "GetCurrentMail : fenetre principale sans reponse en cours"
             End If
-        End If
+        Case "Inspector"
+            Set itm = InspectorMail()
+            If itm Is Nothing Then
+                modDebugLog.DDebug MOD_NAME, "GetCurrentMail : fenetre active sans mail"
+            End If
+        Case Else
+            Set itm = InspectorMail()
+            If itm Is Nothing Then Set itm = InlineMail()
+    End Select
+    If itm Is Nothing Then
+        modDebugLog.DTrace MOD_NAME, "GetCurrentMail : aucun mail en redaction"
+        Exit Function
     End If
 
-    If Not Application.ActiveExplorer Is Nothing Then
-        Dim ilr As Object
-        Set ilr = Application.ActiveExplorer.ActiveInlineResponse
-        If Not ilr Is Nothing Then
-            If TypeOf ilr Is MailItem Then
-                Set GetCurrentMail = ilr
-                modDebugLog.DTrace MOD_NAME, "GetCurrentMail : InlineResponse"
-                Exit Function
-            End If
-        End If
+    Dim wasSent As Boolean
+    wasSent = False
+    wasSent = itm.Sent
+    If wasSent Then
+        modDebugLog.DDebug MOD_NAME, "GetCurrentMail : element deja envoye ou recu, ignore"
+        Exit Function
     End If
 
-    modDebugLog.DTrace MOD_NAME, "GetCurrentMail : aucun mail en redaction"
+    Set GetCurrentMail = itm
+    modDebugLog.DTrace MOD_NAME, "GetCurrentMail : " & IIf(winType = "Explorer", "InlineResponse", "Inspector")
+End Function
+
+' v11.2 : element de la fenetre de message active (MailItem seulement).
+Private Function InspectorMail() As Object
+    On Error Resume Next
+    Set InspectorMail = Nothing
+    If Application.ActiveInspector Is Nothing Then Exit Function
+    Dim itm As Object
+    Set itm = Application.ActiveInspector.CurrentItem
+    If itm Is Nothing Then Exit Function
+    If TypeOf itm Is MailItem Then Set InspectorMail = itm
+End Function
+
+' v11.2 : reponse en cours dans le volet de lecture (MailItem seulement).
+Private Function InlineMail() As Object
+    On Error Resume Next
+    Set InlineMail = Nothing
+    If Application.ActiveExplorer Is Nothing Then Exit Function
+    Dim ilr As Object
+    Set ilr = Application.ActiveExplorer.ActiveInlineResponse
+    If ilr Is Nothing Then Exit Function
+    If TypeOf ilr Is MailItem Then Set InlineMail = ilr
 End Function
 
 '=============================================================================
-' Point d'entree public (compatibilite) : niveau natif OlSensitivity.
-' URGENT n'a pas d'equivalent OlSensitivity et n'est atteint que par le cycle.
-'=============================================================================
-Public Sub SetSensitivity(level As OlSensitivity)
-    modDebugLog.DTrace MOD_NAME, "SetSensitivity ENTREE level=" & level
-    On Error GoTo ErrH
-
-    Dim oMail As MailItem
-    Set oMail = GetCurrentMail()
-    If oMail Is Nothing Then Exit Sub
-
-    Dim tok As String
-    Select Case level
-        Case olConfidential: tok = "CONFIDENTIEL"
-        Case olPersonal:     tok = "PERSONNEL"
-        Case olPrivate:      tok = "PRIVE"
-        Case Else:           tok = ""
-    End Select
-
-    RenderLevelToken oMail, tok, 0
-    Exit Sub
-ErrH:
-    modDebugLog.DError MOD_NAME, "SetSensitivity error " & Err.Number & " - " & Err.Description
-End Sub
-
-'=============================================================================
 ' RenderLevelToken : coeur de pose/retrait pour un niveau donne.
-'   tok : "" (neant) / "CONFIDENTIEL" / "URGENT" / "PERSONNEL" / "PRIVE"
+'   tok : "" (neant) / "CONFIDENTIEL" / "URGENT" / "PERSONNEL"
+'   (v11.2 : "PRIVE" n'est plus pose ; un ancien bandeau Prive est seulement
+'   retire par RemoveBannersIfPresent.)
 '   urgentDate : utilisee seulement si tok="URGENT" ; > 0 -> banniere datee
 '     concrete (finalisation a l'envoi) ; 0 -> gabarit avec XX a completer.
 '=============================================================================
@@ -188,7 +235,6 @@ Private Sub RenderLevelToken(oMail As MailItem, ByVal tok As String, ByVal urgen
     Select Case tok
         Case "CONFIDENTIEL": oMail.Sensitivity = olConfidential
         Case "PERSONNEL":    oMail.Sensitivity = olPersonal
-        Case "PRIVE":        oMail.Sensitivity = olPrivate
         Case Else:           oMail.Sensitivity = olNormal   ' "" et "URGENT"
     End Select
 
@@ -209,10 +255,10 @@ Private Sub RenderLevelToken(oMail As MailItem, ByVal tok As String, ByVal urgen
     Dim removed As Boolean
     removed = RemoveBannersIfPresent(oMail)
 
-    ' 5) Niveau neant : rien a poser.
+    ' 5) Niveau neant : rien a poser. (v11.2 : bip retire, la sortie audio
+    '    d'Outlook est muette sur ce poste.)
     If tok = "" Then
         If removed Then
-            PlaySound "SystemAsterisk", 0, SND_ALIAS Or SND_ASYNC
             modDebugLog.DInfo MOD_NAME, "Bandeaux retires"
         End If
         Exit Sub
@@ -229,10 +275,6 @@ Private Sub RenderLevelToken(oMail As MailItem, ByVal tok As String, ByVal urgen
             fullLabel = "C2 - PERSONNEL"
             textColor = modConfig.ConfidTextColorPersonal()
             bandColor = modConfig.ConfidBandColorPersonal()
-        Case "PRIVE"
-            fullLabel = "C2 - PRIVE"
-            textColor = modConfig.ConfidTextColorPrivate()
-            bandColor = modConfig.ConfidBandColorPrivate()
         Case "URGENT"
             If urgentDate > 0 Then
                 fullLabel = UrgentLabelForDate(urgentDate)
@@ -266,7 +308,6 @@ Private Sub RenderLevelToken(oMail As MailItem, ByVal tok As String, ByVal urgen
     bodyText = InjectBottomBanner(bodyText, bottomBanner)
     oMail.HTMLBody = bodyText
 
-    PlaySound "SystemAsterisk", 0, SND_ALIAS Or SND_ASYNC
     modDebugLog.DInfo MOD_NAME, "Bandeaux poses (" & fullLabel & ")"
     Exit Sub
 
@@ -295,32 +336,6 @@ Private Sub SetSubjectPrefix(oMail As MailItem, ByVal thePrefix As String, ByVal
     Exit Sub
 ErrH:
     modDebugLog.DTrace MOD_NAME, "SetSubjectPrefix err " & Err.Number & " : " & Err.Description
-End Sub
-
-'=============================================================================
-' Toggle simple (compatibilite ascendante) : niveau natif X <-> neant.
-'=============================================================================
-Public Sub ToggleSensitivity(level As OlSensitivity)
-    modDebugLog.DTrace MOD_NAME, "ToggleSensitivity ENTREE level=" & level
-    On Error GoTo ErrH
-
-    Dim oMail As MailItem
-    Set oMail = GetCurrentMail()
-    If oMail Is Nothing Then Exit Sub
-
-    Dim currentLevel As String, requestedLevel As String
-    currentLevel = PresentLevel(oMail.HTMLBody)
-    requestedLevel = LevelText(level)
-
-    If currentLevel <> "" And currentLevel = requestedLevel Then
-        SetSensitivity olNormal
-    Else
-        SetSensitivity level
-    End If
-    Exit Sub
-
-ErrH:
-    modDebugLog.DError MOD_NAME, "ToggleSensitivity error " & Err.Number & " - " & Err.Description
 End Sub
 
 '=============================================================================
@@ -381,19 +396,31 @@ End Function
 ' v11 - ZONE PROPRE vs HISTORIQUE CITE
 ' OwnZoneEnd : position (1-based) du premier separateur de citation Outlook
 ' dans le HTML ; 0 si aucun (tout le corps est la zone propre). Les ancres
-' sont celles de InjectBottomBanner (le style border-top #E1E1E1 est exclu :
-' il pourrait exister plus haut dans une signature). Le bandeau bas est
-' toujours insere AVANT l'ancre retenue, donc les deux bandeaux poses par ce
-' module vivent dans la zone propre. Tout ce qui est apres appartient au mail
-' cite et ne doit ni etre detecte, ni etre retire.
+' sont celles de InjectBottomBanner. Le bandeau bas est toujours insere
+' AVANT l'ancre retenue, donc les deux bandeaux poses par ce module vivent
+' dans la zone propre. Tout ce qui est apres appartient au mail cite et ne
+' doit ni etre detecte, ni etre retire.
+' v11.2 (F5-17, restauration de la v11.1 du 17/08) : ancre border-top
+' #E1E1E1 (separateur le plus constant d'Outlook, au-dessus du bloc
+' "De : / Envoye : / A :") reintroduite : position de la balise <div qui la
+' porte, jamais apres le point d'insertion du bandeau bas (div externe ou
+' div porteuse). Retenue seulement si un libelle "De :" / "From:" suit a
+' moins de BORDER_LABEL_WINDOW caracteres : une bordure de meme couleur
+' dans une signature n'est pas une frontiere. Public (v11.2) : modSendToLLM
+' coupe le texte envoye a un assistant a cette frontiere (F5-20).
 ' OwnZone : le HTML tronque a cette frontiere.
 '=============================================================================
-Private Function OwnZoneEnd(ByVal bodyText As String) As Long
+Public Function OwnZoneEnd(ByVal bodyText As String) As Long
+    Const BORDER_ANCHOR As String = "border-top:solid #e1e1e1"
+    Const BORDER_LABEL_WINDOW As Long = 1500
+
+    On Error GoTo ErrH
     Dim bodyLC As String
     bodyLC = LCase(bodyText)
 
-    Dim best As Long
+    Dim best As Long, bestName As String
     best = 0
+    bestName = ""
 
     Dim anchors As Variant
     anchors = Array( _
@@ -405,17 +432,74 @@ Private Function OwnZoneEnd(ByVal bodyText As String) As Long
     For i = LBound(anchors) To UBound(anchors)
         pos = InStr(1, bodyLC, CStr(anchors(i)))
         If pos > 0 Then
-            If best = 0 Or pos < best Then best = pos
+            If best = 0 Or pos < best Then
+                best = pos
+                bestName = CStr(anchors(i))
+            End If
         End If
     Next i
 
     pos = FindFrenchSeparator(bodyLC)
     If pos > 0 Then
-        If best = 0 Or pos < best Then best = pos
+        If best = 0 Or pos < best Then
+            best = pos
+            bestName = "De : / From:"
+        End If
     End If
 
+    ' v11.2 (F5-17) : border-top #E1E1E1 suivi d'un libelle d'en-tete.
+    Dim posBorder As Long, posDiv As Long
+    posBorder = InStr(1, bodyLC, BORDER_ANCHOR)
+    Do While posBorder > 0
+        If best > 0 And posBorder > best Then Exit Do
+        If HasHeaderLabel(Mid$(bodyLC, posBorder, BORDER_LABEL_WINDOW)) Then
+            posDiv = InStrRev(bodyLC, "<div", posBorder)
+            If posDiv = 0 Then posDiv = posBorder
+            If best = 0 Or posDiv < best Then
+                best = posDiv
+                bestName = "border-top:solid #E1E1E1"
+            End If
+            Exit Do
+        End If
+        posBorder = InStr(posBorder + 1, bodyLC, BORDER_ANCHOR)
+    Loop
+
     OwnZoneEnd = best
+    LogZone best, Len(bodyText), bestName
+    Exit Function
+ErrH:
+    modDebugLog.DError MOD_NAME, "OwnZoneEnd err " & Err.Number & " - " & Err.Description
+    OwnZoneEnd = 0
 End Function
+
+' v11.2 : un libelle d'en-tete de citation ("De :", "From:") figure-t-il
+' dans ce morceau de HTML (en minuscules) ?
+Private Function HasHeaderLabel(ByVal chunkLC As String) As Boolean
+    HasHeaderLabel = (InStr(1, chunkLC, "de&nbsp;:") > 0) Or _
+                     (InStr(1, chunkLC, "de&#160;:") > 0) Or _
+                     (InStr(1, chunkLC, ">de :") > 0) Or _
+                     (InStr(1, chunkLC, "from:") > 0) Or _
+                     (InStr(1, chunkLC, "from&nbsp;:") > 0)
+End Function
+
+' v11.2 (F5-17) : journal de l'ancre retenue (type d'ancre et tailles
+' seulement : jamais le texte du mail). Une ligne par detection distincte.
+Private Sub LogZone(ByVal boundary As Long, ByVal totalLen As Long, ByVal anchorName As String)
+    On Error Resume Next
+    Dim msg As String
+    If boundary > 0 Then
+        msg = "OwnZoneEnd : frontiere a " & boundary & " / " & totalLen & " chars, ancre '" & anchorName & "'"
+    Else
+        msg = "OwnZoneEnd : aucun separateur (" & totalLen & " chars)"
+    End If
+    If msg = mLastZoneLog Then Exit Sub
+    mLastZoneLog = msg
+    If boundary > 0 Then
+        modDebugLog.DInfo MOD_NAME, msg
+    Else
+        modDebugLog.DDebug MOD_NAME, msg
+    End If
+End Sub
 
 Private Function OwnZone(ByVal bodyText As String) As String
     Dim boundary As Long
@@ -427,15 +511,6 @@ Private Function OwnZone(ByVal bodyText As String) As String
     Else
         OwnZone = bodyText
     End If
-End Function
-
-Private Function LevelText(level As OlSensitivity) As String
-    Select Case level
-        Case olPersonal:     LevelText = "PERSONNEL"
-        Case olPrivate:      LevelText = "PRIVE"
-        Case olConfidential: LevelText = "CONFIDENTIEL"
-        Case Else:           LevelText = ""
-    End Select
 End Function
 
 '=============================================================================
@@ -660,7 +735,35 @@ Private Function FindFrenchSeparator(bodyLC As String) As Long
             If best = 0 Or pos < best Then best = pos
         End If
     Next i
+
+    ' v11.2 (F5-17) : libelle enrobe d'un <span> ("<b><span lang=FR>De&nbsp;:
+    ' </span></b>", cas reel des reponses Outlook) : on cherche la fin du
+    ' libelle puis on remonte au <b qui l'ouvre (100 caracteres au plus).
+    Dim wrapped As Variant
+    wrapped = Array("de&nbsp;:</span></b>", "de :</span></b>", "de&#160;:</span></b>", _
+                    "from:</span></b>")
+    Dim posB As Long
+    For i = LBound(wrapped) To UBound(wrapped)
+        pos = InStr(1, bodyLC, CStr(wrapped(i)))
+        If pos > 0 Then
+            posB = BoldTagStart(bodyLC, pos)
+            If posB > 0 Then
+                If best = 0 Or posB < best Then best = posB
+            End If
+        End If
+    Next i
     FindFrenchSeparator = best
+End Function
+
+' v11.2 : debut de la balise <b> (ou <b ...>) la plus proche avant pos, a
+' 100 caracteres au plus ; 0 si aucune (un <br> ou <body> ne compte pas).
+Private Function BoldTagStart(ByVal bodyLC As String, ByVal pos As Long) As Long
+    Dim p1 As Long, p2 As Long
+    BoldTagStart = 0
+    p1 = InStrRev(bodyLC, "<b>", pos)
+    p2 = InStrRev(bodyLC, "<b ", pos)
+    If p2 > p1 Then p1 = p2
+    If p1 > 0 And pos - p1 <= 100 Then BoldTagStart = p1
 End Function
 
 Private Function GoUpToParagraphStart(bodyText As String, innerPos As Long) As Long

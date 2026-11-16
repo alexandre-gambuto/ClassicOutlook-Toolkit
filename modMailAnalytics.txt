@@ -1,7 +1,68 @@
 Option Explicit
 
 ' ============================================================================
-' MODULE UNIQUE - V25.0 - CODE COMPLET (Analyse + Reporting Excel)
+' MODULE UNIQUE - V25.3 - CODE COMPLET (Analyse + Reporting Excel)
+'
+' V25.3 (2026-11-16) : audit 11/2026 - F9-01 a F9-11, F9-15 (+ partie code de
+'   F9-12) : mise a jour delta reparee et exacte, parcours filtre par date,
+'   echecs signales, garde de reentrance, identite et adresses par modSmtp,
+'   taux et delai de reponse.
+'   * F9-01 : RunEmailAnalysisDelta ne demande plus de fichier
+'     (Application.GetOpenFilename / Workbooks.Open sont des membres
+'     d'EXCEL : dans Outlook, erreur 438 masquee, la commande ne faisait
+'     rien). Elle reprend le rapport FULL / DELTA le plus recent du dossier
+'     Sorties, le nomme dans la fenetre de lancement, et lit _ETAT via
+'     modExcelBridge. Aucun rapport ou etat inutilisable : proposition de
+'     lancer une analyse complete dans la foulee.
+'   * F9-02 : _ETAT porte l'horodatage EXACT de fin (PERIOD_END, borne
+'     incluse des compteurs) au lieu du "dernier mois complet" : le delta
+'     compte les mails strictement posterieurs, jusqu'a maintenant ; plus de
+'     double comptage du mois en cours. STATE_FORMAT = 2 ; un etat plus
+'     ancien ou un rapport TEST est refuse (analyse complete proposee).
+'     Fin de periode jamais dans le futur ; fichier nomme DELTA ; Resume :
+'     periode cumulee + periode ajoutee.
+'   * F9-03 : periode restreinte (ou delta) : Items.Restrict sur la date
+'     (modCommon.FormatDaslDate) au comptage et au parcours ; seuls les
+'     mails retenus comptent comme "analyses".
+'   * F9-04 : echec du parcours ou du rapport = message (avec le journal
+'     EmailAnalytics_trace.log) ; un rapport construit mais non enregistre
+'     reste ouvert dans Excel au lieu d'etre jete.
+'   * F9-05 : une seule analyse a la fois ; modDefer.BeginHeavy / EndHeavy
+'     pendant l'analyse (les taches lourdes differees attendent).
+'   * F9-06 : dossiers systeme reconnus par IDENTITE (GetDefaultFolder,
+'     DefaultItemType), Elements envoyes et ses sous-dossiers par EntryID ;
+'     noms en repli seulement.
+'   * F9-07 : adresses via modSmtp (expediteur, destinataires, invites
+'     externes) ; interne = domaines InternalDomains de config.ini quand la
+'     boite est interne. Case "Resolution Exchange" masquee (inutile).
+'   * F9-08 : "envoye par moi" et A / Cc par ADRESSE (adresse de la boite,
+'     ou toutes mes adresses pour la boite principale) ; mot-cle en repli.
+'   * F9-09 : marqueur "Le ..." de debut d'historique : seulement sur une
+'     ligne qui contient "a ecrit" / "wrote".
+'   * F9-10 : feuille Evolution par boite sans borne 2017.
+'   * F9-11 : fin d'analyse sans attente active (message puis fermeture).
+'   * F9-15 : taux et delai de reponse (PR_LAST_VERB_EXECUTED / _TIME),
+'     compteur dictReply, feuille "Reponses".
+'   * F9-12 (partie code) : MOD_NAME / MOD_VERSION / ModVersion, journal via
+'     modDebugLog (plus de Debug.Print), libelles par T().
+'
+' V25.2 (2026-10-25) : EMPLACEMENT DE CLASSICOUTLOOK-TOOLKIT.
+'   config.ini (modConfig.ConfigPath), le journal EmailAnalytics_trace.log
+'   et les rapports Stats_Emails_*.xlsx (modConfig.MacroVBADir :
+'   <outil>\Sorties) suivent le dossier de l'outil trouve par modConfig
+'   v3.17, au lieu du chemin fixe <Bureau>\Macro VBA\Outlook. Ce module
+'   tourne dans le projet VBA d'Outlook, a cote de modConfig (il en utilise
+'   deja T() / A()). Repli : racine du Bureau.
+'
+' V25.1 (2026-10-23) : FIX ERREUR 9 EN GENERATION DU RAPPORT.
+'   GetTopN sur un dictionnaire vide faisait ReDim result(0 To 1, 0 To -1) :
+'   VBA refuse un tableau a borne inversee (erreur 9) et TOUT le rapport
+'   tombait (aucun fichier ecrit). GetTopN renvoie desormais Empty,
+'   WriteTopN laisse la colonne vide. Meme garde dans
+'   CreateSheetNbRecipients (aucun mail envoye -> maxRecip = 0).
+'   Chaque feuille est construite par BuildSheet, qui isole ses erreurs :
+'   une feuille en echec est tracee dans EmailAnalytics_trace.log
+'   ("!!! FEUILLE xxx") et le rapport est enregistre quand meme.
 '
 ' V25.0 (2026-07-25) : ANALYSE EN DELTA.
 '   RunEmailAnalysisDelta demande le rapport precedent, lit sa feuille _ETAT,
@@ -9,6 +70,10 @@ Option Explicit
 '   Si la derniere analyse s'arretait en mai et qu'on est en juillet, seul
 '   juin est parcouru ; le mois COURANT est toujours exclu (incomplet par
 '   nature - le figer interdirait de le completer plus tard).
+'
+'   [V25.3 : la boite de choix du rapport et la regle "mois courant exclu"
+'   sont remplacees par la reprise automatique du dernier rapport et
+'   l'horodatage exact de fin - voir V25.3. 24 compteurs avec dictReply.]
 '
 '   POURQUOI CA MARCHE SANS TOUCHER LES FEUILLES : les 23 compteurs sont des
 '   dictionnaires cle -> nombre plats. On les RECHARGE depuis _ETAT juste
@@ -211,9 +276,11 @@ Option Explicit
 ' V21 : ~200 emails/min
 ' V22 : ~400 a 800 emails/min
 ' V23 : ~400 a 800 emails/min (structure differente, perf inchangee)
+' Mesure du 08/07/2026 (projet Outlook) : 285 695 mails en 22 min 24 s,
+' soit environ 12 700 mails/min.
 '
 ' === NOTE TECHNIQUE ===
-' Taille actuelle du module : ~3300 lignes (2400 lignes de code effectif).
+' Taille actuelle du module : environ 5 000 lignes (V25.3).
 ' Limite VBA par module : ~65534 lignes / limite P-code a surveiller.
 ' Marge d'evolution confortable, mais surveiller si ajout de nombreuses US.
 ' ============================================================================
@@ -221,7 +288,11 @@ Option Explicit
 
 ' --- Constantes PUBLIQUES (plus besoin de Public en V23 mais conserve pour clarte) ---
 Public Const TEST_SAMPLING As Long = 10
-Public Const APP_VERSION As String = "V25.0"
+Public Const APP_VERSION As String = "V25.3"
+
+' V25.3 (F9-12, partie code) : instrumentation commune du toolkit.
+Private Const MOD_NAME As String = "Analytics"
+Private Const MOD_VERSION As String = "V25.3 - 2026-11-16"
 
 ' --- Constantes privees ---
 Private Const DOEVENTS_FREQUENCY As Long = 500
@@ -229,20 +300,36 @@ Private Const PROGRESS_UPDATE_FREQUENCY As Long = 250  ' Plus fluide que DoEvent
 Private Const MAX_RAW_DATA As Long = 5000
 
 ' --- Variables globales de configuration ---
+' V25.3 (F9-07) : g_UseExchangeResolution supprimee (adresses via modSmtp).
 Public g_TestMode As Boolean
-Public g_UseExchangeResolution As Boolean
 Public g_AnalyzeLength As Boolean
 Public g_PeriodStart As Date
 Public g_PeriodEnd As Date
 Public g_DebugMode As Boolean  ' V22 : controle du logging
 
 ' --- Statistiques de deroulement ---
+' V25.3 (F9-03) : m_TotalProcessed = mails RETENUS (dans la periode, hors
+' journaux de synchro...) ; m_TotalScanned = mails examines (progression).
 Private m_TotalProcessed As Long
+Private m_TotalScanned As Long
 Private m_TotalToProcess As Long
 Private m_TotalIgnored As Long   ' V22
 Private m_TotalErrors As Long    ' V22
 Private m_StartTime As Double
 Private m_StartDate As Date
+
+' V25.3 (F9-05) : une seule analyse a la fois (la fenetre de progression est
+' non modale et le parcours rend la main par DoEvents : le ruban reste
+' cliquable).
+Private m_Running As Boolean
+
+' V25.3 (F9-04) : diagnostic des echecs, repris dans le message final.
+Private m_ScanError As String          ' erreur du parcours des boites
+Private m_ReportError As String        ' erreur de GenerateExcelReport
+Private m_ReportLeftOpen As Boolean    ' rapport construit, non enregistre, laisse ouvert dans Excel
+
+' V25.3 (F9-03) : filtre de date Items.Restrict ("" = aucun, tout parcourir)
+Private m_DateFilter As String
 
 ' --- Dictionnaires de statistiques ---
 Public dictStoreStats As Object
@@ -271,37 +358,61 @@ Public dictRawData As Object
 Public dictMsgLength As Object
 Public dictMsgLengthByStore As Object
 Public dictToCc As Object          ' V24 : storeName|YYYY-MM|To/Cc/Indirect -> nb
+Public dictReply As Object         ' V25.3 (F9-15) : storeName|YYYY-MM|To/Cc/Indirect|tranche -> nb
 
 ' V24 : declare ICI, avec les autres declarations de niveau module. Un
 ' Const place plus bas, entre deux procedures, produit "Seuls des
 ' commentaires peuvent apparaitre apres End Sub" a la compilation.
 Private Const STATE_SHEET As String = "_ETAT"
+' V25.3 (F9-02) : format de _ETAT. 2 = PERIOD_END horodatage exact (borne
+' incluse des compteurs). Un etat sans cette marque (V24 a V25.2, regle du
+' "dernier mois complet") n'est pas repris.
+Private Const STATE_FORMAT As Long = 2
+
+' V25.3 (F9-15) : derniere action faite sur un mail recu (Exchange).
+' 102 = repondre, 103 = repondre a tous, 104 = transferer.
+Private Const PR_LAST_VERB As String = "http://schemas.microsoft.com/mapi/proptag/0x10810003"
+Private Const PR_LAST_VERB_TIME As String = "http://schemas.microsoft.com/mapi/proptag/0x10820040"
 
 ' V25 : etat de l'analyse en delta. g_DeltaMode est arme par
 ' RunEmailAnalysisDelta et desarme systematiquement en fin de parcours.
+' V25.3 (F9-02) : g_DeltaStart = fin EXACTE de l'etat repris (borne
+' EXCLUE : seuls les mails strictement posterieurs sont comptes),
+' g_DeltaEnd = moment du lancement.
 Public g_DeltaMode As Boolean
 Public g_DeltaSourcePath As String
-Public g_DeltaLastMonth As String        ' "YYYY-MM" du dernier mois complet
 Public g_DeltaStart As Date
 Public g_DeltaEnd As Date
 Private m_DeltaRows As Variant           ' bloc DICT / KEY / VALUE lu dans _ETAT
 Private m_DeltaConfig As Object          ' storeName -> "email|motcle"
+Private m_DeltaBaseStart As Date         ' V25.3 : debut de la periode cumulee (PERIOD_START de l'etat)
 
 ' --- Configuration des boites ---
+' V25.3 (F9-08) : dictStoreAddressMode supprime (l'adresse sert des qu'elle
+' est connue, le mot-cle en repli).
 Public dictStoreColors As Object
 Public dictStoreDomains As Object
 Public dictStoreEmailUser As Object
 Public dictStoreKeyword As Object
-Public dictStoreAddressMode As Object
 Public dictStoreDateMin As Object
 
 ' --- V22 : cache dossiers exclus (evite recalcul LCase+InStr) ---
+' V25.3 (F9-06) : cle = EntryID du dossier (et non plus son nom).
 Private dictExcludedFolderCache As Object
 Private dictSentFolderCache As Object
 
+' --- V25.3 (F9-06) : dossiers systeme de la boite en cours, par identite ---
+Private m_ExclIDs As Object              ' EntryID -> True
+Private m_SentID As String               ' EntryID des Elements envoyes
+Private m_StoreIdsOk As Boolean          ' au moins un dossier systeme resolu
+
+' --- V25.3 (F9-08) : identite de l'utilisateur par boite ---
+Private dictStoreIdentity As Object      ' storeName -> Dictionary des adresses "moi" (vide = mot-cle)
+
 ' --- V23.4 : cache de resolution annuaire (adresse EX -> SMTP), partage
 '     expediteurs + destinataires. Evite des centaines de milliers
-'     d'appels serveur identiques sur une grosse analyse. ---
+'     d'appels serveur identiques sur une grosse analyse.
+'     V25.3 (F9-07) : la resolution elle-meme passe par modSmtp. ---
 Private dictResolveCache As Object
 
 ' --- V23.4 : journal de bord sur disque (diagnostic blocages) ---
@@ -321,40 +432,71 @@ Private m_StatDefaultSet As Boolean
 Private fConfig As Object
 Private fProgress As Object
 
-' ============================================================================
-' POINT D'ENTREE UNIQUE - SEULE MACRO VISIBLE DANS ALT+F8
-' ============================================================================
+Public Function ModVersion() As String
+    ModVersion = MOD_VERSION
+End Function
 
 ' ============================================================================
 ' ============================================================================
 ' [SECTION 2] POINT D'ENTREE ET TRAITEMENT OUTLOOK
-' Bloc logique initialement dans Module1 V22
 ' ============================================================================
 ' ============================================================================
 
+' Titre commun des boites de dialogue du module.
+Private Function AnalyticsTitle() As String
+    AnalyticsTitle = T("Statistiques des mails", "Mail analytics")
+End Function
+
+'----------------------------------------------------------------------------
+' RunEmailAnalysis - point d'entree (bouton "Statistiques emails" du ruban).
+' V25.3 (F9-05) : garde de reentrance + modDefer.BeginHeavy / EndHeavy.
+' Le parcours rend la main par DoEvents et la fenetre de progression est non
+' modale : sans garde, un second clic relancait une analyse IMBRIQUEE qui
+' remettait a zero les dictionnaires partages de la premiere (chiffres
+' faux sans aucun signe), et les taches lourdes differees (reindexation,
+' archivage...) partaient au milieu. Nom et signature inchanges (ruban).
+'----------------------------------------------------------------------------
 Public Sub RunEmailAnalysis()
+    If m_Running Then
+        modUi.Inform T("Une analyse des mails est d~ej~a en cours.", _
+                       "A mail analysis is already running."), AnalyticsTitle()
+        Exit Sub
+    End If
+    m_Running = True
+    modDefer.BeginHeavy
+    On Error Resume Next
+    RunAnalysisCore
+    modDefer.EndHeavy
+    m_Running = False
+End Sub
+
+Private Sub RunAnalysisCore()
     DebugLog String(70, "=")
     DebugLog "=== LANCEMENT EMAIL ANALYTICS " & APP_VERSION & " (OPTIMISE) ==="
     DebugLog "Date/Heure : " & Format(Now, "dd/mm/yyyy hh:mm:ss")
     DebugLog String(70, "=")
-    
+
     On Error GoTo ErrorHandler
-    
+
     ' Reset compteurs
     m_TotalProcessed = 0
+    m_TotalScanned = 0
     m_TotalIgnored = 0
     m_TotalErrors = 0
-    
+    m_ScanError = ""
+    m_ReportError = ""
+    m_ReportLeftOpen = False
+
     ' --- Configuration ---
     Set fConfig = New frmConfig
     fConfig.Show vbModal
-    
+
     Dim wasCancelled As Boolean
     On Error Resume Next
     wasCancelled = fConfig.Cancelled
     If Err.Number <> 0 Then wasCancelled = True: Err.Clear
     On Error GoTo ErrorHandler
-    
+
     If wasCancelled Then
         g_DeltaMode = False
         m_DeltaRows = Empty
@@ -362,33 +504,35 @@ Public Sub RunEmailAnalysis()
         Unload fConfig
         Exit Sub
     End If
-    
+
     Dim selectedStores As Collection
     On Error Resume Next
     Set selectedStores = fConfig.SelectedStores
     On Error GoTo ErrorHandler
-    
+
     If selectedStores Is Nothing Then
         MsgBox T("Aucune bo~ite s~electionn~ee.", "No mailbox selected."), vbExclamation, T("Attention", "Warning")
+        g_DeltaMode = False
+        m_DeltaRows = Empty
         Unload fConfig
         Exit Sub
     End If
-    
+
     If selectedStores.Count = 0 Then
         MsgBox T("Aucune bo~ite s~electionn~ee.", "No mailbox selected."), vbExclamation, T("Attention", "Warning")
+        g_DeltaMode = False
+        m_DeltaRows = Empty
         Unload fConfig
         Exit Sub
     End If
-    
+
     DebugLog "   -> " & selectedStores.Count & " boites selectionnees"
-    
-    ' V23.1 : forcer g_DebugMode = True temporairement pour voir les logs de diagnostic
-    g_DebugMode = True
-    
+
+    ' V25.3 (F9-12) : plus de g_DebugMode force a True ; le niveau du
+    ' journal est celui de modDebugLog (DebugLog ecrit en DEBUG).
+
     DebugLog "   Lecture IsTestMode..."
     g_TestMode = fConfig.IsTestMode
-    DebugLog "   Lecture UseExchangeResolution..."
-    g_UseExchangeResolution = fConfig.UseExchangeResolution
     DebugLog "   Lecture AnalyzeLength..."
     g_AnalyzeLength = fConfig.AnalyzeLength
     DebugLog "   Lecture PeriodStart..."
@@ -402,24 +546,22 @@ Public Sub RunEmailAnalysis()
     On Error GoTo ErrorHandler
     DebugLog "   Toutes les lectures frmConfig OK - DebugMode final = " & dbgTmp
     g_DebugMode = dbgTmp  ' applique la valeur reelle (ou False si la propriete n'existe pas)
-    
+
     Set dictStoreColors = CreateObject("Scripting.Dictionary")
     Set dictStoreDomains = CreateObject("Scripting.Dictionary")
     Set dictStoreEmailUser = CreateObject("Scripting.Dictionary")
     Set dictStoreKeyword = CreateObject("Scripting.Dictionary")
-    Set dictStoreAddressMode = CreateObject("Scripting.Dictionary")
     Set dictStoreDateMin = CreateObject("Scripting.Dictionary")
-    
+
     Dim storeName As Variant
     For Each storeName In selectedStores
         dictStoreColors(CStr(storeName)) = fConfig.GetStoreColor(CStr(storeName))
         dictStoreDomains(CStr(storeName)) = fConfig.GetStoreDomain(CStr(storeName))
         dictStoreEmailUser(CStr(storeName)) = LCase(CStr(fConfig.GetStoreEmailUser(CStr(storeName))))
         dictStoreKeyword(CStr(storeName)) = LCase(CStr(fConfig.GetStoreKeyword(CStr(storeName))))
-        dictStoreAddressMode(CStr(storeName)) = fConfig.GetStoreAddressMode(CStr(storeName))
         dictStoreDateMin(CStr(storeName)) = fConfig.GetStoreDateMin(CStr(storeName))
     Next storeName
-    
+
     Unload fConfig
 
     ' V25 : en delta, la periode est IMPOSEE par l'etat lu, pas par le
@@ -429,25 +571,32 @@ Public Sub RunEmailAnalysis()
         g_PeriodStart = g_DeltaStart
         g_PeriodEnd = g_DeltaEnd
         g_TestMode = False
-        Heartbeat "DELTA : periode imposee " & Format$(g_PeriodStart, "YYYY-MM-DD") & _
-                  " -> " & Format$(g_PeriodEnd, "YYYY-MM-DD")
+        Heartbeat "DELTA : mails apres " & Format$(g_PeriodStart, "YYYY-MM-DD HH:NN:SS") & _
+                  " jusqu'a " & Format$(g_PeriodEnd, "YYYY-MM-DD HH:NN:SS")
     End If
+
+    ' V25.3 (F9-02) : la fin de periode n'est jamais dans le futur. PERIOD_END
+    ' de _ETAT doit dire exactement jusqu'ou les compteurs vont : un mail
+    ' arrive apres le lancement n'est pas compte, la mise a jour suivante le
+    ' prendra.
+    If g_PeriodEnd > Now Then g_PeriodEnd = Now
 
     ' V23.4 : journal de bord sur disque (survit a un blocage / kill Excel)
     ' V23.5 : chemin host-agnostique (ThisWorkbook n'existe pas partout),
     '         range a cote de debug.log et config.ini du toolkit.
     On Error Resume Next
     Dim traceDir As String
-    traceDir = ResolveDesktopPath() & "\Macro VBA\Outlook"
-    If Len(Dir$(traceDir, vbDirectory)) = 0 Then traceDir = ResolveDesktopPath()
+    traceDir = ReportFolderPath()   ' V25.2 : <outil>\Sorties (repli Bureau)
     m_TraceFile = traceDir & "\EmailAnalytics_trace.log"
     If Len(Dir$(m_TraceFile)) > 0 Then Kill m_TraceFile
     On Error GoTo ErrorHandler
     Heartbeat "=== DEBUT ANALYSE " & APP_VERSION & _
-              " | ExchangeResolution=" & g_UseExchangeResolution & _
               " | AnalyzeLength=" & g_AnalyzeLength & _
-              " | TestMode=" & g_TestMode & " ==="
-    
+              " | TestMode=" & g_TestMode & _
+              " | Delta=" & g_DeltaMode & _
+              " | Periode=" & Format$(g_PeriodStart, "YYYY-MM-DD HH:NN:SS") & _
+              " -> " & Format$(g_PeriodEnd, "YYYY-MM-DD HH:NN:SS") & " ==="
+
     Call InitializeDictionaries
     Call InitializeFolderCaches  ' V22
 
@@ -455,67 +604,101 @@ Public Sub RunEmailAnalysis()
     ' A partir d'ici, les dictionnaires contiennent l'historique ; le scan
     ' ne fera qu'y ajouter les mois manquants.
     If g_DeltaMode Then Call RehydrateFromState
-    
+
     Set fProgress = New frmProgress
     fProgress.Show vbModeless
-    
+
     m_StartTime = Timer
     m_StartDate = Date
-    
+
     Dim success As Boolean
     success = AnalyzeEmails(selectedStores)
-    
+
     DebugLog "[ETAPE 9] Analyse terminee, success = " & success
-    DebugLog "   Traites  : " & Format(m_TotalProcessed, "#,##0")
+    DebugLog "   Retenus  : " & Format(m_TotalProcessed, "#,##0")
+    DebugLog "   Examines : " & Format(m_TotalScanned, "#,##0")
     DebugLog "   Ignores  : " & Format(m_TotalIgnored, "#,##0")
     DebugLog "   Erreurs  : " & Format(m_TotalErrors, "#,##0")
-    
+
+    ' V25.3 (F9-04 / F9-11) : chaque issue a son message, puis la fenetre de
+    ' progression est fermee directement. Avant : un echec du parcours
+    ' (success = False sans annulation) ou du rapport ne disait rien, la
+    ' fenetre restait sur "Analyzing... 47 %", et la fin attendait le clic
+    ' sur Fermer dans une boucle DoEvents sans pause (un coeur a 100 %).
+    Dim elapsedSeconds As Double
+    Dim excelPath As String
+    Dim speed As String
+    Dim failMsg As String
     If success And Not fProgress.Cancelled Then
-        fProgress.SetComplete "Generation du rapport Excel..."
-        
-        Dim excelPath As String
+        fProgress.SetComplete T("G~en~eration du rapport Excel...", "Generating the Excel report...")
+
         excelPath = GenerateExcelReport()
-        
-        Dim elapsedSeconds As Double
         elapsedSeconds = GetElapsedSeconds()
-        
+
         If Len(excelPath) > 0 Then
-            fProgress.SetComplete "Rapport genere : " & excelPath
-            Dim speed As String
+            fProgress.SetComplete T("Rapport g~en~er~e : ", "Report generated: ") & excelPath
             If elapsedSeconds > 0 Then
-                speed = Format(m_TotalProcessed / (elapsedSeconds / 60), "#,##0") & " emails/min"
+                speed = Format(m_TotalScanned / (elapsedSeconds / 60), "#,##0") & " emails/min"
             Else
                 speed = "N/A"
             End If
-            
+
             MsgBox T("Analyse termin~ee !", "Analysis complete!") & vbCrLf & vbCrLf & _
                    T("Emails analys~es : ", "Emails analyzed: ") & Format(m_TotalProcessed, "#,##0") & vbCrLf & _
                    T("Emails ignor~es : ", "Emails ignored: ") & Format(m_TotalIgnored, "#,##0") & vbCrLf & _
                    T("Dur~ee : ", "Duration: ") & Format(elapsedSeconds / 60, "0.0") & " min" & vbCrLf & _
                    T("Vitesse : ", "Speed: ") & speed & vbCrLf & vbCrLf & _
                    T("Fichier : ", "File: ") & excelPath, vbInformation, T("Succ~fs", "Success")
+        Else
+            If m_ReportLeftOpen Then
+                fProgress.SetError T("Rapport non enregistr~e (rest~e ouvert dans Excel)", _
+                                     "Report not saved (left open in Excel)")
+                failMsg = T("Le rapport a ~et~e construit mais n'a pas pu ~xtre enregistr~e. " & _
+                            "Il est rest~e ouvert dans Excel : enregistrez-le ~a la main " & _
+                            "(Fichier > Enregistrer sous).", _
+                            "The report was built but could not be saved. It was left " & _
+                            "open in Excel: save it by hand (File > Save As).")
+            Else
+                fProgress.SetError T("La g~en~eration du rapport Excel a ~echou~e", _
+                                     "Excel report generation failed")
+                failMsg = T("La g~en~eration du rapport Excel a ~echou~e.", _
+                            "Excel report generation failed.")
+            End If
+            If Len(m_ReportError) > 0 Then failMsg = failMsg & vbCrLf & vbCrLf & _
+                T("Erreur : ", "Error: ") & m_ReportError
+            failMsg = failMsg & vbCrLf & vbCrLf & T("Journal : ", "Log: ") & m_TraceFile
+            modUi.Fail failMsg, AnalyticsTitle()
         End If
     ElseIf fProgress.Cancelled Then
-        fProgress.SetError "Analyse annulee par l'utilisateur"
+        ' Annulation demandee par l'utilisateur : la fenetre se ferme, rien
+        ' d'autre a dire.
+        Heartbeat "Analyse annulee par l'utilisateur"
+    Else
+        fProgress.SetError T("Le parcours des bo~ites a ~echou~e", "The mailbox scan failed")
+        failMsg = T("Le parcours des bo~ites a ~echou~e : aucun rapport n'a ~et~e produit.", _
+                    "The mailbox scan failed: no report was produced.")
+        If Len(m_ScanError) > 0 Then failMsg = failMsg & vbCrLf & vbCrLf & _
+            T("Erreur : ", "Error: ") & m_ScanError
+        failMsg = failMsg & vbCrLf & vbCrLf & T("Journal : ", "Log: ") & m_TraceFile
+        modUi.Fail failMsg, AnalyticsTitle()
     End If
-    
-    Do While fProgress.Visible
-        DoEvents
-    Loop
-    
+
     Unload fProgress
-    
-    Heartbeat "=== FIN ANALYSE OK | traites=" & m_TotalProcessed & _
-              " | ignores=" & m_TotalIgnored & " ==="
-    
+    Set fProgress = Nothing
+
+    Heartbeat "=== FIN ANALYSE | success=" & success & " | retenus=" & m_TotalProcessed & _
+              " | ignores=" & m_TotalIgnored & " | rapport=" & excelPath & " ==="
+
     DebugLog String(70, "=")
     DebugLog "ANALYSE TERMINEE ! (" & APP_VERSION & ")"
     DebugLog "Duree : " & Format(GetElapsedSeconds() / 60, "0.0") & " minutes"
-    DebugLog "Emails analyses : " & Format(m_TotalProcessed, "#,##0")
+    DebugLog "Emails retenus : " & Format(m_TotalProcessed, "#,##0")
     If GetElapsedSeconds() > 0 Then
-        DebugLog "Vitesse : " & Format(m_TotalProcessed / (GetElapsedSeconds() / 60), "#,##0") & " emails/min"
+        DebugLog "Vitesse : " & Format(m_TotalScanned / (GetElapsedSeconds() / 60), "#,##0") & " emails/min"
     End If
     DebugLog String(70, "=")
+    modDebugLog.DInfo MOD_NAME, "Analyse terminee : success=" & success & ", retenus=" & m_TotalProcessed & _
+        ", duree=" & Format(GetElapsedSeconds() / 60, "0.0") & " min, delta=" & g_DeltaMode
 
     ' V25 : le mode delta ne doit JAMAIS survivre a un parcours. Sans ce
     ' desarmement, un lancement normal enchaine derriere reutiliserait la
@@ -524,7 +707,7 @@ Public Sub RunEmailAnalysis()
     m_DeltaRows = Empty
 
     Exit Sub
-    
+
 ErrorHandler:
     ' V23.6 : capturer Err AVANT tout appel (Heartbeat contient
     ' On Error Resume Next, qui remet Err a zero)
@@ -534,18 +717,24 @@ ErrorHandler:
     g_DeltaMode = False
     m_DeltaRows = Empty
     Heartbeat "!!! ERREUR " & errNum & " : " & errDesc
-    DebugLog "!!! ERREUR !!! " & errNum & " : " & errDesc
-    MsgBox "Error " & errNum & " : " & errDesc, vbCritical, "Error"
+    modDebugLog.DError MOD_NAME, "Analyse interrompue : erreur " & errNum & " - " & errDesc
     On Error Resume Next
     If Not fProgress Is Nothing Then Unload fProgress
+    Set fProgress = Nothing
     If Not fConfig Is Nothing Then Unload fConfig
+    modUi.Fail T("Analyse interrompue par une erreur : ", "Analysis stopped by an error: ") & _
+               errNum & " - " & errDesc & vbCrLf & vbCrLf & T("Journal : ", "Log: ") & m_TraceFile, _
+               AnalyticsTitle(), vbCritical
 End Sub
 
 ' ============================================================================
 ' V22 : Logging conditionnel
+' V25.3 (F9-12) : vers modDebugLog (niveau DEBUG, filtre "Analytics"), plus
+' de Debug.Print. Le journal de bord EmailAnalytics_trace.log (Heartbeat)
+' reste le diagnostic detaille d'une analyse.
 ' ============================================================================
 Private Sub DebugLog(msg As String)
-    If g_DebugMode Then Debug.Print msg
+    modDebugLog.DDebug MOD_NAME, msg
 End Sub
 
 ' ============================================================================
@@ -579,35 +768,36 @@ End Sub
 Private Sub EnsureStatConfigLoaded()
     If m_StatCfgLoaded Then Exit Sub
     m_StatCfgLoaded = True
-    
+
     Set dictStatPresets = CreateObject("Scripting.Dictionary")
     m_StatPresetCount = 0
     m_StatDefaultSet = False
     m_StatDefaultColor = RGB(136, 136, 136)
-    
+
     On Error Resume Next
-    
+
     Dim cfgPath As String
-    cfgPath = ResolveDesktopPath() & "\Macro VBA\Outlook\config.ini"
+    cfgPath = modConfig.ConfigPath()   ' V25.2 : config.ini du dossier de l'outil
+    If Len(cfgPath) = 0 Then Exit Sub
     If Len(Dir$(cfgPath)) = 0 Then Exit Sub
-    
+
     Dim f As Integer, raw As String
     f = FreeFile
     Open cfgPath For Input As #f
     raw = Input$(LOF(f), f)
     Close #f
     If Len(raw) = 0 Then Exit Sub
-    
+
     raw = Replace(raw, vbCrLf, vbLf)
     raw = Replace(raw, vbCr, vbLf)
-    
+
     Dim arrLines() As String
     arrLines = Split(raw, vbLf)
-    
+
     Dim i As Long, s As String, eq As Long
     Dim keyName As String, keyVal As String
     Dim parts() As String, colorOK As Boolean, colorVal As Long
-    
+
     For i = LBound(arrLines) To UBound(arrLines)
         s = Trim$(arrLines(i))
         If Len(s) > 0 Then
@@ -616,7 +806,7 @@ Private Sub EnsureStatConfigLoaded()
                 If eq > 1 Then
                     keyName = LCase$(Trim$(Left$(s, eq - 1)))
                     keyVal = Trim$(Mid$(s, eq + 1))
-                    
+
                     If keyName = "statmailboxdefault" Then
                         colorVal = HexToColor(keyVal, colorOK)
                         If colorOK Then
@@ -654,7 +844,7 @@ Private Sub EnsureStatConfigLoaded()
                                             p("DateMinSet") = True
                                         End If
                                     End If
-                                    
+
                                     ' Domain derive : email prioritaire, sinon
                                     ' fragment s'il ressemble a un domaine
                                     Dim dom As String
@@ -665,7 +855,7 @@ Private Sub EnsureStatConfigLoaded()
                                         dom = fragment
                                     End If
                                     p("Domain") = LCase$(dom)
-                                    
+
                                     m_StatPresetCount = m_StatPresetCount + 1
                                     dictStatPresets.Add CStr(m_StatPresetCount), p
                                 End If
@@ -684,7 +874,7 @@ End Sub
 Public Function GetStatMailboxPreset(storeName As String) As Object
     Call EnsureStatConfigLoaded
     Set GetStatMailboxPreset = Nothing
-    
+
     Dim i As Long
     For i = 1 To m_StatPresetCount
         Dim p As Object
@@ -779,13 +969,13 @@ End Function
 Private Function GetElapsedSeconds() As Double
     Dim currentTimer As Double
     currentTimer = Timer
-    
+
     If Date > m_StartDate Then
         GetElapsedSeconds = (86400 - m_StartTime) + currentTimer + ((Date - m_StartDate - 1) * 86400)
     Else
         GetElapsedSeconds = currentTimer - m_StartTime
     End If
-    
+
     If GetElapsedSeconds < 0 Then GetElapsedSeconds = 0
 End Function
 
@@ -819,6 +1009,7 @@ Private Sub InitializeDictionaries()
     Set dictMsgLength = CreateObject("Scripting.Dictionary")
     Set dictMsgLengthByStore = CreateObject("Scripting.Dictionary")
     Set dictToCc = CreateObject("Scripting.Dictionary")
+    Set dictReply = CreateObject("Scripting.Dictionary")    ' V25.3 (F9-15)
 End Sub
 
 ' ============================================================================
@@ -828,72 +1019,225 @@ Private Sub InitializeFolderCaches()
     Set dictExcludedFolderCache = CreateObject("Scripting.Dictionary")
     Set dictSentFolderCache = CreateObject("Scripting.Dictionary")
     Set dictResolveCache = CreateObject("Scripting.Dictionary")   ' V23.4
+    dictResolveCache.CompareMode = 1                              ' V25.3 : TextCompare
 End Sub
+
+'----------------------------------------------------------------------------
+' BuildDateFilter (V25.3, F9-03) - filtre Items.Restrict sur la date de
+' reception quand la periode est restreinte (choix "Depuis", periode
+' personnalisee, mise a jour delta). Avant : tous les elements de toutes les
+' boites etaient ouverts, le filtre de date n'intervenant qu'apres, en VBA
+' (une mise a jour d'un mois coutait autant qu'une analyse complete).
+' Bornes au JOUR pres (format court du poste, modCommon.FormatDaslDate :
+' regle du pack v4) ; la comparaison exacte a la seconde reste dans
+' ProcessEmail. "" = pas de filtre (periode "Tout").
+'----------------------------------------------------------------------------
+Private Function BuildDateFilter() As String
+    On Error Resume Next
+    BuildDateFilter = ""
+    If g_DeltaMode Or g_PeriodStart > DateSerial(2000, 1, 1) Or _
+       Int(CDbl(g_PeriodEnd)) < Int(CDbl(Now)) Then
+        BuildDateFilter = "[ReceivedTime] >= '" & _
+            modCommon.FormatDaslDate(CDate(Int(CDbl(g_PeriodStart)))) & _
+            "' AND [ReceivedTime] < '" & _
+            modCommon.FormatDaslDate(CDate(Int(CDbl(g_PeriodEnd)) + 1)) & "'"
+    End If
+End Function
+
+'----------------------------------------------------------------------------
+' PeriodItems (V25.3, F9-03) - elements du dossier, restreints a la periode
+' si un filtre de date est actif. Repli sur folder.Items si Restrict echoue.
+'----------------------------------------------------------------------------
+Private Function PeriodItems(ByVal folder As Object) As Object
+    On Error Resume Next
+    Set PeriodItems = Nothing
+    If Len(m_DateFilter) > 0 Then Set PeriodItems = folder.Items.Restrict(m_DateFilter)
+    If PeriodItems Is Nothing Then Set PeriodItems = folder.Items
+End Function
+
+'----------------------------------------------------------------------------
+' PrepareStoreFolders (V25.3, F9-06) - dossiers systeme de la boite, par
+' IDENTITE (EntryID), valable dans toutes les langues : supprimes,
+' indesirables, problemes de synchronisation, conflits, echecs locaux et
+' serveur, boite d'envoi, brouillons, flux RSS ; et Elements envoyes.
+' Avant : reconnaissance par le NOM ("indesirable" sans accent ne
+' reconnaissait pas "Courrier indesirable" : les spams etaient comptes).
+' Si aucun dossier systeme n'est accessible (boite partagee sans droits),
+' m_StoreIdsOk = False et les anciens motifs de nom servent de repli.
+'----------------------------------------------------------------------------
+Private Sub PrepareStoreFolders(ByVal store As Object)
+    On Error Resume Next
+    Set m_ExclIDs = CreateObject("Scripting.Dictionary")
+    m_SentID = ""
+    m_StoreIdsOk = False
+
+    Dim kinds As Variant, i As Long, fld As Object, eid As String
+    kinds = Array(olFolderDeletedItems, olFolderJunk, olFolderSyncIssues, olFolderConflicts, _
+                  olFolderLocalFailures, olFolderServerFailures, olFolderOutbox, _
+                  olFolderDrafts, olFolderRssFeeds)
+    For i = LBound(kinds) To UBound(kinds)
+        Set fld = Nothing
+        Set fld = store.GetDefaultFolder(CLng(kinds(i)))
+        If Not fld Is Nothing Then
+            eid = ""
+            eid = CStr(fld.EntryID)
+            If Len(eid) > 0 Then
+                m_ExclIDs(eid) = True
+                m_StoreIdsOk = True
+            End If
+        End If
+    Next i
+
+    Set fld = Nothing
+    Set fld = store.GetDefaultFolder(olFolderSentMail)
+    If Not fld Is Nothing Then
+        m_SentID = CStr(fld.EntryID)
+        If Len(m_SentID) > 0 Then m_StoreIdsOk = True
+    End If
+    Set fld = Nothing
+    Err.Clear
+
+    If Not m_StoreIdsOk Then Heartbeat "  dossiers systeme non resolus : repli sur les noms"
+End Sub
+
+'----------------------------------------------------------------------------
+' BuildStoreIdentities (V25.3, F9-08) - adresses qui designent l'utilisateur
+' dans chaque boite analysee :
+'   - adresse de la boite (4e champ de StatMailboxN / champ Email) ;
+'   - si cette adresse est l'une des miennes, ou si la boite principale n'a
+'     pas d'adresse renseignee : toutes mes adresses (modSmtp.MyAddresses :
+'     comptes du profil + alias Exchange).
+' Dictionnaire vide = aucune adresse connue : repli sur le mot-cle.
+' Avant : seul le mot-cle (nom de famille) servait (tous les prereglages
+' forcent ce mode) - un homonyme etait compte comme "moi".
+'----------------------------------------------------------------------------
+Private Sub BuildStoreIdentities(ByVal selectedStores As Collection)
+    On Error Resume Next
+    Set dictStoreIdentity = CreateObject("Scripting.Dictionary")
+
+    Dim defName As String
+    defName = ""
+    defName = CStr(Application.Session.DefaultStore.DisplayName)
+
+    Dim mine As Object
+    Set mine = Nothing
+    Set mine = modSmtp.MyAddresses()
+
+    Dim sn As Variant, ids As Object, userEmail As String, k As Variant, useMine As Boolean
+    For Each sn In selectedStores
+        Set ids = CreateObject("Scripting.Dictionary")
+        ids.CompareMode = 1   ' TextCompare
+        userEmail = ""
+        If dictStoreEmailUser.Exists(CStr(sn)) Then userEmail = LCase$(Trim$(CStr(dictStoreEmailUser(CStr(sn)))))
+        If InStr(userEmail, "@") > 0 Then
+            ids(userEmail) = True
+            useMine = modSmtp.IsMyAddress(userEmail)
+        Else
+            useMine = (StrComp(CStr(sn), defName, vbTextCompare) = 0)
+        End If
+        If useMine And Not mine Is Nothing Then
+            For Each k In mine.Keys
+                ids(LCase$(CStr(k))) = True
+            Next k
+        End If
+        Set dictStoreIdentity(CStr(sn)) = ids
+        modDebugLog.DDebug MOD_NAME, "Identite d'une boite : " & ids.Count & " adresse(s)" & _
+            IIf(ids.Count = 0, " (repli mot-cle)", "")
+    Next sn
+End Sub
+
+' Adresses "moi" de la boite (Nothing si inconnue).
+Private Function StoreIdentity(ByVal storeName As String) As Object
+    On Error Resume Next
+    Set StoreIdentity = Nothing
+    If dictStoreIdentity Is Nothing Then Exit Function
+    If dictStoreIdentity.Exists(storeName) Then Set StoreIdentity = dictStoreIdentity(storeName)
+End Function
+
+' True si la boite reconnait l'utilisateur par adresse (sinon : mot-cle).
+Private Function StoreUsesAddress(ByVal storeName As String) As Boolean
+    Dim ids As Object
+    Set ids = StoreIdentity(storeName)
+    If ids Is Nothing Then Exit Function
+    StoreUsesAddress = (ids.Count > 0)
+End Function
 
 ' ============================================================================
 ' ANALYSE DES EMAILS
 ' ============================================================================
 Private Function AnalyzeEmails(selectedStores As Collection) As Boolean
     On Error GoTo ErrorHandler
-    
+
     Dim olNS As Object
     Dim store As Object
     Dim rootFolder As Object
     Dim storeName As Variant
     Dim storeIndex As Long
     Dim totalEmails As Long
-    
+
     Set olNS = Application.GetNamespace("MAPI")
-    
+
     If fProgress Is Nothing Then
         AnalyzeEmails = False
         Exit Function
     End If
-    
-    fProgress.UpdateProgress 0, 0, "Comptage...", 0, selectedStores.Count
-    
+
+    fProgress.UpdateProgress 0, 0, T("Comptage...", "Counting..."), 0, selectedStores.Count
+
+    ' V25.3 : filtre de date (F9-03) et identite par boite (F9-08), une fois
+    ' pour toute l'analyse.
+    m_DateFilter = BuildDateFilter()
+    If Len(m_DateFilter) > 0 Then Heartbeat "Filtre de date : " & m_DateFilter
+    Call BuildStoreIdentities(selectedStores)
+
     ' Comptage des emails
     totalEmails = 0
     For Each storeName In selectedStores
-        DebugLog "    Comptage boite: " & storeName
+        DebugLog "    Comptage d'une boite"   ' V25.3 : nom de boite (souvent une adresse) hors de debug.log
         Heartbeat "COMPTAGE " & storeName
         For Each store In olNS.Stores
             If store.DisplayName = CStr(storeName) Then
+                Call PrepareStoreFolders(store)       ' V25.3 (F9-06)
                 totalEmails = totalEmails + CountEmailsInStore(store)
                 DebugLog "      -> " & totalEmails & " emails cumules"
                 Exit For
             End If
         Next store
     Next storeName
-    
+
     DebugLog "   -> Total a traiter: " & Format(totalEmails, "#,##0")
     Heartbeat "Total a traiter: " & totalEmails
     m_TotalToProcess = totalEmails
     m_TotalProcessed = 0
-    
+    m_TotalScanned = 0
+
     ' Analyse de chaque boite
     storeIndex = 0
     For Each storeName In selectedStores
         storeIndex = storeIndex + 1
-        DebugLog "   [" & storeIndex & "/" & selectedStores.Count & "] " & storeName
+        DebugLog "   Boite " & storeIndex & "/" & selectedStores.Count
         Heartbeat "STORE [" & storeIndex & "/" & selectedStores.Count & "] " & storeName
-        
+
         For Each store In olNS.Stores
             If store.DisplayName = CStr(storeName) Then
+                Call PrepareStoreFolders(store)       ' V25.3 (F9-06)
                 Set rootFolder = store.GetRootFolder
                 Call ProcessFolder(rootFolder, CStr(storeName), storeIndex, selectedStores.Count)
                 Exit For
             End If
         Next store
-        
+
         If fProgress.Cancelled Then Exit For
     Next storeName
-    
+
     AnalyzeEmails = Not fProgress.Cancelled
     Exit Function
-    
+
 ErrorHandler:
-    DebugLog "  [AnalyzeEmails] ERREUR: " & Err.Number & " - " & Err.Description
+    ' V25.3 (F9-04) : erreur gardee pour le message final et tracee.
+    m_ScanError = Err.Number & " - " & Err.Description
+    Heartbeat "!!! AnalyzeEmails erreur " & m_ScanError
+    modDebugLog.DError MOD_NAME, "Parcours des boites interrompu : " & m_ScanError
     AnalyzeEmails = False
 End Function
 
@@ -901,10 +1245,10 @@ Private Function CountEmailsInStore(store As Object) As Long
     On Error Resume Next
     Dim rootFolder As Object
     Dim count As Long
-    
+
     Set rootFolder = store.GetRootFolder
     count = CountEmailsInFolder(rootFolder)
-    
+
     If g_TestMode Then count = count \ TEST_SAMPLING
     CountEmailsInStore = count
 End Function
@@ -913,38 +1257,108 @@ Private Function CountEmailsInFolder(folder As Object) As Long
     On Error Resume Next
     Dim count As Long
     Dim subFolder As Object
-    
-    If IsExcludedFolder(folder.Name) Then
+
+    If IsExcludedFolder(folder) Then
         CountEmailsInFolder = 0
         Exit Function
     End If
-    
-    count = folder.Items.Count
-    
+
+    ' V25.3 (F9-03) : meme sous-ensemble que le parcours (periode), pour une
+    ' progression juste.
+    count = -1
+    count = PeriodItems(folder).Count
+    If count < 0 Then count = 0
+
     For Each subFolder In folder.Folders
         count = count + CountEmailsInFolder(subFolder)
     Next subFolder
-    
+
     CountEmailsInFolder = count
 End Function
 
 ' ============================================================================
 ' V22 : IsExcludedFolder OPTIMISE avec cache dictionnaire
-' Au lieu de 30+ InStr a chaque appel, on met en cache le resultat
+' V25.3 (F9-06) : par IDENTITE d'abord, valable dans toutes les langues -
+'   1. dossier systeme de la boite (PrepareStoreFolders : EntryID) ;
+'   2. dossier qui ne contient pas de mails (DefaultItemType : calendrier,
+'      contacts, taches, notes, journal) ;
+'   3. nom EXACT d'un dossier systeme sans constante Outlook (historique
+'      des conversations, PersonMetadata...) ;
+'   4. anciens motifs (sous-chaines du nom) seulement si aucun dossier
+'      systeme n'a pu etre resolu pour cette boite.
+' Avant : sous-chaines du nom seulement - "Courrier indesirable" (accent)
+' n'etait pas reconnu, et un dossier de travail contenant "notes",
+' "contacts", "journal", "historique"... etait ignore avec ses sous-dossiers.
+' Cache par EntryID.
 ' ============================================================================
-Private Function IsExcludedFolder(folderName As String) As Boolean
-    ' Cache hit ?
-    If dictExcludedFolderCache.Exists(folderName) Then
-        IsExcludedFolder = dictExcludedFolderCache(folderName)
-        Exit Function
+Private Function IsExcludedFolder(ByVal folder As Object) As Boolean
+    On Error Resume Next
+    Dim eid As String
+    eid = ""
+    eid = CStr(folder.EntryID)
+    If Len(eid) > 0 Then
+        If dictExcludedFolderCache.Exists(eid) Then
+            IsExcludedFolder = dictExcludedFolderCache(eid)
+            Exit Function
+        End If
     End If
-    
-    Dim lowerName As String
-    lowerName = LCase(folderName)
-    
+
     Dim result As Boolean
     result = False
-    
+
+    If Len(eid) > 0 And Not m_ExclIDs Is Nothing Then
+        If m_ExclIDs.Exists(eid) Then result = True
+    End If
+
+    If Not result Then
+        Dim itemKind As Long
+        itemKind = olMailItem
+        itemKind = folder.DefaultItemType
+        If itemKind <> olMailItem Then result = True
+    End If
+
+    Dim lowerName As String
+    lowerName = LCase$(CStr(folder.Name))
+    If Not result Then result = IsSystemFolderName(lowerName)
+    If Not result And Not m_StoreIdsOk Then result = IsExcludedFolderName(lowerName)
+
+    If Len(eid) > 0 Then dictExcludedFolderCache(eid) = result
+    IsExcludedFolder = result
+End Function
+
+'----------------------------------------------------------------------------
+' IsSystemFolderName (V25.3, F9-06) - nom EXACT (minuscules) d'un dossier
+' systeme d'Outlook / Exchange, FR ou EN. Toujours applique : un nom entier
+' ne touche pas un dossier de travail (contrairement aux sous-chaines).
+'----------------------------------------------------------------------------
+Private Function IsSystemFolderName(ByVal lowerName As String) As Boolean
+    Dim e As String
+    e = Chr(233)   ' e accent aigu
+    Select Case lowerName
+        Case "courrier ind" & e & "sirable", "junk email", "junk e-mail", _
+             e & "l" & e & "ments supprim" & e & "s", "deleted items", _
+             "probl" & Chr(232) & "mes de synchronisation", "sync issues", _
+             "conflits", "conflicts", _
+             e & "checs locaux", "local failures", _
+             e & "checs du serveur", "server failures", _
+             "bo" & Chr(238) & "te d'envoi", "outbox", "brouillons", "drafts", _
+             "flux rss", "rss feeds", "rss subscriptions", _
+             "historique des conversations", "conversation history", _
+             "personmetadata", "quick step settings", _
+             "social activity notifications", "recoverable items"
+            IsSystemFolderName = True
+    End Select
+End Function
+
+'----------------------------------------------------------------------------
+' IsExcludedFolderName - anciens motifs (V22), en REPLI seulement (boite dont
+' aucun dossier systeme n'est accessible). V25.3 : variantes accentuees
+' ajoutees (indesirable, probleme, echecs).
+'----------------------------------------------------------------------------
+Private Function IsExcludedFolderName(ByVal lowerName As String) As Boolean
+    Dim result As Boolean
+    result = False
+
     ' Une seule passe de verification, regroupee par patterns
     Select Case True
         ' Corbeille / supprimes
@@ -952,16 +1366,19 @@ Private Function IsExcludedFolder(folderName As String) As Boolean
              InStr(lowerName, "deleted") > 0, _
              InStr(lowerName, "junk") > 0, _
              InStr(lowerName, "spam") > 0, _
-             InStr(lowerName, "indesirable") > 0
+             InStr(lowerName, "indesirable") > 0, _
+             InStr(lowerName, "ind" & Chr(233) & "sirable") > 0
             result = True
         ' Synchronisation / Conflits
         Case InStr(lowerName, "sync issues") > 0, _
              InStr(lowerName, "probleme") > 0 And InStr(lowerName, "sync") > 0, _
+             InStr(lowerName, "probl" & Chr(232) & "me") > 0 And InStr(lowerName, "sync") > 0, _
              InStr(lowerName, "personmetadata") > 0, _
              InStr(lowerName, "conflits") > 0, _
              InStr(lowerName, "conflicts") > 0, _
              InStr(lowerName, "local failures") > 0, _
-             InStr(lowerName, "server failures") > 0
+             InStr(lowerName, "server failures") > 0, _
+             InStr(lowerName, Chr(233) & "checs") > 0
             result = True
         ' Recuperables / Historique
         Case InStr(lowerName, "recoverable") > 0, _
@@ -985,10 +1402,8 @@ Private Function IsExcludedFolder(folderName As String) As Boolean
              InStr(lowerName, "journal") > 0
             result = True
     End Select
-    
-    ' Mise en cache
-    dictExcludedFolderCache(folderName) = result
-    IsExcludedFolder = result
+
+    IsExcludedFolderName = result
 End Function
 
 ' ============================================================================
@@ -998,74 +1413,91 @@ End Function
 ' - Cache des objets Items
 ' - Early exit sur exclusions
 ' ============================================================================
-Private Sub ProcessFolder(folder As Object, storeName As String, storeIndex As Long, storeCount As Long)
+Private Sub ProcessFolder(folder As Object, storeName As String, storeIndex As Long, storeCount As Long, _
+                          Optional ByVal parentIsSent As Boolean = False)
     On Error Resume Next
-    
-    If IsExcludedFolder(folder.Name) Then Exit Sub
+
+    If IsExcludedFolder(folder) Then Exit Sub
     If fProgress.Cancelled Then Exit Sub
-    
+
     ' Cache du flag "dossier d'envoi"
+    ' V25.3 (F9-06) : Elements envoyes reconnu par son EntryID, et ses
+    ' sous-dossiers avec lui ; le nom ne sert qu'en repli (boite dont le
+    ' dossier n'est pas accessible).
     Dim isSentFolder As Boolean
-    isSentFolder = IsSentFolderName(folder.Name)
-    
+    isSentFolder = parentIsSent
+    If Not isSentFolder Then
+        If Len(m_SentID) > 0 Then
+            isSentFolder = (CStr(folder.EntryID) = m_SentID)
+        Else
+            isSentFolder = IsSentFolderName(folder.Name)
+        End If
+    End If
+
     ' V23.4 : trace AVANT l'acces aux Items (un dossier casse peut bloquer ici)
     Heartbeat "DOSSIER " & folder.FolderPath
-    
+
     ' V22 : Cache des Items dans une variable locale
+    ' V25.3 (F9-03) : restreints a la periode si un filtre de date est actif.
     Dim folderItems As Object
-    Set folderItems = folder.Items
-    
+    Set folderItems = PeriodItems(folder)
+
     Dim itemCount As Long
-    itemCount = folderItems.Count
-    
+    itemCount = 0
+    If Not folderItems Is Nothing Then itemCount = folderItems.Count
+
     If itemCount > 0 Then
-        Heartbeat "  items=" & itemCount & " | deja traites=" & m_TotalProcessed
+        Heartbeat "  items=" & itemCount & " | deja examines=" & m_TotalScanned
         Dim item As Object
         Dim counter As Long: counter = 0
         Dim localProcessed As Long: localProcessed = 0
         Dim i As Long
         Dim msgClass As String
-        
+
         ' V22 : Boucle par INDEX (plus rapide et plus robuste)
         For i = 1 To itemCount
             If fProgress.Cancelled Then Exit Sub
-            
+
             ' V23.4 : position courante (index BRUT, y compris items ignores)
             If i Mod PROGRESS_UPDATE_FREQUENCY = 0 Then
-                Heartbeat "  idx " & i & " / " & itemCount & " | total=" & m_TotalProcessed
+                Heartbeat "  idx " & i & " / " & itemCount & " | total=" & m_TotalScanned
             End If
-            
+
             Set item = Nothing
             Set item = folderItems.Item(i)
-            
+
             If Not item Is Nothing Then
                 ' V22 : Test via MessageClass (plus rapide que TypeName)
                 msgClass = ""
                 msgClass = item.MessageClass
-                
+
                 ' IPM.Note = Email standard, IPM.Note.* = variantes d'emails
                 If Left$(msgClass, 8) = "IPM.Note" Then
                     counter = counter + 1
-                    
+
                     If (Not g_TestMode) Or (counter Mod TEST_SAMPLING = 0) Then
-                        Call ProcessEmail(item, storeName, isSentFolder)
-                        m_TotalProcessed = m_TotalProcessed + 1
+                        ' V25.3 (F9-03) : seuls les mails RETENUS comptent comme
+                        ' analyses ; la progression suit les mails examines.
+                        If ProcessEmail(item, storeName, isSentFolder) Then
+                            m_TotalProcessed = m_TotalProcessed + 1
+                        End If
+                        m_TotalScanned = m_TotalScanned + 1
                         localProcessed = localProcessed + 1
-                        
+
                         ' V22 : Deux frequences separees
                         ' - Progress update plus frequent (250)
                         ' - DoEvents moins frequent (500) car plus couteux
                         If localProcessed Mod PROGRESS_UPDATE_FREQUENCY = 0 Then
-                            fProgress.UpdateProgress m_TotalProcessed, m_TotalToProcess, storeName, storeIndex, storeCount
-                            
+                            fProgress.UpdateProgress m_TotalScanned, m_TotalToProcess, storeName, storeIndex, storeCount
+
                             Dim elapsed As Double, remaining As Long
                             elapsed = GetElapsedSeconds()
-                            If elapsed > 0 And m_TotalProcessed > 0 Then
-                                remaining = CLng((elapsed / m_TotalProcessed) * (m_TotalToProcess - m_TotalProcessed))
+                            If elapsed > 0 And m_TotalScanned > 0 Then
+                                remaining = CLng((elapsed / m_TotalScanned) * (m_TotalToProcess - m_TotalScanned))
                                 fProgress.SetTimeInfo CLng(elapsed), remaining
                             End If
                         End If
-                        
+
                         If localProcessed Mod DOEVENTS_FREQUENCY = 0 Then
                             DoEvents
                         End If
@@ -1076,15 +1508,16 @@ Private Sub ProcessFolder(folder As Object, storeName As String, storeIndex As L
             End If
         Next i
     End If
-    
+
     Set folderItems = Nothing
-    
-    ' Recursion sur sous-dossiers
+
+    ' Recursion sur sous-dossiers (V25.3 : un sous-dossier des Elements
+    ' envoyes est un dossier d'envoi)
     Dim subFolder As Object
     For Each subFolder In folder.Folders
-        Call ProcessFolder(subFolder, storeName, storeIndex, storeCount)
+        Call ProcessFolder(subFolder, storeName, storeIndex, storeCount, isSentFolder)
     Next subFolder
-    
+
     On Error GoTo 0
 End Sub
 
@@ -1096,29 +1529,26 @@ Private Function IsSentFolderName(folderName As String) As Boolean
         IsSentFolderName = dictSentFolderCache(folderName)
         Exit Function
     End If
-    
+
     Dim lowerName As String
     lowerName = LCase(folderName)
-    
+
     Dim result As Boolean
     result = False
-    
+
     Select Case lowerName
         Case "elements envoyes", "envoyes", "sent items", "sent", "sent mail", _
              "elements envoyes [", "envoyes [", _
              Chr(233) & "l" & Chr(233) & "ments envoy" & Chr(233) & "s"  ' "Elements envoyes"
             result = True
     End Select
-    
-    ' Fallback : contient "envoy" ou "sent "
-    If Not result Then
-        If InStr(lowerName, "envoy") > 0 Or InStr(lowerName, "sent") > 0 Then
-            ' Verification fine pour eviter faux positifs
-            If InStr(lowerName, "envoy") > 0 And Len(lowerName) < 30 Then result = True
-            If InStr(lowerName, "sent") > 0 And Len(lowerName) < 20 Then result = True
-        End If
-    End If
-    
+
+    ' V25.3 (F9-06) : plus de repli par sous-chaine ("sent" dans
+    ' "Presentations", "envoy" dans "Renvoyes"...) : cette fonction ne sert
+    ' plus qu'en repli, quand les Elements envoyes de la boite ne sont pas
+    ' accessibles ; la reconnaissance par adresse (IsSentByUser) fait le
+    ' reste.
+
     dictSentFolderCache(folderName) = result
     IsSentFolderName = result
 End Function
@@ -1128,30 +1558,35 @@ End Function
 ' - Cache de TOUTES les proprietes COM en variables locales
 ' - Pre-calcul des cles temporelles via Year/Month/Day (pas Format)
 ' - Gestion erreur fine
+' V25.3 (F9-03) : Function - True si le mail est RETENU (compte dans les
+' statistiques), False s'il est ignore (sans objet ni expediteur, journal de
+' synchronisation, hors periode). Le message final ne compte plus comme
+' "analyses" les mails hors periode.
 ' ============================================================================
-Private Sub ProcessEmail(mail As Object, storeName As String, Optional isSentFolder As Boolean = False)
+Private Function ProcessEmail(mail As Object, storeName As String, Optional isSentFolder As Boolean = False) As Boolean
     On Error GoTo ErrHandler
-    
+    ProcessEmail = False
+
     ' === V22 : Cache des proprietes COM en variables locales ===
     Dim subj As String
     Dim senderName As String, senderAddr As String, senderEmailType As String
     Dim emailDate As Date
     Dim bodyText As String
-    
+
     subj = Trim$(CStr(mail.Subject))
     senderName = CStr(mail.SenderName)
     senderAddr = CStr(mail.SenderEmailAddress)
     senderEmailType = CStr(mail.SenderEmailType)
     emailDate = mail.ReceivedTime
-    
+
     ' === EXCLUSION : Emails vides ou sans sujet ===
     If Len(subj) = 0 Then
         If Len(Trim$(senderName)) = 0 And Len(Trim$(senderAddr)) = 0 Then
             m_TotalIgnored = m_TotalIgnored + 1
-            Exit Sub
+            Exit Function
         End If
     End If
-    
+
     ' === EXCLUSION : Journaux de synchronisation (verification UNIQUE avec LCase cache) ===
     Dim subjLower As String
     subjLower = LCase$(subj)
@@ -1160,22 +1595,31 @@ Private Sub ProcessEmail(mail As Object, storeName As String, Optional isSentFol
        InStr(subjLower, "synchronization log") > 0 Or _
        InStr(subjLower, "probleme de synchronisation") > 0 Then
         m_TotalIgnored = m_TotalIgnored + 1
-        Exit Sub
+        Exit Function
     End If
-    
+
     ' === FILTRES DATES ===
-    If emailDate < g_PeriodStart Or emailDate > g_PeriodEnd Then
-        m_TotalIgnored = m_TotalIgnored + 1
-        Exit Sub
+    ' V25.3 (F9-02) : en delta, g_PeriodStart est la fin EXACTE de l'etat
+    ' repris, borne INCLUSE de ses compteurs : seuls les mails strictement
+    ' posterieurs sont comptes (aucun mail compte deux fois).
+    Dim outOfPeriod As Boolean
+    If g_DeltaMode Then
+        outOfPeriod = (emailDate <= g_PeriodStart)
+    Else
+        outOfPeriod = (emailDate < g_PeriodStart)
     End If
-    
+    If outOfPeriod Or emailDate > g_PeriodEnd Then
+        m_TotalIgnored = m_TotalIgnored + 1
+        Exit Function
+    End If
+
     Dim yearNum As Long
     yearNum = Year(emailDate)
     If yearNum < 2000 Then
         m_TotalIgnored = m_TotalIgnored + 1
-        Exit Sub
+        Exit Function
     End If
-    
+
     ' Date minimum par boite
     If dictStoreDateMin.Exists(storeName) Then
         Dim dateMin As Date
@@ -1183,26 +1627,21 @@ Private Sub ProcessEmail(mail As Object, storeName As String, Optional isSentFol
         If dateMin > DateSerial(1990, 1, 1) Then
             If emailDate < dateMin Then
                 m_TotalIgnored = m_TotalIgnored + 1
-                Exit Sub
+                Exit Function
             End If
         End If
     End If
-    
-    ' === Resolution adresse expediteur ===
-    If Len(senderAddr) = 0 Then
-        If Not mail.Sender Is Nothing Then
-            senderAddr = ResolveEmailAddressFromSender(mail.Sender, senderEmailType, senderAddr)
-        End If
-    Else
-        If senderEmailType = "SMTP" Then
-            senderAddr = LCase$(senderAddr)
-        ElseIf g_UseExchangeResolution And senderEmailType = "EX" Then
-            If Not mail.Sender Is Nothing Then
-                senderAddr = ResolveEmailAddressFromSender(mail.Sender, senderEmailType, senderAddr)
-            End If
-        End If
-    End If
-    
+
+    ' Le mail est retenu (une erreur plus bas ne change pas ce verdict).
+    ProcessEmail = True
+
+    ' === Adresse SMTP de l'expediteur ===
+    ' V25.3 (F9-07) : modSmtp (PR_SENDER_SMTP_ADDRESS lue sur l'element, puis
+    ' annuaire), avec cache par adresse Exchange. Avant, sans la case
+    ' "Resolution Exchange", l'adresse d'un collegue restait au format /o=...
+    ' et le mail partait en "inconnu".
+    senderAddr = SenderSmtpCached(mail, senderAddr, senderEmailType)
+
     ' Detection Sent/Received
     Dim isSent As Boolean
     If isSentFolder Then
@@ -1210,21 +1649,24 @@ Private Sub ProcessEmail(mail As Object, storeName As String, Optional isSentFol
     Else
         isSent = IsSentByUser(senderAddr, senderName, storeName)
     End If
-    
+
     Dim direction As String
     If isSent Then direction = "Sent" Else direction = "Received"
-    
+
     ' === STATS PAR BOITE ===
     IncrementDict dictStoreStats, storeName & "|" & direction
     IncrementDict dictStoreStats, storeName & "|Total"
 
     ' V24 : A / Cc / Indirect - uniquement sur les mails RECUS (sur un envoi
     ' la question n'a pas de sens : l'utilisateur est l'expediteur).
+    ' V25.3 : role garde pour le taux de reponse (F9-15).
+    Dim recipRole As String
     If Not isSent Then
+        recipRole = RecipientRole(mail, storeName)
         IncrementDict dictToCc, storeName & "|" & Format$(emailDate, "YYYY-MM") & _
-                                "|" & RecipientRole(mail, storeName)
+                                "|" & recipRole
     End If
-    
+
     ' === V22 : Pre-calcul OPTIMISE des cles temporelles ===
     ' Format() est tres lent ; Year/Month/Day + concatenation sont 10x plus rapides
     Dim monthNum As Long, dayNum As Long, hourNum As Long, dowNum As Long
@@ -1232,17 +1674,17 @@ Private Sub ProcessEmail(mail As Object, storeName As String, Optional isSentFol
     dayNum = Day(emailDate)
     hourNum = Hour(emailDate)
     dowNum = Weekday(emailDate, vbMonday)
-    
+
     Dim yearStr As String, monthStr As String, dayStr As String, hourStr As String
     yearStr = CStr(yearNum)
     monthStr = Format$(monthNum, "00")
     dayStr = Format$(dayNum, "00")
     hourStr = Format$(hourNum, "00")
-    
+
     Dim monthKey As String, dayKey As String
     monthKey = yearStr & "-" & monthStr
     dayKey = monthKey & "-" & dayStr
-    
+
     Dim weekKey As String, yearKey As String, quarterKey As String, semesterKey As String
     yearKey = yearStr
     weekKey = yearStr & "-W" & Format$(DatePart("ww", emailDate, vbMonday), "00")
@@ -1252,38 +1694,38 @@ Private Sub ProcessEmail(mail As Object, storeName As String, Optional isSentFol
     Else
         semesterKey = yearStr & "-S2"
     End If
-    
+
     Dim hourKey As String, dowKey As String
     hourKey = hourStr
     dowKey = CStr(dowNum)
-    
+
     ' === STATS TEMPORELLES ===
     IncrementDict dictMonthly, monthKey & "|" & storeName & "|" & direction
     IncrementDict dictMonthly, monthKey & "|" & storeName & "|Total"
     IncrementDict dictMonthly, monthKey & "|_TOTAL|" & direction
     IncrementDict dictMonthly, monthKey & "|_TOTAL|Total"
-    
+
     IncrementDict dictWeekly, weekKey & "|" & direction
     IncrementDict dictWeekly, weekKey & "|Total"
-    
+
     IncrementDict dictDaily, dayKey & "|" & direction
     IncrementDict dictDaily, dayKey & "|Total"
-    
+
     IncrementDict dictQuarterly, quarterKey & "|" & direction
     IncrementDict dictQuarterly, quarterKey & "|Total"
-    
+
     IncrementDict dictYearly, yearKey & "|" & direction
     IncrementDict dictYearly, yearKey & "|Total"
-    
+
     IncrementDict dictSemesterly, semesterKey & "|" & storeName & "|" & direction
     IncrementDict dictSemesterly, semesterKey & "|" & storeName & "|Total"
-    
+
     IncrementDict dictHourly, hourKey & "|" & direction
     IncrementDict dictHourly, hourKey & "|Total"
-    
+
     IncrementDict dictDayOfWeek, dowKey & "|" & direction
     IncrementDict dictDayOfWeek, dowKey & "|Total"
-    
+
     ' === HEATMAPS ===
     Dim heatKey As String
     heatKey = dowKey & "|" & hourNum
@@ -1293,75 +1735,64 @@ Private Sub ProcessEmail(mail As Object, storeName As String, Optional isSentFol
         IncrementDict dictHeatmapReceived, heatKey
     End If
     IncrementDict dictHeatmapTotal, heatKey
-    
+
     ' ============================================================================
     ' LOGIQUE INTERNE / EXTERNE / INCONNU
     ' ============================================================================
     Dim storeDomain As String
     storeDomain = ""
     If dictStoreDomains.Exists(storeName) Then storeDomain = LCase$(CStr(dictStoreDomains(storeName)))
-    
+
     Dim emailClassification As String
     emailClassification = "Unknown"
-    
+
     Dim displayRecip As String  ' V22 : pour raw data en fin
     Dim displaySender As String
     Dim recipName As String, recipAddr As String
-    
+
     If isSent Then
         ' === EMAIL ENVOYE : Analyser les destinataires ===
         Dim recipients As Object
         Set recipients = mail.Recipients
-        
+
         Dim recipCount As Long: recipCount = 0
         Dim hasExternal As Boolean: hasExternal = False
         Dim hasInternal As Boolean: hasInternal = False
         Dim allUnknown As Boolean: allUnknown = True
-        
+
         Dim recip As Object
-        Dim resolvedRecipAddr As String
-        Dim recipDomain As String
-        
+
+        ' V25.3 (F9-07) : adresse via modSmtp (cache), verdict par
+        ' ClassifyAddress (domaines internes de config.ini pour une boite
+        ' interne). Plus de case "Resolution Exchange".
         For Each recip In recipients
             recipCount = recipCount + 1
-            
-            If g_UseExchangeResolution Then
-                resolvedRecipAddr = ForceResolveRecipientSMTP(recip, recipName)
-            Else
-                recipName = CStr(recip.Name)
-                resolvedRecipAddr = GetSimpleRecipientAddress(recip)
-            End If
-            recipAddr = resolvedRecipAddr
-            
+
+            recipName = CStr(recip.Name)
+            recipAddr = RecipientSmtpCached(recip)
+
             displayRecip = GetBestContactDisplay(recipAddr, recipName)
-            
+
             If Len(displayRecip) > 0 Then
                 IncrementDict dictSentTo, displayRecip
             End If
-            
-            If IsValidSMTPAddress(resolvedRecipAddr) Then
-                allUnknown = False
-                recipDomain = LCase$(ExtractDomain(resolvedRecipAddr))
-                
-                If Len(storeDomain) > 0 And Len(recipDomain) > 0 Then
-                    If recipDomain = storeDomain Then
-                        hasInternal = True
-                        If Len(displayRecip) > 0 Then IncrementDict dictSentToInternal, displayRecip
-                    Else
-                        hasExternal = True
-                        If Len(displayRecip) > 0 Then IncrementDict dictSentToExternal, displayRecip
-                    End If
-                Else
+
+            Select Case ClassifyAddress(recipAddr, storeDomain)
+                Case "Internal"
+                    allUnknown = False
+                    hasInternal = True
+                    If Len(displayRecip) > 0 Then IncrementDict dictSentToInternal, displayRecip
+                Case "External"
+                    allUnknown = False
                     hasExternal = True
                     If Len(displayRecip) > 0 Then IncrementDict dictSentToExternal, displayRecip
-                End If
-            Else
-                If Len(displayRecip) > 0 Then IncrementDict dictSentToUnknown, displayRecip
-            End If
+                Case Else
+                    If Len(displayRecip) > 0 Then IncrementDict dictSentToUnknown, displayRecip
+            End Select
         Next recip
-        
+
         Set recipients = Nothing
-        
+
         If allUnknown Then
             emailClassification = "Unknown"
         ElseIf hasExternal Then
@@ -1369,11 +1800,11 @@ Private Sub ProcessEmail(mail As Object, storeName As String, Optional isSentFol
         Else
             emailClassification = "Internal"
         End If
-        
+
         If recipCount > 0 Then
             IncrementDict dictNbRecipients, CStr(recipCount)
         End If
-        
+
         ' === Length message envoye (V20/V22) ===
         If g_AnalyzeLength Then
             bodyText = CStr(mail.Body)
@@ -1384,7 +1815,7 @@ Private Sub ProcessEmail(mail As Object, storeName As String, Optional isSentFol
                 ' V22 : Cle numerique simple au lieu de Format(...) - plus rapide
                 lenKey = CStr(dictMsgLength.Count + 1)
                 dictMsgLength.Add lenKey, msgLen
-                
+
                 If Not dictMsgLengthByStore.Exists(storeName) Then
                     Dim newStoreDict As Object
                     Set newStoreDict = CreateObject("Scripting.Dictionary")
@@ -1395,57 +1826,44 @@ Private Sub ProcessEmail(mail As Object, storeName As String, Optional isSentFol
                 storeDict.Add CStr(storeDict.Count + 1), msgLen
             End If
         End If
-        
+
     Else
         ' === EMAIL RECU : Analyser l'expediteur ===
         displaySender = GetBestContactDisplay(senderAddr, senderName)
-        
+
         If Len(displaySender) > 0 Then
             IncrementDict dictReceivedFrom, displaySender
         End If
-        
-        Dim resolvedSenderAddr As String
-        If g_UseExchangeResolution Then
-            resolvedSenderAddr = ForceResolveSenderSMTP(mail)
-        Else
-            resolvedSenderAddr = senderAddr
-        End If
-        
-        If IsValidSMTPAddress(resolvedSenderAddr) Then
-            Dim senderDomain As String
-            senderDomain = LCase$(ExtractDomain(resolvedSenderAddr))
-            
-            If Len(storeDomain) > 0 And Len(senderDomain) > 0 Then
-                If senderDomain = storeDomain Then
-                    emailClassification = "Internal"
-                    If Len(displaySender) > 0 Then IncrementDict dictReceivedFromInternal, displaySender
-                Else
-                    emailClassification = "External"
-                    If Len(displaySender) > 0 Then IncrementDict dictReceivedFromExternal, displaySender
-                End If
-            Else
-                emailClassification = "External"
+
+        ' V25.3 (F9-07) : senderAddr est deja l'adresse SMTP (modSmtp).
+        emailClassification = ClassifyAddress(senderAddr, storeDomain)
+        Select Case emailClassification
+            Case "Internal"
+                If Len(displaySender) > 0 Then IncrementDict dictReceivedFromInternal, displaySender
+            Case "External"
                 If Len(displaySender) > 0 Then IncrementDict dictReceivedFromExternal, displaySender
-            End If
-        Else
-            emailClassification = "Unknown"
-            If Len(displaySender) > 0 Then IncrementDict dictReceivedFromUnknown, displaySender
-        End If
+            Case Else
+                If Len(displaySender) > 0 Then IncrementDict dictReceivedFromUnknown, displaySender
+        End Select
+
+        ' V25.3 (F9-15) : reponse faite depuis Outlook, et en combien de temps.
+        IncrementDict dictReply, storeName & "|" & monthKey & "|" & recipRole & "|" & _
+                                 ReplyBucket(mail, emailDate)
     End If
-    
+
     ' Stats Internal/External
     IncrementDict dictInternalExternal, storeName & "|" & emailClassification
     IncrementDict dictInternalExternal, "_TOTAL|" & emailClassification
-    
+
     ' === Raw data (5000 premiers) ===
     If dictRawData.Count < MAX_RAW_DATA Then
         Dim rawKey As String, rawVal As String
         rawKey = CStr(dictRawData.Count + 1)  ' V22 : plus de Format()
-        
+
         Dim dateStr As String
         ' V22 : Concatenation directe au lieu de Format - beaucoup plus rapide
         dateStr = yearStr & "-" & monthStr & "-" & dayStr & " " & hourStr & ":" & Format$(Minute(emailDate), "00")
-        
+
         rawVal = storeName & "|" & dateStr & "|" & direction & "|"
         If isSent Then
             rawVal = rawVal & Left$(GetBestContactDisplay(recipAddr, recipName), 50)
@@ -1455,97 +1873,152 @@ Private Sub ProcessEmail(mail As Object, storeName As String, Optional isSentFol
         rawVal = rawVal & "|" & Left$(subj, 100)
         dictRawData.Add rawKey, rawVal
     End If
-    
-    Exit Sub
-    
+
+    Exit Function
+
 ErrHandler:
     ' V22 : Erreur sur un email = on passe au suivant, on n'interrompt pas
+    ' V25.3 (F9-12) : 10 premieres erreurs dans debug.log et le journal de bord.
     m_TotalErrors = m_TotalErrors + 1
-    If g_DebugMode And (m_TotalErrors <= 10) Then
-        Debug.Print "  [ProcessEmail] Erreur " & Err.Number & " : " & Err.Description & " (email ignore)"
+    If m_TotalErrors <= 10 Then
+        Dim errTxt As String
+        errTxt = Err.Number & " - " & Err.Description   ' avant Heartbeat (On Error Resume Next remet Err a zero)
+        Heartbeat "  ProcessEmail erreur " & errTxt & " (email ignore)"
+        modDebugLog.DError MOD_NAME, "Mail ignore sur erreur " & errTxt
     End If
-End Sub
-
-' ============================================================================
-' V22 : RESOLUTION SIMPLIFIEE (sans appel Exchange)
-' ============================================================================
-Private Function GetSimpleRecipientAddress(recip As Object) As String
-    On Error Resume Next
-    GetSimpleRecipientAddress = ""
-    
-    Dim addrEntry As Object
-    Set addrEntry = recip.AddressEntry
-    If addrEntry Is Nothing Then
-        GetSimpleRecipientAddress = LCase$(CStr(recip.Name))
-        Exit Function
-    End If
-    
-    Dim addrType As String
-    addrType = CStr(addrEntry.Type)
-    
-    If addrType = "SMTP" Then
-        GetSimpleRecipientAddress = LCase$(CStr(addrEntry.Address))
-        Exit Function
-    End If
-    
-    Dim addr As String
-    addr = CStr(addrEntry.Address)
-    If InStr(addr, "@") > 0 And Left$(UCase$(addr), 3) <> "/O=" Then
-        GetSimpleRecipientAddress = LCase$(addr)
-        Exit Function
-    End If
-    
-    GetSimpleRecipientAddress = LCase$(CStr(recip.Name))
 End Function
 
 ' ============================================================================
-' FONCTIONS DE RESOLUTION D'ADRESSES
+' V25.3 (F9-07) : ADRESSES SMTP PAR modSmtp
+' Remplace GetSimpleRecipientAddress, ResolveEmailAddressFromSender,
+' ResolveSenderDirect et ForceResolve* (environ 250 lignes qui refaisaient,
+' en moins bien, ce que modSmtp fait deja : PR_SENDER_SMTP_ADDRESS lue sur
+' l'element sans appel a l'annuaire, invites externes Exchange, listes de
+' distribution). Le cache local par adresse Exchange (dictResolveCache)
+' garde le cout par mail au niveau d'une recherche dans un dictionnaire.
 ' ============================================================================
-' V23.4 : wrapper avec cache. La resolution annuaire (GetExchangeUser) est
-' un appel serveur potentiellement lent ; un expediteur donne n'est
-' desormais resolu qu'une seule fois par analyse.
-Private Function ResolveEmailAddressFromSender(sender As Object, emailType As String, emailAddr As String) As String
+
+' Adresse SMTP (minuscules) de l'expediteur, "" si introuvable.
+'   rawAddr / addrType : SenderEmailAddress / SenderEmailType deja lus.
+Private Function SenderSmtpCached(ByVal mail As Object, ByVal rawAddr As String, _
+                                  ByVal addrType As String) As String
     On Error Resume Next
-    
-    If g_UseExchangeResolution And emailType = "EX" And Len(emailAddr) > 0 Then
-        If dictResolveCache Is Nothing Then Set dictResolveCache = CreateObject("Scripting.Dictionary")
-        If dictResolveCache.Exists(emailAddr) Then
-            ResolveEmailAddressFromSender = dictResolveCache(emailAddr)
+    SenderSmtpCached = ""
+    If addrType = "SMTP" And InStr(rawAddr, "@") > 0 Then
+        SenderSmtpCached = LCase$(Trim$(rawAddr))
+        Exit Function
+    End If
+    If Len(rawAddr) > 0 And Not dictResolveCache Is Nothing Then
+        If dictResolveCache.Exists(rawAddr) Then
+            SenderSmtpCached = CStr(dictResolveCache(rawAddr))
             Exit Function
         End If
-        ResolveEmailAddressFromSender = ResolveSenderDirect(sender, emailType, emailAddr)
-        dictResolveCache(emailAddr) = ResolveEmailAddressFromSender
-        Exit Function
     End If
-    
-    ResolveEmailAddressFromSender = ResolveSenderDirect(sender, emailType, emailAddr)
+    Dim s As String
+    s = LCase$(modSmtp.SenderSmtp(mail))
+    If Len(rawAddr) > 0 And Not dictResolveCache Is Nothing Then dictResolveCache(rawAddr) = s
+    SenderSmtpCached = s
 End Function
 
-Private Function ResolveSenderDirect(sender As Object, emailType As String, emailAddr As String) As String
+' Adresse SMTP (minuscules) d'un destinataire, "" si introuvable.
+Private Function RecipientSmtpCached(ByVal recip As Object) As String
     On Error Resume Next
-    
-    If emailType = "SMTP" Then
-        ResolveSenderDirect = LCase$(emailAddr)
+    RecipientSmtpCached = ""
+    Dim raw As String
+    raw = ""
+    raw = CStr(recip.Address)
+    If InStr(raw, "@") > 0 And Left$(UCase$(raw), 3) <> "/O=" Then
+        RecipientSmtpCached = LCase$(Trim$(raw))
         Exit Function
     End If
-    
-    If g_UseExchangeResolution Then
-        If emailType = "EX" Then
-            Dim exUser As Object
-            Set exUser = sender.GetExchangeUser
-            If Not exUser Is Nothing Then
-                If Len(exUser.PrimarySmtpAddress) > 0 Then
-                    ResolveSenderDirect = LCase$(CStr(exUser.PrimarySmtpAddress))
-                    Exit Function
-                End If
-            End If
+    If Len(raw) > 0 And Not dictResolveCache Is Nothing Then
+        If dictResolveCache.Exists(raw) Then
+            RecipientSmtpCached = CStr(dictResolveCache(raw))
+            Exit Function
         End If
     End If
-    
-    If InStr(emailAddr, "@") > 0 Then
-        ResolveSenderDirect = LCase$(emailAddr)
+    Dim s As String
+    s = LCase$(modSmtp.RecipientSmtp(recip))
+    If Len(raw) > 0 And Not dictResolveCache Is Nothing Then dictResolveCache(raw) = s
+    RecipientSmtpCached = s
+End Function
+
+'----------------------------------------------------------------------------
+' ClassifyAddress (V25.3, F9-07) - "Internal" / "External" / "Unknown".
+' Boite interne (domaine vide ou l'un des InternalDomains de config.ini) :
+' interne = l'un des domaines internes, sous-domaines compris
+' (modSmtp.IsInternalDomain). Autre boite : meme domaine que la boite.
+' Avant : un seul domaine par boite - les collegues du second domaine
+' interne etaient comptes comme externes.
+'----------------------------------------------------------------------------
+Private Function ClassifyAddress(ByVal addr As String, ByVal storeDomain As String) As String
+    On Error Resume Next
+    ClassifyAddress = "Unknown"
+    If Not IsValidSMTPAddress(addr) Then Exit Function
+    Dim dom As String
+    dom = LCase$(ExtractDomain(addr))
+    If Len(dom) = 0 Then Exit Function
+    Dim isInternal As Boolean
+    If Len(storeDomain) = 0 Then
+        isInternal = modSmtp.IsInternalDomain(dom)
+    ElseIf modSmtp.IsInternalDomain(storeDomain) Then
+        isInternal = modSmtp.IsInternalDomain(dom)
     Else
-        ResolveSenderDirect = LCase$(CStr(sender.Name))
+        isInternal = (dom = storeDomain)
+    End If
+    If isInternal Then
+        ClassifyAddress = "Internal"
+    Else
+        ClassifyAddress = "External"
+    End If
+End Function
+
+'----------------------------------------------------------------------------
+' ReplyBucket (V25.3, F9-15) - reponse faite depuis Outlook a un mail RECU,
+' lue sur le mail lui-meme : Exchange y pose la derniere action executee
+' (PR_LAST_VERB_EXECUTED : 102 repondre, 103 repondre a tous, 104
+' transferer) et son heure UTC (PR_LAST_VERB_EXECUTION_TIME). Une seule
+' lecture (GetProperties) par mail recu, aucun parcours des envoyes.
+' Tranches ADDITIVES (compatibles avec _ETAT et le delta) :
+'   H1 < 1 h, H4 1-4 h, H24 4-24 h, D3 1-3 j, D3P > 3 j,
+'   Unknown = repondu, heure illisible ; None = pas de reponse (un
+'   transfert ne compte pas comme une reponse).
+'----------------------------------------------------------------------------
+Private Function ReplyBucket(ByVal mail As Object, ByVal receivedAt As Date) As String
+    On Error Resume Next
+    ReplyBucket = "None"
+
+    Dim pa As Object, v As Variant, verb As Long
+    Set pa = Nothing
+    Set pa = mail.PropertyAccessor
+    If pa Is Nothing Then Exit Function
+    v = Empty
+    v = pa.GetProperties(Array(PR_LAST_VERB, PR_LAST_VERB_TIME))
+    If Not IsArray(v) Then Exit Function
+    If IsError(v(LBound(v))) Or Not IsNumeric(v(LBound(v))) Then Exit Function
+    verb = 0
+    verb = CLng(v(LBound(v)))
+    If verb <> 102 And verb <> 103 Then Exit Function
+
+    ReplyBucket = "Unknown"
+    If VarType(v(LBound(v) + 1)) <> vbDate Then Exit Function
+    Dim doneAt As Date
+    doneAt = 0
+    doneAt = pa.UTCToLocalTime(CDate(v(LBound(v) + 1)))
+    If doneAt = 0 Then Exit Function
+
+    Dim hrs As Double
+    hrs = (CDbl(doneAt) - CDbl(receivedAt)) * 24#
+    If hrs < 1 Then
+        ReplyBucket = "H1"
+    ElseIf hrs < 4 Then
+        ReplyBucket = "H4"
+    ElseIf hrs < 24 Then
+        ReplyBucket = "H24"
+    ElseIf hrs < 72 Then
+        ReplyBucket = "D3"
+    Else
+        ReplyBucket = "D3P"
     End If
 End Function
 
@@ -1555,12 +2028,14 @@ End Function
 ' Sur un mail RECU, dit si l'utilisateur figure en A, en Cc, ou dans aucun
 ' des deux ("Indirect" : liste de diffusion, boite partagee, Cci).
 '
-' On lit les CHAINES .To et .CC, pas la collection Recipients : elles sont
-' deja resolues et ne coutent rien, alors qu'iterer Recipients rouvre l'item
-' et ramene le probleme des adresses au format EX. Contrepartie : la
-' reconnaissance repose sur les memes reperes que IsSentByUser - l'email de
-' la boite (4e champ de StatMailboxN) et le mot-cle (2e champ). Un panier
-' "Indirect" anormalement gros signalerait que ces reperes sont mal regles.
+' V25.3 (F9-08) : quand la boite connait l'adresse de l'utilisateur
+' (BuildStoreIdentities), on parcourt la collection Recipients (Type 1 = A,
+' 2 = Cc) et on compare les ADRESSES (modSmtp, cache par adresse Exchange).
+' Avant : les chaines .To / .CC (des NOMS affiches) etaient comparees au
+' mot-cle (nom de famille) - un homonyme en A alors que l'utilisateur
+' etait en Cc donnait "A". Le mot-cle sur .To / .CC ne sert plus qu'en
+' repli, pour une boite sans adresse connue. Un panier "Indirect"
+' anormalement gros signalerait des reperes mal regles.
 '
 ' Les trois categories totalisent 100 % : tout mail recu tombe dans une et
 ' une seule.
@@ -1569,18 +2044,52 @@ Private Function RecipientRole(mail As Object, storeName As String) As String
     On Error Resume Next
     RecipientRole = "Indirect"
 
+    Dim ids As Object
+    Set ids = StoreIdentity(storeName)
+    If Not ids Is Nothing Then
+        If ids.Count > 0 Then
+            Dim rcps As Object, r As Object, i As Long, n As Long, typ As Long, addr As String
+            Set rcps = Nothing
+            Set rcps = mail.Recipients
+            If rcps Is Nothing Then Exit Function
+            n = 0
+            n = rcps.Count
+            For i = 1 To n
+                Set r = Nothing
+                Set r = rcps.Item(i)
+                If Not r Is Nothing Then
+                    typ = 0
+                    typ = r.Type
+                    If typ = olTo Or typ = olCC Then
+                        addr = RecipientSmtpCached(r)
+                        If Len(addr) > 0 Then
+                            If ids.Exists(addr) Then
+                                If typ = olTo Then
+                                    RecipientRole = "To"
+                                    Exit Function
+                                End If
+                                RecipientRole = "Cc"   ' on cherche encore un A
+                            End If
+                        End If
+                    End If
+                End If
+            Next i
+            Exit Function
+        End If
+    End If
+
+    ' Repli (boite sans adresse connue) : mot-cle dans les chaines .To / .CC
     Dim toStr As String, ccStr As String
     toStr = LCase$(CStr(mail.To))
     ccStr = LCase$(CStr(mail.CC))
     If Len(toStr) = 0 And Len(ccStr) = 0 Then Exit Function
 
-    Dim userEmail As String, motCle As String
-    If dictStoreEmailUser.Exists(storeName) Then userEmail = LCase$(CStr(dictStoreEmailUser(storeName)))
+    Dim motCle As String
     If dictStoreKeyword.Exists(storeName) Then motCle = LCase$(CStr(dictStoreKeyword(storeName)))
 
-    If MatchesIdentity(toStr, userEmail, motCle) Then
+    If MatchesIdentity(toStr, "", motCle) Then
         RecipientRole = "To"
-    ElseIf MatchesIdentity(ccStr, userEmail, motCle) Then
+    ElseIf MatchesIdentity(ccStr, "", motCle) Then
         RecipientRole = "Cc"
     End If
 End Function
@@ -1596,29 +2105,33 @@ Private Function MatchesIdentity(hay As String, userEmail As String, motCle As S
     End If
 End Function
 
+'----------------------------------------------------------------------------
+' IsSentByUser - le mail vient-il de l'utilisateur ?
+' V25.3 (F9-08) : par ADRESSE des que la boite connait celle de
+' l'utilisateur (adresse de la boite ; pour la boite principale, toutes mes
+' adresses, alias compris). Le mot-cle ne sert qu'en repli, pour une boite
+' sans adresse connue. Avant : tous les prereglages forcaient le mode
+' mot-cle - tout expediteur dont le nom contenait le nom de famille de
+' l'utilisateur etait compte comme "moi" (homonymes, proches).
+'----------------------------------------------------------------------------
 Private Function IsSentByUser(senderAddr As String, senderName As String, storeName As String) As Boolean
     On Error Resume Next
     IsSentByUser = False
-    
-    Dim modeAdresse As Boolean
-    modeAdresse = True
-    If dictStoreAddressMode.Exists(storeName) Then modeAdresse = dictStoreAddressMode(storeName)
-    
-    If modeAdresse Then
-        Dim userEmail As String
-        If dictStoreEmailUser.Exists(storeName) Then userEmail = CStr(dictStoreEmailUser(storeName))
-        If Len(userEmail) > 0 And Len(senderAddr) > 0 Then
-            If InStr(LCase$(senderAddr), userEmail) > 0 Then
-                IsSentByUser = True
-            End If
+
+    Dim ids As Object
+    Set ids = StoreIdentity(storeName)
+    If Not ids Is Nothing Then
+        If ids.Count > 0 Then
+            If Len(senderAddr) > 0 Then IsSentByUser = ids.Exists(LCase$(senderAddr))
+            Exit Function
         End If
-    Else
-        Dim motCle As String
-        If dictStoreKeyword.Exists(storeName) Then motCle = CStr(dictStoreKeyword(storeName))
-        If Len(motCle) > 0 Then
-            If InStr(LCase$(senderName), motCle) > 0 Or InStr(LCase$(senderAddr), motCle) > 0 Then
-                IsSentByUser = True
-            End If
+    End If
+
+    Dim motCle As String
+    If dictStoreKeyword.Exists(storeName) Then motCle = CStr(dictStoreKeyword(storeName))
+    If Len(motCle) > 0 Then
+        If InStr(LCase$(senderName), motCle) > 0 Or InStr(LCase$(senderAddr), motCle) > 0 Then
+            IsSentByUser = True
         End If
     End If
 End Function
@@ -1640,14 +2153,14 @@ Private Function ExtractCurrentMessageLength(bodyText As String) As Long
     On Error Resume Next
     ExtractCurrentMessageLength = 0
     If Len(bodyText) = 0 Then Exit Function
-    
+
     Dim msgText As String
     msgText = bodyText
-    
+
     ' V22 : Test les marqueurs les plus frequents en premier
     Dim minPos As Long: minPos = Len(msgText) + 1
     Dim pos As Long
-    
+
     ' Marqueur 1 : "-----Original Message-----" / "-----Message d'origine-----"
     pos = InStr(1, msgText, "-----", vbTextCompare)
     If pos > 10 And pos < minPos Then
@@ -1658,163 +2171,54 @@ Private Function ExtractCurrentMessageLength(bodyText As String) As Long
             minPos = pos
         End If
     End If
-    
+
     ' Marqueur 2 : "________________________________" (32 underscores)
     pos = InStr(1, msgText, "________________________________", vbTextCompare)
     If pos > 10 And pos < minPos Then minPos = pos
-    
+
     ' Marqueur 3 : "From:" en debut de ligne
     pos = InStr(1, msgText, vbCrLf & "From:", vbTextCompare)
     If pos > 10 And pos < minPos Then minPos = pos
-    
+
     ' Marqueur 4 : "De :" en debut de ligne
     pos = InStr(1, msgText, vbCrLf & "De :", vbTextCompare)
     If pos > 10 And pos < minPos Then minPos = pos
-    
+
     ' Marqueur 5 : "Le " suivi de date (debut de reponse francaise)
+    ' V25.3 (F9-09) : seulement si la ligne (ou la suivante, l'en-tete etant
+    ' souvent coupe en deux) contient "a ecrit" ou "wrote" - "Le 12/11/2026
+    ' a 10:02, X a ecrit :". Avant : la premiere ligne du message commencant
+    ' par l'article "Le" coupait le message a cet endroit.
+    Dim segEnd As Long, seg As String
     pos = InStr(1, msgText, vbCrLf & "Le ", vbTextCompare)
-    If pos > 10 And pos < minPos Then minPos = pos
-    
+    Do While pos > 0 And pos < minPos
+        If pos > 10 Then
+            segEnd = InStr(pos + 2, msgText, vbCrLf)
+            If segEnd > 0 Then segEnd = InStr(segEnd + 2, msgText, vbCrLf)
+            If segEnd = 0 Then segEnd = Len(msgText) + 1
+            If segEnd - pos > 400 Then segEnd = pos + 400
+            seg = Mid$(msgText, pos, segEnd - pos)
+            If InStr(1, seg, "a " & Chr(233) & "crit", vbTextCompare) > 0 Or _
+               InStr(1, seg, "a ecrit", vbTextCompare) > 0 Or _
+               InStr(1, seg, "wrote", vbTextCompare) > 0 Then
+                minPos = pos
+                Exit Do
+            End If
+        End If
+        pos = InStr(pos + 2, msgText, vbCrLf & "Le ", vbTextCompare)
+    Loop
+
     If minPos <= Len(msgText) Then
         msgText = Left$(msgText, minPos - 1)
     End If
-    
+
     ' Nettoyer
     msgText = Replace(msgText, vbCrLf, " ")
     msgText = Replace(msgText, vbCr, " ")
     msgText = Replace(msgText, vbLf, " ")
     msgText = Trim$(msgText)
-    
+
     ExtractCurrentMessageLength = Len(msgText)
-End Function
-
-' ============================================================================
-' FONCTIONS DE RESOLUTION EXCHANGE FORCEE
-' ============================================================================
-' V23.4 : wrapper avec cache (cle = adresse EX du destinataire).
-Private Function ForceResolveRecipientSMTP(recip As Object, ByRef outName As String) As String
-    On Error Resume Next
-    ForceResolveRecipientSMTP = ""
-    outName = recip.Name
-    
-    Dim ck As String
-    ck = ""
-    ck = CStr(recip.Address)
-    If Len(ck) > 0 Then
-        If dictResolveCache Is Nothing Then Set dictResolveCache = CreateObject("Scripting.Dictionary")
-        If dictResolveCache.Exists(ck) Then
-            ForceResolveRecipientSMTP = dictResolveCache(ck)
-            Exit Function
-        End If
-    End If
-    
-    ForceResolveRecipientSMTP = ForceResolveRecipientDirect(recip)
-    If Len(ck) > 0 Then dictResolveCache(ck) = ForceResolveRecipientSMTP
-End Function
-
-Private Function ForceResolveRecipientDirect(recip As Object) As String
-    On Error Resume Next
-    ForceResolveRecipientDirect = ""
-    
-    Dim addrEntry As Object
-    Set addrEntry = recip.AddressEntry
-    If addrEntry Is Nothing Then Exit Function
-    
-    If addrEntry.Type = "SMTP" Then
-        ForceResolveRecipientDirect = LCase$(CStr(addrEntry.Address))
-        Exit Function
-    End If
-    
-    Dim exUser As Object
-    Set exUser = addrEntry.GetExchangeUser
-    If Not exUser Is Nothing Then
-        If Len(exUser.PrimarySmtpAddress) > 0 Then
-            ForceResolveRecipientDirect = LCase$(CStr(exUser.PrimarySmtpAddress))
-            Exit Function
-        End If
-    End If
-    
-    Dim exDL As Object
-    Set exDL = addrEntry.GetExchangeDistributionList
-    If Not exDL Is Nothing Then
-        If Len(exDL.PrimarySmtpAddress) > 0 Then
-            ForceResolveRecipientDirect = LCase$(CStr(exDL.PrimarySmtpAddress))
-            Exit Function
-        End If
-    End If
-    
-    Dim propVal As Variant
-    propVal = addrEntry.PropertyAccessor.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x39FE001F")
-    If Len(propVal) > 0 Then
-        ForceResolveRecipientDirect = LCase$(CStr(propVal))
-        Exit Function
-    End If
-    
-    ForceResolveRecipientDirect = CStr(addrEntry.Address)
-End Function
-
-' V23.4 : wrapper avec cache (cle = adresse EX de l'expediteur).
-Private Function ForceResolveSenderSMTP(mail As Object) As String
-    On Error Resume Next
-    ForceResolveSenderSMTP = ""
-    
-    If mail.SenderEmailType = "SMTP" Then
-        ForceResolveSenderSMTP = LCase$(CStr(mail.SenderEmailAddress))
-        Exit Function
-    End If
-    
-    Dim ck As String
-    ck = ""
-    ck = CStr(mail.SenderEmailAddress)
-    If Len(ck) > 0 Then
-        If dictResolveCache Is Nothing Then Set dictResolveCache = CreateObject("Scripting.Dictionary")
-        If dictResolveCache.Exists(ck) Then
-            ForceResolveSenderSMTP = dictResolveCache(ck)
-            Exit Function
-        End If
-    End If
-    
-    ForceResolveSenderSMTP = ForceResolveSenderDirect(mail)
-    If Len(ck) > 0 Then dictResolveCache(ck) = ForceResolveSenderSMTP
-End Function
-
-Private Function ForceResolveSenderDirect(mail As Object) As String
-    On Error Resume Next
-    ForceResolveSenderDirect = ""
-    
-    Dim sender As Object
-    Set sender = mail.Sender
-    If sender Is Nothing Then
-        ForceResolveSenderDirect = CStr(mail.SenderEmailAddress)
-        Exit Function
-    End If
-    
-    Dim exUser As Object
-    Set exUser = sender.GetExchangeUser
-    If Not exUser Is Nothing Then
-        If Len(exUser.PrimarySmtpAddress) > 0 Then
-            ForceResolveSenderDirect = LCase$(CStr(exUser.PrimarySmtpAddress))
-            Exit Function
-        End If
-    End If
-    
-    Dim exDL As Object
-    Set exDL = sender.GetExchangeDistributionList
-    If Not exDL Is Nothing Then
-        If Len(exDL.PrimarySmtpAddress) > 0 Then
-            ForceResolveSenderDirect = LCase$(CStr(exDL.PrimarySmtpAddress))
-            Exit Function
-        End If
-    End If
-    
-    Dim propVal As Variant
-    propVal = sender.PropertyAccessor.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x39FE001F")
-    If Len(propVal) > 0 Then
-        ForceResolveSenderDirect = LCase$(CStr(propVal))
-        Exit Function
-    End If
-    
-    ForceResolveSenderDirect = CStr(mail.SenderEmailAddress)
 End Function
 
 ' ============================================================================
@@ -1851,12 +2255,12 @@ End Function
 Private Function IsValidSMTPAddress(addr As String) As Boolean
     IsValidSMTPAddress = False
     If Len(addr) = 0 Then Exit Function
-    
+
     Dim atPos As Long
     atPos = InStr(addr, "@")
     If atPos <= 1 Then Exit Function
     If Left$(UCase$(addr), 3) = "/O=" Then Exit Function
-    
+
     If Len(addr) > atPos + 2 Then
         If InStr(atPos, addr, ".") > atPos Then
             IsValidSMTPAddress = True
@@ -1867,17 +2271,13 @@ End Function
 Private Function ExtractDomain(emailAddr As String) As String
     ExtractDomain = ""
     If Len(emailAddr) = 0 Then Exit Function
-    
+
     Dim atPos As Long
     atPos = InStr(emailAddr, "@")
     If atPos > 0 And atPos < Len(emailAddr) Then
         ExtractDomain = Mid$(emailAddr, atPos + 1)
     End If
 End Function
-
-' ============================================================================
-' FIN DU MODULE 1 V22
-' ============================================================================
 
 ' ============================================================================
 ' ============================================================================
@@ -1932,71 +2332,80 @@ Private Function ResolveDesktopPath() As String
 End Function
 
 '============================================================================
-' V24 - Dossier de sortie du rapport : le meme que config.ini et debug.log
-' (<Bureau>\Macro VBA\Outlook). Repli sur la racine du Bureau si absent.
+' V24 - Dossier de sortie du rapport (et, V25.2, du journal de bord).
+' V25.2 : dossier Sorties de ClassicOutlook-Toolkit, donne par
+' modConfig.MacroVBADir() (<outil>\Sorties ; ancien emplacement : le dossier
+' lui-meme, a cote de config.ini et de debug.log). Ce module tourne dans le
+' projet VBA d'Outlook, a cote de modConfig (il en utilise deja T() / A()).
+' Repli sur la racine du Bureau si le dossier est inaccessible.
 '============================================================================
 Private Function ReportFolderPath() As String
     On Error Resume Next
-    Dim d As String
-    d = ResolveDesktopPath() & "\Macro VBA\Outlook"
-    If Len(Dir$(d, vbDirectory)) = 0 Then d = ResolveDesktopPath()
+    Dim d As String, fso As Object
+    d = ""
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    If Not (fso Is Nothing) Then
+        d = modConfig.MacroVBADir()
+        If Len(d) > 0 Then
+            If Not fso.FolderExists(d) Then fso.CreateFolder d
+            If Not fso.FolderExists(d) Then d = ""
+        End If
+    End If
+    If Len(d) = 0 Then d = ResolveDesktopPath()
     ReportFolderPath = d
 End Function
 
+' ----------------------------------------------------------------------------
+' GenerateExcelReport
+' V25.1 : chaque feuille est construite via BuildSheet, qui a son propre
+' gestionnaire d'erreur. Une feuille en echec est tracee (EmailAnalytics_
+' trace.log) mais n'empeche plus l'enregistrement du rapport.
+' ----------------------------------------------------------------------------
 Public Function GenerateExcelReport() As String
     On Error GoTo ErrorHandler
-    
+
     Heartbeat "GENERATION RAPPORT EXCEL"
-    
+
     Dim xlApp As Object, xlWB As Object, filePath As String
-    
+
     Set xlApp = CreateObject("Excel.Application")
     xlApp.Visible = False
     xlApp.DisplayAlerts = False
-    
+
     Set xlWB = xlApp.Workbooks.Add
-    
-    ' V22 : Optimisations de performance Excel
-    ' V23.7 : deplacees APRES Workbooks.Add (Calculation exige un classeur
-    ' ouvert, sinon erreur 1004) et protegees : pure optimisation, ne doit
-    ' jamais empecher la generation du rapport.
+
+    ' V23.7 : apres Workbooks.Add, protege (pure optimisation)
     On Error Resume Next
     xlApp.ScreenUpdating = False
     xlApp.Calculation = -4135  ' xlCalculationManual
     xlApp.EnableEvents = False
     On Error GoTo ErrorHandler
-    
-    ' Supprimer toutes les feuilles par defaut sauf une
+
     Do While xlWB.Worksheets.Count > 1
         xlWB.Worksheets(xlWB.Worksheets.Count).Delete
     Loop
     xlWB.Worksheets(1).Name = "TempSheet"
 
-    ' V24 : _ETAT existe AVANT toutes les autres feuilles - les graphiques
-    ' doivent pouvoir y pointer au moment ou ils sont construits.
-    Call CreateSheetState(xlWB)
-    
-    ' Creer toutes les feuilles
-    Call CreateSheetDashboard(xlWB)
-    Call CreateSheetResume(xlWB)
-    Call CreateSheetParHeure(xlWB)
-    Call CreateSheetParJourSemaine(xlWB)
-    Call CreateSheetParMois(xlWB)
-    Call CreateSheetParAnnee(xlWB)
-    Call CreateSheetEvolutions(xlWB)
-    Call CreateSheetHeatmaps(xlWB)
-    Call CreateSheetContacts(xlWB)
-    Call CreateSheetContactsInternalExternal(xlWB)
-    Call CreateSheetNbRecipients(xlWB)
-    
-    If g_AnalyzeLength Then
-        Call CreateSheetLongueurMessages(xlWB)
-    End If
-    
-    Call CreateSheetToCc(xlWB)
-    Call CreateSheetDATA(xlWB)
-    Call FillStateSheet(xlWB)
-    
+    ' V24 : _ETAT existe AVANT toutes les autres feuilles
+    BuildSheet xlWB, "State"
+
+    BuildSheet xlWB, "Dashboard"
+    BuildSheet xlWB, "Resume"
+    BuildSheet xlWB, "ParHeure"
+    BuildSheet xlWB, "ParJourSemaine"
+    BuildSheet xlWB, "ParMois"
+    BuildSheet xlWB, "ParAnnee"
+    BuildSheet xlWB, "Evolutions"
+    BuildSheet xlWB, "Heatmaps"
+    BuildSheet xlWB, "Contacts"
+    BuildSheet xlWB, "ContactsIntExt"
+    BuildSheet xlWB, "NbRecipients"
+    If g_AnalyzeLength Then BuildSheet xlWB, "LongueurMessages"
+    BuildSheet xlWB, "ToCc"
+    BuildSheet xlWB, "Replies"          ' V25.3 (F9-15)
+    BuildSheet xlWB, "DATA"
+    BuildSheet xlWB, "FillState"
+
     ' Supprimer les feuilles parasites
     On Error Resume Next
     xlApp.DisplayAlerts = False
@@ -2009,55 +2418,109 @@ Public Function GenerateExcelReport() As String
         End If
     Next i
     On Error GoTo ErrorHandler
-    
-    ' V24 : un seul point d'entree pour la finition - graphiques flottants,
-    ' onglets colores, volets figes, filtres. Centralise volontairement :
-    ' 14 modifications dispersees dans les constructeurs de feuilles
-    ' seraient impossibles a verifier.
-    Call PolishWorkbook(xlWB)
 
+    BuildSheet xlWB, "Polish"
+
+    On Error Resume Next
     xlWB.Worksheets(1).Activate
-    
+    On Error GoTo ErrorHandler
+
+    ' V25.3 (F9-02) : "DELTA" pour une mise a jour (la reprise suivante
+    ' accepte FULL et DELTA, jamais TEST).
     Dim modeStr As String
-    modeStr = IIf(g_TestMode, "TEST", "FULL")
-    ' V24 : range a cote de config.ini et debug.log, plus a la racine du Bureau.
+    If g_TestMode Then
+        modeStr = "TEST"
+    ElseIf g_DeltaMode Then
+        modeStr = "DELTA"
+    Else
+        modeStr = "FULL"
+    End If
     filePath = ReportFolderPath() & "\Stats_Emails_" & modeStr & "_" & Format(Now, "YYYYMMDD_HHMMSS") & ".xlsx"
-    
+
     xlWB.SaveAs filePath, 51
-    
+
     Heartbeat "RAPPORT ECRIT: " & filePath
-    
-    ' V22 : Restauration des parametres (V23.7 : protegee, cosmetique)
+
     On Error Resume Next
     xlApp.ScreenUpdating = True
     xlApp.Calculation = -4105  ' xlCalculationAutomatic
     xlApp.EnableEvents = True
+    xlApp.DisplayAlerts = True ' V25.3 : Excel rendu a l'utilisateur avec ses alertes
     xlApp.Visible = True
     xlWB.Activate
     On Error GoTo ErrorHandler
-    
+
     GenerateExcelReport = filePath
     Exit Function
-    
+
 ErrorHandler:
-    Debug.Print "[GenerateExcelReport] Erreur " & Err.Number & " : " & Err.Description
+    ' V25.3 (F9-04) : erreur gardee pour le message final ; un classeur deja
+    ' construit n'est plus jete (xlWB.Close False + Quit detruisaient un
+    ' rapport complet, par exemple quand le dossier Sorties refusait
+    ' l'enregistrement) : il reste ouvert dans Excel, a enregistrer a la
+    ' main. Err capture AVANT Heartbeat (On Error Resume Next le remet a 0).
+    m_ReportError = Err.Number & " - " & Err.Description
+    Heartbeat "!!! GenerateExcelReport erreur " & m_ReportError
+    modDebugLog.DError MOD_NAME, "Rapport Excel : erreur " & m_ReportError
     GenerateExcelReport = ""
     On Error Resume Next
     If Not xlApp Is Nothing Then
         xlApp.ScreenUpdating = True
         xlApp.Calculation = -4105
         xlApp.EnableEvents = True
+        xlApp.DisplayAlerts = True
     End If
-    If Not xlWB Is Nothing Then xlWB.Close False
-    If Not xlApp Is Nothing Then xlApp.Quit
+    If Not xlWB Is Nothing Then
+        xlApp.Visible = True
+        xlApp.UserControl = True     ' Excel reste ouvert une fois la reference relachee
+        xlWB.Activate
+        m_ReportLeftOpen = True
+    ElseIf Not xlApp Is Nothing Then
+        xlApp.Quit
+    End If
 End Function
+
+' ----------------------------------------------------------------------------
+' BuildSheet - construit UNE feuille, isole ses erreurs.
+' Une erreur dans un constructeur sans gestionnaire remonte ici (et plus
+' jusqu'a GenerateExcelReport) : elle est tracee, la generation continue.
+' ----------------------------------------------------------------------------
+Private Sub BuildSheet(ByRef xlWB As Object, ByVal which As String)
+    On Error GoTo Fail
+    Select Case which
+        Case "State":            CreateSheetState xlWB
+        Case "Dashboard":        CreateSheetDashboard xlWB
+        Case "Resume":           CreateSheetResume xlWB
+        Case "ParHeure":         CreateSheetParHeure xlWB
+        Case "ParJourSemaine":   CreateSheetParJourSemaine xlWB
+        Case "ParMois":          CreateSheetParMois xlWB
+        Case "ParAnnee":         CreateSheetParAnnee xlWB
+        Case "Evolutions":       CreateSheetEvolutions xlWB
+        Case "Heatmaps":         CreateSheetHeatmaps xlWB
+        Case "Contacts":         CreateSheetContacts xlWB
+        Case "ContactsIntExt":   CreateSheetContactsInternalExternal xlWB
+        Case "NbRecipients":     CreateSheetNbRecipients xlWB
+        Case "LongueurMessages": CreateSheetLongueurMessages xlWB
+        Case "ToCc":             CreateSheetToCc xlWB
+        Case "Replies":          CreateSheetReplies xlWB
+        Case "DATA":             CreateSheetDATA xlWB
+        Case "FillState":        FillStateSheet xlWB
+        Case "Polish":           PolishWorkbook xlWB
+    End Select
+    Exit Sub
+Fail:
+    Dim errTxt As String
+    errTxt = Err.Number & " - " & Err.Description   ' avant Heartbeat (remet Err a zero)
+    Heartbeat "!!! FEUILLE " & which & " : erreur " & errTxt
+    modDebugLog.DError MOD_NAME, "Feuille " & which & " : erreur " & errTxt
+End Sub
 
 ' ============================================================================
 ' DASHBOARD - V22 (ecriture par bloc)
 ' ============================================================================
 Private Sub CreateSheetDashboard(ByRef xlWB As Object)
     On Error Resume Next
-    
+
     Dim ws As Object
     Set ws = xlWB.Worksheets.Add(After:=xlWB.Worksheets(xlWB.Worksheets.Count))
     ws.Name = T("Tableau de bord", "Dashboard")
@@ -2067,39 +2530,39 @@ Private Sub CreateSheetDashboard(ByRef xlWB As Object)
     ' des colonnes de la feuille visible.
     Dim wsState As Object
     Set wsState = StateSheet(xlWB)
-    
+
     ws.Cells(1, 1).Value = T("TABLEAU DE BORD - ANALYSE DES EMAILS (", "DASHBOARD - EMAIL ANALYSIS (") & APP_VERSION & ")"
     ws.Cells(1, 1).Font.Bold = True
     ws.Cells(1, 1).Font.Size = 16
-    
+
     ws.Cells(2, 1).Value = T("G~en~er~e le ", "Generated on ") & Format(Now, "DD/MM/YYYY HH:MM")
     ws.Cells(2, 1).Font.Italic = True
-    
+
     If g_TestMode Then
         ws.Cells(2, 4).Value = T("MODE TEST (~echantillon)", "TEST MODE (sample)")
         ws.Cells(2, 4).Font.Color = RGB(255, 0, 0)
         ws.Cells(2, 4).Font.Bold = True
     End If
-    
+
     ws.Cells(4, 1).Value = T("STATISTIQUES GLOBALES", "GLOBAL STATISTICS")
     ws.Cells(4, 1).Font.Bold = True
     ws.Cells(4, 1).Font.Size = 12
-    
+
     If dictStoreStats Is Nothing Then
         ws.Cells(5, 1).Value = T("Erreur : aucune donn~ee disponible (dictStoreStats vide)", "Error: no data available (dictStoreStats empty)")
         Exit Sub
     End If
-    
+
     Dim totalSent As Long, totalReceived As Long, totalEmails As Long, k As Variant
     totalSent = 0
     totalReceived = 0
-    
+
     For Each k In dictStoreStats.Keys
         If InStr(CStr(k), "|Sent") > 0 Then totalSent = totalSent + dictStoreStats(k)
         If InStr(CStr(k), "|Received") > 0 Then totalReceived = totalReceived + dictStoreStats(k)
     Next k
     totalEmails = totalSent + totalReceived
-    
+
     ' V22 : Ecriture par bloc (array) pour les stats globales
     Dim statsArr(1 To 4, 1 To 2) As Variant
     statsArr(1, 1) = T("Total emails analys~es :", "Total emails analyzed:"): statsArr(1, 2) = totalEmails
@@ -2108,11 +2571,11 @@ Private Sub CreateSheetDashboard(ByRef xlWB As Object)
     statsArr(4, 1) = T("Nombre de bo~ites :", "Number of mailboxes:"): statsArr(4, 2) = dictStoreColors.Count
     ws.Range("A5:B8").Value = statsArr
     ws.Range("B5:B7").NumberFormat = "#,##0"
-    
+
     ws.Cells(10, 1).Value = T("BO~ITES ANALYS~EES", "MAILBOXES ANALYZED")
     ws.Cells(10, 1).Font.Bold = True
     ws.Cells(10, 1).Font.Size = 12
-    
+
     ' Headers en bloc
     Dim headerArr(1 To 1, 1 To 4) As Variant
     headerArr(1, 1) = T("Bo~ite", "Mailbox")
@@ -2121,15 +2584,15 @@ Private Sub CreateSheetDashboard(ByRef xlWB As Object)
     headerArr(1, 4) = T("Total", "Total")
     ws.Range("A11:D11").Value = headerArr
     ws.Range("A11:D11").Font.Bold = True
-    
+
     Dim storeData As Object: Set storeData = CreateObject("Scripting.Dictionary")
     Dim storeName As Variant
     For Each storeName In dictStoreColors.Keys
         storeData(CStr(storeName)) = GetDictValue(dictStoreStats, CStr(storeName) & "|Total")
     Next storeName
-    
+
     Dim sortedStores As Variant: sortedStores = GetSortedKeysByValueDesc(storeData)
-    
+
     ' V22 : Preparer les donnees en array puis ecrire en un seul coup
     Dim nStores As Long
     If IsArray(sortedStores) Then
@@ -2137,7 +2600,7 @@ Private Sub CreateSheetDashboard(ByRef xlWB As Object)
     Else
         nStores = 0
     End If
-    
+
     If nStores > 0 Then
         Dim dataArr() As Variant
         ReDim dataArr(1 To nStores, 1 To 4)
@@ -2150,9 +2613,9 @@ Private Sub CreateSheetDashboard(ByRef xlWB As Object)
             dataArr(rowIdx, 3) = GetDictValue(dictStoreStats, CStr(sn) & "|Received")
             dataArr(rowIdx, 4) = GetDictValue(dictStoreStats, CStr(sn) & "|Total")
         Next sn
-        
+
         ws.Range(ws.Cells(12, 1), ws.Cells(11 + nStores, 4)).Value = dataArr
-        
+
         ' Couleurs (doit se faire cellule par cellule)
         Dim row As Long: row = 12
         For Each sn In sortedStores
@@ -2160,35 +2623,35 @@ Private Sub CreateSheetDashboard(ByRef xlWB As Object)
             ws.Cells(row, 1).Font.Color = RGB(255, 255, 255)
             row = row + 1
         Next sn
-        
+
         Dim lastRowMailboxes As Long: lastRowMailboxes = 11 + nStores
         ws.Range("B12:D" & lastRowMailboxes).NumberFormat = "#,##0"
-        
+
         ' === Donnees pour graphiques (colonne J) ===
         Dim dataCol As Long: dataCol = 10
-        
+
         Dim pieArr1(1 To 3, 1 To 2) As Variant
         pieArr1(1, 1) = "Type": pieArr1(1, 2) = "Nombre"
         pieArr1(2, 1) = T("Envoy~es", "Sent"): pieArr1(2, 2) = totalSent
         pieArr1(3, 1) = T("Re" & Chr(231) & "us", "Received"): pieArr1(3, 2) = totalReceived
         wsState.Range("A2:B4").Value = pieArr1      ' V24 : source hors feuille visible
-        
+
         Dim totalInternal As Long, totalExternal As Long, totalUnknown As Long
         totalInternal = GetDictValue(dictInternalExternal, "_TOTAL|Internal")
         totalExternal = GetDictValue(dictInternalExternal, "_TOTAL|External")
         totalUnknown = GetDictValue(dictInternalExternal, "_TOTAL|Unknown")
-        
+
         Dim pieArr2(1 To 4, 1 To 2) As Variant
         pieArr2(1, 1) = "Type": pieArr2(1, 2) = "Nombre"
         pieArr2(2, 1) = T("Interne", "Internal"): pieArr2(2, 2) = totalInternal
         pieArr2(3, 1) = T("Externe", "External"): pieArr2(3, 2) = totalExternal
         pieArr2(4, 1) = T("Inconnu", "Unknown"): pieArr2(4, 2) = totalUnknown
         wsState.Range("A6:B9").Value = pieArr2      ' V24
-        
+
         ' === CREATION DES GRAPHIQUES ===
         Dim chartLeft As Long: chartLeft = 320
         Dim chartObj As Object
-        
+
         ' Graphique 1 : Camembert Envoyes/Recus
         If totalSent + totalReceived > 0 Then
             On Error Resume Next
@@ -2217,7 +2680,7 @@ Private Sub CreateSheetDashboard(ByRef xlWB As Object)
             End If
             On Error GoTo 0
         End If
-        
+
         ' Graphique 2 : Volume par boite
         If lastRowMailboxes >= 12 Then
             On Error Resume Next
@@ -2234,7 +2697,7 @@ Private Sub CreateSheetDashboard(ByRef xlWB As Object)
             End If
             On Error GoTo 0
         End If
-        
+
         ' Graphique 3 : Camembert Interne/Externe
         If totalInternal + totalExternal + totalUnknown > 0 Then
             On Error Resume Next
@@ -2265,7 +2728,7 @@ Private Sub CreateSheetDashboard(ByRef xlWB As Object)
             On Error GoTo 0
         End If
     End If
-    
+
     ws.Columns("A:D").AutoFit
     ' V23.8 : donnees sources des camemberts masquees (colonnes J:K)
     ' V24 : plus de colonnes masquees. Les sources des camemberts vivent
@@ -2279,26 +2742,43 @@ End Sub
 ' ============================================================================
 Private Sub CreateSheetResume(ByRef xlWB As Object)
     On Error GoTo ErrHandler
-    
+
     Dim ws As Object
     Set ws = xlWB.Worksheets.Add(After:=xlWB.Worksheets(xlWB.Worksheets.Count))
     ws.Name = T("R~esum~e", "Summary")
-    
+
     ws.Cells(1, 1).Value = T("R~ESUM~E DE L'ANALYSE", "ANALYSIS SUMMARY")
     ws.Cells(1, 1).Font.Bold = True
     ws.Cells(1, 1).Font.Size = 14
-    
+
     ws.Cells(3, 1).Value = T("PARAM~fTRES", "PARAMETERS")
     ws.Cells(3, 1).Font.Bold = True
-    
+
     ' V22 : Ecriture par bloc pour les parametres
+    ' V25.3 (F9-02) : periode CUMULEE (debut de l'analyse complete d'origine
+    ' en delta) ; la ligne 3 dit ce qu'une mise a jour a ajoute (elle
+    ' remplace "Resolution Exchange", supprimee par F9-07).
     Dim paramArr(1 To 6, 1 To 2) As Variant
     paramArr(1, 1) = T("Mode :", "Mode:")
-    paramArr(1, 2) = IIf(g_TestMode, T("Test (1/", "Test (1/") & TEST_SAMPLING & ")", T("Complet", "Full"))
+    If g_TestMode Then
+        paramArr(1, 2) = T("Test (1/", "Test (1/") & TEST_SAMPLING & ")"
+    ElseIf g_DeltaMode Then
+        paramArr(1, 2) = T("Mise ~a jour (delta)", "Update (delta)")
+    Else
+        paramArr(1, 2) = T("Complet", "Full")
+    End If
     paramArr(2, 1) = T("P~eriode :", "Period:")
-    paramArr(2, 2) = Format(g_PeriodStart, "DD/MM/YYYY") & " - " & Format(g_PeriodEnd, "DD/MM/YYYY")
-    paramArr(3, 1) = T("R~esolution Exchange :", "Exchange resolution:")
-    paramArr(3, 2) = IIf(g_UseExchangeResolution, T("Oui", "Yes"), T("Non", "No"))
+    paramArr(2, 2) = Format(ReportPeriodStart(), "DD/MM/YYYY") & " - " & Format(g_PeriodEnd, "DD/MM/YYYY hh:nn")
+    paramArr(3, 1) = T("Mise ~a jour :", "Update:")
+    If g_DeltaMode Then
+        paramArr(3, 2) = T("mails ajout~es apr~fs le ", "mail added after ") & _
+                         Format(g_PeriodStart, "DD/MM/YYYY hh:nn") & " - " & _
+                         T("base : ", "base: ") & FileNameOf(g_DeltaSourcePath) & " - " & _
+                         T("feuilles DATA et Longueur : mails ajout~es seulement", _
+                           "DATA and Length sheets: added mail only")
+    Else
+        paramArr(3, 2) = T("Non", "No")
+    End If
     paramArr(4, 1) = T("Analyse longueur :", "Length analysis:")
     paramArr(4, 2) = IIf(g_AnalyzeLength, T("Oui", "Yes"), T("Non", "No"))
     paramArr(5, 1) = T("Date de g~en~eration :", "Generation date:")
@@ -2306,10 +2786,10 @@ Private Sub CreateSheetResume(ByRef xlWB As Object)
     paramArr(6, 1) = T("Version :", "Version:")
     paramArr(6, 2) = APP_VERSION
     ws.Range("A4:B9").Value = paramArr
-    
+
     ws.Cells(11, 1).Value = T("STATISTIQUES PAR BO~ITE", "STATISTICS BY MAILBOX")
     ws.Cells(11, 1).Font.Bold = True
-    
+
     ' Headers
     Dim headerArr(1 To 1, 1 To 7) As Variant
     headerArr(1, 1) = T("Bo~ite", "Mailbox")
@@ -2321,40 +2801,39 @@ Private Sub CreateSheetResume(ByRef xlWB As Object)
     headerArr(1, 7) = T("% Env", "% Sent")
     ws.Range("A12:G12").Value = headerArr
     ws.Range("A12:G12").Font.Bold = True
-    
+
     ' V22 : Preparer toutes les donnees en array puis ecrire en une fois
     Dim nStores As Long
     nStores = dictStoreColors.Count
-    
+
     If nStores > 0 Then
         Dim dataArr() As Variant
         ReDim dataArr(1 To nStores, 1 To 7)
-        
+
         Dim idx As Long: idx = 0
         Dim storeName As Variant
         Dim sent As Long, recv As Long, total As Long
-        
+
         For Each storeName In dictStoreColors.Keys
             idx = idx + 1
             sent = GetDictValue(dictStoreStats, CStr(storeName) & "|Sent")
             recv = GetDictValue(dictStoreStats, CStr(storeName) & "|Received")
             total = GetDictValue(dictStoreStats, CStr(storeName) & "|Total")
-            
+
             dataArr(idx, 1) = storeName
             If dictStoreDomains.Exists(CStr(storeName)) Then
                 dataArr(idx, 2) = dictStoreDomains(CStr(storeName))
             End If
-            If dictStoreAddressMode.Exists(CStr(storeName)) Then
-                dataArr(idx, 3) = IIf(dictStoreAddressMode(CStr(storeName)), T("Adresse", "Address"), T("Mot-cl~e", "Keyword"))
-            End If
+            ' V25.3 (F9-08) : reperage reellement utilise pour la boite
+            dataArr(idx, 3) = IIf(StoreUsesAddress(CStr(storeName)), T("Adresse", "Address"), T("Mot-cl~e", "Keyword"))
             dataArr(idx, 4) = sent
             dataArr(idx, 5) = recv
             dataArr(idx, 6) = total
             If total > 0 Then dataArr(idx, 7) = sent / total
         Next storeName
-        
+
         ws.Range(ws.Cells(13, 1), ws.Cells(12 + nStores, 7)).Value = dataArr
-        
+
         ' Coloration cellule par cellule (necessaire)
         Dim row As Long: row = 13
         For Each storeName In dictStoreColors.Keys
@@ -2362,17 +2841,32 @@ Private Sub CreateSheetResume(ByRef xlWB As Object)
             ws.Cells(row, 1).Font.Color = RGB(255, 255, 255)
             row = row + 1
         Next storeName
-        
+
         ws.Range("D13:F" & (12 + nStores)).NumberFormat = "#,##0"
         ws.Range("G13:G" & (12 + nStores)).NumberFormat = "0.0%"
     End If
-    
+
     ws.Columns("A:G").AutoFit
     Exit Sub
-    
+
 ErrHandler:
-    Debug.Print "[CreateSheetResume] Erreur " & Err.Number & " : " & Err.Description
+    modDebugLog.DError MOD_NAME, "Feuille Resume : erreur " & Err.Number & " - " & Err.Description
 End Sub
+
+' V25.3 : debut de la periode couverte par le rapport (en delta : celui de
+' l'analyse complete d'origine, relu dans _ETAT).
+Private Function ReportPeriodStart() As Date
+    If g_DeltaMode And m_DeltaBaseStart > 0 Then
+        ReportPeriodStart = m_DeltaBaseStart
+    Else
+        ReportPeriodStart = g_PeriodStart
+    End If
+End Function
+
+' V25.3 : nom de fichier seul (sans dossier).
+Private Function FileNameOf(ByVal fullPath As String) As String
+    FileNameOf = Mid$(fullPath, InStrRev(fullPath, "\") + 1)
+End Function
 
 ' ============================================================================
 ' PAR JOUR DE LA SEMAINE - V22
@@ -2381,17 +2875,17 @@ Private Sub CreateSheetParJourSemaine(ByRef xlWB As Object)
     Dim ws As Object
     Set ws = xlWB.Worksheets.Add(After:=xlWB.Worksheets(xlWB.Worksheets.Count))
     ws.Name = T("Par jour", "Per weekday")
-    
+
     ws.Cells(1, 1).Value = T("R~EPARTITION PAR JOUR DE LA SEMAINE", "BREAKDOWN BY DAY OF WEEK")
     ws.Cells(1, 1).Font.Bold = True
-    
+
     ' V22 : Tout en array
     Dim dataArr(1 To 8, 1 To 4) As Variant
     dataArr(1, 1) = T("Jour", "Day"): dataArr(1, 2) = T("Envoy~es", "Sent"): dataArr(1, 3) = T("Re" & Chr(231) & "us", "Received"): dataArr(1, 4) = T("Total", "Total")
-    
+
     Dim dayNames As Variant
     dayNames = DayNames()
-    
+
     Dim d As Long
     For d = 1 To 7
         dataArr(d + 1, 1) = dayNames(d - 1)
@@ -2399,11 +2893,11 @@ Private Sub CreateSheetParJourSemaine(ByRef xlWB As Object)
         dataArr(d + 1, 3) = GetDictValue(dictDayOfWeek, d & "|Received")
         dataArr(d + 1, 4) = GetDictValue(dictDayOfWeek, d & "|Total")
     Next d
-    
+
     ws.Range("A3:D10").Value = dataArr
     ws.Range("A3:D3").Font.Bold = True
     ws.Range("B4:D10").NumberFormat = "#,##0"
-    
+
     On Error Resume Next
     Dim chart1 As Object
     Set chart1 = ws.ChartObjects.Add(Left:=300, Top:=40, Width:=500, Height:=320)
@@ -2426,14 +2920,14 @@ Private Sub CreateSheetParHeure(ByRef xlWB As Object)
     Dim ws As Object
     Set ws = xlWB.Worksheets.Add(After:=xlWB.Worksheets(xlWB.Worksheets.Count))
     ws.Name = T("Par heure", "Per hour")
-    
+
     ws.Cells(1, 1).Value = T("R~EPARTITION PAR HEURE", "BREAKDOWN BY HOUR")
     ws.Cells(1, 1).Font.Bold = True
-    
+
     ' V22 : Tout en array
     Dim dataArr(1 To 25, 1 To 4) As Variant
     dataArr(1, 1) = T("Heure", "Hour"): dataArr(1, 2) = T("Envoy~es", "Sent"): dataArr(1, 3) = T("Re" & Chr(231) & "us", "Received"): dataArr(1, 4) = T("Total", "Total")
-    
+
     Dim h As Long
     Dim hStr As String
     For h = 0 To 23
@@ -2443,11 +2937,11 @@ Private Sub CreateSheetParHeure(ByRef xlWB As Object)
         dataArr(h + 2, 3) = GetDictValue(dictHourly, hStr & "|Received")
         dataArr(h + 2, 4) = GetDictValue(dictHourly, hStr & "|Total")
     Next h
-    
+
     ws.Range("A3:D27").Value = dataArr
     ws.Range("A3:D3").Font.Bold = True
     ws.Range("B4:D27").NumberFormat = "#,##0"
-    
+
     On Error Resume Next
     Dim chart1 As Object
     Set chart1 = ws.ChartObjects.Add(Left:=300, Top:=40, Width:=600, Height:=380)
@@ -2470,16 +2964,16 @@ Public Function GetSortedKeysByValueDesc(dict As Object) As Variant
     Dim keys As Variant, vals As Variant
     Dim i As Long, j As Long
     Dim tempK As Variant, tempV As Variant, count As Long
-    
+
     count = dict.Count
     If count = 0 Then
         GetSortedKeysByValueDesc = Array()
         Exit Function
     End If
-    
+
     ReDim keys(0 To count - 1)
     ReDim vals(0 To count - 1)
-    
+
     i = 0
     Dim k As Variant
     For Each k In dict.Keys
@@ -2487,7 +2981,7 @@ Public Function GetSortedKeysByValueDesc(dict As Object) As Variant
         vals(i) = dict(k)
         i = i + 1
     Next k
-    
+
     ' Tri par insertion pour petites listes, tri rapide pour grandes
     If count < 30 Then
         For i = 0 To count - 2
@@ -2502,7 +2996,7 @@ Public Function GetSortedKeysByValueDesc(dict As Object) As Variant
     Else
         Call QuickSortByValueDesc(keys, vals, 0, count - 1)
     End If
-    
+
     GetSortedKeysByValueDesc = keys
 End Function
 
@@ -2511,16 +3005,16 @@ Private Sub QuickSortByValueDesc(ByRef keys As Variant, ByRef vals As Variant, _
                                    ByVal low As Long, ByVal high As Long)
     Dim i As Long, j As Long
     Dim pivot As Variant, tempK As Variant, tempV As Variant
-    
+
     If low < high Then
         pivot = vals((low + high) \ 2)
         i = low
         j = high
-        
+
         Do
             Do While vals(i) > pivot: i = i + 1: Loop
             Do While vals(j) < pivot: j = j - 1: Loop
-            
+
             If i <= j Then
                 tempK = keys(i): tempV = vals(i)
                 keys(i) = keys(j): vals(i) = vals(j)
@@ -2529,7 +3023,7 @@ Private Sub QuickSortByValueDesc(ByRef keys As Variant, ByRef vals As Variant, _
                 j = j - 1
             End If
         Loop Until i > j
-        
+
         If low < j Then Call QuickSortByValueDesc(keys, vals, low, j)
         If i < high Then Call QuickSortByValueDesc(keys, vals, i, high)
     End If
@@ -2553,130 +3047,129 @@ Private Sub CreateSheetEvolutions(ByRef xlWB As Object)
     Dim ws As Object
     Set ws = xlWB.Worksheets.Add(After:=xlWB.Worksheets(xlWB.Worksheets.Count))
     ws.Name = T("~Evolution par bo~ite", "Evolution by mailbox")
-    
+
     Dim months As Object, boites As Object, semesters As Object
     Set months = CreateObject("Scripting.Dictionary")
     Set boites = CreateObject("Scripting.Dictionary")
     Set semesters = CreateObject("Scripting.Dictionary")
-    
+
+    ' V25.3 (F9-10) : plus de borne "2017" ecrite en dur (non documentee) :
+    ' les courbes couvrent toute la periode analysee, comme "Par annee" et la
+    ' synthese globale en bas de cette feuille.
     Dim k As Variant, parts As Variant
     For Each k In dictMonthly.Keys
         parts = Split(CStr(k), "|")
         If UBound(parts) >= 2 Then
-            If CStr(parts(0)) >= "2017-01" Then
-                If Not months.Exists(CStr(parts(0))) Then months.Add CStr(parts(0)), True
-                If CStr(parts(1)) <> "_TOTAL" Then
-                    If Not boites.Exists(CStr(parts(1))) Then boites.Add CStr(parts(1)), True
-                End If
+            If Not months.Exists(CStr(parts(0))) Then months.Add CStr(parts(0)), True
+            If CStr(parts(1)) <> "_TOTAL" Then
+                If Not boites.Exists(CStr(parts(1))) Then boites.Add CStr(parts(1)), True
             End If
         End If
     Next k
-    
+
     For Each k In dictSemesterly.Keys
         parts = Split(CStr(k), "|")
         If UBound(parts) >= 2 Then
-            If CStr(parts(0)) >= "2017-S1" Then
-                If Not semesters.Exists(CStr(parts(0))) Then semesters.Add CStr(parts(0)), True
-            End If
+            If Not semesters.Exists(CStr(parts(0))) Then semesters.Add CStr(parts(0)), True
         End If
     Next k
-    
+
     If months.Count = 0 Or boites.Count = 0 Then Exit Sub
-    
+
     Dim sortedMonths As Variant, sortedSemesters As Variant, boitesList As Variant
     sortedMonths = SortDictKeys(months)
     sortedSemesters = SortDictKeys(semesters)
     boitesList = boites.Keys
-    
+
     Dim nMailboxes As Long: nMailboxes = boites.Count
     Dim lastColM As Long: lastColM = nMailboxes + 1
-    
+
     ' Position des graphiques
     Dim chartLeft As Long: chartLeft = lastColM * 80 + 50
     Dim chartHeight As Long: chartHeight = 280
     Dim chartSpacing As Long: chartSpacing = 30
     Dim nextChartTop As Long: nextChartTop = 15
-    
+
     ' ==========================================================================
     ' PARTIE 1 : SEMESTRIEL
     ' ==========================================================================
     ws.Cells(1, 1).Value = T("~EVOLUTION SEMESTRIELLE PAR BO~ITE", "HALF-YEARLY EVOLUTION BY MAILBOX")
     ws.Cells(1, 1).Font.Bold = True
     ws.Cells(1, 1).Font.Size = 12
-    
+
     ' Headers
     Call WriteEvolutionHeaders(ws, 3, 1, T("Semestre", "Half-year"), boitesList, nMailboxes)
-    
+
     Dim lastRowS As Long
     If semesters.Count > 0 Then
         lastRowS = WriteEvolutionDataBlock(ws, 4, sortedSemesters, boitesList, dictSemesterly, "Total", lastColM)
     Else
         lastRowS = 3
     End If
-    
+
     If lastRowS >= 4 Then
         ws.Range(ws.Cells(4, 2), ws.Cells(lastRowS, lastColM)).NumberFormat = "#,##0"
         Call CreateEvolutionChart(ws, 3, lastRowS, lastColM, boitesList, chartLeft, nextChartTop, T("~Evolution semestrielle", "Half-yearly evolution"), False)
         nextChartTop = nextChartTop + chartHeight + chartSpacing
     End If
-    
+
     ' ==========================================================================
     ' PARTIE 2 : MENSUEL - TOTAL
     ' ==========================================================================
     Dim startRowTotal As Long: startRowTotal = lastRowS + 3
-    
+
     ws.Cells(startRowTotal, 1).Value = T("~EVOLUTION MENSUELLE PAR BO~ITE - TOTAL", "MONTHLY EVOLUTION BY MAILBOX - TOTAL")
     ws.Cells(startRowTotal, 1).Font.Bold = True
     ws.Cells(startRowTotal, 1).Font.Size = 12
-    
+
     Call WriteEvolutionHeaders(ws, startRowTotal + 2, 1, T("Mois", "Month"), boitesList, nMailboxes)
-    
+
     Dim lastRowTotal As Long
     lastRowTotal = WriteEvolutionDataBlock(ws, startRowTotal + 3, sortedMonths, boitesList, dictMonthly, "Total", lastColM)
-    
+
     ws.Range(ws.Cells(startRowTotal + 3, 2), ws.Cells(lastRowTotal, lastColM)).NumberFormat = "#,##0"
     Call CreateEvolutionChart(ws, startRowTotal + 2, lastRowTotal, lastColM, boitesList, chartLeft, nextChartTop, T("~Evolution mensuelle - TOTAL", "Monthly evolution - TOTAL"), True)
     nextChartTop = nextChartTop + chartHeight + chartSpacing
-    
+
     ' ==========================================================================
     ' PARTIE 3 : MENSUEL - ENVOYES
     ' ==========================================================================
     Dim startRowSent As Long: startRowSent = lastRowTotal + 3
-    
+
     ws.Cells(startRowSent, 1).Value = T("~EVOLUTION MENSUELLE PAR BO~ITE - ENVOY~ES", "MONTHLY EVOLUTION BY MAILBOX - SENT")
     ws.Cells(startRowSent, 1).Font.Bold = True
     ws.Cells(startRowSent, 1).Font.Size = 12
-    
+
     Call WriteEvolutionHeaders(ws, startRowSent + 2, 1, T("Mois", "Month"), boitesList, nMailboxes)
-    
+
     Dim lastRowSent As Long
     lastRowSent = WriteEvolutionDataBlock(ws, startRowSent + 3, sortedMonths, boitesList, dictMonthly, "Sent", lastColM)
-    
+
     ws.Range(ws.Cells(startRowSent + 3, 2), ws.Cells(lastRowSent, lastColM)).NumberFormat = "#,##0"
     Call CreateEvolutionChart(ws, startRowSent + 2, lastRowSent, lastColM, boitesList, chartLeft, nextChartTop, T("~Evolution mensuelle - ENVOY~ES", "Monthly evolution - SENT"), True)
     nextChartTop = nextChartTop + chartHeight + chartSpacing
-    
+
     ' ==========================================================================
     ' PARTIE 4 : MENSUEL - RECUS
     ' ==========================================================================
     Dim startRowRecv As Long: startRowRecv = lastRowSent + 3
-    
+
     ws.Cells(startRowRecv, 1).Value = T("~EVOLUTION MENSUELLE PAR BO~ITE - RE" & Chr(199) & "US", "MONTHLY EVOLUTION BY MAILBOX - RECEIVED")
     ws.Cells(startRowRecv, 1).Font.Bold = True
     ws.Cells(startRowRecv, 1).Font.Size = 12
-    
+
     Call WriteEvolutionHeaders(ws, startRowRecv + 2, 1, T("Mois", "Month"), boitesList, nMailboxes)
-    
+
     Dim lastRowRecv As Long
     lastRowRecv = WriteEvolutionDataBlock(ws, startRowRecv + 3, sortedMonths, boitesList, dictMonthly, "Received", lastColM)
-    
+
     ws.Range(ws.Cells(startRowRecv + 3, 2), ws.Cells(lastRowRecv, lastColM)).NumberFormat = "#,##0"
     Call CreateEvolutionChart(ws, startRowRecv + 2, lastRowRecv, lastColM, boitesList, chartLeft, nextChartTop, T("~Evolution mensuelle - RE" & Chr(199) & "US", "Monthly evolution - RECEIVED"), True)
     nextChartTop = nextChartTop + chartHeight + chartSpacing
-    
+
     ' V23.9 : synthese globale (toutes boites) - tables + histogrammes 100%
     Call AppendEvolutionGlobalSection(ws, lastRowRecv + 4, chartLeft, nextChartTop, chartHeight, chartSpacing)
-    
+
     ws.Columns("A").AutoFit
 End Sub
 
@@ -2685,16 +3178,16 @@ Private Sub WriteEvolutionHeaders(ws As Object, row As Long, startCol As Long, f
                                     boitesList As Variant, nMailboxes As Long)
     Dim headerArr() As Variant
     ReDim headerArr(1 To 1, 1 To nMailboxes + 1)
-    
+
     headerArr(1, 1) = firstHeader
     Dim i As Long
     For i = 0 To nMailboxes - 1
         headerArr(1, i + 2) = boitesList(i)
     Next i
-    
+
     ws.Range(ws.Cells(row, startCol), ws.Cells(row, startCol + nMailboxes)).Value = headerArr
     ws.Rows(row).Font.Bold = True
-    
+
     ' Couleurs (cellule par cellule, inevitable)
     For i = 0 To nMailboxes - 1
         ws.Cells(row, startCol + 1 + i).Interior.Color = GetStoreColor(CStr(boitesList(i)))
@@ -2712,18 +3205,18 @@ Private Function WriteEvolutionDataBlock(ws As Object, startRow As Long, sortedK
     Else
         nRows = 0
     End If
-    
+
     If nRows = 0 Then
         WriteEvolutionDataBlock = startRow - 1
         Exit Function
     End If
-    
+
     Dim nMailboxes As Long
     nMailboxes = UBound(boitesList) - LBound(boitesList) + 1
-    
+
     Dim dataArr() As Variant
     ReDim dataArr(1 To nRows, 1 To nMailboxes + 1)
-    
+
     Dim i As Long, j As Long
     For i = 0 To nRows - 1
         dataArr(i + 1, 1) = sortedKeys(i)
@@ -2731,9 +3224,9 @@ Private Function WriteEvolutionDataBlock(ws As Object, startRow As Long, sortedK
             dataArr(i + 1, j + 2) = GetDictValue(dict, CStr(sortedKeys(i)) & "|" & CStr(boitesList(j)) & "|" & suffix)
         Next j
     Next i
-    
+
     ws.Range(ws.Cells(startRow, 1), ws.Cells(startRow + nRows - 1, lastCol)).Value = dataArr
-    
+
     WriteEvolutionDataBlock = startRow + nRows - 1
 End Function
 
@@ -2742,12 +3235,12 @@ Private Sub CreateEvolutionChart(ws As Object, headerRow As Long, lastRow As Lon
                                   boitesList As Variant, chartLeft As Long, chartTop As Long, chartTitle As String, _
                                   ByVal asLine As Boolean)
     On Error Resume Next
-    
+
     If lastRow <= headerRow + 1 Then Exit Sub
-    
+
     Dim chart As Object
     Set chart = ws.ChartObjects.Add(Left:=chartLeft, Top:=chartTop, Width:=550, Height:=280)
-    
+
     With chart.Chart
         .ChartType = IIf(asLine, 4, 51)  ' V23.8 : 4 = courbe pour le mensuel
         .SetSourceData ws.Range(ws.Cells(headerRow, 1), ws.Cells(lastRow, lastCol))
@@ -2755,7 +3248,7 @@ Private Sub CreateEvolutionChart(ws As Object, headerRow As Long, lastRow As Lon
         .ChartTitle.Text = chartTitle
         .HasLegend = True
         .Legend.Position = -4107
-        
+
         Dim serIdx As Long, boiteIdx As Long
         boiteIdx = 0
         For serIdx = 1 To .SeriesCollection.Count
@@ -2770,7 +3263,7 @@ Private Sub CreateEvolutionChart(ws As Object, headerRow As Long, lastRow As Lon
             End If
         Next serIdx
     End With
-    
+
     On Error GoTo 0
 End Sub
 
@@ -3084,36 +3577,36 @@ Private Sub CreateSheetHeatmaps(ByRef xlWB As Object)
     Dim ws As Object
     Set ws = xlWB.Worksheets.Add(After:=xlWB.Worksheets(xlWB.Worksheets.Count))
     ws.Name = T("Heatmaps", "Heatmaps")
-    
+
     Dim currentRow As Long: currentRow = 1
-    
+
     ' === HEATMAP TOTAL ===
     ws.Cells(currentRow, 1).Value = T("HEATMAP - TOTAL (ENVOY~ES + RE" & Chr(199) & "US)", "HEATMAP - TOTAL (SENT + RECEIVED)")
     ws.Cells(currentRow, 1).Font.Bold = True
     ws.Cells(currentRow, 1).Font.Size = 12
     Call CreateHeatmapTableTotal(ws, currentRow + 2)
     currentRow = currentRow + 12
-    
+
     ' === HEATMAP RECUS ===
     ws.Cells(currentRow, 1).Value = T("HEATMAP - EMAILS RE" & Chr(199) & "US", "HEATMAP - RECEIVED EMAILS")
     ws.Cells(currentRow, 1).Font.Bold = True
     ws.Cells(currentRow, 1).Font.Size = 12
     Call CreateHeatmapTable(ws, currentRow + 2, dictHeatmapReceived)
     currentRow = currentRow + 12
-    
+
     ' === HEATMAP ENVOYES ===
     ws.Cells(currentRow, 1).Value = T("HEATMAP - EMAILS ENVOY~ES", "HEATMAP - SENT EMAILS")
     ws.Cells(currentRow, 1).Font.Bold = True
     ws.Cells(currentRow, 1).Font.Size = 12
     Call CreateHeatmapTable(ws, currentRow + 2, dictHeatmapSent)
-    
+
     ws.Columns("A:Z").AutoFit
 End Sub
 
 Private Sub CreateHeatmapTableTotal(ws As Object, startRow As Long)
     Dim dayNames As Variant
     dayNames = DayNames()
-    
+
     ' V22 : Headers en bloc
     Dim headerArr(1 To 1, 1 To 25) As Variant
     headerArr(1, 1) = T("Jour \ Heure", "Day \ Hour")
@@ -3123,14 +3616,14 @@ Private Sub CreateHeatmapTableTotal(ws As Object, startRow As Long)
     Next h
     ws.Range(ws.Cells(startRow, 1), ws.Cells(startRow, 25)).Value = headerArr
     ws.Range(ws.Cells(startRow, 1), ws.Cells(startRow, 25)).Font.Bold = True
-    
+
     ' V22 : Calcul du max et des valeurs en une seule passe
     Dim valuesArr(1 To 7, 1 To 24) As Long
     Dim dataArr(1 To 7, 1 To 25) As Variant
-    
+
     Dim d As Long, val As Long
     Dim maxVal As Long: maxVal = 1
-    
+
     For d = 1 To 7
         dataArr(d, 1) = dayNames(d - 1)
         For h = 0 To 23
@@ -3140,11 +3633,11 @@ Private Sub CreateHeatmapTableTotal(ws As Object, startRow As Long)
             If val > maxVal Then maxVal = val
         Next h
     Next d
-    
+
     ' Ecriture des donnees en bloc
     ws.Range(ws.Cells(startRow + 1, 1), ws.Cells(startRow + 7, 25)).Value = dataArr
     ws.Range(ws.Cells(startRow + 1, 1), ws.Cells(startRow + 7, 1)).Font.Bold = True
-    
+
     ' Coloration (inevitable cellule par cellule)
     For d = 1 To 7
         For h = 0 To 23
@@ -3160,7 +3653,7 @@ End Sub
 Private Sub CreateHeatmapTable(ws As Object, startRow As Long, dict As Object)
     Dim dayNames As Variant
     dayNames = DayNames()
-    
+
     ' V22 : Headers en bloc
     Dim headerArr(1 To 1, 1 To 25) As Variant
     headerArr(1, 1) = T("Jour \ Heure", "Day \ Hour")
@@ -3170,14 +3663,14 @@ Private Sub CreateHeatmapTable(ws As Object, startRow As Long, dict As Object)
     Next h
     ws.Range(ws.Cells(startRow, 1), ws.Cells(startRow, 25)).Value = headerArr
     ws.Range(ws.Cells(startRow, 1), ws.Cells(startRow, 25)).Font.Bold = True
-    
+
     ' Calcul et ecriture en bloc
     Dim valuesArr(1 To 7, 1 To 24) As Long
     Dim dataArr(1 To 7, 1 To 25) As Variant
-    
+
     Dim d As Long, val As Long
     Dim maxVal As Long: maxVal = 1
-    
+
     For d = 1 To 7
         dataArr(d, 1) = dayNames(d - 1)
         For h = 0 To 23
@@ -3187,10 +3680,10 @@ Private Sub CreateHeatmapTable(ws As Object, startRow As Long, dict As Object)
             If val > maxVal Then maxVal = val
         Next h
     Next d
-    
+
     ws.Range(ws.Cells(startRow + 1, 1), ws.Cells(startRow + 7, 25)).Value = dataArr
     ws.Range(ws.Cells(startRow + 1, 1), ws.Cells(startRow + 7, 1)).Font.Bold = True
-    
+
     ' Coloration
     For d = 1 To 7
         For h = 0 To 23
@@ -3207,9 +3700,9 @@ End Sub
 Private Function GetHeatmapColor(val As Long, maxVal As Long) As Long
     Dim intensity As Double
     intensity = val / maxVal
-    
+
     Dim r As Long, g As Long, b As Long
-    
+
     If intensity <= 0.5 Then
         Dim t1 As Double: t1 = intensity * 2
         r = CLng(0 + t1 * 255)
@@ -3221,7 +3714,7 @@ Private Function GetHeatmapColor(val As Long, maxVal As Long) As Long
         g = CLng(255 - t2 * 255)
         b = 0
     End If
-    
+
     GetHeatmapColor = RGB(r, g, b)
 End Function
 
@@ -3237,32 +3730,23 @@ End Function
 ' ============================================================================
 
 ' ============================================================================
-' TOP 10 JOURS
-' ============================================================================
-
-' ============================================================================
-' TOP 10 SEMAINES
-' ============================================================================
-
-
-' ============================================================================
 ' CONTACTS
 ' ============================================================================
 Private Sub CreateSheetContacts(ByRef xlWB As Object)
     Dim ws As Object
     Set ws = xlWB.Worksheets.Add(After:=xlWB.Worksheets(xlWB.Worksheets.Count))
     ws.Name = T("Contacts", "Contacts")
-    
+
     ws.Cells(1, 1).Value = T("TOP 50 DESTINATAIRES", "TOP 50 RECIPIENTS"): ws.Cells(1, 1).Font.Bold = True
     ws.Cells(2, 1).Value = T("Email / Nom", "Email / Name"): ws.Cells(2, 2).Value = T("Nb emails", "# emails")
     ws.Range("A2:B2").Font.Bold = True
     Call WriteTopN(ws, dictSentTo, 50, 3, 1)
-    
+
     ws.Cells(1, 4).Value = T("TOP 50 EXP~EDITEURS", "TOP 50 SENDERS"): ws.Cells(1, 4).Font.Bold = True
     ws.Cells(2, 4).Value = T("Email / Nom", "Email / Name"): ws.Cells(2, 5).Value = T("Nb emails", "# emails")
     ws.Range("D2:E2").Font.Bold = True
     Call WriteTopN(ws, dictReceivedFrom, 50, 3, 4)
-    
+
     ws.Columns.AutoFit
     ws.Columns(1).ColumnWidth = 45
     ws.Columns(4).ColumnWidth = 45
@@ -3275,67 +3759,70 @@ Private Sub CreateSheetContactsInternalExternal(ByRef xlWB As Object)
     Dim ws As Object
     Set ws = xlWB.Worksheets.Add(After:=xlWB.Worksheets(xlWB.Worksheets.Count))
     ws.Name = T("Contacts Int-Ext", "Contacts Int-Ext")
-    
+
     ' === DESTINATAIRES ===
     ws.Cells(1, 1).Value = T("TOP DEST. INTERNES", "TOP INTERNAL RECIP.")
     ws.Cells(1, 1).Font.Bold = True: ws.Cells(1, 1).Interior.Color = RGB(198, 239, 206)
     ws.Cells(2, 1).Value = T("Email / Nom", "Email / Name"): ws.Cells(2, 2).Value = T("Nb", "Nb")
     ws.Range("A2:B2").Font.Bold = True
     Call WriteTopN(ws, dictSentToInternal, 25, 3, 1)
-    
+
     ws.Cells(1, 4).Value = T("TOP DEST. EXTERNES", "TOP EXTERNAL RECIP.")
     ws.Cells(1, 4).Font.Bold = True: ws.Cells(1, 4).Interior.Color = RGB(255, 199, 206)
     ws.Cells(2, 4).Value = T("Email / Nom", "Email / Name"): ws.Cells(2, 5).Value = T("Nb", "Nb")
     ws.Range("D2:E2").Font.Bold = True
     Call WriteTopN(ws, dictSentToExternal, 25, 3, 4)
-    
+
     ws.Cells(1, 7).Value = T("TOP DEST. INCONNUS", "TOP UNKNOWN RECIP.")
     ws.Cells(1, 7).Font.Bold = True: ws.Cells(1, 7).Interior.Color = RGB(217, 217, 217)
     ws.Cells(2, 7).Value = T("Email / Nom", "Email / Name"): ws.Cells(2, 8).Value = T("Nb", "Nb")
     ws.Range("G2:H2").Font.Bold = True
     Call WriteTopN(ws, dictSentToUnknown, 25, 3, 7)
-    
+
     ' === EXPEDITEURS ===
     ws.Cells(1, 10).Value = T("TOP EXP. INTERNES", "TOP INTERNAL SENDERS")
     ws.Cells(1, 10).Font.Bold = True: ws.Cells(1, 10).Interior.Color = RGB(198, 239, 206)
     ws.Cells(2, 10).Value = T("Email / Nom", "Email / Name"): ws.Cells(2, 11).Value = T("Nb", "Nb")
     ws.Range("J2:K2").Font.Bold = True
     Call WriteTopN(ws, dictReceivedFromInternal, 25, 3, 10)
-    
+
     ws.Cells(1, 13).Value = T("TOP EXP. EXTERNES", "TOP EXTERNAL SENDERS")
     ws.Cells(1, 13).Font.Bold = True: ws.Cells(1, 13).Interior.Color = RGB(255, 199, 206)
     ws.Cells(2, 13).Value = T("Email / Nom", "Email / Name"): ws.Cells(2, 14).Value = T("Nb", "Nb")
     ws.Range("M2:N2").Font.Bold = True
     Call WriteTopN(ws, dictReceivedFromExternal, 25, 3, 13)
-    
+
     ws.Cells(1, 16).Value = T("TOP EXP. INCONNUS", "TOP UNKNOWN SENDERS")
     ws.Cells(1, 16).Font.Bold = True: ws.Cells(1, 16).Interior.Color = RGB(217, 217, 217)
     ws.Cells(2, 16).Value = T("Email / Nom", "Email / Name"): ws.Cells(2, 17).Value = T("Nb", "Nb")
     ws.Range("P2:Q2").Font.Bold = True
     Call WriteTopN(ws, dictReceivedFromUnknown, 25, 3, 16)
-    
+
     ws.Columns.AutoFit
 End Sub
 
+' ----------------------------------------------------------------------------
+' WriteTopN
+' V25.1 : liste vide -> on laisse la colonne vide.
+' ----------------------------------------------------------------------------
 Private Sub WriteTopN(ws As Object, dict As Object, n As Long, startRow As Long, startCol As Long)
     Dim sorted As Variant
     sorted = GetTopN(dict, n)
-    
-    If UBound(sorted, 2) < 0 Then Exit Sub
-    
-    ' V22 : Ecriture en bloc
+    If Not IsArray(sorted) Then Exit Sub
+
     Dim nItems As Long
     nItems = UBound(sorted, 2) + 1
-    
+    If nItems < 1 Then Exit Sub
+
     Dim dataArr() As Variant
     ReDim dataArr(1 To nItems, 1 To 2)
-    
+
     Dim i As Long
     For i = 0 To nItems - 1
         dataArr(i + 1, 1) = sorted(0, i)
         dataArr(i + 1, 2) = sorted(1, i)
     Next i
-    
+
     ws.Range(ws.Cells(startRow, startCol), ws.Cells(startRow + nItems - 1, startCol + 1)).Value = dataArr
     ws.Range(ws.Cells(startRow, startCol + 1), ws.Cells(startRow + nItems - 1, startCol + 1)).NumberFormat = "#,##0"
 End Sub
@@ -3343,55 +3830,66 @@ End Sub
 ' ============================================================================
 ' NB DESTINATAIRES
 ' ============================================================================
+' ----------------------------------------------------------------------------
+' CreateSheetNbRecipients
+' V25.1 : aucun mail envoye -> maxRecip = 0 -> ReDim (1 To 0) = erreur 9.
+' Garde ajoutee.
+' ----------------------------------------------------------------------------
 Private Sub CreateSheetNbRecipients(ByRef xlWB As Object)
     Dim ws As Object
     Set ws = xlWB.Worksheets.Add(After:=xlWB.Worksheets(xlWB.Worksheets.Count))
     ws.Name = T("Nb destinataires", "# recipients")
-    
+
     ws.Cells(1, 1).Value = T("DISTRIBUTION DU NOMBRE DE DESTINATAIRES", "RECIPIENT COUNT DISTRIBUTION")
     ws.Cells(1, 1).Font.Bold = True
-    
+
     ws.Cells(3, 1).Value = T("Nb dest.", "# recip.")
     ws.Cells(3, 2).Value = T("Nb emails", "# emails")
     ws.Cells(3, 3).Value = T("% cumul~e", "% cumulative")
     ws.Range("A3:C3").Font.Bold = True
-    
+
     Dim total As Long: total = 0
     Dim maxRecip As Long: maxRecip = 0
     Dim k As Variant
-    
-    For Each k In dictNbRecipients.Keys
-        total = total + CLng(dictNbRecipients(k))
-        If CLng(k) > maxRecip Then maxRecip = CLng(k)
-    Next k
-    
-    ' V22 : Preparation en array puis ecriture en bloc
+
+    If Not dictNbRecipients Is Nothing Then
+        For Each k In dictNbRecipients.Keys
+            total = total + CLng(dictNbRecipients(k))
+            If CLng(k) > maxRecip Then maxRecip = CLng(k)
+        Next k
+    End If
+
+    If maxRecip = 0 Then
+        ws.Cells(4, 1).Value = T("(Aucune donn~ee)", "(No data)")
+        ws.Columns("A:C").AutoFit
+        Exit Sub
+    End If
+
     Dim tmpArr() As Variant
     ReDim tmpArr(1 To maxRecip, 1 To 3)
-    
+
     Dim cumul As Long: cumul = 0
     Dim n As Long
     Dim nRowsWritten As Long: nRowsWritten = 0
-    
+    Dim val As Long
+    Dim pctCumul As Double
+
     For n = 1 To maxRecip
-        Dim val As Long
         val = GetDictValue(dictNbRecipients, CStr(n))
         If val > 0 Then
             cumul = cumul + val
-            Dim pctCumul As Double
             If total > 0 Then pctCumul = cumul / total * 100 Else pctCumul = 0
-            
+
             nRowsWritten = nRowsWritten + 1
             tmpArr(nRowsWritten, 1) = n
             tmpArr(nRowsWritten, 2) = val
             tmpArr(nRowsWritten, 3) = pctCumul / 100
-            
+
             If pctCumul >= 99 Then Exit For
         End If
     Next n
-    
+
     If nRowsWritten > 0 Then
-        ' Redimensionner et ecrire en bloc
         Dim finalArr() As Variant
         ReDim finalArr(1 To nRowsWritten, 1 To 3)
         Dim i As Long
@@ -3400,13 +3898,13 @@ Private Sub CreateSheetNbRecipients(ByRef xlWB As Object)
             finalArr(i, 2) = tmpArr(i, 2)
             finalArr(i, 3) = tmpArr(i, 3)
         Next i
-        
+
         ws.Range(ws.Cells(4, 1), ws.Cells(3 + nRowsWritten, 3)).Value = finalArr
-        
+
         Dim lastRow As Long: lastRow = 3 + nRowsWritten
         ws.Range("B4:B" & lastRow).NumberFormat = "#,##0"
         ws.Range("C4:C" & lastRow).NumberFormat = "0.0%"
-        
+
         If lastRow > 4 Then
             On Error Resume Next
             Dim chart1 As Object
@@ -3421,7 +3919,7 @@ Private Sub CreateSheetNbRecipients(ByRef xlWB As Object)
             On Error GoTo 0
         End If
     End If
-    
+
     ws.Columns("A:C").AutoFit
 End Sub
 
@@ -3432,11 +3930,11 @@ Private Sub CreateSheetDATA(ByRef xlWB As Object)
     Dim ws As Object
     Set ws = xlWB.Worksheets.Add(After:=xlWB.Worksheets(xlWB.Worksheets.Count))
     ws.Name = T("DATA", "DATA")
-    
+
     ws.Cells(1, 1).Value = T("DONN~EES BRUTES (5000 premiers emails)", "RAW DATA (first 5000 emails)")
     ws.Cells(1, 1).Font.Bold = True
     ws.Cells(1, 1).Font.Size = 12
-    
+
     ' Headers en bloc
     Dim headerArr(1 To 1, 1 To 6) As Variant
     headerArr(1, 1) = "#"
@@ -3449,21 +3947,21 @@ Private Sub CreateSheetDATA(ByRef xlWB As Object)
     ws.Range("A3:F3").Font.Bold = True
     ws.Range("A3:F3").Interior.Color = RGB(68, 114, 196)
     ws.Range("A3:F3").Font.Color = RGB(255, 255, 255)
-    
+
     If dictRawData Is Nothing Then Exit Sub
     If dictRawData.Count = 0 Then
         ws.Cells(4, 1).Value = T("(Aucune donn~ee)", "(No data)")
         Exit Sub
     End If
-    
+
     ' V22 : Preparation en array puis ecriture en bloc (ENORME gain sur 5000 lignes)
     Dim nRows As Long: nRows = dictRawData.Count
     Dim dataArr() As Variant
     ReDim dataArr(1 To nRows, 1 To 6)
-    
+
     Dim k As Variant, parts As Variant
     Dim idx As Long: idx = 0
-    
+
     For Each k In dictRawData.Keys
         parts = Split(CStr(dictRawData(k)), "|")
         If UBound(parts) >= 4 Then
@@ -3476,17 +3974,17 @@ Private Sub CreateSheetDATA(ByRef xlWB As Object)
             dataArr(idx, 6) = parts(4)
         End If
     Next k
-    
+
     If idx > 0 Then
         ws.Range(ws.Cells(4, 1), ws.Cells(3 + idx, 6)).Value = dataArr
-        
+
         ' Alternate row coloring (applique par blocs via Interior)
         Dim r As Long
         For r = 4 To 3 + idx Step 2
             ws.Range(ws.Cells(r + 1, 1), ws.Cells(r + 1, 6)).Interior.Color = RGB(242, 242, 242)
         Next r
     End If
-    
+
     ws.Columns.AutoFit
     ws.Columns(6).ColumnWidth = 60
 End Sub
@@ -3494,19 +3992,23 @@ End Sub
 ' ============================================================================
 ' UTILITAIRE : GetTopN - V22 avec QuickSort pour gros dictionnaires
 ' ============================================================================
+' ----------------------------------------------------------------------------
+' GetTopN
+' V25.1 : dictionnaire vide -> renvoie Empty. L'ancien
+' ReDim result(0 To 1, 0 To -1) leve l'erreur 9 en VBA (pas de tableau vide
+' par ReDim) : c'est ce qui faisait tomber tout le rapport.
+' ----------------------------------------------------------------------------
 Public Function GetTopN(dict As Object, n As Long) As Variant
     Dim result() As Variant
     Dim items() As Variant
     Dim i As Long
     Dim count As Long
-    
+
+    GetTopN = Empty
+    If dict Is Nothing Then Exit Function
     count = dict.Count
-    If count = 0 Then
-        ReDim result(0 To 1, 0 To -1)  ' Tableau vide (UBound=-1)
-        GetTopN = result
-        Exit Function
-    End If
-    
+    If count = 0 Or n < 1 Then Exit Function
+
     ReDim items(0 To 1, 0 To count - 1)
     i = 0
     Dim k As Variant
@@ -3515,8 +4017,7 @@ Public Function GetTopN(dict As Object, n As Long) As Variant
         items(1, i) = dict(k)
         i = i + 1
     Next k
-    
-    ' V22 : Tri decroissant - QuickSort pour > 30 elements, sinon bulle
+
     If count > 30 Then
         Call QuickSortTopN(items, 0, count - 1)
     Else
@@ -3531,17 +4032,17 @@ Public Function GetTopN(dict As Object, n As Long) As Variant
             Next j
         Next i
     End If
-    
+
     Dim resultCount As Long
     resultCount = n
     If resultCount > count Then resultCount = count
-    
+
     ReDim result(0 To 1, 0 To resultCount - 1)
     For i = 0 To resultCount - 1
         result(0, i) = items(0, i)
         result(1, i) = items(1, i)
     Next i
-    
+
     GetTopN = result
 End Function
 
@@ -3549,16 +4050,16 @@ End Function
 Private Sub QuickSortTopN(ByRef items As Variant, ByVal low As Long, ByVal high As Long)
     Dim i As Long, j As Long
     Dim pivot As Variant, tempK As Variant, tempV As Variant
-    
+
     If low < high Then
         pivot = items(1, (low + high) \ 2)
         i = low
         j = high
-        
+
         Do
             Do While items(1, i) > pivot: i = i + 1: Loop
             Do While items(1, j) < pivot: j = j - 1: Loop
-            
+
             If i <= j Then
                 tempK = items(0, i): tempV = items(1, i)
                 items(0, i) = items(0, j): items(1, i) = items(1, j)
@@ -3567,7 +4068,7 @@ Private Sub QuickSortTopN(ByRef items As Variant, ByVal low As Long, ByVal high 
                 j = j - 1
             End If
         Loop Until i > j
-        
+
         If low < j Then Call QuickSortTopN(items, low, j)
         If i < high Then Call QuickSortTopN(items, i, high)
     End If
@@ -3591,37 +4092,37 @@ Private Sub CreateSheetLongueurMessages(ByRef xlWB As Object)
     Dim ws As Object
     Set ws = xlWB.Worksheets.Add(After:=xlWB.Worksheets(xlWB.Worksheets.Count))
     ws.Name = T("Longueur messages", "Length messages")
-    
+
     ws.Cells(1, 1).Value = T("ANALYSE DE LA LONGUEUR DES MESSAGES ENVOY~ES", "SENT MESSAGE LENGTH ANALYSIS")
     ws.Cells(1, 1).Font.Bold = True
     ws.Cells(1, 1).Font.Size = 14
-    
+
     ws.Cells(2, 1).Value = T("(Message courant extrait, hors historique de fil - longueurs en CARACT~fRES)", "(Current message extracted, without thread history - lengths in CHARACTERS)")
     ws.Cells(2, 1).Font.Italic = True
     ws.Cells(2, 1).Font.Color = RGB(128, 128, 128)
-    
+
     If dictMsgLength Is Nothing Or dictMsgLength.Count = 0 Then
         ws.Cells(4, 1).Value = T("Aucune donn~ee disponible.", "No data available.")
         ws.Cells(5, 1).Value = T("Activez l'option 'Analyser la longueur des messages envoy~es' pour g~en~erer ces statistiques.", "Enable the 'Analyze sent message length' option to generate these statistics.")
         Exit Sub
     End If
-    
+
     ' === STATISTIQUES GLOBALES ===
     ws.Cells(4, 1).Value = T("STATISTIQUES GLOBALES", "GLOBAL STATISTICS")
     ws.Cells(4, 1).Font.Bold = True
     ws.Cells(4, 1).Font.Size = 12
-    
+
     ' Calculer les statistiques
     Dim lengths() As Long
     Dim count As Long: count = dictMsgLength.Count
     ReDim lengths(0 To count - 1)
-    
+
     Dim i As Long: i = 0
     Dim k As Variant
     Dim totalLen As Double: totalLen = 0
     Dim minLen As Long: minLen = 999999999
     Dim maxLen As Long: maxLen = 0
-    
+
     For Each k In dictMsgLength.Keys
         lengths(i) = dictMsgLength(k)
         totalLen = totalLen + lengths(i)
@@ -3629,20 +4130,20 @@ Private Sub CreateSheetLongueurMessages(ByRef xlWB As Object)
         If lengths(i) > maxLen Then maxLen = lengths(i)
         i = i + 1
     Next k
-    
+
     ' Trier pour la mediane et percentiles
     Call SortLongArray(lengths)
-    
+
     Dim moyenne As Double
     moyenne = totalLen / count
-    
+
     Dim mediane As Long
     If count Mod 2 = 0 Then
         mediane = (lengths(count \ 2 - 1) + lengths(count \ 2)) \ 2
     Else
         mediane = lengths(count \ 2)
     End If
-    
+
     ' V22 : Ecriture en bloc des statistiques globales
     Dim statsArr(1 To 8, 1 To 2) As Variant
     statsArr(1, 1) = T("Nombre de messages analys~es :", "Messages analyzed:"): statsArr(1, 2) = count
@@ -3653,33 +4154,33 @@ Private Sub CreateSheetLongueurMessages(ByRef xlWB As Object)
     statsArr(6, 1) = T("Percentile 25% :", "25th percentile:"): statsArr(6, 2) = lengths(count \ 4)
     statsArr(7, 1) = T("Percentile 75% :", "75th percentile:"): statsArr(7, 2) = lengths((count * 3) \ 4)
     statsArr(8, 1) = T("Percentile 95% :", "95th percentile:"): statsArr(8, 2) = lengths((count * 95) \ 100)
-    
+
     ws.Range("A5:B12").Value = statsArr
     ws.Range("B5:B12").NumberFormat = "#,##0"
-    
+
     ' === DISTRIBUTION PAR TRANCHES ===
     ws.Cells(14, 1).Value = T("DISTRIBUTION PAR TRANCHE", "DISTRIBUTION BY RANGE")
     ws.Cells(14, 1).Font.Bold = True
     ws.Cells(14, 1).Font.Size = 12
-    
+
     ws.Cells(15, 1).Value = T("Tranche", "Range")
     ws.Cells(15, 2).Value = T("Nb messages", "# messages")
     ws.Cells(15, 3).Value = T("Pourcentage", "Percentage")
     ws.Range("A15:C15").Font.Bold = True
-    
+
     ' Tranches
     Dim tranches As Variant
     tranches = Array(0, 100, 250, 500, 1000, 2000, 5000, 10000, 999999999)
-    
+
     Dim trancheLabels As Variant
     trancheLabels = Array("0 - 100", "101 - 250", "251 - 500", "501 - 1000", "1001 - 2000", _
                            "2001 - 5000", "5001 - 10000", "> 10000")
-    
+
     ' V22 : Preparation en array
     Dim nTranches As Long: nTranches = UBound(trancheLabels) + 1
     Dim trancheArr() As Variant
     ReDim trancheArr(1 To nTranches, 1 To 3)
-    
+
     Dim ti As Long, j As Long
     For ti = 0 To UBound(trancheLabels)
         Dim trancheCount As Long: trancheCount = 0
@@ -3688,18 +4189,18 @@ Private Sub CreateSheetLongueurMessages(ByRef xlWB As Object)
                 trancheCount = trancheCount + 1
             End If
         Next j
-        
+
         trancheArr(ti + 1, 1) = trancheLabels(ti)
         trancheArr(ti + 1, 2) = trancheCount
         trancheArr(ti + 1, 3) = trancheCount / count
     Next ti
-    
+
     ws.Range(ws.Cells(16, 1), ws.Cells(15 + nTranches, 3)).Value = trancheArr
     ws.Range(ws.Cells(16, 2), ws.Cells(15 + nTranches, 2)).NumberFormat = "#,##0"
     ws.Range(ws.Cells(16, 3), ws.Cells(15 + nTranches, 3)).NumberFormat = "0.0%"
-    
+
     Dim lastRowTranches As Long: lastRowTranches = 15 + nTranches
-    
+
     ' Graphique distribution (caracteres)
     On Error Resume Next
     Dim chartDist As Object
@@ -3712,38 +4213,38 @@ Private Sub CreateSheetLongueurMessages(ByRef xlWB As Object)
         .HasLegend = False
     End With
     On Error GoTo 0
-    
+
     ' === DISTRIBUTION EN LIGNES A4 ===
     Const CHARS_PAR_LIGNE As Long = 80
-    
+
     Dim startRowA4 As Long: startRowA4 = lastRowTranches + 3
-    
+
     ws.Cells(startRowA4, 1).Value = T("DISTRIBUTION EN LIGNES A4", "DISTRIBUTION IN A4 LINES")
     ws.Cells(startRowA4, 1).Font.Bold = True
     ws.Cells(startRowA4, 1).Font.Size = 12
-    
+
     ws.Cells(startRowA4 + 1, 1).Value = T("(1 ligne A4 = environ 80 caract~fres, police standard 11pt)", "(1 A4 line = approx. 80 characters, standard 11pt font)")
     ws.Cells(startRowA4 + 1, 1).Font.Italic = True
     ws.Cells(startRowA4 + 1, 1).Font.Color = RGB(128, 128, 128)
-    
+
     ws.Cells(startRowA4 + 3, 1).Value = T("Nb lignes A4", "# A4 lines")
     ws.Cells(startRowA4 + 3, 2).Value = T("Nb messages", "# messages")
     ws.Cells(startRowA4 + 3, 3).Value = T("Pourcentage", "Percentage")
     ws.Range(ws.Cells(startRowA4 + 3, 1), ws.Cells(startRowA4 + 3, 3)).Font.Bold = True
-    
+
     Dim tranchesA4 As Variant
     tranchesA4 = Array(0, 1, 2, 5, 10, 20, 50, 100, 999999)
-    
+
     Dim trancheLabelsA4 As Variant
     trancheLabelsA4 = Array(T("< 1 ligne", "< 1 line"), T("1-2 lignes", "1-2 lines"), _
                               T("2-5 lignes", "2-5 lines"), T("5-10 lignes", "5-10 lines"), _
                               T("10-20 lignes", "10-20 lines"), T("20-50 lignes", "20-50 lines"), _
                               T("50-100 lignes", "50-100 lines"), T("> 100 lignes", "> 100 lines"))
-    
+
     Dim nTranchesA4 As Long: nTranchesA4 = UBound(trancheLabelsA4) + 1
     Dim trancheA4Arr() As Variant
     ReDim trancheA4Arr(1 To nTranchesA4, 1 To 3)
-    
+
     For ti = 0 To UBound(trancheLabelsA4)
         Dim trancheCountA4 As Long: trancheCountA4 = 0
         For j = 0 To count - 1
@@ -3753,7 +4254,7 @@ Private Sub CreateSheetLongueurMessages(ByRef xlWB As Object)
                 trancheCountA4 = trancheCountA4 + 1
             End If
         Next j
-        
+
         trancheA4Arr(ti + 1, 1) = trancheLabelsA4(ti)
         trancheA4Arr(ti + 1, 2) = trancheCountA4
         If count > 0 Then
@@ -3762,13 +4263,13 @@ Private Sub CreateSheetLongueurMessages(ByRef xlWB As Object)
             trancheA4Arr(ti + 1, 3) = 0
         End If
     Next ti
-    
+
     ws.Range(ws.Cells(startRowA4 + 4, 1), ws.Cells(startRowA4 + 3 + nTranchesA4, 3)).Value = trancheA4Arr
     ws.Range(ws.Cells(startRowA4 + 4, 2), ws.Cells(startRowA4 + 3 + nTranchesA4, 2)).NumberFormat = "#,##0"
     ws.Range(ws.Cells(startRowA4 + 4, 3), ws.Cells(startRowA4 + 3 + nTranchesA4, 3)).NumberFormat = "0.0%"
-    
+
     Dim lastRowA4 As Long: lastRowA4 = startRowA4 + 3 + nTranchesA4
-    
+
     ' Graphique distribution (lignes A4)
     On Error Resume Next
     Dim chartA4 As Object
@@ -3781,22 +4282,22 @@ Private Sub CreateSheetLongueurMessages(ByRef xlWB As Object)
         .HasLegend = False
     End With
     On Error GoTo 0
-    
+
     ' Statistiques en lignes A4
     ws.Cells(lastRowA4 + 2, 1).Value = T("Moyenne en lignes A4 :", "Average in A4 lines:")
     ws.Cells(lastRowA4 + 2, 2).Value = Round(moyenne / CHARS_PAR_LIGNE, 1)
-    
+
     ws.Cells(lastRowA4 + 3, 1).Value = T("M~ediane en lignes A4 :", "Median in A4 lines:")
     ws.Cells(lastRowA4 + 3, 2).Value = Round(mediane / CHARS_PAR_LIGNE, 1)
-    
+
     ' === STATISTIQUES PAR BOITE ===
     If dictMsgLengthByStore.Count > 0 Then
         Dim startRowStore As Long: startRowStore = lastRowA4 + 6
-        
+
         ws.Cells(startRowStore, 1).Value = T("STATISTIQUES PAR BO~ITE", "STATISTICS BY MAILBOX")
         ws.Cells(startRowStore, 1).Font.Bold = True
         ws.Cells(startRowStore, 1).Font.Size = 12
-        
+
         Dim headerArr(1 To 1, 1 To 6) As Variant
         headerArr(1, 1) = T("Bo~ite", "Mailbox")
         headerArr(1, 2) = T("Nb messages", "# messages")
@@ -3806,28 +4307,28 @@ Private Sub CreateSheetLongueurMessages(ByRef xlWB As Object)
         headerArr(1, 6) = T("Max", "Max")
         ws.Range(ws.Cells(startRowStore + 1, 1), ws.Cells(startRowStore + 1, 6)).Value = headerArr
         ws.Range(ws.Cells(startRowStore + 1, 1), ws.Cells(startRowStore + 1, 6)).Font.Bold = True
-        
+
         ' V22 : Preparation en array
         Dim nStoresLen As Long: nStoresLen = dictMsgLengthByStore.Count
         Dim storeArr() As Variant
         ReDim storeArr(1 To nStoresLen, 1 To 6)
-        
+
         Dim idxStore As Long: idxStore = 0
         Dim storeName As Variant
         For Each storeName In dictMsgLengthByStore.Keys
             Dim storeDict As Object
             Set storeDict = dictMsgLengthByStore(storeName)
-            
+
             If storeDict.Count > 0 Then
                 Dim storeLengths() As Long
                 Dim storeCount As Long: storeCount = storeDict.Count
                 ReDim storeLengths(0 To storeCount - 1)
-                
+
                 Dim idxL As Long: idxL = 0
                 Dim storeTotal As Double: storeTotal = 0
                 Dim storeMin As Long: storeMin = 999999999
                 Dim storeMax As Long: storeMax = 0
-                
+
                 Dim sk As Variant
                 For Each sk In storeDict.Keys
                     storeLengths(idxL) = storeDict(sk)
@@ -3836,16 +4337,16 @@ Private Sub CreateSheetLongueurMessages(ByRef xlWB As Object)
                     If storeLengths(idxL) > storeMax Then storeMax = storeLengths(idxL)
                     idxL = idxL + 1
                 Next sk
-                
+
                 Call SortLongArray(storeLengths)
-                
+
                 Dim storeMediane As Long
                 If storeCount Mod 2 = 0 Then
                     storeMediane = (storeLengths(storeCount \ 2 - 1) + storeLengths(storeCount \ 2)) \ 2
                 Else
                     storeMediane = storeLengths(storeCount \ 2)
                 End If
-                
+
                 idxStore = idxStore + 1
                 storeArr(idxStore, 1) = storeName
                 storeArr(idxStore, 2) = storeCount
@@ -3855,11 +4356,11 @@ Private Sub CreateSheetLongueurMessages(ByRef xlWB As Object)
                 storeArr(idxStore, 6) = storeMax
             End If
         Next storeName
-        
+
         If idxStore > 0 Then
             ws.Range(ws.Cells(startRowStore + 2, 1), ws.Cells(startRowStore + 1 + idxStore, 6)).Value = storeArr
             ws.Range(ws.Cells(startRowStore + 2, 2), ws.Cells(startRowStore + 1 + idxStore, 6)).NumberFormat = "#,##0"
-            
+
             ' Coloration des noms de boites
             Dim row As Long: row = startRowStore + 2
             For Each storeName In dictMsgLengthByStore.Keys
@@ -3871,7 +4372,7 @@ Private Sub CreateSheetLongueurMessages(ByRef xlWB As Object)
             Next storeName
         End If
     End If
-    
+
     ws.Columns("A:F").AutoFit
 End Sub
 
@@ -3885,28 +4386,28 @@ End Sub
 
 Private Sub QuickSortLong(ByRef arr() As Long, ByVal low As Long, ByVal high As Long)
     Dim pivot As Long, i As Long, j As Long, temp As Long
-    
+
     If low < high Then
         Dim mid As Long: mid = (low + high) \ 2
         If arr(low) > arr(mid) Then: temp = arr(low): arr(low) = arr(mid): arr(mid) = temp
         If arr(low) > arr(high) Then: temp = arr(low): arr(low) = arr(high): arr(high) = temp
         If arr(mid) > arr(high) Then: temp = arr(mid): arr(mid) = arr(high): arr(high) = temp
-        
+
         pivot = arr(mid)
         i = low
         j = high
-        
+
         Do
             Do While arr(i) < pivot: i = i + 1: Loop
             Do While arr(j) > pivot: j = j - 1: Loop
-            
+
             If i <= j Then
                 temp = arr(i): arr(i) = arr(j): arr(j) = temp
                 i = i + 1
                 j = j - 1
             End If
         Loop Until i > j
-        
+
         If low < j Then Call QuickSortLong(arr, low, j)
         If i < high Then Call QuickSortLong(arr, i, high)
     End If
@@ -3920,46 +4421,46 @@ Public Function SortDictKeys(dict As Object) As Variant
         SortDictKeys = Array()
         Exit Function
     End If
-    
+
     If dict.Count = 0 Then
         SortDictKeys = Array()
         Exit Function
     End If
-    
+
     Dim keys() As String
     ReDim keys(0 To dict.Count - 1)
-    
+
     Dim i As Long: i = 0
     Dim k As Variant
     For Each k In dict.Keys
         keys(i) = CStr(k)
         i = i + 1
     Next k
-    
+
     Call QuickSortStrings(keys, LBound(keys), UBound(keys))
-    
+
     SortDictKeys = keys
 End Function
 
 Private Sub QuickSortStrings(ByRef arr() As String, ByVal low As Long, ByVal high As Long)
     Dim pivot As String, i As Long, j As Long, temp As String
-    
+
     If low < high Then
         pivot = arr((low + high) \ 2)
         i = low
         j = high
-        
+
         Do
             Do While arr(i) < pivot: i = i + 1: Loop
             Do While arr(j) > pivot: j = j - 1: Loop
-            
+
             If i <= j Then
                 temp = arr(i): arr(i) = arr(j): arr(j) = temp
                 i = i + 1
                 j = j - 1
             End If
         Loop Until i > j
-        
+
         If low < j Then Call QuickSortStrings(arr, low, j)
         If i < high Then Call QuickSortStrings(arr, i, high)
     End If
@@ -4029,16 +4530,23 @@ Private Sub FillStateSheet(ByRef xlWB As Object)
     Set ws = StateSheet(xlWB)
     If ws Is Nothing Then Exit Sub
 
+    ' V25.3 (F9-02) : PERIOD_START = debut de la periode CUMULEE ; PERIOD_END
+    ' = horodatage EXACT de fin (dates Excel, pas du texte), borne INCLUSE
+    ' des compteurs : la mise a jour suivante compte les mails strictement
+    ' posterieurs. Remplace LAST_COMPLETE_MONTH, qui declarait "complet" le
+    ' mois precedent alors que les compteurs contenaient deja le debut du
+    ' mois en cours (compte deux fois au delta suivant).
     ws.Cells(12, 1).Value = "STATE_VERSION"
     ws.Cells(12, 2).Value = APP_VERSION
     ws.Cells(13, 1).Value = "GENERATED"
     ws.Cells(13, 2).Value = Format$(Now, "YYYY-MM-DD HH:MM:SS")
     ws.Cells(14, 1).Value = "PERIOD_START"
-    ws.Cells(14, 2).Value = Format$(g_PeriodStart, "YYYY-MM-DD")
+    ws.Cells(14, 2).Value = ReportPeriodStart()
     ws.Cells(15, 1).Value = "PERIOD_END"
-    ws.Cells(15, 2).Value = Format$(g_PeriodEnd, "YYYY-MM-DD")
-    ws.Cells(16, 1).Value = "LAST_COMPLETE_MONTH"
-    ws.Cells(16, 2).Value = LastCompleteMonth()
+    ws.Cells(15, 2).Value = g_PeriodEnd
+    ws.Range(ws.Cells(14, 2), ws.Cells(15, 2)).NumberFormat = "yyyy-mm-dd hh:mm:ss"
+    ws.Cells(16, 1).Value = "STATE_FORMAT"
+    ws.Cells(16, 2).Value = STATE_FORMAT
     ws.Cells(17, 1).Value = "TEST_MODE"
     ws.Cells(17, 2).Value = IIf(g_TestMode, "1", "0")
 
@@ -4060,8 +4568,9 @@ Private Sub FillStateSheet(ByRef xlWB As Object)
     End If
 
     ' --- Compteurs ---
-    Dim names(1 To 23) As String
-    Dim ds(1 To 23) As Object
+    ' V25.3 (F9-15) : 24e compteur dictReply.
+    Dim names(1 To 24) As String
+    Dim ds(1 To 24) As Object
     names(1) = "dictStoreStats":            Set ds(1) = dictStoreStats
     names(2) = "dictMonthly":               Set ds(2) = dictMonthly
     names(3) = "dictWeekly":                Set ds(3) = dictWeekly
@@ -4085,6 +4594,7 @@ Private Sub FillStateSheet(ByRef xlWB As Object)
     names(21) = "dictNbRecipients":         Set ds(21) = dictNbRecipients
     names(22) = "dictInternalExternal":     Set ds(22) = dictInternalExternal
     names(23) = "dictToCc":                 Set ds(23) = dictToCc
+    names(24) = "dictReply":                Set ds(24) = dictReply
 
     ws.Cells(30, 1).Value = "DICT"
     ws.Cells(30, 2).Value = "KEY"
@@ -4097,7 +4607,7 @@ Private Sub FillStateSheet(ByRef xlWB As Object)
     nBuf = 0
     outRow = 31
 
-    For i = 1 To 23
+    For i = 1 To 24
         If Not ds(i) Is Nothing Then
             For Each k In ds(i).Keys
                 nBuf = nBuf + 1
@@ -4152,19 +4662,8 @@ Fin:
     On Error Resume Next
 End Sub
 
-'----------------------------------------------------------------------------
-' LastCompleteMonth - dernier mois ENTIEREMENT couvert par l'analyse.
-' Le mois courant est toujours exclu : il est incomplet par nature, et le
-' figer dans l'etat interdirait de le completer plus tard.
-'----------------------------------------------------------------------------
-Private Function LastCompleteMonth() As String
-    On Error Resume Next
-    Dim d As Date
-    d = g_PeriodEnd
-    If d > Now Then d = Now
-    If Year(d) = Year(Now) And Month(d) = Month(Now) Then d = DateAdd("m", -1, d)
-    LastCompleteMonth = Format$(d, "YYYY-MM")
-End Function
+' V25.3 (F9-02) : LastCompleteMonth supprimee (remplacee par PERIOD_END
+' exact dans FillStateSheet).
 
 '----------------------------------------------------------------------------
 ' CreateSheetToCc (V24) - repartition A / Cc / Indirect sur les mails RECUS.
@@ -4342,6 +4841,214 @@ Fin:
 End Sub
 
 '----------------------------------------------------------------------------
+' CreateSheetReplies (V25.3, F9-15) - taux et delai de reponse aux mails
+' RECUS, d'apres la derniere action posee par Exchange sur chaque mail
+' (ReplyBucket). Deux blocs : par boite (avec une ligne "toutes boites"),
+' puis suivi mensuel avec la courbe des taux. "Taux en A" = mails recus ou
+' l'utilisateur etait en A (plus parlant que le taux global, qui melange
+' copies et listes de diffusion).
+'----------------------------------------------------------------------------
+Private Sub CreateSheetReplies(ByRef xlWB As Object)
+    On Error GoTo Fin
+
+    Dim ws As Object
+    Set ws = xlWB.Worksheets.Add(After:=xlWB.Worksheets(xlWB.Worksheets.count))
+    ws.Name = T("R~eponses", "Replies")
+
+    ws.Cells(1, 1).Value = T("TAUX ET D~ELAI DE R~EPONSE (mails re" & Chr(231) & "us)", _
+                             "REPLY RATE AND DELAY (received mail)")
+    ws.Cells(1, 1).Font.Bold = True
+    ws.Cells(1, 1).Font.Size = 14
+    ws.Cells(2, 1).Value = T("R~eponse = R~epondre ou R~epondre ~a tous fait depuis Outlook sur le mail re" & Chr(231) & "u " & _
+                             "(marque pos~ee par Exchange) ; un transfert ne compte pas. " & _
+                             "D~elai = heure de la r~eponse - heure de r~eception.", _
+                             "Reply = Reply or Reply All done from Outlook on the received mail " & _
+                             "(flag set by Exchange); a forward does not count. " & _
+                             "Delay = reply time - received time.")
+    ws.Cells(2, 1).Font.Italic = True
+
+    If dictReply Is Nothing Then Exit Sub
+    If dictReply.count = 0 Then
+        ws.Cells(4, 1).Value = T("Aucun mail re" & Chr(231) & "u sur la p~eriode.", "No received mail over the period.")
+        Exit Sub
+    End If
+
+    ' --- Agregation : boite | mois | role | tranche -> nb ---
+    Dim aggS As Object, aggM As Object, stores As Object, months As Object
+    Set aggS = CreateObject("Scripting.Dictionary")
+    Set aggM = CreateObject("Scripting.Dictionary")
+    Set stores = CreateObject("Scripting.Dictionary")
+    Set months = CreateObject("Scripting.Dictionary")
+
+    Dim k As Variant, parts() As String, nb As Long, scopes(1 To 3) As String, sc As Long
+    Dim agg As Object
+    For Each k In dictReply.Keys
+        parts = Split(CStr(k), "|")
+        If UBound(parts) = 3 Then
+            nb = CLng(dictReply(k))
+            If Not stores.Exists(parts(0)) Then stores.Add parts(0), 1
+            If Not months.Exists(parts(1)) Then months.Add parts(1), 1
+            scopes(1) = parts(0)          ' par boite
+            scopes(2) = "_ALL"            ' toutes boites
+            scopes(3) = parts(1)          ' par mois
+            For sc = 1 To 3
+                If sc = 3 Then Set agg = aggM Else Set agg = aggS
+                IncrementDict agg, scopes(sc) & "|R", nb                       ' recus
+                If parts(2) = "To" Then IncrementDict agg, scopes(sc) & "|RT", nb
+                If parts(3) <> "None" Then
+                    IncrementDict agg, scopes(sc) & "|A", nb                   ' repondus
+                    If parts(2) = "To" Then IncrementDict agg, scopes(sc) & "|AT", nb
+                    IncrementDict agg, scopes(sc) & "|" & parts(3), nb         ' tranche
+                End If
+            Next sc
+        End If
+    Next k
+
+    Dim buckets As Variant
+    buckets = Array("H1", "H4", "H24", "D3", "D3P")
+
+    ' --- Bloc 1 : par boite ---
+    Dim r As Long, i As Long, j As Long, sn As String
+    r = 4
+    ws.Cells(r, 1).Value = T("PAR BO~ITE", "BY MAILBOX")
+    ws.Cells(r, 1).Font.Bold = True
+    ws.Cells(r, 1).Font.Size = 12
+    r = r + 1
+
+    Dim sortedStores As Variant
+    sortedStores = SortDictKeys(stores)
+    Dim nS As Long
+    nS = UBound(sortedStores) - LBound(sortedStores) + 1
+
+    Dim blk() As Variant
+    ReDim blk(1 To nS + 2, 1 To 12)
+    blk(1, 1) = T("Bo~ite", "Mailbox")
+    blk(1, 2) = T("Re" & Chr(231) & "us", "Received")
+    blk(1, 3) = T("R~epondus", "Replied")
+    blk(1, 4) = T("Taux", "Rate")
+    blk(1, 5) = T("Re" & Chr(231) & "us en A", "Received as To")
+    blk(1, 6) = T("R~epondus en A", "Replied as To")
+    blk(1, 7) = T("Taux en A", "Rate as To")
+    blk(1, 8) = T("< 1 h", "< 1 h")
+    blk(1, 9) = T("1 ~a 4 h", "1 to 4 h")
+    blk(1, 10) = T("4 ~a 24 h", "4 to 24 h")
+    blk(1, 11) = T("1 ~a 3 j", "1 to 3 d")
+    blk(1, 12) = T("> 3 j", "> 3 d")
+    Dim key0 As String, recv As Long, repl As Long, recvTo As Long, replTo As Long
+    For i = 1 To nS + 1
+        If i <= nS Then
+            key0 = CStr(sortedStores(LBound(sortedStores) + i - 1))
+            blk(i + 1, 1) = key0
+        Else
+            key0 = "_ALL"
+            blk(i + 1, 1) = T("Toutes bo~ites", "All mailboxes")
+        End If
+        recv = GetDictValue(aggS, key0 & "|R")
+        repl = GetDictValue(aggS, key0 & "|A")
+        recvTo = GetDictValue(aggS, key0 & "|RT")
+        replTo = GetDictValue(aggS, key0 & "|AT")
+        blk(i + 1, 2) = recv
+        blk(i + 1, 3) = repl
+        If recv > 0 Then blk(i + 1, 4) = repl / recv
+        blk(i + 1, 5) = recvTo
+        blk(i + 1, 6) = replTo
+        If recvTo > 0 Then blk(i + 1, 7) = replTo / recvTo
+        For j = 0 To 4
+            blk(i + 1, 8 + j) = GetDictValue(aggS, key0 & "|" & CStr(buckets(j)))
+        Next j
+    Next i
+    Dim headerRowS As Long
+    headerRowS = r
+    ws.Range(ws.Cells(r, 1), ws.Cells(r + nS + 1, 12)).Value = blk
+    ws.Range(ws.Cells(r, 1), ws.Cells(r, 12)).Font.Bold = True
+    ws.Range(ws.Cells(r + nS + 1, 1), ws.Cells(r + nS + 1, 12)).Font.Bold = True
+    ws.Range(ws.Cells(r + 1, 2), ws.Cells(r + nS + 1, 3)).NumberFormat = "#,##0"
+    ws.Range(ws.Cells(r + 1, 5), ws.Cells(r + nS + 1, 6)).NumberFormat = "#,##0"
+    ws.Range(ws.Cells(r + 1, 8), ws.Cells(r + nS + 1, 12)).NumberFormat = "#,##0"
+    ws.Range(ws.Cells(r + 1, 4), ws.Cells(r + nS + 1, 4)).NumberFormat = "0.0%"
+    ws.Range(ws.Cells(r + 1, 7), ws.Cells(r + nS + 1, 7)).NumberFormat = "0.0%"
+    For i = 1 To nS
+        sn = CStr(sortedStores(LBound(sortedStores) + i - 1))
+        ws.Cells(r + i, 1).Interior.Color = GetStoreColor(sn)
+        ws.Cells(r + i, 1).Font.Color = RGB(255, 255, 255)
+    Next i
+    r = r + nS + 1
+
+    ' --- Bloc 2 : suivi mensuel ---
+    r = r + 2
+    Dim monthHeader As Long
+    monthHeader = r
+    ws.Cells(r, 1).Value = T("~EVOLUTION MENSUELLE", "MONTHLY TREND")
+    ws.Cells(r, 1).Font.Bold = True
+    ws.Cells(r, 1).Font.Size = 12
+    r = r + 1
+
+    Dim sortedMonths As Variant
+    sortedMonths = SortDictKeys(months)
+    Dim nM As Long
+    nM = UBound(sortedMonths) - LBound(sortedMonths) + 1
+
+    Dim blkM() As Variant
+    ReDim blkM(1 To nM + 1, 1 To 10)
+    blkM(1, 1) = T("Mois", "Month")
+    blkM(1, 2) = T("Re" & Chr(231) & "us", "Received")
+    blkM(1, 3) = T("R~epondus", "Replied")
+    blkM(1, 4) = T("Taux", "Rate")
+    blkM(1, 5) = T("Taux en A", "Rate as To")
+    blkM(1, 6) = T("< 1 h", "< 1 h")
+    blkM(1, 7) = T("1 ~a 4 h", "1 to 4 h")
+    blkM(1, 8) = T("4 ~a 24 h", "4 to 24 h")
+    blkM(1, 9) = T("1 ~a 3 j", "1 to 3 d")
+    blkM(1, 10) = T("> 3 j", "> 3 d")
+    For i = 1 To nM
+        key0 = CStr(sortedMonths(LBound(sortedMonths) + i - 1))
+        recv = GetDictValue(aggM, key0 & "|R")
+        repl = GetDictValue(aggM, key0 & "|A")
+        recvTo = GetDictValue(aggM, key0 & "|RT")
+        replTo = GetDictValue(aggM, key0 & "|AT")
+        blkM(i + 1, 1) = key0
+        blkM(i + 1, 2) = recv
+        blkM(i + 1, 3) = repl
+        If recv > 0 Then blkM(i + 1, 4) = repl / recv
+        If recvTo > 0 Then blkM(i + 1, 5) = replTo / recvTo
+        For j = 0 To 4
+            blkM(i + 1, 6 + j) = GetDictValue(aggM, key0 & "|" & CStr(buckets(j)))
+        Next j
+    Next i
+    Dim firstDataRow As Long
+    firstDataRow = r + 1
+    ' Mois ecrits en texte (sinon Excel convertit "2026-11" en date)
+    ws.Range(ws.Cells(r + 1, 1), ws.Cells(r + nM, 1)).NumberFormat = "@"
+    ws.Range(ws.Cells(r, 1), ws.Cells(r + nM, 10)).Value = blkM
+    ws.Range(ws.Cells(r, 1), ws.Cells(r, 10)).Font.Bold = True
+    ws.Range(ws.Cells(firstDataRow, 2), ws.Cells(r + nM, 3)).NumberFormat = "#,##0"
+    ws.Range(ws.Cells(firstDataRow, 4), ws.Cells(r + nM, 5)).NumberFormat = "0.0%"
+    ws.Range(ws.Cells(firstDataRow, 6), ws.Cells(r + nM, 10)).NumberFormat = "#,##0"
+
+    ' Courbe des deux taux
+    If nM >= 2 Then
+        Dim chartObj As Object, srcAddr As String
+        srcAddr = ws.Range(ws.Cells(r, 1), ws.Cells(r + nM, 1)).Address & "," & _
+                  ws.Range(ws.Cells(r, 4), ws.Cells(r + nM, 5)).Address
+        Set chartObj = ws.ChartObjects.Add(Left:=700, Top:=(monthHeader - 1) * 15, Width:=560, Height:=300)
+        If Not chartObj Is Nothing Then
+            With chartObj.Chart
+                .ChartType = 4          ' xlLine
+                .SetSourceData ws.Range(srcAddr)
+                .HasTitle = True
+                .ChartTitle.Text = T("Taux de r~eponse par mois", "Reply rate per month")
+            End With
+        End If
+    End If
+
+    ws.Columns("A:L").AutoFit
+    ws.Columns("A").ColumnWidth = 22
+    Exit Sub
+Fin:
+    modDebugLog.DError MOD_NAME, "Feuille Reponses : erreur " & Err.Number & " - " & Err.Description
+End Sub
+
+'----------------------------------------------------------------------------
 ' PolishWorkbook (V24) - finition, en un seul endroit.
 '
 ' Placement = 3 (xlFreeFloating) sur TOUS les graphiques : par defaut ils
@@ -4361,6 +5068,7 @@ Private Sub PolishWorkbook(ByRef xlWB As Object)
     colors(T("Tableau de bord", "Dashboard")) = RGB(0, 169, 186)
     colors(T("R~esum~e", "Summary")) = RGB(0, 169, 186)
     colors(T("A - Cc", "To - Cc")) = RGB(0, 169, 186)
+    colors(T("R~eponses", "Replies")) = RGB(0, 169, 186)     ' V25.3 (F9-15)
     colors(T("Par heure", "By hour")) = RGB(45, 38, 97)
     colors(T("Par jour semaine", "By weekday")) = RGB(45, 38, 97)
     colors(T("Par mois", "By month")) = RGB(45, 38, 97)
@@ -4426,84 +5134,112 @@ End Sub
 '----------------------------------------------------------------------------
 ' RunEmailAnalysisDelta - POINT D'ENTREE (bouton / Alt+F8).
 '
-' 1. demande le rapport precedent
-' 2. lit sa feuille _ETAT (configuration + dernier mois complet + compteurs)
-' 3. calcule les mois manquants
-' 4. enchaine sur RunEmailAnalysis, qui pre-remplira la fenetre et
-'    n'analysera que ces mois.
+' V25.3 (F9-01 / F9-02) :
+' 1. reprend le rapport FULL ou DELTA le plus recent du dossier Sorties
+'    (plus de boite de choix : Application.GetOpenFilename est un membre
+'    d'EXCEL, absent d'Outlook - erreur 438 masquee, la commande ne faisait
+'    rien du tout) ;
+' 2. lit sa feuille _ETAT par modExcelBridge (configuration, fin exacte,
+'    compteurs) ; un etat d'avant la V25.3 ou un rapport TEST est refuse ;
+' 3. analyse les mails STRICTEMENT posterieurs a la fin de l'etat, jusqu'a
+'    maintenant (le mois en cours n'est plus ni exclu ni compte deux fois) ;
+' 4. enchaine sur RunEmailAnalysis : la fenetre de lancement nomme le
+'    rapport repris.
+' Aucun rapport, ou etat inutilisable : proposition de lancer une analyse
+' complete dans la foulee (parcours sans rupture).
 '----------------------------------------------------------------------------
 Public Sub RunEmailAnalysisDelta()
     On Error GoTo ErrH
+
+    If m_Running Then
+        modUi.Inform T("Une analyse des mails est d~ej~a en cours.", _
+                       "A mail analysis is already running."), AnalyticsTitle()
+        Exit Sub
+    End If
 
     g_DeltaMode = False
     g_DeltaSourcePath = ""
 
     Dim p As String
-    p = AskForPreviousReport()
-    If Len(p) = 0 Then Exit Sub
-
-    If Not LoadStateFromWorkbook(p) Then Exit Sub
-
-    ' Bornes : du mois SUIVANT le dernier mois complet, jusqu'au dernier mois
-    ' entierement ecoule. Le mois courant est exclu.
-    Dim lastDone As Date
-    lastDone = MonthKeyToDate(g_DeltaLastMonth)
-    If lastDone = 0 Then
-        MsgBox T("Le fichier choisi ne porte pas de mois de r~ef~erence exploitable.", _
-                 "The selected file carries no usable reference month."), _
-               vbExclamation, "Analytics " & APP_VERSION
+    p = LatestReportPath()
+    If Len(p) = 0 Then
+        If modUi.Ask(T("Aucun rapport pr~ec~edent (analyse compl~ete ou mise ~a jour) " & _
+                       "dans le dossier :", _
+                       "No previous report (full analysis or update) in the folder:") & _
+                     vbCrLf & ReportFolderPath() & vbCrLf & vbCrLf & _
+                     T("Lancer une analyse compl~ete maintenant ?", "Run a full analysis now?"), _
+                     AnalyticsTitle()) = vbYes Then RunEmailAnalysis
         Exit Sub
     End If
 
-    g_DeltaStart = DateSerial(Year(lastDone), Month(lastDone) + 1, 1)
-    g_DeltaEnd = DateSerial(Year(Now), Month(Now), 1) - 1
-    g_DeltaEnd = DateSerial(Year(g_DeltaEnd), Month(g_DeltaEnd), Day(g_DeltaEnd)) + 0.99999
+    Dim whyNot As String
+    If Not LoadStateFromWorkbook(p, whyNot) Then
+        ' whyNot rempli = etat inutilisable (ancien format, rapport TEST...) ;
+        ' vide = erreur de lecture deja signalee.
+        If Len(whyNot) > 0 Then
+            If modUi.Ask(whyNot & vbCrLf & vbCrLf & _
+                         T("Lancer une analyse compl~ete maintenant ?", "Run a full analysis now?"), _
+                         AnalyticsTitle()) = vbYes Then RunEmailAnalysis
+        End If
+        Exit Sub
+    End If
 
-    If g_DeltaStart > g_DeltaEnd Then
-        MsgBox T("Rien ~a ajouter : l'analyse pr~ec~edente couvre d~ej~a tous les mois complets.", _
-                 "Nothing to add: the previous analysis already covers every complete month.") & _
-               vbCrLf & vbCrLf & _
-               T("Dernier mois analys~e : ", "Last month analyzed: ") & g_DeltaLastMonth, _
-               vbInformation, "Analytics " & APP_VERSION
+    g_DeltaEnd = Now
+    If g_DeltaStart >= g_DeltaEnd Then
+        modUi.Inform T("Rien ~a ajouter : le dernier rapport va d~ej~a jusqu'~a maintenant.", _
+                       "Nothing to add: the latest report already runs up to now.") & _
+                     vbCrLf & vbCrLf & FileNameOf(p), AnalyticsTitle()
         Exit Sub
     End If
 
     g_DeltaMode = True
     g_DeltaSourcePath = p
 
-    DebugLog "DELTA : source=" & p & " | dernier mois=" & g_DeltaLastMonth & _
-             " | a analyser " & Format$(g_DeltaStart, "YYYY-MM-DD") & " -> " & _
-             Format$(g_DeltaEnd, "YYYY-MM-DD")
+    modDebugLog.DInfo MOD_NAME, "Mise a jour delta : base " & FileNameOf(p) & _
+        ", mails apres " & Format$(g_DeltaStart, "yyyy-mm-dd hh:nn:ss")
 
-    Call RunEmailAnalysis
+    RunEmailAnalysis
     Exit Sub
 
 ErrH:
+    Dim errTxt As String
+    errTxt = Err.Number & " - " & Err.Description
     g_DeltaMode = False
-    MsgBox T("Erreur en mode delta : ", "Delta mode error: ") & Err.Number & " - " & Err.Description, _
-           vbCritical, "Analytics " & APP_VERSION
+    m_DeltaRows = Empty
+    modDebugLog.DError MOD_NAME, "Mise a jour delta : erreur " & errTxt
+    modUi.Fail T("Erreur en mode delta : ", "Delta mode error: ") & errTxt, AnalyticsTitle(), vbCritical
 End Sub
 
 '----------------------------------------------------------------------------
-' AskForPreviousReport - selection du rapport precedent. Demarre dans le
-' dossier ou les rapports sont ecrits depuis la V24.
+' LatestReportPath (V25.3, F9-01) - rapport Stats_Emails_FULL_* ou
+' Stats_Emails_DELTA_* le plus recent du dossier Sorties (horodatage du nom
+' de fichier, AAAAMMJJ_HHMMSS). Les rapports TEST (1 mail sur 10) ne
+' servent jamais de base. "" si aucun.
 '----------------------------------------------------------------------------
-Private Function AskForPreviousReport() As String
+Private Function LatestReportPath() As String
     On Error Resume Next
-    AskForPreviousReport = ""
+    LatestReportPath = ""
 
-    Dim prev As String
-    prev = CurDir$
-    ChDir ReportFolderPath()
+    Dim folder As String
+    folder = ReportFolderPath()
+    If Len(folder) = 0 Then Exit Function
 
-    Dim f As Variant
-    f = Application.GetOpenFilename( _
-            T("Rapport d'analyse (*.xlsx),*.xlsx", "Analysis report (*.xlsx),*.xlsx"), _
-            1, T("Choisir le rapport pr~ec~edent", "Select the previous report"))
+    Dim f As String, u As String, stamp As String, bestStamp As String, best As String
+    f = Dir$(folder & "\Stats_Emails_*.xlsx")
+    Do While Len(f) > 0
+        u = UCase$(f)
+        If u Like "STATS_EMAILS_FULL_########_######.XLSX" Or _
+           u Like "STATS_EMAILS_DELTA_########_######.XLSX" Then
+            stamp = Mid$(u, Len(u) - 19, 15)          ' AAAAMMJJ_HHMMSS
+            If stamp > bestStamp Then
+                bestStamp = stamp
+                best = f
+            End If
+        End If
+        f = Dir$()
+    Loop
 
-    ChDir prev
-    If VarType(f) = vbBoolean Then Exit Function
-    AskForPreviousReport = CStr(f)
+    If Len(best) > 0 Then LatestReportPath = folder & "\" & best
 End Function
 
 '----------------------------------------------------------------------------
@@ -4511,73 +5247,136 @@ End Function
 '
 ' Ouverture en LECTURE SEULE et fermeture sans enregistrer : le rapport
 ' precedent ne doit jamais etre modifie par une analyse delta.
+' V25.3 (F9-01) : par modExcelBridge (OpenWorkbook / ReadBlock /
+' CloseWorkbook) : Application.Workbooks.Open n'existe pas dans Outlook. Un
+' rapport deja ouvert a l'ecran est lu sans etre referme.
+' V25.3 (F9-02) : refuse un etat sans STATE_FORMAT 2 (regle du "dernier
+' mois complet", qui comptait deux fois le debut du mois en cours) et un
+' rapport TEST ; whyNot dit pourquoi (la question "analyse complete ?" est
+' posee par l'appelant). Erreur de lecture : message ici, whyNot = "".
 '
 ' Le bloc de compteurs est lu EN UNE FOIS dans un tableau Variant. Lu cellule
 ' par cellule, 100 000 lignes prendraient plusieurs minutes en COM.
 '----------------------------------------------------------------------------
-Private Function LoadStateFromWorkbook(ByVal path As String) As Boolean
+Private Function LoadStateFromWorkbook(ByVal path As String, ByRef whyNot As String) As Boolean
     LoadStateFromWorkbook = False
+    whyNot = ""
+    m_DeltaRows = Empty
+    Set m_DeltaConfig = Nothing
+
+    Dim xlApp As Object, wb As Object, ws As Object
+    Dim wasOpen As Boolean, ownXl As Boolean
+    Set xlApp = Nothing
+
     On Error GoTo ErrH
+    If Not modExcelBridge.OpenWorkbook(path, True, xlApp, wb, wasOpen, ownXl) Then
+        modUi.Fail T("Impossible d'ouvrir le dernier rapport :", "Cannot open the latest report:") & _
+                   vbCrLf & path, AnalyticsTitle()
+        GoTo Cleanup
+    End If
 
-    Dim wb As Object, ws As Object
-    Set wb = Application.Workbooks.Open(path, , True)   ' ReadOnly
-
+    Set ws = Nothing
     On Error Resume Next
     Set ws = wb.Worksheets(STATE_SHEET)
     On Error GoTo ErrH
 
     If ws Is Nothing Then
-        wb.Close False
-        ' v- 2026-08-22 : STATE_SHEET sort de T(). C'est un NOM DE FEUILLE
-        ' Excel, donc une donnee du contrat : le faire traverser A() est
-        ' faux par principe, et le rendrait faux en fait le jour ou ce nom
-        ' contiendrait un "~". Le titre passe par T() (il melait une
-        ' etiquette technique et un numero de version).
-        MsgBox T("Ce rapport n'a pas de feuille ", "This report has no ") & _
-                 STATE_SHEET & _
+        ' v- 2026-08-22 : STATE_SHEET hors de T() (nom de feuille = donnee).
+        whyNot = FileNameOf(path) & vbCrLf & vbCrLf & _
+                 T("Ce rapport n'a pas de feuille ", "This report has no ") & STATE_SHEET & _
                  T(" : il a ~et~e produit par une version ant~erieure ~a la V24.", _
-                   " sheet: it was produced before V24.") & vbCrLf & vbCrLf & _
-                 T("Une derni~ere analyse COMPL~ETE est n~ecessaire pour cr~eer " & _
-                   "l'~etat. Les analyses en delta seront possibles ensuite.", _
-                   "One last FULL analysis is required to build the state. " & _
-                   "Delta runs will work afterwards."), _
-               vbExclamation + vbMsgBoxSetForeground, _
-               T("Statistiques ", "Analytics ") & APP_VERSION
-        Exit Function
+                   " sheet: it was produced before V24.")
+        GoTo Cleanup
     End If
 
-    g_DeltaLastMonth = Trim$(CStr(ws.Cells(16, 2).Value))
+    ' En-tete : lignes 12 a 28 en un seul appel (ligne L -> hdr(L - 11, c)).
+    Dim hdr As Variant
+    hdr = modExcelBridge.ReadBlock(ws, 12, 1, 28, 3)
 
-    ' Configuration des boites telle qu'utilisee lors de l'analyse d'origine.
+    If Trim$(CStr(hdr(5, 1))) <> "STATE_FORMAT" Or Val(CStr(hdr(5, 2))) < STATE_FORMAT Then
+        whyNot = FileNameOf(path) & vbCrLf & vbCrLf & _
+                 T("Ce rapport a ~et~e produit avant la V25.3 : sa feuille d'~etat ne " & _
+                   "permet pas une mise ~a jour exacte (le d~ebut du mois en cours y ~etait " & _
+                   "compt~e deux fois).", _
+                   "This report was produced before V25.3: its state sheet does not " & _
+                   "allow an exact update (the start of the current month was counted " & _
+                   "twice).")
+        GoTo Cleanup
+    End If
+    If Trim$(CStr(hdr(6, 2))) = "1" Then
+        whyNot = FileNameOf(path) & vbCrLf & vbCrLf & _
+                 T("Ce rapport est un rapport de TEST (1 mail sur 10) : il ne peut pas " & _
+                   "servir de base ~a une mise ~a jour.", _
+                   "This is a TEST report (1 mail in 10): it cannot be the base of an update.")
+        GoTo Cleanup
+    End If
+
+    Dim dStart As Date, dEnd As Date
+    If Not CellDate(hdr(3, 2), dStart) Or Not CellDate(hdr(4, 2), dEnd) Then
+        whyNot = FileNameOf(path) & vbCrLf & vbCrLf & _
+                 T("La p~eriode de ce rapport est illisible.", "The period of this report is unreadable.")
+        GoTo Cleanup
+    End If
+    m_DeltaBaseStart = dStart
+    g_DeltaStart = dEnd            ' borne EXCLUE du delta (incluse dans l'etat)
+
+    ' Configuration des boites telle qu'utilisee lors de l'analyse d'origine
+    ' (lignes 20 a 28).
     Set m_DeltaConfig = CreateObject("Scripting.Dictionary")
-    Dim r As Long
-    For r = 20 To 28
-        Dim sn As String
-        sn = Trim$(CStr(ws.Cells(r, 1).Value))
+    Dim r As Long, sn As String
+    For r = 9 To 17
+        sn = Trim$(CStr(hdr(r, 1)))
         If Len(sn) > 0 Then
-            m_DeltaConfig(sn) = CStr(ws.Cells(r, 2).Value) & "|" & CStr(ws.Cells(r, 3).Value)
+            m_DeltaConfig(sn) = CStr(hdr(r, 2)) & "|" & CStr(hdr(r, 3))
         End If
     Next r
 
     Dim nRows As Long
-    nRows = CLng(ws.Cells(18, 2).Value)
+    nRows = 0
+    If IsNumeric(hdr(7, 2)) Then nRows = CLng(hdr(7, 2))
     If nRows > 0 Then
-        m_DeltaRows = ws.Range(ws.Cells(31, 1), ws.Cells(30 + nRows, 3)).Value
+        m_DeltaRows = modExcelBridge.ReadBlock(ws, 31, 1, 30 + nRows, 3)
     Else
         m_DeltaRows = Empty
     End If
 
-    wb.Close False
-    Set wb = Nothing
-
     LoadStateFromWorkbook = True
+
+Cleanup:
+    On Error Resume Next
+    Set ws = Nothing
+    modExcelBridge.CloseWorkbook xlApp, wb, wasOpen, ownXl, False
     Exit Function
 
 ErrH:
-    On Error Resume Next
-    If Not wb Is Nothing Then wb.Close False
-    MsgBox T("Lecture de l'~etat impossible : ", "Cannot read state: ") & Err.Description, _
-           vbCritical, "Analytics " & APP_VERSION
+    Dim errTxt As String
+    errTxt = Err.Number & " - " & Err.Description
+    modDebugLog.DError MOD_NAME, "Lecture de l'etat impossible : " & errTxt
+    modUi.Fail T("Lecture de l'~etat impossible : ", "Cannot read state: ") & errTxt, _
+               AnalyticsTitle(), vbCritical
+    LoadStateFromWorkbook = False
+    whyNot = ""
+    Resume Cleanup
+End Function
+
+' V25.3 : date lue dans une cellule (Date, nombre de serie Excel ou texte).
+Private Function CellDate(ByVal v As Variant, ByRef outDate As Date) As Boolean
+    On Error GoTo Bad
+    CellDate = False
+    If IsEmpty(v) Or IsError(v) Then Exit Function
+    If VarType(v) = vbDate Then
+        outDate = v
+    ElseIf IsNumeric(v) Then
+        outDate = CDate(CDbl(v))
+    ElseIf IsDate(v) Then
+        outDate = CDate(v)
+    Else
+        Exit Function
+    End If
+    CellDate = (outDate > DateSerial(1990, 1, 1))
+    Exit Function
+Bad:
+    CellDate = False
 End Function
 
 '----------------------------------------------------------------------------
@@ -4598,7 +5397,8 @@ Private Sub RehydrateFromState()
         End If
     Next i
 
-    Heartbeat "DELTA : " & n & " compteurs recharges depuis " & g_DeltaLastMonth
+    Heartbeat "DELTA : " & n & " compteurs recharges (etat jusqu'au " & _
+              Format$(g_DeltaStart, "YYYY-MM-DD HH:NN:SS") & ")"
 Fin:
     On Error Resume Next
 End Sub
@@ -4636,32 +5436,21 @@ Private Function SeedDict(ByVal dictName As String, ByVal k As String, ByVal v A
         Case "dictNbRecipients":          dictNbRecipients(k) = v
         Case "dictInternalExternal":      dictInternalExternal(k) = v
         Case "dictToCc":                  dictToCc(k) = v
+        Case "dictReply":                 dictReply(k) = v       ' V25.3 (F9-15)
         Case Else:                        SeedDict = False
     End Select
 End Function
 
 '----------------------------------------------------------------------------
-' MonthKeyToDate - "YYYY-MM" -> 1er du mois. 0 si illisible.
-'----------------------------------------------------------------------------
-Private Function MonthKeyToDate(ByVal mk As String) As Date
-    On Error Resume Next
-    MonthKeyToDate = 0
-    If Len(mk) < 7 Then Exit Function
-    Dim y As Long, m As Long
-    y = CLng(Left$(mk, 4))
-    m = CLng(Mid$(mk, 6, 2))
-    If y < 2000 Or m < 1 Or m > 12 Then Exit Function
-    MonthKeyToDate = DateSerial(y, m, 1)
-End Function
-
-'----------------------------------------------------------------------------
 ' DeltaBannerText - libelle affiche dans la fenetre de lancement.
 ' Public : lu par frmConfig.
+' V25.3 (F9-01) : nomme le rapport repris et la date a partir de laquelle
+' les mails sont ajoutes.
 '----------------------------------------------------------------------------
 Public Function DeltaBannerText() As String
-    DeltaBannerText = T("Analyse incr~ementale - mois ajout~es : ", _
-                        "Incremental analysis - months added: ") & _
-                      Format$(g_DeltaStart, "MMM YYYY") & " > " & Format$(g_DeltaEnd, "MMM YYYY")
+    DeltaBannerText = T("Mise ~a jour de ", "Updating ") & FileNameOf(g_DeltaSourcePath) & _
+                      T(" : mails apr~fs le ", ": mail after ") & _
+                      Format$(g_DeltaStart, "dd/mm/yyyy hh:nn")
 End Function
 
 '----------------------------------------------------------------------------
@@ -4694,10 +5483,10 @@ Private Sub DetectYearRange(ByRef minYear As Long, ByRef maxYear As Long)
     On Error Resume Next
     minYear = 0
     maxYear = 0
-    
+
     If dictYearly Is Nothing Then Exit Sub
     If dictYearly.Count = 0 Then Exit Sub
-    
+
     Dim k As Variant, parts As Variant, y As Long
     For Each k In dictYearly.Keys
         parts = Split(CStr(k), "|")
@@ -4712,21 +5501,5 @@ Private Sub DetectYearRange(ByRef minYear As Long, ByRef maxYear As Long)
 End Sub
 
 ' ============================================================================
-' GRAPHIQUE A : EVOLUTION ANNUELLE
-' ============================================================================
-
-' ============================================================================
-' GRAPHIQUE B : REPARTITION MENSUELLE
-' ============================================================================
-
-' ============================================================================
-' GRAPHIQUE C : PAR JOUR DE LA SEMAINE
-' ============================================================================
-
-' ============================================================================
-' FIN DU MODULE 2 - PARTIE 5 - GRAPHIQUES TEMPORELS V22
-' ============================================================================
-
-' ============================================================================
-' FIN DU MODULE V23 - CODE COMPLET UNIFIE
+' FIN DU MODULE (V25.3)
 ' ============================================================================

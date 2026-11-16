@@ -1,7 +1,58 @@
 Option Explicit
 
 '=============================================================================
-' modConfig v3.15
+' modConfig v3.18
+'
+' v3.18 (2026-11-16) : audit 11/2026 - F2-08, F2-02, F5-15, F10-03, F10-02,
+'   F10-12, F6-04, F4-07 :
+'   (a) CfgL : une valeur numerique trop grande (ou un nombre mal ecrit) ne
+'   coupe plus le chargement de toute la suite de config.ini : la cle
+'   fautive prend sa valeur par defaut et est signalee UNE fois au journal
+'   (nom de cle, valeur lue). Meme signalement pour CfgB (valeur ni oui ni
+'   non). Fichier absent : un seul essai de lecture par chargement (plus de
+'   Dir() a chaque Cfg).
+'   (b) Defauts alignes sur les vrais classeurs : "Suivi des mails.xlsm" et
+'   "Suivi des Campagnes.xlsm".
+'   (c) Nouvelles cles et getters : ToastOnManualFiling (0),
+'   BirthdayCalendarFocusFirst (0), OutlookDefaultSlot (30) ; chemin du
+'   fichier des echeances du suivi (DueCachePath) ; niveau de journal lu
+'   sans LoadConfig (ConfiguredLogLevel, pour modDebugLog).
+'   (d) integration : constante MOD_VERSION alignee sur l'en-tete
+'   (elle annoncait encore v3.17) ; en-tete de CampaignWorkbookFilename
+'   corrige (nouveau defaut).
+'
+' v3.17 (2026-10-25) : EMPLACEMENT DE L'OUTIL. Fin du chemin fixe
+'   <Bureau>\Macro VBA\Outlook. L'outil vit dans UN dossier
+'   "ClassicOutlook-Toolkit" (ToolkitDir) : config.ini a sa racine,
+'   Classeurs\ (classeurs Excel), Sorties\ (debug.log, exports,
+'   Sauvegardes\), Ressources\ (son), Code\ (sources a coller).
+'   Recherche au premier appel, dans l'ordre : dossier memorise (registre
+'   HKCU, ClassicOutlookToolkit\Paths\ToolkitDir) s'il contient config.ini ;
+'   dossier "ClassicOutlook-Toolkit" contenant config.ini a la racine puis
+'   un niveau sous la racine de OneDrive Entreprise, OneDrive perso,
+'   OneDrive et du Bureau (ex. <OneDrive>\Atelier VBA\ClassicOutlook-Toolkit),
+'   memorise des qu'il est trouve ; dossier memorise sans config.ini ;
+'   ancien emplacement <Bureau>\Macro VBA\Outlook, meme sans config.ini
+'   (reconnu tel quel, tout a plat, classeurs a la racine du Bureau, jamais
+'   memorise, y compris via SetToolkitFolder) ; a defaut
+'   <Bureau>\ClassicOutlook-Toolkit (premiere installation). Le dossier
+'   memorise est relu par les classeurs Excel (modSuiviTemps,
+'   modMailAnalytics). Macro SetToolkitFolder pour le designer a la main.
+'   Nouveaux getters ToolkitDir(), WorkbooksDir(), IsLegacyLayout(),
+'   ToolkitDirRemembered(). MacroVBADir() = dossier des SORTIES
+'   (<outil>\Sorties), nom conserve pour ses 20 appelants. Classeurs par
+'   defaut dans <outil>\Classeurs ; VBADir() par defaut <outil>\Code.
+'   Valeurs de config.ini : jeton %TOOLKIT% = dossier de l'outil, %NOM% =
+'   variable d'environnement Windows (ex. %OneDriveConsumer%) ; jeton
+'   inconnu laisse tel quel. Ex. InboxAlertSound1=%TOOLKIT%\Ressources\x.wav
+'
+' v3.16 (2026-10-24) : classeur des campagnes (modMailCampaign v12).
+'   Cles CampaignWorkbookFilename (defaut "Suivi des Campagnes.xlsm" depuis v3.18),
+'   CampaignWorkbookPath (chemin complet si le classeur n'est pas a la racine
+'   du Bureau) et CampaignDefaultAccount (adresse du compte d'envoi quand une
+'   campagne n'en precise pas). Getters EnsureLoaded-safe :
+'   CampaignWorkbookFilename(), CampaignWorkbookPath(), CampaignDefaultAccount().
+'   Meme logique de chemin que MailTrackingPath (racine du Bureau par defaut).
 '
 ' v3.15 (2026-08-18) : alertes nouveau mail par boite (modInboxAlert).
 '   Globales g_InboxAlert* + getters EnsureLoaded-safe : InboxAlertEnabled(),
@@ -77,7 +128,7 @@ Option Explicit
 ' chemins et constantes utilises par plusieurs modules.
 '
 ' NOUVEAU v2 : chargement d'un fichier de configuration externe
-'   <Bureau>\Macro VBA\Outlook\config.ini
+'   <dossier de l'outil>\config.ini (v3.17 ; avant : <Bureau>\Macro VBA\Outlook)
 ' Format INI simple :  cle=valeur  (une par ligne)
 '   - lignes vides ignorees
 '   - lignes commencant par ; ou # ignorees (commentaires)
@@ -98,12 +149,18 @@ Option Explicit
 '
 ' Points d'entree publics (chemins) :
 '   - DesktopPath()                : chemin du Bureau (avec cache)
-'   - TimeTrackingPath()          : Bureau\Suivi de temps.xlsm
-'   - MailTrackingPath()         : Bureau\Suivi des mails.xlsx
+'   - ToolkitDir()                 : dossier de l'outil (v3.17)
+'   - WorkbooksDir()               : <outil>\Classeurs (v3.17)
+'   - TimeTrackingPath()          : <outil>\Classeurs\Suivi de temps.xlsm
+'   - MailTrackingPath()         : <outil>\Classeurs\Suivi des mails.xlsm
+'   - CampaignWorkbookPath()      : <outil>\Classeurs\Suivi des Campagnes.xlsm (v3.16)
+'   - DueCachePath()              : <outil>\Sorties\suivi-echeances.txt (v3.18)
 '   - AppDataOutlookPath()        : %APPDATA%\Microsoft\Outlook
-'   - MacroVBADir()               : Bureau\Macro VBA\Outlook
-'   - VBADir()                    : Bureau\Macro VBA\Outlook\VBA
-'   - ConfigPath()                : chemin du config.ini
+'   - MacroVBADir()               : <outil>\Sorties (journal, exports, sauvegardes)
+'   - VBADir()                    : <outil>\Code
+'   - ConfigPath()                : <outil>\config.ini
+'   - SetToolkitFolder             : macro, choix manuel du dossier (v3.17)
+'   (ancien emplacement <Bureau>\Macro VBA\Outlook : comme avant v3.17)
 '
 ' Points d'entree publics (config externe) :
 '   - LoadConfig()                : peuple les globales g_* (appel au boot)
@@ -136,7 +193,7 @@ Option Explicit
 
 
 Private Const MOD_NAME As String = "Config"
-Private Const MOD_VERSION As String = "v3.15 - 2026-08-18"
+Private Const MOD_VERSION As String = "v3.18 - 2026-11-16"
 
 ' =====================================================================
 ' === VARIABLES DE CONFIGURATION GLOBALES =============================
@@ -162,8 +219,9 @@ Private Const MOD_VERSION As String = "v3.15 - 2026-08-18"
 ' --- Referentiels Excel (noms de fichiers et feuilles) ---
 Public g_TimeTrackingFilename As String   ' "Suivi de temps.xlsm"
 Public g_TimeTrackingSheet    As String   ' "Temps par mois"
-Public g_MailTrackingFilename As String   ' "Suivi des mails.xlsx"
+Public g_MailTrackingFilename As String   ' "Suivi des mails.xlsm" (v3.18 ; avant .xlsx)
 Public g_MailTrackingSheet    As String   ' "Suivi"
+Public g_CampaignWorkbookFilename As String   ' "Suivi des Campagnes.xlsm" (v3.16 ; v3.18)
 
 ' --- Archivage automatique (modFolderScan) ---
 Public g_AutoArchiveFolders     As String   ' sous-dossiers Inbox a archiver, separes par |
@@ -183,6 +241,7 @@ Public g_SpecialContractCategory As String   ' categorie appliquee si le contrat
 Public g_DefaultAppointmentDuration     As Long     ' duree par defaut nouveau RDV (min)
 Public g_MeetingDuration       As Long     ' duree attendue anti-chevauchement
 Public g_ShiftMinutes    As Long     ' pas de decalage si collision (min)
+Public g_OutlookDefaultSlot As Long     ' v3.18 : duree proposee par Outlook a une fiche neuve (min)
 
 ' --- Suivi des mails / suspicion de reponse ---
 Public g_ReplyDelayDays  As Long     ' delai avant rappel suivi (jours)
@@ -204,6 +263,7 @@ Public g_CampaignStepSec      As Long    ' delai entre 2 livraisons (secondes)
 Public g_CampaignBatchSize As Long   ' nb d'envois avant pause longue
 Public g_CampaignPauseSec    As Long    ' pause longue entre paquets (secondes)
 Public g_CampaignCap     As Long    ' plafond dur d'envois par lancement
+Public g_CampaignDefaultAccount As String   ' compte d'envoi par defaut (v3.16, vide = compte Outlook par defaut)
 
 ' --- Signature : delimiteur de signature (modSendToLLM, modMailCampaign) ---
 ' SignatureBookmark : nom du signet HTML qui marque le debut de la signature
@@ -237,6 +297,10 @@ Public g_ToastColorSuccess As String  ' action aboutie
 Public g_ToastColorInfo  As String    ' information de service
 Public g_ToastColorWarn  As String    ' action partielle / attention
 Public g_ToastColorError As String    ' echec non bloquant
+Public g_ToastOnManualFiling As Boolean  ' v3.18 : toast apres un classement MANUEL (OFF defaut)
+
+' --- Vue calendrier des anniversaires (modContactBirthday) ---
+Public g_BirthdayCalendarFocusFirst As Boolean  ' v3.18 : mise au premier plan du calendrier (OFF defaut)
 
 ' --- Alertes nouveau mail par boite (modInboxAlert) ---
 Public g_InboxAlertEnabled          As Boolean  ' interrupteur ON/OFF de la fonction
@@ -302,17 +366,38 @@ Public g_FourDigitPattern   As String  ' detecte 4 chiffres isoles -> capture
 Public g_ContractPattern     As String  ' detecte "20YY_NNNNN"
 Public g_DigitsPattern    As String  ' \d{N} : extrait N chiffres d'un bloc
 
-' === Config externe ===
-Private Const CONFIG_SUBDIR As String = "Macro VBA\Outlook"
+' === Config externe et emplacement de l'outil (v3.17) ===
+' Dossier de l'outil : config.ini a sa racine, puis Classeurs\, Sorties\,
+' Ressources\, Code\. Voir ToolkitDir().
+Private Const TOOLKIT_FOLDER As String = "ClassicOutlook-Toolkit"
+Private Const WORK_SUBDIR As String = "Sorties"              ' journal, exports, Sauvegardes\
+Private Const WORKBOOKS_SUBDIR As String = "Classeurs"       ' classeurs Excel
+Private Const CODE_SUBDIR As String = "Code"                 ' sources VBA (VBADir)
+Private Const LEGACY_SUBDIR As String = "Macro VBA\Outlook"  ' ancien emplacement (Bureau)
 Private Const CONFIG_FILENAME As String = "config.ini"
+' Dossier memorise (HKCU\Software\VB and VBA Program Settings), relu aussi
+' par les classeurs Excel (modSuiviTemps, modMailAnalytics).
+Private Const REG_APP_TK As String = "ClassicOutlookToolkit"
+Private Const REG_SECTION_PATHS As String = "Paths"
+Private Const REG_KEY_TOOLKITDIR As String = "ToolkitDir"
 
 ' === Cache local du chemin Bureau (resolu une seule fois par session) ===
 Private mDesktopPath As String
 
+' === Cache du dossier de l'outil (v3.17, resolu une fois par session) ===
+Private mToolkitDir As String
+Private mToolkitLegacy As Boolean
+
 ' === Cache du dictionnaire de config (charge a la demande) ===
 Private mCfg As Object              ' Scripting.Dictionary
 Private mCfgLoaded As Boolean       ' un fichier a-t-il ete charge ?
+Private mCfgTried As Boolean        ' v3.18 : lecture deja tentee (fichier absent compris)
 Private mGlobalsLoaded As Boolean   ' LoadConfig a-t-il deja peuple les g_ ?
+Private mBadKeys As Object          ' v3.18 : cles a valeur invalide deja signalees
+
+' v3.18 : defauts partages avec un autre module (un seul endroit).
+Private Const DEFAULT_LOG_LEVEL As Long = 1                       ' INFO
+Private Const DUE_CACHE_FILENAME As String = "suivi-echeances.txt"   ' F4-07
 
 '=============================================================================
 ' DesktopPath
@@ -337,7 +422,8 @@ End Function
 
 '=============================================================================
 ' TimeTrackingPath
-' Chemin complet de "Suivi de temps.xlsm".
+' Chemin complet de "Suivi de temps.xlsm" : <outil>\Classeurs (v3.17 ;
+' ancien emplacement : racine du Bureau).
 ' Surchargeable par la cle INI "TimeTrackingPath" (chemin absolu complet).
 '=============================================================================
 Public Function TimeTrackingPath() As String
@@ -347,13 +433,14 @@ Public Function TimeTrackingPath() As String
         TimeTrackingPath = o
     Else
         EnsureLoaded
-        TimeTrackingPath = DesktopPath() & "\" & g_TimeTrackingFilename
+        TimeTrackingPath = WorkbooksDir() & "\" & g_TimeTrackingFilename
     End If
 End Function
 
 '=============================================================================
 ' MailTrackingPath
-' Chemin complet de "Suivi des mails.xlsx".
+' Chemin complet de "Suivi des mails.xlsm" : <outil>\Classeurs (v3.17 ;
+' ancien emplacement : racine du Bureau).
 ' Surchargeable par la cle INI "MailTrackingPath".
 '=============================================================================
 Public Function MailTrackingPath() As String
@@ -363,7 +450,24 @@ Public Function MailTrackingPath() As String
         MailTrackingPath = o
     Else
         EnsureLoaded
-        MailTrackingPath = DesktopPath() & "\" & g_MailTrackingFilename
+        MailTrackingPath = WorkbooksDir() & "\" & g_MailTrackingFilename
+    End If
+End Function
+
+'=============================================================================
+' CampaignWorkbookPath (v3.16)
+' Chemin complet du classeur des campagnes ("Suivi des Campagnes.xlsm" par defaut,
+' dans <outil>\Classeurs comme le suivi des mails ; v3.17).
+' Surchargeable par la cle INI "CampaignWorkbookPath" (chemin absolu complet).
+'=============================================================================
+Public Function CampaignWorkbookPath() As String
+    Dim o As String
+    o = Cfg("CampaignWorkbookPath", "")
+    If Len(o) > 0 Then
+        CampaignWorkbookPath = o
+    Else
+        EnsureLoaded
+        CampaignWorkbookPath = WorkbooksDir() & "\" & g_CampaignWorkbookFilename
     End If
 End Function
 
@@ -377,15 +481,23 @@ End Function
 
 '=============================================================================
 ' MacroVBADir
-' <Bureau>\Macro VBA\Outlook  (dossier debug.log, exports, etc.)
+' Dossier des SORTIES de l'outil : debug.log, exports, Sauvegardes\.
+' v3.17 : <outil>\Sorties (avant : <Bureau>\Macro VBA\Outlook). Ancien
+' emplacement detecte : le dossier lui-meme, comme avant. Nom conserve
+' (20 appelants).
 '=============================================================================
 Public Function MacroVBADir() As String
-    MacroVBADir = DesktopPath() & "\" & CONFIG_SUBDIR
+    If IsLegacyLayout() Then
+        MacroVBADir = ToolkitDir()
+    Else
+        MacroVBADir = ToolkitDir() & "\" & WORK_SUBDIR
+    End If
 End Function
 
 '=============================================================================
 ' VBADir
-' <Bureau>\Macro VBA\Outlook\VBA  (dossier des sources VBA exportees).
+' Dossier des sources VBA (.txt a coller dans le VBE).
+' v3.17 : <outil>\Code (ancien emplacement : <Bureau>\Macro VBA\Outlook\VBA).
 ' Surchargeable par la cle INI "VBADir".
 '=============================================================================
 Public Function VBADir() As String
@@ -393,26 +505,300 @@ Public Function VBADir() As String
     o = Cfg("VBADir", "")
     If Len(o) > 0 Then
         VBADir = o
-    Else
+    ElseIf IsLegacyLayout() Then
         VBADir = MacroVBADir() & "\VBA"
+    Else
+        VBADir = ToolkitDir() & "\" & CODE_SUBDIR
     End If
 End Function
 
 '=============================================================================
 ' ConfigPath
-' Chemin complet du fichier config.ini.
+' Chemin complet du fichier config.ini : <outil>\config.ini (v3.17).
 '=============================================================================
 Public Function ConfigPath() As String
-    ConfigPath = MacroVBADir() & "\" & CONFIG_FILENAME
+    ConfigPath = ToolkitDir() & "\" & CONFIG_FILENAME
 End Function
 
 '=============================================================================
 ' InvalidateDesktopCache
-' Reset du cache Bureau (utile si on change de session OneDrive, ou test).
+' Reset du cache Bureau et (v3.17) du dossier de l'outil : utile si on
+' change de session OneDrive, ou pour un test.
 '=============================================================================
 Public Sub InvalidateDesktopCache()
     mDesktopPath = ""
+    mToolkitDir = ""
+    mToolkitLegacy = False
 End Sub
+
+' =====================================================================
+' === DOSSIER DE L'OUTIL (v3.17) =====================================
+' =====================================================================
+
+'=============================================================================
+' ToolkitDir (v3.17)
+' Dossier de l'outil : config.ini a sa racine, Classeurs\, Sorties\,
+' Ressources\, Code\. Resolu une fois par session (cache), dans l'ordre :
+'   1. dossier memorise (registre) s'il contient config.ini ;
+'   2. dossier "ClassicOutlook-Toolkit" contenant config.ini, a la racine
+'      puis un niveau sous la racine de : OneDrive Entreprise, OneDrive
+'      perso, OneDrive, Bureau (ex. <OneDrive perso>\Atelier VBA\
+'      ClassicOutlook-Toolkit). Memorise des qu'il est trouve ;
+'   3. dossier memorise sans config.ini (choisi a la main via
+'      SetToolkitFolder, premiere installation) ;
+'   4. ancien emplacement <Bureau>\Macro VBA\Outlook s'il existe (avec ou
+'      sans config.ini) : utilise tel quel (tout a plat), jamais memorise ;
+'   5. a defaut : <Bureau>\ClassicOutlook-Toolkit (premiere installation,
+'      cf. modQuickStart).
+' Ne lit pas config.ini et ne journalise pas : appele par ConfigPath() et,
+' via MacroVBADir(), par le logger lui-meme.
+'=============================================================================
+Public Function ToolkitDir() As String
+    If Len(mToolkitDir) = 0 Then ResolveToolkitDir
+    ToolkitDir = mToolkitDir
+End Function
+
+'=============================================================================
+' IsLegacyLayout (v3.17)
+' True si l'outil tourne depuis l'ancien emplacement <Bureau>\Macro VBA\
+' Outlook (tout a plat, classeurs a la racine du Bureau).
+'=============================================================================
+Public Function IsLegacyLayout() As Boolean
+    If Len(mToolkitDir) = 0 Then ResolveToolkitDir
+    IsLegacyLayout = mToolkitLegacy
+End Function
+
+'=============================================================================
+' WorkbooksDir (v3.17)
+' Dossier des classeurs Excel : <outil>\Classeurs (ancien emplacement :
+' racine du Bureau). Les cles TimeTrackingPath / MailTrackingPath /
+' CampaignWorkbookPath de config.ini restent prioritaires.
+'=============================================================================
+Public Function WorkbooksDir() As String
+    If IsLegacyLayout() Then
+        WorkbooksDir = DesktopPath()
+    Else
+        WorkbooksDir = ToolkitDir() & "\" & WORKBOOKS_SUBDIR
+    End If
+End Function
+
+'=============================================================================
+' ToolkitDirRemembered (v3.17)
+' Dossier memorise dans le registre ("" si aucun). Diagnostic
+' (modMaintenance.MaintDiagnosePaths).
+'=============================================================================
+Public Function ToolkitDirRemembered() As String
+    On Error Resume Next
+    ToolkitDirRemembered = NormDir(GetSetting(REG_APP_TK, REG_SECTION_PATHS, REG_KEY_TOOLKITDIR, ""))
+End Function
+
+'=============================================================================
+' SetToolkitFolder (v3.17) - macro (Alt+F8, ou fenetre Execution du VBE)
+' Designe a la main le dossier de l'outil (celui qui contient config.ini),
+' si la recherche automatique ne le trouve pas ou pour en changer. Le
+' chemin est memorise (registre HKCU) puis la configuration est relue.
+' Champ vide = oubli du dossier memorise (retour a la recherche auto).
+'=============================================================================
+Public Sub SetToolkitFolder()
+    On Error GoTo ErrH
+    Dim ttl As String, ans As String, p As String
+    ttl = T("Dossier de l'outil", "Toolkit folder")
+    ans = InputBox(T("Dossier de l'outil, celui qui contient config.ini (chemin copi~e depuis l'Explorateur).", _
+                     "Toolkit folder, the one holding config.ini (path copied from Explorer).") & vbCrLf & vbCrLf & _
+                   T("Vide = recherche automatique.", "Empty = automatic search."), ttl, ToolkitDir())
+    If StrPtr(ans) = 0 Then Exit Sub                 ' Annuler
+    p = NormDir(Replace(ans, """", ""))
+    If Len(p) > 0 Then
+        If Not FolderOk(p) Then
+            MsgBox T("Dossier introuvable :", "Folder not found:") & vbCrLf & p, vbExclamation, ttl
+            Exit Sub
+        End If
+        If Not HasConfig(p) Then
+            If MsgBox(T("Ce dossier ne contient pas config.ini. Le retenir quand m~xme ?", _
+                        "This folder holds no config.ini. Keep it anyway?"), _
+                      vbQuestion + vbYesNo, ttl) <> vbYes Then Exit Sub
+        End If
+    End If
+    ' L'ancien emplacement n'est jamais memorise (il est reconnu tout seul) :
+    ' memorise, il masquerait le nouveau dossier a chaque demarrage.
+    Dim legacyPick As Boolean
+    legacyPick = IsLegacyPath(p)
+    If legacyPick Then
+        SaveSetting REG_APP_TK, REG_SECTION_PATHS, REG_KEY_TOOLKITDIR, ""
+    Else
+        SaveSetting REG_APP_TK, REG_SECTION_PATHS, REG_KEY_TOOLKITDIR, p
+    End If
+    InvalidateDesktopCache
+    If Len(p) > 0 Then
+        ' Choix explicite : pris tel quel pour cette session (meme sans
+        ' config.ini, que le guide de demarrage ou Maintenance > Ouvrir
+        ' config creera ici).
+        mToolkitDir = p
+        mToolkitLegacy = legacyPick
+    End If
+    ' Dossier Sorties cree tout de suite : le journal (modDebugLog) ne le
+    ' recree pas en cours de session.
+    On Error Resume Next
+    If FolderOk(ToolkitDir()) Then
+        If Not FolderOk(MacroVBADir()) Then MkDir MacroVBADir()
+    End If
+    On Error GoTo ErrH
+    ReloadConfig
+    modDebugLog.DInfo MOD_NAME, "SetToolkitFolder : " & ToolkitDir()
+    MsgBox T("Dossier de l'outil :", "Toolkit folder:") & vbCrLf & ToolkitDir() & vbCrLf & _
+           IIf(legacyPick, T("(ancien emplacement : utilis~e tel quel, non m~emoris~e)", _
+                             "(former location: used as is, not remembered)") & vbCrLf, "") & vbCrLf & _
+           T("Red~emarrer Outlook pour que tous les modules le prennent en compte.", _
+             "Restart Outlook so that every module picks it up."), vbInformation, ttl
+    Exit Sub
+ErrH:
+    MsgBox T("Erreur : ", "Error: ") & Err.Number & " - " & Err.Description, vbExclamation, _
+           T("Dossier de l'outil", "Toolkit folder")
+End Sub
+
+'=============================================================================
+' ResolveToolkitDir (interne, v3.17) - voir ToolkitDir.
+'=============================================================================
+Private Sub ResolveToolkitDir()
+    On Error Resume Next
+    Dim reg As String, p As String
+    mToolkitLegacy = False
+
+    ' 1. Dossier memorise, s'il contient config.ini. L'ancien emplacement
+    '    n'est jamais pris d'ici (il passerait devant le nouveau dossier).
+    reg = NormDir(GetSetting(REG_APP_TK, REG_SECTION_PATHS, REG_KEY_TOOLKITDIR, ""))
+    If IsLegacyPath(reg) Then reg = ""
+    If HasConfig(reg) Then
+        mToolkitDir = reg
+        Exit Sub
+    End If
+
+    ' 2. Recherche : OneDrive Entreprise / perso / Bureau, racine puis un niveau
+    p = FindToolkitDir()
+    If Len(p) > 0 Then
+        mToolkitDir = p
+        If StrComp(p, reg, vbTextCompare) <> 0 Then
+            SaveSetting REG_APP_TK, REG_SECTION_PATHS, REG_KEY_TOOLKITDIR, p
+        End If
+        Exit Sub
+    End If
+
+    ' 3. Dossier memorise sans config.ini (choisi a la main)
+    If FolderOk(reg) Then
+        mToolkitDir = reg
+        Exit Sub
+    End If
+
+    ' 4. Ancien emplacement : utilise tel quel, jamais memorise. Reconnu
+    '    meme sans config.ini (installation qui tourne sur les defauts :
+    '    debug.log y est cree depuis toujours).
+    p = DesktopPath() & "\" & LEGACY_SUBDIR
+    If FolderOk(p) Then
+        mToolkitDir = p
+        mToolkitLegacy = True
+        Exit Sub
+    End If
+
+    ' 5. Premiere installation
+    mToolkitDir = DesktopPath() & "\" & TOOLKIT_FOLDER
+    If Len(mToolkitDir) <= Len(TOOLKIT_FOLDER) + 1 Then
+        mToolkitDir = Environ$("USERPROFILE") & "\" & TOOLKIT_FOLDER
+    End If
+End Sub
+
+'=============================================================================
+' FindToolkitDir (interne, v3.17)
+' Premier dossier "ClassicOutlook-Toolkit" contenant config.ini, a la
+' racine de chaque base, puis un niveau sous la racine. "" si aucun.
+'=============================================================================
+Private Function FindToolkitDir() As String
+    On Error Resume Next
+    FindToolkitDir = ""
+    Dim bases(1 To 4) As String, i As Long, j As Long, p As String
+    bases(1) = NormDir(Environ$("OneDriveCommercial"))
+    bases(2) = NormDir(Environ$("OneDriveConsumer"))
+    bases(3) = NormDir(Environ$("OneDrive"))
+    bases(4) = NormDir(DesktopPath())
+    ' Doublons neutralises (OneDrive = l'un des deux autres en general)
+    For i = 2 To 4
+        For j = 1 To i - 1
+            If StrComp(bases(i), bases(j), vbTextCompare) = 0 Then bases(i) = ""
+        Next j
+    Next i
+    ' Racine de chaque base d'abord
+    For i = 1 To 4
+        If Len(bases(i)) > 0 Then
+            If HasConfig(bases(i) & "\" & TOOLKIT_FOLDER) Then
+                FindToolkitDir = bases(i) & "\" & TOOLKIT_FOLDER
+                Exit Function
+            End If
+        End If
+    Next i
+    ' Puis un niveau sous la racine
+    For i = 1 To 4
+        If Len(bases(i)) > 0 Then
+            p = ScanOneLevel(bases(i))
+            If Len(p) > 0 Then
+                FindToolkitDir = p
+                Exit Function
+            End If
+        End If
+    Next i
+End Function
+
+' Sous-dossiers directs de base : premier <base>\<x>\ClassicOutlook-Toolkit
+' contenant config.ini. Erreur d'acces : recherche abandonnee pour cette base.
+Private Function ScanOneLevel(ByVal base As String) As String
+    On Error GoTo Fin
+    ScanOneLevel = ""
+    Dim fso As Object, sf As Object, p As String
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    If Not fso.FolderExists(base) Then Exit Function
+    For Each sf In fso.GetFolder(base).SubFolders
+        p = base & "\" & CStr(sf.Name) & "\" & TOOLKIT_FOLDER
+        If HasConfig(p) Then
+            ScanOneLevel = p
+            Exit Function
+        End If
+    Next sf
+Fin:
+End Function
+
+' True si le dossier p contient config.ini. FSO plutot que Dir$ : l'etat de
+' Dir$ est partage avec l'appelant (boucle Dir$ en cours).
+Private Function HasConfig(ByVal p As String) As Boolean
+    On Error Resume Next
+    Dim ok As Boolean
+    ok = False
+    If Len(p) > 0 Then ok = CreateObject("Scripting.FileSystemObject").FileExists(p & "\" & CONFIG_FILENAME)
+    HasConfig = ok
+End Function
+
+' True si le dossier p existe (erreur = non).
+Private Function FolderOk(ByVal p As String) As Boolean
+    On Error Resume Next
+    Dim ok As Boolean
+    ok = False
+    If Len(p) > 0 Then ok = CreateObject("Scripting.FileSystemObject").FolderExists(p)
+    FolderOk = ok
+End Function
+
+' True si p est l'ancien emplacement <Bureau>\Macro VBA\Outlook (choisi a
+' la main ou memorise) : disposition a plat, comme avant v3.17.
+Private Function IsLegacyPath(ByVal p As String) As Boolean
+    IsLegacyPath = False
+    If Len(p) = 0 Then Exit Function
+    IsLegacyPath = (StrComp(NormDir(p), DesktopPath() & "\" & LEGACY_SUBDIR, vbTextCompare) = 0)
+End Function
+
+' Chemin de dossier normalise : espaces et separateur final retires.
+Private Function NormDir(ByVal p As String) As String
+    p = Trim$(p)
+    Do While Len(p) > 3 And Right$(p, 1) = "\"
+        p = Left$(p, Len(p) - 1)
+    Loop
+    NormDir = p
+End Function
 
 ' =====================================================================
 ' === CONFIG EXTERNE (config.ini) ====================================
@@ -422,6 +808,7 @@ End Sub
 ' Cfg
 ' Renvoie la valeur string d'une cle de config.ini.
 ' Charge le fichier au premier appel (lazy). defaultVal si cle absente.
+' v3.17 : jetons %TOOLKIT% / %VARIABLE% remplaces (ExpandTokens).
 '=============================================================================
 Public Function Cfg(ByVal key As String, ByVal defaultVal As String) As String
     On Error Resume Next
@@ -431,31 +818,83 @@ Public Function Cfg(ByVal key As String, ByVal defaultVal As String) As String
         Exit Function
     End If
     If mCfg.Exists(LCase$(key)) Then
-        Cfg = mCfg(LCase$(key))
+        Cfg = ExpandTokens(CStr(mCfg(LCase$(key))))   ' v3.17 : %TOOLKIT%, %VARIABLE%
     Else
         Cfg = defaultVal
     End If
 End Function
 
 '=============================================================================
+' ExpandTokens (interne, v3.17)
+' Jetons dans une valeur de config.ini : %TOOLKIT% = dossier de l'outil,
+' %NOM% = variable d'environnement Windows (ex. %OneDriveConsumer%,
+' %USERPROFILE%). Jeton inconnu ou vide : laisse tel quel. Valeur sans "%" :
+' renvoyee sans traitement.
+'=============================================================================
+Private Function ExpandTokens(ByVal s As String) As String
+    ExpandTokens = s
+    If InStr(1, s, "%") = 0 Then Exit Function
+    Dim res As String, pos As Long, p1 As Long, p2 As Long, v As String
+    pos = 1
+    Do
+        p1 = InStr(pos, s, "%")
+        If p1 = 0 Then Exit Do
+        p2 = InStr(p1 + 1, s, "%")
+        If p2 = 0 Then Exit Do
+        v = TokenValue(Mid$(s, p1 + 1, p2 - p1 - 1))
+        If Len(v) > 0 Then
+            res = res & Mid$(s, pos, p1 - pos) & v
+            pos = p2 + 1
+        Else
+            res = res & Mid$(s, pos, p1 - pos + 1)
+            pos = p1 + 1
+        End If
+    Loop
+    ExpandTokens = res & Mid$(s, pos)
+End Function
+
+' Valeur d'un jeton (nom sans les %). "" si nom invalide ou inconnu.
+Private Function TokenValue(ByVal nm As String) As String
+    On Error Resume Next
+    TokenValue = ""
+    If Len(nm) = 0 Or Len(nm) > 40 Then Exit Function
+    If nm Like "*[!A-Za-z0-9_]*" Then Exit Function
+    If UCase$(nm) = "TOOLKIT" Then
+        TokenValue = ToolkitDir()
+    Else
+        TokenValue = Environ$(nm)
+    End If
+End Function
+
+'=============================================================================
 ' CfgL
 ' Valeur Long d'une cle. defaultVal si absente ou non numerique.
+' v3.18 (F2-08) : une valeur hors des limites d'un Long (ex. un zero de
+' trop) ou non numerique prend defaultVal et est signalee UNE fois au
+' journal, au lieu de lever l'erreur 6 qui arretait LoadConfig et laissait
+' a zero tous les reglages lus apres elle.
 '=============================================================================
 Public Function CfgL(ByVal key As String, ByVal defaultVal As Long) As Long
     Dim s As String
     s = Cfg(key, "")
-    If Len(s) = 0 Then
-        CfgL = defaultVal
-    ElseIf IsNumeric(s) Then
-        CfgL = CLng(s)
-    Else
-        CfgL = defaultVal
+    CfgL = defaultVal
+    If Len(s) = 0 Then Exit Function
+    If Not IsNumeric(s) Then
+        WarnBadValue key, s, CStr(defaultVal)
+        Exit Function
     End If
+    On Error GoTo Bad
+    CfgL = CLng(s)
+    Exit Function
+Bad:
+    CfgL = defaultVal
+    WarnBadValue key, s, CStr(defaultVal)
 End Function
 
 '=============================================================================
 ' CfgB
 ' Valeur Boolean d'une cle. 1 / true / vrai / oui / yes = True.
+' v3.18 (F2-08) : valeur non reconnue -> defaut, signalee une fois.
 '=============================================================================
 Public Function CfgB(ByVal key As String, ByVal defaultVal As Boolean) As Boolean
     Dim s As String
@@ -471,8 +910,28 @@ Public Function CfgB(ByVal key As String, ByVal defaultVal As Boolean) As Boolea
             CfgB = False
         Case Else
             CfgB = defaultVal
+            WarnBadValue key, s, IIf(defaultVal, "1", "0")
     End Select
 End Function
+
+'=============================================================================
+' WarnBadValue (interne, v3.18 - F2-08)
+' Signale au journal (ERREUR, une seule fois par cle et par chargement de
+' config.ini) une valeur illisible et la valeur par defaut retenue a la
+' place. Le nom de la cle est ecrit tel quel : c'est lui qu'il faut
+' chercher dans config.ini.
+'=============================================================================
+Private Sub WarnBadValue(ByVal key As String, ByVal rawValue As String, ByVal usedValue As String)
+    On Error Resume Next
+    If mBadKeys Is Nothing Then
+        Set mBadKeys = CreateObject("Scripting.Dictionary")
+        mBadKeys.CompareMode = 1
+    End If
+    If mBadKeys.Exists(key) Then Exit Sub
+    mBadKeys(key) = True
+    modDebugLog.DError MOD_NAME, "config.ini : cle " & key & " = '" & Left$(rawValue, 40) & _
+        "' illisible ou hors limites, valeur par defaut utilisee (" & usedValue & ")"
+End Sub
 
 '=============================================================================
 ' ReloadConfig
@@ -482,7 +941,9 @@ End Function
 '=============================================================================
 Public Sub ReloadConfig()
     mCfgLoaded = False
+    mCfgTried = False
     Set mCfg = Nothing
+    Set mBadKeys = Nothing
     EnsureConfigLoaded
     mGlobalsLoaded = False
     LoadConfig
@@ -503,8 +964,9 @@ Public Sub LoadConfig()
     ' --- Referentiels Excel ---
     g_TimeTrackingFilename = Cfg("TimeTrackingFilename", "Suivi de temps.xlsm")
     g_TimeTrackingSheet = Cfg("TimeTrackingSheet", "Temps par mois")
-    g_MailTrackingFilename = Cfg("MailTrackingFilename", "Suivi des mails.xlsx")
+    g_MailTrackingFilename = Cfg("MailTrackingFilename", "Suivi des mails.xlsm")
     g_MailTrackingSheet = Cfg("MailTrackingSheet", "Suivi")
+    g_CampaignWorkbookFilename = Cfg("CampaignWorkbookFilename", "Suivi des Campagnes.xlsm")
 
     ' --- Archivage automatique ---
     g_AutoArchiveFolders = Cfg("AutoArchiveFolders", "")
@@ -522,6 +984,10 @@ Public Sub LoadConfig()
     g_DefaultAppointmentDuration = CfgL("DefaultAppointmentDuration", 15)
     g_MeetingDuration = CfgL("MeetingDuration", 15)
     g_ShiftMinutes = CfgL("ShiftMinutes", 15)
+    ' v3.18 (F6-04) : duree qu'Outlook propose a une fiche neuve (double-clic
+    ' sur une case, Nouveau rendez-vous). Seule cette duree-la est remplacee
+    ' par DefaultAppointmentDuration ; une plage choisie a la souris est gardee.
+    g_OutlookDefaultSlot = CfgL("OutlookDefaultSlot", 30)
 
     ' --- Suivi mails / suspicion ---
     g_ReplyDelayDays = CfgL("ReplyDelayDays", 7)
@@ -543,6 +1009,7 @@ Public Sub LoadConfig()
     g_CampaignBatchSize = CfgL("CampaignBatchSize", 50)
     g_CampaignPauseSec = CfgL("CampaignPauseSec", 180)
     g_CampaignCap = CfgL("CampaignCap", 200)
+    g_CampaignDefaultAccount = Cfg("CampaignDefaultAccount", "")
 
     ' --- Signature : delimiteur de signature ---
     g_SignatureBookmark = Cfg("SignatureBookmark", "_MailAutoSig")
@@ -571,6 +1038,14 @@ Public Sub LoadConfig()
     g_ToastColorInfo = Cfg("ToastColorInfo", "#1565C0")
     g_ToastColorWarn = Cfg("ToastColorWarn", "#EF6C00")
     g_ToastColorError = Cfg("ToastColorError", "#C62828")
+    ' v3.18 (F10-12) : pas de toast de confirmation apres un classement
+    ' MANUEL (le mail quitte deja la liste sous les yeux de l'utilisateur).
+    g_ToastOnManualFiling = CfgB("ToastOnManualFiling", False)
+
+    ' --- Vue calendrier des anniversaires (v3.18, F10-02 choix A) ---
+    ' Mise au premier plan du calendrier : coupee par defaut (elle precede
+    ' les trois arrets brutaux d'Outlook releves dans le journal).
+    g_BirthdayCalendarFocusFirst = CfgB("BirthdayCalendarFocusFirst", False)
 
     ' --- Alertes nouveau mail par boite (modInboxAlert) ---
     g_InboxAlertEnabled = CfgB("InboxAlertEnabled", False)
@@ -607,7 +1082,7 @@ Public Sub LoadConfig()
     If g_Language <> "EN" Then g_Language = "FR"
 
     ' --- Logging (defaut INFO pour conserver le comportement historique) ---
-    g_DefaultLogLevel = CfgL("DefaultLogLevel", 1)
+    g_DefaultLogLevel = ConfiguredLogLevel()
 
     ' --- Codes metier : briques de construction ---
     g_ProjectPrefix = Cfg("ProjectPrefix", "DOSS")
@@ -744,6 +1219,18 @@ End Function
 Public Function CampaignCap() As Long
     EnsureLoaded
     CampaignCap = g_CampaignCap
+End Function
+
+' v3.16 : classeur des campagnes et compte d'envoi par defaut.
+Public Function CampaignWorkbookFilename() As String
+    EnsureLoaded
+    CampaignWorkbookFilename = g_CampaignWorkbookFilename
+    If Len(CampaignWorkbookFilename) = 0 Then CampaignWorkbookFilename = "Suivi des Campagnes.xlsm"
+End Function
+
+Public Function CampaignDefaultAccount() As String
+    EnsureLoaded
+    CampaignDefaultAccount = g_CampaignDefaultAccount
 End Function
 
 ' v3.14 : les 3 getters manquants du lot v3.13 (appeles par modProjectTag).
@@ -986,6 +1473,54 @@ Public Function InboxAlertDefaultSound() As String
 End Function
 
 '=============================================================================
+' v3.18 (audit 11/2026) : getters des nouvelles cles.
+'=============================================================================
+
+' ToastOnManualFiling (F10-12) : False (defaut) = pas de toast "Range dans"
+' apres un classement MANUEL ; les classements faits sans geste de
+' l'utilisateur (reponse rangee a sa place, envoye classe seul) gardent le
+' leur. Lu par modQuickMove avant modNotify.NotifyFiled.
+Public Function ToastOnManualFiling() As Boolean
+    EnsureLoaded
+    ToastOnManualFiling = g_ToastOnManualFiling
+End Function
+
+' BirthdayCalendarFocusFirst (F10-02, choix A) : False (defaut) = la vue
+' anniversaires ne met plus le calendrier au premier plan.
+Public Function BirthdayCalendarFocusFirst() As Boolean
+    EnsureLoaded
+    BirthdayCalendarFocusFirst = g_BirthdayCalendarFocusFirst
+End Function
+
+' OutlookDefaultSlotMinutes (F6-04) : duree (minutes) qu'Outlook donne a une
+' fiche de rendez-vous neuve (30 par defaut). Une fiche qui arrive avec une
+' autre duree (plage choisie a la souris, .ics importe) la garde.
+Public Function OutlookDefaultSlotMinutes() As Long
+    EnsureLoaded
+    OutlookDefaultSlotMinutes = g_OutlookDefaultSlot
+    If OutlookDefaultSlotMinutes <= 0 Then OutlookDefaultSlotMinutes = 30
+End Function
+
+' DueCachePath (F4-07) : petit fichier texte des echeances du suivi des
+' mails, tenu a jour a chaque enregistrement du classeur et lu par le
+' rappel du matin sans ouvrir Excel. Nom FIXE dans le dossier des sorties
+' (<outil>\Sorties\suivi-echeances.txt ; ancien emplacement : a plat), pour
+' que le classeur le retrouve seul (dossier de l'outil memorise dans le
+' registre : ClassicOutlookToolkit\Paths\ToolkitDir, puis \Sorties).
+Public Function DueCachePath() As String
+    DueCachePath = MacroVBADir() & "\" & DUE_CACHE_FILENAME
+End Function
+
+' ConfiguredLogLevel (F10-03) : niveau de journal de config.ini
+' (DefaultLogLevel, defaut 1 = INFO), lu dans le fichier SANS passer par
+' LoadConfig. Utilise par modDebugLog pour retrouver son niveau apres une
+' remise a zero du projet VBA (aucune boucle : ne journalise rien d'autre
+' qu'une valeur illisible, une fois).
+Public Function ConfiguredLogLevel() As Long
+    ConfiguredLogLevel = CfgL("DefaultLogLevel", DEFAULT_LOG_LEVEL)
+End Function
+
+'=============================================================================
 ' PACK v3 : getters manquants (modOneNote lisait g_TimeTrackingFilename en
 ' direct ; aucun getter pour Language, SignatureBookmark, OneNoteNotebookN,
 ' ProjectCodeLength, ContractYearPrefix, OpportunityTypes,
@@ -1153,10 +1688,16 @@ End Function
 ' EnsureConfigLoaded (interne)
 ' Charge config.ini une seule fois. Cree mCfg meme si le fichier est absent
 ' (dictionnaire vide) pour que les appels suivants soient stables.
+' v3.18 (F2-08) : un seul essai par chargement, fichier absent compris
+' (mCfgTried ; avant, chaque Cfg() refaisait la lecture et un Dir() sur le
+' chemin OneDrive tant que config.ini manquait). ReloadConfig relance un
+' essai. Existence testee par FSO (HasConfig) : Dir() remettait a zero la
+' boucle Dir$ en cours chez l'appelant.
 '=============================================================================
 Private Sub EnsureConfigLoaded()
     On Error GoTo ErrH
-    If mCfgLoaded And Not (mCfg Is Nothing) Then Exit Sub
+    If mCfgTried And Not (mCfg Is Nothing) Then Exit Sub
+    mCfgTried = True
 
     Set mCfg = CreateObject("Scripting.Dictionary")
     mCfg.CompareMode = 1   ' TextCompare (insensible a la casse, mais on stocke deja en LCase)
@@ -1164,7 +1705,7 @@ Private Sub EnsureConfigLoaded()
 
     Dim path As String
     path = ConfigPath()
-    If Dir(path) = "" Then
+    If Not HasConfig(ToolkitDir()) Then
         ' Pas de fichier : dictionnaire vide, defauts utilises partout.
         Exit Sub
     End If
@@ -1215,6 +1756,17 @@ ErrH:
         " - " & Err.Description
     ' On garde un dictionnaire vide : defauts partout, pas de plantage.
     If mCfg Is Nothing Then Set mCfg = CreateObject("Scripting.Dictionary")
+    CloseQuietly f
+    ' v3.18 : erreur de LECTURE (verrou OneDrive passager...) : nouvel essai
+    ' au prochain appel, comme avant. Seul le fichier absent est definitif.
+    mCfgTried = False
+End Sub
+
+' Ferme un numero de fichier sans jamais lever d'erreur (appelable depuis un
+' gestionnaire d'erreur actif). 0 = rien a fermer.
+Private Sub CloseQuietly(ByVal fileNum As Integer)
+    On Error Resume Next
+    If fileNum <> 0 Then Close #fileNum
 End Sub
 
 '=============================================================================

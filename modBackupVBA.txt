@@ -1,7 +1,11 @@
 Option Explicit
 
 '=============================================================================
-' modBackupVBA (v3 - 2026-08-22)
+' modBackupVBA (v3.1 - 2026-11-16)
+'
+' v3.1 (2026-11-16) : audit 11/2026 - F1-10 : BackupVBASilent supprimee (aucun appelant, aucun bouton ; ses
+'   echecs ouvraient des MsgBox malgre son nom) ; en-tete a jour (dossier
+'   Sorties de l'outil au lieu du Bureau).
 '
 ' v3 (2026-08-22) : revue UX pop-ups + traduction.
 '   (a) Le recapitulatif de SUCCES passe en toast : aucune decision a
@@ -16,20 +20,20 @@ Option Explicit
 '
 ' v2
 ' Purpose (EN): backs up VbaProject.OTM (the whole Outlook VBA environment:
-'   modules, classes, UserForms, references) into a timestamped subfolder of
-'   the Desktop. BackupVBA is interactive (confirmation + result MsgBox);
-'   BackupVBASilent runs quietly (used at startup). Note: do Ctrl+S in the
-'   VBE first so the latest unsaved edits are included in the copy.
+'   modules, classes, UserForms, references) into the Sauvegardes subfolder
+'   of the toolkit Output folder. BackupVBA is interactive (confirmation,
+'   toast on success). Note: do Ctrl+S in the VBE first so the latest
+'   unsaved edits are included in the copy.
 '
 ' Sauvegarde le fichier VbaProject.OTM (qui contient TOUT l'environnement
 ' VBA Outlook : modules, classes, UserForms, references) dans :
-'     Bureau\Macro VBA\Outlook\Sauvegardes\
+'     <outil>\Sorties\Sauvegardes\   (modConfig.MacroVBADir ; ancien
+'     emplacement : Bureau\Macro VBA\Outlook\Sauvegardes\)
 '
 ' Nom du backup : VbaProject_YYYY-MM-DD_HH-MM-SS.otm
 '
-' Points d'entree publics :
-'   - BackupVBA       : sauvegarde interactive (MsgBox a la fin)
-'   - BackupVBASilent : sauvegarde silencieuse (pas de MsgBox en cas de succes)
+' Point d'entree public :
+'   - BackupVBA       : sauvegarde interactive (toast a la fin)
 '
 ' IMPORTANT : le fichier source est VbaProject.OTM ouvert par Outlook.
 ' La copie est faite via Scripting.FileSystemObject qui accepte la lecture
@@ -40,10 +44,9 @@ Option Explicit
 '=============================================================================
 
 Private Const MOD_NAME As String = "BackupVBA"
-Private Const MOD_VERSION As String = "v3 - 2026-08-22"
+Private Const MOD_VERSION As String = "v3.1 - 2026-11-16"
 
-' Sous-dossier de backup, relatif au Bureau
-' Pack v3 (D11) : relatif a modConfig.MacroVBADir() (plus de segment duplique).
+' Sous-dossier de backup, relatif a modConfig.MacroVBADir() (pack v3 - D11).
 Private Const BACKUP_SUBDIR As String = "Sauvegardes"
 Private Const OTM_NAME As String = "VbaProject.OTM"
 
@@ -102,23 +105,6 @@ ErrHandler:
     modDebugLog.DError MOD_NAME, "BackupVBA err " & Err.Number & " - " & Err.Description
     MsgBox T("Erreur : ", "Error: ") & Err.Number & " - " & Err.Description, _
            vbExclamation, UiTitle()
-End Sub
-
-'=============================================================================
-' Variante silencieuse (pas de MsgBox en cas de succes)
-'=============================================================================
-Public Sub BackupVBASilent()
-    Dim destFile As String
-    Dim okMsg As String
-
-    On Error Resume Next
-    destFile = DoBackup(okMsg)
-    If Len(destFile) > 0 Then
-        modDebugLog.DInfo MOD_NAME, "BackupVBASilent OK : " & destFile
-    Else
-        modDebugLog.DError MOD_NAME, "BackupVBASilent ECHEC"
-    End If
-    On Error GoTo 0
 End Sub
 
 '=============================================================================

@@ -1,12 +1,13 @@
 Option Explicit
 
 '=============================================================================
-' modMailExport v3.1
-' Purpose (EN): batch-exports selected mails (Explorer or Inspector) to PDF
-'   and/or DOCX, using Word as the rendering engine (no native Outlook PDF
-'   API). Body only; attachments are not included. (Historique -> CHANGELOG.)
+' modMailExport v3.2
+' Purpose (EN): batch-exports the mails selected in the active Explorer to
+'   PDF and/or DOCX, using Word as the rendering engine (no native Outlook
+'   PDF API). Body only; attachments are not included. (Historique ->
+'   CHANGELOG.)
 '
-' Export par lot des mails selectionnes (Explorer ou Inspector) vers PDF
+' Export par lot des mails selectionnes dans l'explorateur actif vers PDF
 ' et/ou DOCX, via Word comme moteur de rendu.
 '
 ' POURQUOI WORD : Outlook VBA n'a aucune API native de generation PDF/DOCX.
@@ -21,7 +22,8 @@ Option Explicit
 ' PAS une reproduction pixel-perfect du mail.
 '
 ' Choix retenus (session de creation) :
-'   - Format : demande au lancement (PDF / DOCX / les deux).
+'   - Format : demande au lancement (PDF / DOCX / les deux), par deux
+'     modMsgBoxCustom.Confirm3 avec Annuler (cf. AskFormat).
 '   - Destination : dossier choisi a chaque lancement (BrowseForFolder).
 '   - Pieces jointes : non incluses (corps du mail seulement).
 '
@@ -29,11 +31,9 @@ Option Explicit
 '   - ExportSelectedMails
 '
 ' v2 (2026-06-10) :
-'   - AskFormat : MsgBox Win32 a boutons renommes "PDF / DOCX / Les deux"
-'     (modMsgBoxCustom.Choose3, vbAbortRetryIgnore) au lieu de l'InputBox
-'     numerique. ARI natif = pas d'Echap ni de croix : les 3 libelles
-'     couvrent toutes les issues ; l'annulation reelle se joue a l'etape
-'     suivante (bouton Annuler du choix de dossier).
+'   - AskFormat : MsgBox Win32 a boutons renommes au lieu de l'InputBox
+'     numerique (Choose3 a l'origine ; remplace le 22/08 par Confirm3, qui
+'     a un vrai bouton Annuler - cf. AskFormat).
 '   - Helpers generiques migres vers modCommon : SanitizeFileName,
 '     EscapeHTML, SafeSubject, SafeReceivedTime (copies privees supprimees).
 '
@@ -44,16 +44,27 @@ Option Explicit
 ' v3.1 (2026-06-10) : fix B11 - Randomize avant le Rnd du nom de fichier
 '   temporaire (sans graine, Rnd rejoue la meme sequence a chaque session :
 '   risque theorique de collision de nom dans %TEMP%).
+' v3.2 (2026-11-16) : audit 11/2026 - F3-14 : le fichier temporaire
+'   exportmail_*.htm (texte du mail, en clair dans %TEMP%) est efface APRES
+'   la fermeture du document Word (avant : Kill pendant que Word le tenait
+'   ouvert, echec silencieux, fichier jamais efface) ; les restes des
+'   exports precedents sont purges en fin de lot et en cas d'erreur. Toast
+'   de depart pour un lot de plus de 20 mails (Outlook est fige pendant
+'   l'export). F3-18 : en-tete corrige (selection de l'explorateur
+'   seulement ; Confirm3).
 '
 ' Late binding partout (CreateObject Word.Application, Shell.Application,
-' Scripting). 64-bit safe : aucune Declare API (le hook Win32 de Choose3
+' Scripting). 64-bit safe : aucune Declare API (le hook Win32 de Confirm3
 ' vit dans modMsgBoxCustom). Dependances : modConfig, modDebugLog,
-' modCommon (v1), modMsgBoxCustom (v2).
+' modCommon (v1), modMsgBoxCustom (v2), modUi (Toast).
 '=============================================================================
 
 
 Private Const MOD_NAME As String = "MailExport"
-Private Const MOD_VERSION As String = "v3.1 - 2026-06-10"
+Private Const MOD_VERSION As String = "v3.2 - 2026-11-16"
+
+' v3.2 (F3-14) : prefixe des fichiers temporaires (dans %TEMP%).
+Private Const TMP_PREFIX As String = "exportmail_"
 
 ' Constantes Word (late binding : valeurs en dur)
 Private Const WD_FORMAT_DOCX     As Long = 12   ' wdFormatXMLDocument
@@ -109,6 +120,13 @@ Public Sub ExportSelectedMails()
     modDebugLog.DInfo MOD_NAME, "Export demande : " & mailCount & " mail(s), " & _
         "format=" & FormatLabel(fmt) & ", dest=" & targetFolder
 
+    ' v3.2 (F3-14) : un gros lot fige Outlook plusieurs minutes (2,3 s par
+    ' mail en moyenne) : un toast de depart evite de croire a un plantage.
+    If mailCount > 20 Then
+        modUi.Toast T("Export de ", "Exporting ") & mailCount & _
+                    T(" mails en cours...", " mails..."), uiInfo
+    End If
+
     ' --- 4. Demarrer Word (une seule instance pour tout le lot) ---
     Dim wd As Object
     Set wd = CreateObject("Word.Application")
@@ -141,8 +159,10 @@ Public Sub ExportSelectedMails()
 
         ' Generer le document Word a partir du corps du mail
         Dim doc As Object
+        Dim tmpHtm As String
         Set doc = Nothing
-        Set doc = BuildWordDoc(wd, mail)
+        tmpHtm = ""
+        Set doc = BuildWordDoc(wd, mail, tmpHtm)
         If doc Is Nothing Then
             errs = errs + 1
             modDebugLog.DError MOD_NAME, "Echec construction doc pour '" & _
@@ -184,6 +204,10 @@ Public Sub ExportSelectedMails()
         ' Fermer le doc sans sauvegarder le .docx temporaire en trop
         On Error Resume Next
         doc.Close False   ' wdDoNotSaveChanges
+        ' v3.2 (F3-14) : le .htm temporaire n'est plus tenu par Word : on
+        ' peut enfin l'effacer (il contient le texte du mail en clair).
+        If Len(tmpHtm) > 0 Then Kill tmpHtm
+        Err.Clear
         On Error GoTo ErrH
         Set doc = Nothing
 Continue:
@@ -194,6 +218,7 @@ Continue:
     wd.Quit
     On Error GoTo ErrH
     Set wd = Nothing
+    PurgeTempExports          ' v3.2 (F3-14) : restes eventuels
     SetStatus ""
 
     Dim msg As String
@@ -213,13 +238,18 @@ Continue:
     Exit Sub
 
 ErrH:
+    ' v3.2 : erreur relevee AVANT le nettoyage (Quit / purge la remettent a 0).
+    Dim errNo As Long, errDesc As String
+    errNo = Err.Number
+    errDesc = Err.Description
     On Error Resume Next
     If Not wd Is Nothing Then wd.Quit
     Set wd = Nothing
+    PurgeTempExports          ' v3.2 (F3-14) : Word ferme, fichiers liberes
     SetStatus ""
     modDebugLog.DError MOD_NAME, "ExportSelectedMails error " & _
-        Err.Number & " - " & Err.Description
-    MsgBox T("Erreur pendant l'export : ", "Error during export: ") & Err.Description, _
+        errNo & " - " & errDesc
+    MsgBox T("Erreur pendant l'export : ", "Error during export: ") & errDesc, _
            vbCritical, "Export mails"
 End Sub
 
@@ -290,8 +320,12 @@ End Function
 ' Methode : on ecrit le HTMLBody dans un fichier .htm temporaire (UTF-8 via
 ' ADODB.Stream), puis Word l'ouvre. C'est nettement plus fiable que
 ' d'injecter du HTML dans la presse-papier ou via Range.
+' v3.2 (F3-14) : tmpPath (ByRef) rend le chemin du .htm temporaire ; c'est
+' l'appelant qui l'efface APRES doc.Close (Word le tient ouvert d'ici la).
+' En cas d'echec avant l'ouverture par Word, il est efface ici.
 '=============================================================================
-Private Function BuildWordDoc(ByVal wd As Object, ByVal mail As Object) As Object
+Private Function BuildWordDoc(ByVal wd As Object, ByVal mail As Object, _
+                              ByRef tmpPath As String) As Object
     On Error GoTo ErrH
 
     Dim htm As String
@@ -299,7 +333,7 @@ Private Function BuildWordDoc(ByVal wd As Object, ByVal mail As Object) As Objec
 
     Dim tmp As String
     Randomize   ' v3.1 (B11) : graine, sinon Rnd rejoue la meme sequence
-    tmp = Environ$("TEMP") & "\exportmail_" & Format(Now, "yyyymmddhhnnss") & _
+    tmp = Environ$("TEMP") & "\" & TMP_PREFIX & Format(Now, "yyyymmddhhnnss") & _
           "_" & CStr(Int(Rnd * 100000)) & ".htm"
 
     ' Ecriture UTF-8 BOM via ADODB.Stream (preserve les accents du HTML)
@@ -318,10 +352,10 @@ Private Function BuildWordDoc(ByVal wd As Object, ByVal mail As Object) As Objec
                                 ReadOnly:=False, AddToRecentFiles:=False, _
                                 Format:=0)   ' wdOpenFormatAuto (parse HTML tolerant)
 
-    ' Le .htm temporaire ne sert plus une fois charge dans Word
-    On Error Resume Next
-    Kill tmp
-    On Error GoTo ErrH
+    ' v3.2 (F3-14) : PAS de Kill ici - Word tient le fichier ouvert, le Kill
+    ' echouait en silence et le .htm restait dans %TEMP%. L'appelant
+    ' l'efface apres doc.Close.
+    tmpPath = tmp
 
     Set BuildWordDoc = doc
     Exit Function
@@ -330,7 +364,38 @@ ErrH:
     modDebugLog.DError MOD_NAME, "BuildWordDoc error " & Err.Number & _
         " - " & Err.Description
     Set BuildWordDoc = Nothing
+    ' Document non ouvert : le .htm n'est tenu par personne, on l'efface.
+    On Error Resume Next
+    If Len(tmp) > 0 Then Kill tmp
+    tmpPath = ""
 End Function
+
+'=============================================================================
+' PurgeTempExports (v3.2, F3-14) : efface les fichiers temporaires
+' exportmail_*.htm restes dans %TEMP% (lot interrompu, exports des versions
+' precedentes). A appeler une fois Word ferme (sinon fichiers verrouilles).
+' Un fichier verrouille est simplement saute.
+'=============================================================================
+Private Sub PurgeTempExports()
+    On Error Resume Next
+    Dim dirTmp As String, f As String, n As Long
+    Dim names As Collection, v As Variant
+    dirTmp = Environ$("TEMP")
+    If Len(dirTmp) = 0 Then Exit Sub
+    Set names = New Collection
+    f = Dir(dirTmp & "\" & TMP_PREFIX & "*.htm")
+    Do While Len(f) > 0
+        names.Add f
+        f = Dir()
+    Loop
+    For Each v In names
+        Err.Clear
+        Kill dirTmp & "\" & CStr(v)
+        If Err.Number = 0 Then n = n + 1
+    Next v
+    Err.Clear
+    If n > 0 Then modDebugLog.DDebug MOD_NAME, "Fichiers temporaires d'export effaces : " & n
+End Sub
 
 '=============================================================================
 ' BuildHTML

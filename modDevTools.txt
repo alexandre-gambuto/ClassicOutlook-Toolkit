@@ -1,7 +1,7 @@
 Option Explicit
 
 ' =====================================================================
-' modDevTools v8  (2026-08-22)
+' modDevTools v8.1  (2026-11-16)
 ' Purpose (EN): VBA dev utilities. Reinit re-binds all Outlook event
 '   handlers after a VBE recompile (Ctrl+S resets module-level WithEvents),
 '   without restarting Outlook. ReinitSilent is the no-UI-if-OK variant
@@ -10,6 +10,15 @@ Option Explicit
 ' Utilitaires de developpement VBA. Logs via modDebugLog.
 ' Reinit rejoue les liaisons d'evenements apres un Ctrl+S dans le VBE
 ' (qui remet a zero les WithEvents module-level), sans redemarrer Outlook.
+'
+' v8.1 (2026-11-16) : audit 11/2026 - F1-12 : la reparation ne recharge
+'   plus les projets en direct. DoReinit refait d'abord les liaisons
+'   (InitEvents, RebindEvents), puis confie le chargement des projets a la
+'   tache differee "TagPreload" (modDefer, +10 s) au lieu d'appeler
+'   modProjectTag.InitProjectTag au milieu d'un envoi ou d'une reception
+'   (jusqu'a 18 s de gel, boite "Fichier introuvable" bloquante). Etat de
+'   la question d'etiquetage : celui memorise (modProjectTag.AutoAskEnabled),
+'   plus True force.
 '
 ' v8 (2026-08-22) : revue UX pop-ups.
 '   (a) PrepareForEdit passe en TOAST (modUi.Toast). C'est une confirmation
@@ -49,7 +58,13 @@ Option Explicit
 ' =====================================================================
 
 Private Const MOD_NAME As String = "DevTools"
-Private Const MOD_VERSION As String = "v8 - 2026-08-22"
+Private Const MOD_VERSION As String = "v8.1 - 2026-11-16"
+
+' v8.1 (F1-12) : delai du prechargement des projets apres une reparation.
+' Assez pour sortir de l'evenement en cours (envoi, reception, rappel) ;
+' court, parce qu'une minuterie encore armee pendant un nouvel
+' enregistrement dans l'editeur VBA peut faire planter Outlook.
+Private Const REINIT_TAG_PRELOAD_SEC As Long = 10
 
 ' ---------------------------------------------------------------------
 ' ModVersion - version REELLEMENT chargee dans le VBE.
@@ -104,12 +119,22 @@ Private Sub DoReinit(ByVal silentIfOk As Boolean)
     ' tue les WithEvents). Couvre tous les lecteurs directs de g_*.
     modConfig.LoadConfig
 
+    ' v8.1 (F1-12) : les liaisons d'abord (InitEvents avant RebindEvents :
+    ' RebindEvents relie l'ecoute du volet de lecture a l'objet que cree
+    ' InitEvents), rien de lent avant elles.
     modNewMeetingDefault.InitEvents
-    modReplyInPlace.EnsureInit
-    modProjectTag.InitProjectTag
     ThisOutlookSession.RebindEvents
+    modReplyInPlace.EnsureInit
 
-    modDebugLog.DInfo MOD_NAME, "Reinit OK"
+    ' v8.1 (F1-12) : projets recharges HORS de l'evenement en cours (la
+    ' reparation automatique tourne pendant un envoi, une reception ou un
+    ' rappel) : meme tache differee qu'au demarrage ("TagPreload" ->
+    ' modProjectTag.InitProjectTag). Etat de la question d'etiquetage :
+    ' celui memorise dans le registre, plus True force.
+    modProjectTag.PROJECT_AUTO_ASK = modProjectTag.AutoAskEnabled()
+    modDefer.ArmUnique "TagPreload", REINIT_TAG_PRELOAD_SEC
+
+    modDebugLog.DInfo MOD_NAME, "Reinit OK (projets recharges en differe +" & REINIT_TAG_PRELOAD_SEC & " s)"
 
     ' v4 : verification REELLE post-rebind (remplace la MsgBox statique).
     modMaintenance.AssertBindings silentIfOk

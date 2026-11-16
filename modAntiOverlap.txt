@@ -1,7 +1,17 @@
 Option Explicit
 
 ' =====================================================================
-' modAntiOverlap v7.1
+' modAntiOverlap v7.2
+' v7.2 (2026-11-16) : audit 11/2026 - F6-02, F6-03, F6-08, F6-17 : (a) seuls
+'   les rendez-vous simples (MeetingStatus olNonMeeting) sont decales, plus
+'   les reunions envoyees ou recues ; (b) la recherche du creneau developpe
+'   les series (Sort + IncludeRecurrences + Restrict sur le chevauchement +
+'   GetFirst/GetNext, 200 tours au plus) : une reunion periodique est vue,
+'   ainsi qu'un element commence la veille ; (c) MarkAsUserPlaced (publique)
+'   : marque "deja decale" posee sans Save par modShiftAppointment sur un
+'   rendez-vous place a la main, que TryShift ne deplace plus ; (d) variable
+'   locale "a" renommee "ap" dans TryShift (regle T()/A()) ; (e) integration
+'   integration - F10-13 : "Non decale (creneau aussi occupe)" au niveau DEBUG.
 ' v7.1 (2026-09-24) : date du filtre Find au FORMAT DU POSTE (pack v4, cf.
 '   modCommon.FormatDaslDate v1.3). Le m/d/yyyy h:mm AM/PM en dur etait relu
 '   jour/mois sur un poste francais quand le jour est <= 12 : fenetre de
@@ -28,7 +38,7 @@ Option Explicit
 ' =====================================================================
 
 Private Const MOD_NAME As String = "AntiOverlap"
-Private Const MOD_VERSION As String = "v7.1 - 2026-09-24"
+Private Const MOD_VERSION As String = "v7.2 - 2026-11-16"
 
 ' Parametres externalises dans config.ini, lus via les GETTERS
 ' EnsureLoaded-safe de modConfig (v7 ; jamais les globales g_* en direct) :
@@ -49,60 +59,69 @@ Public Function TryShift(ByVal appt As Object) As Boolean
     If appt Is Nothing Then Exit Function
     If Not (TypeOf appt Is Outlook.AppointmentItem) Then Exit Function
     
-    Dim a As Outlook.AppointmentItem
-    Set a = appt
+    Dim ap As Outlook.AppointmentItem
+    Set ap = appt
     
-    modDebugLog.DTrace MOD_NAME, "TryShift '" & a.subject & _
-        "' duration=" & a.Duration & " start=" & Format(a.Start, "dd/mm hh:nn")
+    modDebugLog.DTrace MOD_NAME, "TryShift '" & ap.subject & _
+        "' duration=" & ap.Duration & " start=" & Format(ap.Start, "dd/mm hh:nn")
     
-    If a.IsRecurring Then
+    If ap.IsRecurring Then
         modDebugLog.DDebug MOD_NAME, "  Skip : recurrent"
         Exit Function
     End If
-    If a.AllDayEvent Then
+    If ap.AllDayEvent Then
         modDebugLog.DDebug MOD_NAME, "  Skip : journee entiere"
         Exit Function
     End If
-    If a.Duration <> modConfig.MeetingDuration Then
-        modDebugLog.DDebug MOD_NAME, "  Skip : duree=" & a.Duration & _
+    ' v7.2 (F6-02) : seuls les rendez-vous simples sont decales. Une reunion
+    ' (envoyee a des invites ou recue) decalee dans mon seul calendrier ne
+    ' serait plus a la meme heure que chez les autres participants.
+    If ap.MeetingStatus <> olNonMeeting Then
+        modDebugLog.DDebug MOD_NAME, "  Skip : reunion (MeetingStatus=" & ap.MeetingStatus & ")"
+        Exit Function
+    End If
+    If ap.Duration <> modConfig.MeetingDuration Then
+        modDebugLog.DDebug MOD_NAME, "  Skip : duree=" & ap.Duration & _
             " (attendu " & modConfig.MeetingDuration & ")"
         Exit Function
     End If
-    If a.entryID = "" Then
+    If ap.entryID = "" Then
         modDebugLog.DDebug MOD_NAME, "  Skip : entryID vide"
         Exit Function
     End If
-    If AlreadyShifted(a) Then
+    If AlreadyShifted(ap) Then
         modDebugLog.DDebug MOD_NAME, "  Skip : deja decale"
         Exit Function
     End If
     
     Dim overlaps As Boolean
-    overlaps = OtherApptInSlot(a.Start, a.End, a.entryID)
+    overlaps = OtherApptInSlot(ap.Start, ap.End, ap.entryID)
     modDebugLog.DDebug MOD_NAME, "  Chevauchement : " & overlaps
     If Not overlaps Then Exit Function
     
     Dim newStart As Date
     Dim newEnd As Date
-    newStart = DateAdd("n", modConfig.ShiftMinutes, a.Start)
-    newEnd = DateAdd("n", modConfig.ShiftMinutes, a.End)
+    newStart = DateAdd("n", modConfig.ShiftMinutes, ap.Start)
+    newEnd = DateAdd("n", modConfig.ShiftMinutes, ap.End)
     
-    If OtherApptInSlot(newStart, newEnd, a.entryID) Then
-        modDebugLog.DInfo MOD_NAME, "Non decale (creneau +" & _
+    If OtherApptInSlot(newStart, newEnd, ap.entryID) Then
+        ' Integration 11/2026 (F10-13) : DEBUG (repete a chaque enregistrement
+        ' du meme rendez-vous : 118 lignes pour 36 rendez-vous).
+        modDebugLog.DDebug MOD_NAME, "Non decale (creneau +" & _
             modConfig.ShiftMinutes & " aussi occupe) : '" & _
-            a.subject & "' " & Format(a.Start, "dd/mm hh:nn")
+            ap.subject & "' " & Format(ap.Start, "dd/mm hh:nn")
         Exit Function
     End If
     
-    modDebugLog.DInfo MOD_NAME, "DECALE '" & a.subject & "' de " & _
-        Format(a.Start, "hh:nn") & " vers " & Format(newStart, "hh:nn")
+    modDebugLog.DInfo MOD_NAME, "DECALE '" & ap.subject & "' de " & _
+        Format(ap.Start, "hh:nn") & " vers " & Format(newStart, "hh:nn")
     
     ' Fix v6 : marquer-ET-sauver la UserProperty AVANT de modifier Start.
     ' Si Start echoue (RDV verrouille...), au moins on ne retentera pas
     ' a chaque ItemChange ulterieur grace a la UserProperty persistee.
-    MarkShifted a
-    a.Start = newStart
-    a.Save
+    MarkShifted ap
+    ap.Start = newStart
+    ap.Save
     
     TryShift = True
     Exit Function
@@ -120,29 +139,37 @@ Private Function OtherApptInSlot(ByVal startT As Date, ByVal endT As Date, _
     Dim calFolder As Outlook.folder
     Set calFolder = Application.Session.GetDefaultFolder(olFolderCalendar)
     
+    ' v7.2 (F6-03) : series DEVELOPPEES. Avant (IncludeRecurrences = False +
+    ' Find sur [Start] du jour), seul le maitre de chaque serie, date de sa
+    ' PREMIERE occurrence, etait vu : une reunion periodique n'etait jamais
+    ' comparee. Modele eprouve (piege 1) : Sort [Start] PUIS
+    ' IncludeRecurrences = True, Restrict sur le chevauchement du creneau
+    ' (debut avant la fin du creneau ET fin apres son debut : couvre aussi un
+    ' element commence la veille ou plus tot), parcours GetFirst / GetNext
+    ' (jamais Count ni For Each), plafonne a SCAN_MAX tours.
+    Const SCAN_MAX As Long = 200
+
     Dim items As Outlook.items
     Set items = calFolder.items
-    items.IncludeRecurrences = False
     items.Sort "[Start]"
-    
-    Dim dayStart As Date
-    Dim dayEnd As Date
-    dayStart = DateSerial(Year(startT), Month(startT), Day(startT))
-    dayEnd = DateAdd("d", 1, DateSerial(Year(endT), Month(endT), Day(endT)))
+    items.IncludeRecurrences = True
     
     Dim dasl As String
-    dasl = "[Start] >= '" & FormatOutlookDate(DateAdd("d", -1, dayStart)) & "'" & _
-           " AND [Start] < '" & FormatOutlookDate(dayEnd) & "'"
+    dasl = "[Start] < '" & FormatOutlookDate(endT) & "'" & _
+           " AND [End] > '" & FormatOutlookDate(startT) & "'"
     
-    modDebugLog.DTrace MOD_NAME, "  filtre Find: " & dasl
+    modDebugLog.DTrace MOD_NAME, "  filtre Restrict: " & dasl
+
+    Dim found As Outlook.items
+    Set found = items.Restrict(dasl)
     
     Dim itm As Object
-    Set itm = items.Find(dasl)
+    Set itm = found.GetFirst
     
     Dim scanCount As Long
     scanCount = 0
     
-    Do While Not itm Is Nothing And scanCount < 500
+    Do While Not itm Is Nothing And scanCount < SCAN_MAX
         scanCount = scanCount + 1
         
         If TypeOf itm Is Outlook.AppointmentItem Then
@@ -165,7 +192,7 @@ Private Function OtherApptInSlot(ByVal startT As Date, ByVal endT As Date, _
             End If
         End If
         
-        Set itm = items.FindNext
+        Set itm = found.GetNext
     Loop
     
     modDebugLog.DTrace MOD_NAME, "  " & scanCount & _
@@ -201,14 +228,35 @@ End Function
 
 Private Sub MarkShifted(ByVal a As Outlook.AppointmentItem)
     On Error Resume Next
-    Dim up As Outlook.UserProperty
-    Set up = a.UserProperties.Find(modConfig.UpShiftName)
-    If up Is Nothing Then
-        Set up = a.UserProperties.Add(modConfig.UpShiftName, olText, False)
-    End If
-    up.Value = "1"
+    ' v7.2 : pose de la marque partagee avec MarkAsUserPlaced.
+    MarkAsUserPlaced a
     ' v6 : Save immediat pour persister la UserProperty meme si la
     ' modification ulterieure de Start echoue. Cf. en-tete module.
     a.Save
     On Error GoTo 0
+End Sub
+
+'=============================================================================
+' MarkAsUserPlaced (v7.2, F6-08) : pose la marque "deja decale" (UserProperty
+' UpShiftName) SANS enregistrer, sur un rendez-vous que l'utilisateur vient
+' de placer lui-meme (boutons -15 / +15 min, duree reelle de
+' modShiftAppointment). A appeler juste avant le Save de l'appelant :
+' TryShift ne deplacera plus jamais ce rendez-vous, quel que soit le moment
+' ou arrive l'ItemChange (la suspension des evenements ne couvre pas un
+' ItemChange livre apres coup). Sans effet sur un element periodique
+' (TryShift ne les traite pas). N'echoue jamais vers l'appelant.
+'=============================================================================
+Public Sub MarkAsUserPlaced(ByVal appt As Object)
+    On Error Resume Next
+    If appt Is Nothing Then Exit Sub
+    If Not (TypeOf appt Is Outlook.AppointmentItem) Then Exit Sub
+    Dim ap As Outlook.AppointmentItem
+    Set ap = appt
+    If ap.IsRecurring Then Exit Sub
+    Dim up As Outlook.UserProperty
+    Set up = ap.UserProperties.Find(modConfig.UpShiftName)
+    If up Is Nothing Then
+        Set up = ap.UserProperties.Add(modConfig.UpShiftName, olText, False)
+    End If
+    up.Value = "1"
 End Sub

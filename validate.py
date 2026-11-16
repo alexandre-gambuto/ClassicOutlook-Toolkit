@@ -5,11 +5,12 @@ validate.py - controle technique des sources VBA de ClassicOutlook-Toolkit.
 
 A LANCER AVANT DE COLLER QUOI QUE CE SOIT DANS LE VBE.
 
-    python validate.py               # tout le dossier courant
+    python validate.py               # tout Code/ (voir 2026-10-25 plus bas)
     python validate.py modUi.txt     # un ou plusieurs fichiers
     python validate.py --quiet       # ne sort que les anomalies
     python validate.py --strict      # code retour 1 si AVERTISSEMENT aussi
-    python validate.py --config config.ini   # cles inconnues du code (typos)
+    python validate.py --config config.ini   # cles inconnues, en double, vides
+    python validate.py --against <dossier>   # recul par rapport a une reference
     python validate.py --gen-versions        # Select Case de ModuleVersionOf
     python validate.py --gen-config          # config_ini.example genere du code
 
@@ -17,6 +18,56 @@ Pack v3 (2026-09-02) : marqueurs d'accent etendus (~x ~c ~u ~U ~A ~y),
 detection des marqueurs inconnus et des "e circonflexe" ecrits ~e, Dim en
 double dans une procedure, collections COM re-evaluees dans une boucle,
 controle des cles de config.ini, generateurs (versions, config example).
+
+2026-10-24 : code du classeur Campagnes.xlsm (Campagnes__ThisWorkbook,
+Campagnes__modCampaignBook) exempte de MOD_NAME / MOD_VERSION comme le
+classeur Suivi des mails (projet VBA Excel distinct).
+
+2026-10-25 : sources rangees par application sous Code/ (Outlook/,
+Excel/<classeur>/, Interface/Rubans/ et Interface/Formulaires/, Docs/,
+Outils/), ce script dans Code/Outils/. Sans fichier en argument : tout
+Code/, sous-dossiers compris, que le script soit lance depuis
+Code/Outils, depuis Code/ ou depuis le dossier de l'outil ; un depot a
+plat (GitHub) se controle comme avant, depuis sa racine. Erreur DOUBLON
+si un meme fichier existe a deux endroits (livraison posee au mauvais
+endroit : on risquerait de coller l'ancien).
+
+2026-11-16 (audit 11/2026) :
+  - VERSION (erreur, F0-02) : le MOD_VERSION d'un module doit etre >= au
+    plus haut numero cite pour lui dans CHANGELOG.txt depuis
+    VERSION_SINCE. Incident : quatre livraisons refaites sur une ancienne
+    copie (modFolderSort v3.1 du 18/08 ecrasee par une "v2" du 22/08,
+    modMaintenance, modSuiviTemps, modBackupAuto).
+    REGLE DE LIVRAISON : toute modification part du fichier de Code\\
+    (jamais d'une copie de l'espace du projet) et recoit un numero de
+    version NOUVEAU, superieur a tout numero deja employe.
+  - --against <dossier> (alias --installe) : RECUL (erreur) quand une
+    entree d'historique "vN (AAAA-MM-JJ)" de l'en-tete de la reference a
+    disparu du nouveau fichier, ou quand le contenu differe sans que
+    MOD_VERSION augmente. Reference : dernier Code\\ livre, ou modules
+    extraits de la sauvegarde du projet installe.
+  - --config : CFGDUP (cle en double avec deux valeurs, la derniere gagne)
+    et CFGEMPTY (cle presente mais vide alors que le code a un defaut non
+    vide : Cfg() renvoie alors du vide). Cles : appels Cfg/CfgL/CfgB a DEUX
+    arguments seulement (un dictionnaire local nomme cfg("Keyword") n'est
+    plus pris pour une cle, F2-02).
+  - MSGLOOP (avertissement, F2-01) : texte construit dans une boucle puis
+    passe a une boite (MsgBox, InputBox, modUi, MsgBoxC) : risque de
+    depasser 1 024 caracteres. Commentaire "MSGLOOP-OK" sur la ligne
+    precedente pour une boucle bornee.
+  - ITREMA (avertissement) : "~yt" (i trema) presque toujours mis pour un
+    i circonflexe (~i) : "reconna~yt".
+  - ACCENT : guillemets doubles "" acceptes dans A("...") (6 fausses
+    erreurs dans modSuiviTemps).
+  - Fichier dont l'en-tete porte "ARCHIVE (MM/AAAA)" (modules sortis du
+    projet installe, F9-14) : non controle ; toute reference
+    modArchive.Membre ailleurs est une ERREUR XREF (ne compilerait plus).
+  - modMailAnalytics et ses formulaires ne sont plus dispenses (F9-12) ;
+    seuls les fichiers de code des formulaires restent dispenses de
+    MOD_VERSION. Debug.Print toleres seulement dans le code des classeurs.
+  - --gen-config : cles dont le defaut du code n'est pas vide ecrites en
+    commentaire (";Cle=defaut"), defauts construits ou constantes
+    signales, cles numerotees documentees (F2-02).
 
 Lecture seule. Pas de COM, pas d'Outlook, pas de droits admin : le script
 n'ouvre que des fichiers texte. Rien qui puisse alerter un EDR.
@@ -57,13 +108,56 @@ NO_MOD_NAME_OK = {
     # distinct, sans modDebugLog ni modMaintenance).
     "Suivi_des_mails__ThisWorkbook.txt",
     "Suivi_des_mails__modMailTracker.txt",
+    # 2026-10-24 : code du classeur Campagnes.xlsm (meme statut).
+    "Campagnes__ThisWorkbook.txt",
+    "Campagnes__modCampaignBook.txt",
+    # 2026-10-25 : meme code, fichiers nommes d'apres le classeur
+    # "Suivi des Campagnes.xlsm".
+    "Suivi des Campagnes__ThisWorkbook.txt",
+    "Suivi des Campagnes__modCampaignBook.txt",
+    # 2026-11-16 : code du classeur Suivi de temps.xlsm (meme statut ; un
+    # MOD_NAME y produirait une erreur "absent de MODULES_DEFAULT").
+    "Suivi de temps__modSuiviTemps.txt",
+    "Suivi de temps__ThisWorkbook.txt",
     "frmConfig.txt",
     "frmProgress.txt",
-    "modMailAnalytics__frmConfig_Code.txt",
-    "modMailAnalytics__frmProgress_Code.txt",
-    "modMailAnalytics.txt",
+    # 2026-11-16 (F9-12) : modMailAnalytics.txt et les deux fichiers de code
+    # des formulaires retires de cette liste : ils vivent dans le projet
+    # Outlook (MOD_NAME "Analytics", modDebugLog).
     "modDebugLog.txt",       # le logger lui-meme
 }
+
+# 2026-11-16 (F9-12) : dispenses du seul controle MOD_VERSION / ModVersion.
+# Un formulaire n'a pas de ModVersion() : frmConfig.ModVersion chargerait le
+# formulaire et lancerait son Initialize. Sa version suit modMailAnalytics.
+NO_MOD_VERSION_OK = {
+    "modMailAnalytics__frmConfig_Code.txt",
+    "modMailAnalytics__frmProgress_Code.txt",
+}
+
+# 2026-11-16 (F9-14) : en-tete d'un module archive (sorti du projet installe,
+# garde dans le depot). Le fichier n'est pas controle ; une reference a ce
+# module depuis un autre fichier est une erreur (ne compilerait plus).
+RE_ARCHIVED = re.compile(r"^\s*'\s*ARCHIVE\s*\(\d{2}/\d{4}\)", re.M)
+ARCHIVE_HEADER_LINES = 40
+
+# 2026-11-16 (F0-02) : controle VERSION. Numeros de CHANGELOG.txt pris en
+# compte a partir de cette date : avant, plusieurs modules ont ete
+# renumerotes (ThisOutlookSession v12 -> v10.x en juillet, modQuickMove
+# v15 -> v10.x en juin, modMaintenance v1.2 -> v1 en mai...).
+VERSION_SINCE = "2026-08-01"
+RE_CHANGELOG_DATE = re.compile(r"^\[(\d{4}-\d{2}-\d{2})\]")
+RE_CHANGELOG_CITE = re.compile(r"\b(mod\w+|cls\w+|ThisOutlookSession)\s+[vV](\d+(?:\.\d+)*)\b")
+RE_MOD_VERSION = re.compile(r'Private\s+Const\s+MOD_VERSION\s+As\s+String\s*=\s*"\s*[vV]?(\d+(?:\.\d+)*)')
+# Entree d'historique d'en-tete : "' v4.5 (2026-10-25) : ..." (RECUL).
+RE_HISTORY_ENTRY = re.compile(r"^\s*'\s*[vV](\d+(?:\.\d+)*)\s*\((\d{4}-\d{2}-\d{2})")
+
+# 2026-11-16 (F2-01) : boites dont le texte est coupe vers 1 024 caracteres
+# (MSGLOOP) : nom de l'appel -> le texte est le 1er argument.
+MSG_CALLS = re.compile(
+    r"(?<![.\w])(MsgBox|InputBox|MsgBoxC|Confirm3|modUi\.(?:Ask|AskText|AskTextEx|Inform|Fail)"
+    r"|modMsgBoxCustom\.(?:MsgBoxC|Confirm3|Choose3))\b\s*(\(?)", re.I)
+MSGLOOP_OK = "MSGLOOP-OK"
 
 # Wrappers globaux de modConfig qu'une variable locale ne doit pas masquer.
 # VBA est insensible a la casse : Dim t et la fonction T() se disputent la
@@ -193,8 +287,35 @@ def strip_T_calls(s):
             r'\s*,\s*"(?:[^"]|"")*"'
             r'(?:\s*&\s*(?:vbCrLf|vbLf|vbTab|"(?:[^"]|"")*"|[\w.$]+\([^()]*\)|[\w.$]+))*\s*\)',
             "", s)
-        s = re.sub(r'\bA\(\s*"[^"]*"\s*\)', "", s)
+        # 2026-11-16 : guillemets doubles "" acceptes dans le litteral.
+        s = re.sub(r'\bA\(\s*"(?:[^"]|"")*"\s*\)', "", s)
     return s
+
+
+def is_archived(txt):
+    """En-tete "ARCHIVE (MM/AAAA)" dans les premieres lignes (F9-14)."""
+    head = "\n".join(txt.split("\n")[:ARCHIVE_HEADER_LINES])
+    return bool(RE_ARCHIVED.search(head))
+
+
+def version_tuple(s):
+    """'4.5' -> (4, 5) ; None si illisible."""
+    try:
+        return tuple(int(x) for x in s.split("."))
+    except (ValueError, AttributeError):
+        return None
+
+
+def module_key(path):
+    """Nom de module tel qu'ecrit dans CHANGELOG : modX ; pour le code d'un
+    classeur "Classeur__modY.txt" : modY. ThisWorkbook : None (ambigu)."""
+    base = os.path.basename(path)
+    if base.endswith(".txt"):
+        base = base[:-4]
+    key = base.split("__")[-1]
+    if key.lower() == "thisworkbook":
+        return None
+    return key
 
 
 def call_span(line, start):
@@ -418,7 +539,8 @@ def check_accent_markers(path, txt, rep):
         if is_comment(line):
             continue
         rest = strip_T_calls(line)
-        for lit in re.findall(r'"([^"]*)"', rest):
+        # 2026-11-16 : litteral avec guillemets doubles "" lu en entier.
+        for lit in re.findall(r'"((?:[^"]|"")*)"', rest):
             if re.search(r"~[A-Za-z]", lit):
                 rep.error(path, ln, "ACCENT",
                           f"marqueur d'accent hors T()/A() : \"{lit[:45]}\"")
@@ -439,6 +561,13 @@ def check_accent_markers(path, txt, rep):
                 rep.warn(path, ln, "ECIRC",
                          f"\"{m2.group(0)}\" : accent probablement faux (~e = e aigu) "
                          f"- utiliser {'~f (e grave)' if grave else '~x (e circonflexe)'}")
+            # 2026-11-16 : "~yt" = i trema devant t, presque toujours mis
+            # pour un i circonflexe (reconna~yt, appara~ytre).
+            m3 = re.search(r"\w*(?<!u)~yt\w*", lit)     # ambigu~yte : juste
+            if m3:
+                rep.warn(path, ln, "ITREMA",
+                         f"\"{m3.group(0)}\" : ~y = i trema ; i circonflexe probable "
+                         f"- utiliser ~i")
 
 
 def check_vars_in_T(path, txt, rep):
@@ -659,7 +788,7 @@ def check_mod_name(path, txt, rep, known_short_names):
 def check_mod_version(path, txt, rep):
     """MOD_VERSION et ModVersion vont par paire."""
     base = os.path.basename(path)
-    if base in NO_MOD_NAME_OK:
+    if base in NO_MOD_NAME_OK or base in NO_MOD_VERSION_OK:
         return
     has_const = bool(re.search(r"Private\s+Const\s+MOD_VERSION\b", txt))
     has_func = bool(re.search(r"Public\s+Function\s+ModVersion\s*\(", txt))
@@ -674,11 +803,22 @@ def check_mod_version(path, txt, rep):
                  "pas d'instrumentation de version (MOD_VERSION / ModVersion)")
 
 
+def is_workbook_code(path):
+    """Code d'un classeur Excel (projet VBA distinct, sans modDebugLog)."""
+    base = os.path.basename(path)
+    if base.startswith(("Suivi", "Campagnes")):
+        return True
+    # Code\Excel\<classeur>\fichier.txt : "Excel" = dossier grand-parent.
+    parts = [p.lower() for p in os.path.normpath(os.path.abspath(path)).split(os.sep)]
+    return "excel" in parts[-3:-1]
+
+
 def check_debug_print(path, txt, rep):
     """Debug.Print interdit en production cote Outlook (modDebugLog fait foi).
-    Le projet Excel Analytics est un VBProject separe : exempte."""
-    base = os.path.basename(path)
-    if "Analytics" in base or base.startswith("frm"):
+    2026-11-16 (F9-12) : seul le code des classeurs Excel (projets VBA
+    distincts, sans modDebugLog) est exempte. modMailAnalytics et ses
+    formulaires vivent dans le projet Outlook : controles."""
+    if is_workbook_code(path):
         return
     for i, line in enumerate(txt.split("\n"), 1):
         if is_comment(line):
@@ -687,6 +827,106 @@ def check_debug_print(path, txt, rep):
             rep.warn(path, i, "DBGPRINT",
                      "Debug.Print - utiliser modDebugLog (DTrace/DInfo/DError)")
 
+
+
+RE_LOOP_OPEN = re.compile(r"^\s*(For|Do|While)\b", re.I)
+RE_LOOP_CLOSE = re.compile(r"^\s*(Next|Loop|Wend)\b", re.I)
+RE_GROW = re.compile(r"^\s*(\w+)\s*=\s*(\w+)\s*&", re.I)
+# Borne de boucle For jugee limitee : constante en capitales (NB_BINDINGS),
+# nombre, ou nom qui dit une page / un plafond (pageEnd, maxShown, iLast...).
+RE_BOUNDED = re.compile(r"\b[A-Z][A-Z0-9_]{2,}\b|^\s*\d+\s*$"
+                        r"|page|max|cap|limit|size|top|first|last|half|end|stop|shown", 0)
+
+
+def for_is_bounded(stmt):
+    """Boucle For dont la borne est visiblement limitee (voir RE_BOUNDED)."""
+    m = re.match(r"^\s*For\s+Each\s+\w+\s+In\s+(.+)$", stmt, re.I)
+    if m:
+        bound = m.group(1)
+    else:
+        m = re.search(r"\bTo\b(.+?)(?:\bStep\b.*)?$", stmt, re.I)
+        bound = m.group(1) if m else ""
+    return bool(RE_BOUNDED.search(bound.strip())) if bound.strip() else False
+
+
+def check_msg_loop(path, txt, rep):
+    """
+    2026-11-16 (F2-01). Une MsgBox comme une InputBox est coupee vers 1 024
+    caracteres. Signale le texte d'une boite (1er argument de MsgBox,
+    InputBox, modUi.Ask/AskText/AskTextEx/Inform/Fail, MsgBoxC, Confirm3)
+    qui contient une variable allongee (x = x & ...) dans une boucle For
+    sans borne visible (For Each sur une collection, For ... To n) de la
+    meme procedure. Incidents : MaintModuleVersions (24 modules sur 58
+    visibles), MaintFilterModules (32 sur 65). Non signale : boucle bornee
+    par une constante en capitales ou un nom de page / plafond (pageEnd,
+    maxShown...), boucles Do / While (dialogues repetes). Boucle bornee
+    autrement : commentaire "MSGLOOP-OK" sur la ligne qui precede l'appel.
+    """
+    for name, start, body in procedures(txt):
+        raw = body.split("\n")
+        grown = {}
+        stack = []                    # pour chaque boucle ouverte : None (Do/While) ou borne (For)
+        # logical_lines renumerote a partir de 1 : decaler sur la procedure.
+        for ln, line in logical_lines(body):
+            if is_comment(line):
+                continue
+            # Litteraux vides de meme longueur (les positions restent celles
+            # de line), commentaire de fin retire.
+            code = re.sub(r'"[^"]*"', lambda mm: '"' + " " * (len(mm.group(0)) - 2) + '"', line)
+            if "'" in code:
+                code = code[:code.index("'")]
+            for stmt in code.split(":"):
+                mo = RE_LOOP_OPEN.match(stmt)
+                if mo and not re.match(r"^\s*Do\s+While\b.*\bLoop\b", stmt, re.I):
+                    if mo.group(1).lower() == "for":
+                        stack.append(for_is_bounded(stmt))
+                    else:
+                        stack.append(None)
+                elif RE_LOOP_CLOSE.match(stmt):
+                    if stack:
+                        stack.pop()
+                m = RE_GROW.match(stmt)
+                if m and m.group(1).lower() == m.group(2).lower():
+                    fors = [b for b in stack if b is not None]
+                    if fors and fors[-1] is False:
+                        grown.setdefault(m.group(1).lower(), start + ln - 1)
+            if not grown:
+                continue
+            for mc in MSG_CALLS.finditer(code):
+                if mc.group(2) == "(":
+                    args = split_args(call_span(line, mc.end()))
+                else:
+                    args = split_args(line[mc.end():len(code)])
+                if not args:
+                    continue
+                first = re.sub(r'"(?:[^"]|"")*"', '""', args[0])
+                ids = {x.lower() for x in re.findall(r"[A-Za-z_]\w*", first)}
+                hit = sorted(v for v in grown if v in ids)
+                if not hit:
+                    continue
+                prev = raw[ln - 2] if ln >= 2 else ""
+                if MSGLOOP_OK in prev or MSGLOOP_OK in raw[ln - 1]:
+                    continue
+                rep.warn(path, start + ln - 1, "MSGLOOP",
+                         f"[{name}] {mc.group(1)} : texte construit dans une boucle "
+                         f"({', '.join(hit)}, ligne {grown[hit[0]]}) - une boite est "
+                         f"coupee vers 1 024 caracteres (fichier + notepad, ou pages)")
+
+
+def collect_archived(files):
+    """Modules archives (en-tete "ARCHIVE (MM/AAAA)") : {nom de module}."""
+    out = set()
+    for f in files:
+        base = os.path.basename(f)
+        if base in NOT_VBA or not base.endswith(".txt"):
+            continue
+        try:
+            txt, _ = read_source(f)
+        except Exception:
+            continue
+        if is_archived(txt):
+            out.add(base[:-4])
+    return out
 
 
 def collect_public_symbols(folder, files):
@@ -706,6 +946,8 @@ def collect_public_symbols(folder, files):
                                  if not os.path.dirname(f) else f)
         except Exception:
             continue
+        if is_archived(txt):
+            continue                  # 2026-11-16 : hors projet installe
         names, enums = set(), set()
         in_enum = False
         for line in txt.split("\n"):
@@ -745,7 +987,7 @@ def collect_public_symbols(folder, files):
     return symbols, enum_members
 
 
-def check_xref(path, txt, rep, symbols, all_enum_members):
+def check_xref(path, txt, rep, symbols, all_enum_members, archived=frozenset()):
     """
     References croisees entre modules. Deux controles :
 
@@ -771,6 +1013,13 @@ def check_xref(path, txt, rep, symbols, all_enum_members):
 
         for m in re.finditer(r"\b(mod\w+|cls\w+|ThisOutlookSession)\.(\w+)", code):
             mod, member = m.group(1), m.group(2)
+            if mod in archived:
+                # 2026-11-16 (F9-14) : module archive, absent du projet
+                # installe -> "Variable non definie" a la compilation.
+                rep.error(path, ln, "XREF",
+                          f"{mod}.{member} : {mod} est archive (hors projet "
+                          f"installe) - retirer cette reference")
+                continue
             if mod not in known:
                 continue
             if member not in symbols[mod]:
@@ -787,9 +1036,15 @@ def check_xref(path, txt, rep, symbols, all_enum_members):
                           f"depot - le module qui la definit n'est pas a jour")
 
 
-def collect_short_names(folder):
+def collect_short_names(folder, files=()):
     """Lit MODULES_DEFAULT dans modMaintenance.txt."""
     p = os.path.join(folder, "modMaintenance.txt")
+    # 2026-10-25 : Code range par application, modMaintenance.txt est
+    # dans Code\Outlook : on le prend dans la liste des fichiers.
+    for f in files:
+        if os.path.basename(f) == "modMaintenance.txt" and os.path.exists(f):
+            p = f
+            break
     if not os.path.exists(p):
         return set()
     try:
@@ -819,16 +1074,52 @@ def collect_short_names(folder):
 # Pack v3 : cles de configuration lues par le code, generateurs
 # =============================================================================
 
-RE_CFG = re.compile(r'\bCfg[LB]?\(\s*"([A-Za-z0-9_]+)"(?:\s*,\s*((?:"(?:[^"]|"")*")|-?\d+(?:\.\d+)?|True|False))?', re.I)
-RE_CFG_DYN = re.compile(r'\bCfg[LB]?\(\s*"([A-Za-z0-9_]+)"\s*&', re.I)
+# 2026-11-16 (F2-02) : une cle de config.ini = appel Cfg / CfgL / CfgB (ou le
+# helper ReadUrl de modSendToLLM) a DEUX arguments dont le premier est un
+# litteral. Exclus : cle construite ("InboxAlertStore" & i, "NewFolderParent"
+# & cat), cle passee par variable, et dictionnaire local nomme cfg
+# (cfg("Keyword") = ..., un seul argument : faux "Keyword=" dans le modele).
+RE_CFG = re.compile(r'\b(Cfg[LB]?|ReadUrl)\(\s*"([A-Za-z0-9_]+)"\s*,', re.I)
 # Prefixes de cles numerotees ("InboxAlertStore" & i) et cles construites
-# par variable ("NewFolderParent" & category).
+# par variable ("NewFolderParent" & category) : documentees a part.
 CFG_DYNAMIC_PREFIXES = ("InboxAlertStore", "InboxAlertColor", "InboxAlertSound",
                         "StatMailbox", "NewFolderParent", "OneNoteNotebook")
+CFG_DYNAMIC_DOC = (
+    "InboxAlertStoreN / InboxAlertColorN / InboxAlertSoundN (N = 1, 2... : une serie par boite)",
+    "StatMailboxN (N = 1, 2... : boites des statistiques)",
+    "NewFolderParentProject / NewFolderParentContract (obligatoires pour \"Creer le dossier\")",
+    "OneNoteNotebook1 a 3 (module OneNote archive)",
+)
+# Cles internes d'un dictionnaire de modMailAnalytics (jamais dans config.ini),
+# filet de securite si un appel a deux arguments les reintroduisait.
+CFG_NOT_KEYS = {"addressmode", "colorindex", "colorrgb", "datemin",
+                "dateminenabled", "domain", "emailuser", "keyword"}
+
+
+def classify_default(expr):
+    """Defaut d'un appel Cfg : (valeur affichable, nature).
+    nature : 'empty' | 'literal' | 'number' | 'bool' | 'constant' | 'built'."""
+    e = expr.strip()
+    m = re.fullmatch(r'"((?:[^"]|"")*)"', e)
+    if m:
+        v = m.group(1).replace('""', '"')
+        return (v, "literal" if v else "empty")
+    if re.fullmatch(r"-?\d+(?:\.\d+)?", e):
+        return (e, "number")
+    if e.lower() in ("true", "false"):
+        return ("1" if e.lower() == "true" else "0", "bool")
+    if re.fullmatch(r"[A-Za-z_][\w.]*(?:\(\s*\))?", e):
+        return (e, "constant")
+    return (e, "built")
 
 
 def collect_config_keys(folder, files):
-    """Renvoie {cle: (module, defaut)} des Cfg*("Cle", defaut) du depot."""
+    """
+    {cle: infos} des Cfg*("Cle", defaut) du depot. infos = dict(module,
+    default, nature, kinds (fonctions qui la lisent), nonempty_str (lue par
+    Cfg() avec un defaut non vide : une valeur vide dans config.ini
+    l'annule)). Premier defaut non vide retenu pour l'affichage.
+    """
     keys = {}
     for f in files:
         base = os.path.basename(f)
@@ -838,39 +1129,87 @@ def collect_config_keys(folder, files):
             txt, _ = read_source(f)
         except Exception:
             continue
+        if is_archived(txt):
+            continue
+        # Constantes du module a valeur simple : defaut affiche en clair
+        # (DEF_DELAY_CLAUDE = 4000 -> ";LLM_DelayClaudeMs=4000").
+        consts = {}
+        for mc in re.finditer(r'^\s*(?:Private\s+|Public\s+)?Const\s+(\w+)(?:\s+As\s+\w+)?\s*=\s*'
+                              r'("(?:[^"]|"")*"|-?\d+(?:\.\d+)?)\s*(?:\'.*)?$', txt, re.M | re.I):
+            consts[mc.group(1).lower()] = mc.group(2)
         for ln, line in logical_lines(txt):
             if is_comment(line):
                 continue
             for m in RE_CFG.finditer(line):
-                k = m.group(1)
-                d = m.group(2) if m.group(2) is not None else ""
-                if k not in keys:
-                    keys[k] = (base[:-4], d)
+                fn, k = m.group(1), m.group(2)
+                if k.lower() in CFG_NOT_KEYS:
+                    continue
+                args = split_args(call_span(line, line.index("(", m.start()) + 1))
+                if len(args) < 2:
+                    continue
+                d, nature = classify_default(args[1])
+                if nature == "constant" and d.lower() in consts:
+                    d, nature = classify_default(consts[d.lower()])
+                info = keys.setdefault(k, {"module": base[:-4], "default": d,
+                                           "nature": nature, "kinds": set(),
+                                           "nonempty_str": False})
+                info["kinds"].add(fn.lower())
+                if info["nature"] == "empty" and nature != "empty":
+                    info.update(module=base[:-4], default=d, nature=nature)
+                if fn.lower() == "cfg" and nature != "empty":
+                    info["nonempty_str"] = True
     return keys
 
 
-def config_file_keys(path):
-    """Cles presentes dans un config.ini (hors commentaires / sections)."""
+def config_file_entries(path):
+    """Cles presentes dans un config.ini (hors commentaires / sections) :
+    [(ligne, cle, valeur)]."""
     out = []
     try:
         txt, _ = read_source(path)
     except Exception:
         return out
-    for ln, line in enumerate(txt.split("\n"), 1):
+    for ln, line in enumerate(txt.replace("\r", "\n").split("\n"), 1):
         s = line.strip()
         if not s or s[0] in ";#[":
             continue
         if "=" in s:
-            out.append((ln, s.split("=", 1)[0].strip()))
+            k, v = s.split("=", 1)
+            out.append((ln, k.strip(), v.strip()))
     return out
 
 
+def config_file_keys(path):
+    """Compatibilite : [(ligne, cle)]."""
+    return [(ln, k) for ln, k, _ in config_file_entries(path)]
+
+
 def check_config_file(cfg_path, folder, files, rep):
-    """--config : cles du fichier inconnues du code (typos, cles obsoletes)."""
-    known = {k.lower() for k in collect_config_keys(folder, files)}
-    for ln, key in config_file_keys(cfg_path):
+    """
+    --config : cles du fichier inconnues du code (typos, cles obsoletes) ;
+    2026-11-16 : CFGDUP (meme cle deux fois avec deux valeurs : la derniere
+    gagne, cas reel du double bloc des campagnes) et CFGEMPTY (cle presente
+    mais vide alors que le code a un defaut non vide : Cfg() renvoie le
+    vide, cas reel de ContactSkipFolders= dans le modele). S'applique aussi
+    a Docs\\config_ini.example.
+    """
+    keys = collect_config_keys(folder, files)
+    known = {k.lower(): v for k, v in keys.items()}
+    seen = {}
+    for ln, key, val in config_file_entries(cfg_path):
         kl = key.lower()
+        if kl in seen and seen[kl][1] != val:
+            rep.warn(cfg_path, ln, "CFGDUP",
+                     f"cle '{key}' deja presente ligne {seen[kl][0]} avec une autre "
+                     f"valeur - c'est la DERNIERE qui compte")
+        seen[kl] = (ln, val)
         if kl in known:
+            info = known[kl]
+            if val == "" and info["nonempty_str"]:
+                rep.warn(cfg_path, ln, "CFGEMPTY",
+                         f"cle '{key}' vide : remplace le defaut du code "
+                         f"({info['nature']} '{info['default'][:30]}') par du vide - "
+                         f"la mettre en commentaire (;{key}=) pour garder le defaut")
             continue
         if any(kl.startswith(p.lower()) for p in CFG_DYNAMIC_PREFIXES):
             continue
@@ -879,17 +1218,19 @@ def check_config_file(cfg_path, folder, files, rep):
 
 
 def gen_versions(folder, files):
-    """--gen-versions : Select Case de modMaintenance.ModuleVersionOf."""
+    """--gen-versions : Select Case de modMaintenance.ModuleVersionOf.
+    2026-11-16 : modMailAnalytics inclus (F9-12), modules archives exclus
+    (F9-14)."""
     cases = []
     for f in files:
         base = os.path.basename(f)
         if base in NOT_VBA or not (base.startswith("mod") or base == "ThisOutlookSession.txt"):
             continue
-        if "MailAnalytics" in base:
-            continue
         try:
             txt, _ = read_source(f)
         except Exception:
+            continue
+        if is_archived(txt):
             continue
         m = re.search(r'Private\s+Const\s+MOD_NAME\s+As\s+String\s*=\s*"([^"]+)"', txt)
         short = m.group(1) if m else ("DebugLog" if base == "modDebugLog.txt" else None)
@@ -905,22 +1246,178 @@ def gen_versions(folder, files):
 
 
 def gen_config_example(folder, files):
-    """--gen-config : template config_ini.example genere depuis le code."""
+    """
+    --gen-config : template config_ini.example genere depuis le code.
+    2026-11-16 (F2-02) : une cle dont le defaut du code n'est pas vide est
+    ecrite EN COMMENTAIRE (";Cle=defaut") : une cle presente mais vide
+    remplacerait le defaut par du vide. Defaut construit dans le code
+    ("Aper" & Chr(231) & "u") ou constante (DEFAULT_SKIP) : jamais recopie,
+    seulement signale. Cles numerotees ou construites : documentees en fin.
+    Sortie a relire avant de remplacer le bloc genere du modele.
+    """
     keys = collect_config_keys(folder, files)
     by_mod = {}
-    for k, (mod, d) in keys.items():
-        by_mod.setdefault(mod, []).append((k, d))
+    for k, info in keys.items():
+        by_mod.setdefault(info["module"], []).append((k, info))
     print("; config_ini.example - GENERE par validate.py --gen-config")
     print("; Une cle par ligne : Cle=valeur. Valeurs par defaut = celles du code.")
-    print("; Les cles numerotees (InboxAlertStore1, StatMailbox1...) se declinent en N.")
+    print("; Cle en commentaire (;Cle=...) : le code a un defaut non vide ; ne la")
+    print("; decommenter que pour la remplacer par une vraie valeur (une cle")
+    print("; presente mais vide remplace le defaut par du vide).")
     print("[ClassicOutlookToolkit]")
     for mod in sorted(by_mod):
         print(f"\n; --- {mod} ---")
-        for k, d in sorted(by_mod[mod]):
-            v = d
-            if v.startswith('"') and v.endswith('"'):
-                v = v[1:-1].replace('""', '"')
-            print(f"{k}={v}")
+        for k, info in sorted(by_mod[mod], key=lambda x: x[0].lower()):
+            nature, d = info["nature"], info["default"]
+            if nature == "empty":
+                print(f"{k}=")
+            elif nature in ("literal", "number", "bool"):
+                print(f";{k}={d}")
+            elif nature == "constant":
+                print(f";   {k} : defaut = {d} (constante ou fonction du code)")
+                print(f";{k}=")
+            else:
+                print(f";   {k} : defaut construit dans le code ({d[:40]}) - ne pas recopier")
+                print(f";{k}=")
+    print("\n; --- Cles numerotees ou construites (non generees) ---")
+    for line in CFG_DYNAMIC_DOC:
+        print(f";   {line}")
+
+
+# =============================================================================
+# 2026-11-16 (F0-02) : livraisons refaites sur une ancienne copie
+# =============================================================================
+
+def find_changelog(folder):
+    """CHANGELOG.txt du dossier des sources ou d'un dossier parent (2 niveaux)."""
+    d = os.path.abspath(folder)
+    for _ in range(3):
+        p = os.path.join(d, "CHANGELOG.txt")
+        if os.path.exists(p):
+            return p
+        d = os.path.dirname(d)
+    return None
+
+
+def changelog_versions(path):
+    """{module: (version, date, ligne)} : plus haut numero cite pour chaque
+    module dans les entrees datees de VERSION_SINCE ou apres."""
+    out = {}
+    try:
+        txt, _ = read_source(path)
+    except Exception:
+        return out
+    date = None
+    for ln, line in enumerate(txt.split("\n"), 1):
+        m = RE_CHANGELOG_DATE.match(line)
+        if m:
+            date = m.group(1)
+        if date is None or date < VERSION_SINCE:
+            continue
+        for mm in RE_CHANGELOG_CITE.finditer(line):
+            v = version_tuple(mm.group(2))
+            if v is None:
+                continue
+            k = mm.group(1)
+            if k not in out or v > out[k][0]:
+                out[k] = (v, date, ln)
+    return out
+
+
+def check_version_vs_changelog(path, txt, rep, cl_versions):
+    """
+    VERSION (erreur) : MOD_VERSION du fichier inferieur au plus haut numero
+    cite pour ce module dans CHANGELOG.txt (depuis VERSION_SINCE) : le
+    fichier a ete refait a partir d'une copie anterieure a une livraison
+    (cas reel : modFolderSort "v2" du 22/08 sur la v3.1 du 18/08 ; tri des
+    dossiers casse pendant trois mois).
+    """
+    key = module_key(path)
+    if not key or key not in cl_versions:
+        return
+    m = RE_MOD_VERSION.search(txt)
+    if not m:
+        return
+    fv = version_tuple(m.group(1))
+    cv, cdate, cline = cl_versions[key]
+    if fv is not None and fv < cv:
+        rep.error(path, 0, "VERSION",
+                  f"MOD_VERSION v{m.group(1)} inferieur a la v{'.'.join(map(str, cv))} "
+                  f"citee dans CHANGELOG.txt (ligne {cline}, {cdate}) - livraison "
+                  f"refaite sur une ancienne copie ? Repartir du fichier de Code\\ "
+                  f"et donner un numero nouveau")
+
+
+def history_entries(txt):
+    """Entrees d'historique de l'en-tete : {(version, date)} (lignes de
+    commentaire "' vN.N (AAAA-MM-JJ)" avant la premiere procedure)."""
+    out = set()
+    for line in txt.split("\n"):
+        if RE_PROC.match(line):
+            break
+        m = RE_HISTORY_ENTRY.match(line)
+        if m:
+            out.add((m.group(1), m.group(2)))
+    return out
+
+
+def normalized_code(txt):
+    """Texte compare pour RECUL : casse et blancs ignores (le VBE change la
+    casse des identifiants - Shell / shell, Item / item - et les espaces
+    autour de ":" et apres "," quand on colle un module)."""
+    return re.sub(r"\s+", "", txt.lower())
+
+
+def check_against(files, ref_dir, rep):
+    """
+    --against <dossier> (alias --installe) : compare chaque fichier a son
+    homonyme dans un dossier de reference (dernier Code\\ livre, ou modules
+    extraits de la sauvegarde du projet installe ; a plat ou range par
+    application). RECUL (erreur) :
+      - une entree "vN (date)" de l'en-tete de la reference a disparu alors
+        qu'elle n'est pas plus ancienne que la plus ancienne entree gardee
+        (un historique ancien deplace dans CHANGELOG n'est pas un recul) ;
+      - le contenu differe et MOD_VERSION n'a pas augmente.
+    Cas reel : modMaintenance "v4.5 du 02/11" batie sur la v4.4, sans
+    l'entree "v4.5 (2026-10-25)" du module installe.
+    """
+    refs = {}
+    for d, _dirs, fs in os.walk(ref_dir):
+        for f in fs:
+            if f.endswith(".txt"):
+                refs.setdefault(f.lower(), os.path.join(d, f))
+    compared = 0
+    for f in files:
+        base = os.path.basename(f)
+        if base in NOT_VBA or base.lower() not in refs:
+            continue
+        try:
+            new_txt, _ = read_source(f)
+            ref_txt, _ = read_source(refs[base.lower()])
+        except Exception:
+            continue
+        compared += 1
+        if normalized_code(new_txt) == normalized_code(ref_txt):
+            continue
+        new_h, ref_h = history_entries(new_txt), history_entries(ref_txt)
+        if new_h:
+            oldest_kept = min(dt for _v, dt in new_h)
+            lost = sorted(e for e in ref_h - new_h if e[1] >= oldest_kept)
+            new_versions = {v for v, _dt in new_h}
+            for v, dt in lost:
+                note = " (meme numero donne a un autre contenu)" if v in new_versions else ""
+                rep.error(f, 0, "RECUL",
+                          f"entree d'historique v{v} ({dt}) de la reference absente{note} "
+                          f"- fichier refait a partir d'une copie plus ancienne ?")
+        mn, mr = RE_MOD_VERSION.search(new_txt), RE_MOD_VERSION.search(ref_txt)
+        if mn and mr:
+            vn, vr = version_tuple(mn.group(1)), version_tuple(mr.group(1))
+            if vn is not None and vr is not None and vn <= vr:
+                rep.error(f, 0, "RECUL",
+                          f"contenu different de la reference mais MOD_VERSION "
+                          f"v{mn.group(1)} <= v{mr.group(1)} - donner un numero nouveau "
+                          f"(ou fichier plus ancien que la reference)")
+    return compared
 
 
 # =============================================================================
@@ -932,12 +1429,15 @@ CHECKS_TXT = [
 ]
 
 
-def validate_file(path, rep, known, symbols=None, enum_members=None):
+def validate_file(path, rep, known, symbols=None, enum_members=None,
+                  archived=frozenset(), cl_versions=None):
     try:
         txt, raw = read_source(path)
     except Exception as exc:
         rep.error(path, 0, "READ", f"lecture impossible : {exc}")
-        return
+        return False
+    if is_archived(txt):
+        return False      # 2026-11-16 (F9-14) : module archive, non controle
 
     check_encoding(path, txt, raw, rep)
     check_option_explicit(path, txt, rep)
@@ -957,8 +1457,51 @@ def validate_file(path, rep, known, symbols=None, enum_members=None):
     check_mod_name(path, txt, rep, known)
     check_mod_version(path, txt, rep)
     check_debug_print(path, txt, rep)
+    check_msg_loop(path, txt, rep)
+    if cl_versions:
+        check_version_vs_changelog(path, txt, rep, cl_versions)
     if symbols is not None:
-        check_xref(path, txt, rep, symbols, enum_members)
+        check_xref(path, txt, rep, symbols, enum_members, archived)
+    return True
+
+
+# Rangement du 2026-10-25 : sources rangees par application sous Code\
+# (Outlook\, Excel\<classeur>\, Interface\Rubans\ et
+# Interface\Formulaires\, Docs\, Outils\) ; ce script vit dans
+# Code\Outils\. Sans fichier en argument, on controle tout Code\,
+# sous-dossiers compris, sur deux niveaux au plus (Excel\<classeur>\,
+# Interface\Rubans\). Docs\ et Outils\ ne contiennent pas de VBA.
+# Un depot a plat (GitHub) se controle comme avant, depuis sa racine.
+SKIP_DIRS = {"docs", "outils", "tools", "archives"}   # 2026-11-16 : dossier Archives (F9-14)
+MAX_DEPTH = 2
+
+
+def sources_root(start):
+    """Dossier des sources a controler quand aucun fichier n'est donne."""
+    here = os.path.abspath(start)
+    if os.path.basename(here).lower() in ("outils", "tools"):
+        parent = os.path.dirname(here)
+        if os.path.isdir(os.path.join(parent, "Outlook")):
+            return parent                       # lance depuis Code\Outils
+    if os.path.isdir(os.path.join(here, "Code", "Outlook")):
+        return os.path.join(here, "Code")       # depuis le dossier de l'outil
+    return here                                 # Code\ lui-meme, ou depot a plat
+
+
+def list_sources(root):
+    """Fichiers .txt de root et de ses sous-dossiers (MAX_DEPTH niveaux)."""
+    out = []
+    for d, dirs, files in os.walk(root):
+        depth = 0 if d == root else os.path.relpath(d, root).count(os.sep) + 1
+        if depth >= MAX_DEPTH:
+            dirs[:] = []
+        else:
+            dirs[:] = sorted(x for x in dirs
+                             if not x.startswith(".") and x.lower() not in SKIP_DIRS)
+        for f in sorted(files):
+            if f.endswith(".txt") and f not in NOT_VBA:
+                out.append(os.path.join(d, f))
+    return out
 
 
 def main(argv):
@@ -970,15 +1513,22 @@ def main(argv):
         if i + 1 < len(argv):
             cfg_path = argv[i + 1]
             argv = argv[:i] + argv[i + 2:]
+    # 2026-11-16 (F0-02) : dossier de reference pour le controle RECUL.
+    ref_dir = None
+    for opt in ("--against", "--installe"):
+        if opt in argv:
+            i = argv.index(opt)
+            if i + 1 < len(argv):
+                ref_dir = argv[i + 1]
+                argv = argv[:i] + argv[i + 2:]
     args = [a for a in argv if not a.startswith("--")]
 
     if args:
         files = args
         folder = os.path.dirname(os.path.abspath(args[0])) or "."
     else:
-        folder = "."
-        files = sorted(f for f in os.listdir(folder)
-                       if f.endswith(".txt") and f not in NOT_VBA)
+        folder = sources_root(".")
+        files = list_sources(folder)
 
     if "--gen-versions" in argv:
         gen_versions(folder, [os.path.join(folder, f) if not os.path.isabs(f) and not os.path.exists(f) else f for f in files])
@@ -987,20 +1537,43 @@ def main(argv):
         gen_config_example(folder, [os.path.join(folder, f) if not os.path.isabs(f) and not os.path.exists(f) else f for f in files])
         return 0
 
-    known = collect_short_names(folder)
+    known = collect_short_names(folder, files)
     symbols, enums_by_mod = collect_public_symbols(folder, files)
+    archived = collect_archived(files)
+    # 2026-11-16 (F0-02) : numeros de version cites dans CHANGELOG.txt.
+    cl_path = find_changelog(folder)
+    cl_versions = changelog_versions(cl_path) if cl_path else {}
     all_enum_members = set()
     for v in enums_by_mod.values():
         all_enum_members |= v
     rep = Report()
+    # 2026-10-25 : un meme fichier a deux endroits (Code range par
+    # application) = une livraison posee au mauvais endroit.
+    seen = {}
+    for f in files:
+        seen.setdefault(os.path.basename(f).lower(), []).append(f)
+    for same in seen.values():
+        for f in same[1:]:
+            rep.error(f, 0, "DOUBLON",
+                      f"meme fichier a deux endroits : "
+                      f"{os.path.relpath(same[0], folder)} et "
+                      f"{os.path.relpath(f, folder)} - n'en garder qu'un "
+                      f"(livraison posee au mauvais endroit ?)")
     for f in files:
         base = os.path.basename(f)
         if base in NOT_VBA or "config_ini" in base or base.startswith("CHANGELOG"):
             continue
-        validate_file(f, rep, known, symbols, all_enum_members)
+        validate_file(f, rep, known, symbols, all_enum_members, archived, cl_versions)
 
     if cfg_path:
         check_config_file(cfg_path, folder, [os.path.join(folder, f) if not os.path.exists(f) else f for f in files], rep)
+
+    compared = None
+    if ref_dir:
+        if os.path.isdir(ref_dir):
+            compared = check_against(files, ref_dir, rep)
+        else:
+            rep.error(ref_dir, 0, "RECUL", "dossier de reference introuvable")
 
     def show(items, label):
         if not items:
@@ -1028,6 +1601,12 @@ def main(argv):
     else:
         print(f"{n} fichier(s) - {len(rep.errors)} erreur(s), "
               f"{len(rep.warns)} avertissement(s).")
+    if archived:
+        print(f"Archive(s) non controle(s) : {', '.join(sorted(archived))}.")
+    if cl_path is None:
+        print("CHANGELOG.txt introuvable : controle VERSION non fait.")
+    if compared is not None:
+        print(f"Compare(s) a la reference {ref_dir} : {compared} fichier(s).")
     print("=" * 78)
 
     if rep.errors:

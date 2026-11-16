@@ -1,6 +1,18 @@
+Option Explicit
+
 ' ============================================================================
-' frmProgress - CODE V23.6
+' frmProgress - CODE V23.7
 ' Formulaire de progression de l'analyse
+' V23.7 (2026-11-16) : audit 11/2026 - F9-11, F9-04 (+ partie code de F9-12) :
+'         * F9-11 : le bouton Pause change vraiment d'intitule (Chr(9654) /
+'           Chr(9208) levaient l'erreur 5, masquee : la ligne etait sautee ;
+'           symboles retires, texte seul) ; etat "En pause..." traduit ;
+'           la pause attend par modCommon.SleepMs (avant : boucle DoEvents
+'           sans pause, un coeur du processeur a 100 %).
+'         * F9-04 : modMailAnalytics affiche le message final puis ferme la
+'           fenetre lui-meme (plus d'attente du clic sur Fermer).
+'         * F9-12 : libelles par T(), journal par modDebugLog, Option
+'           Explicit en ligne 1.
 ' V23.6 : la barre bleue s'affichait en haut a gauche du FORMULAIRE :
 '         lblProgressBar existe bien dans la maquette mais comme enfant
 '         du formulaire (pas du cadre gris), et la V23.4 le positionnait
@@ -9,7 +21,10 @@
 '         son parent, et pilotee via une reference m_Bar unique.
 ' ADAPTE aux noms de controles existants
 ' ============================================================================
-Option Explicit
+
+' V23.7 (F9-12) : meme filtre de journal que modMailAnalytics.
+Private Const MOD_NAME As String = "Analytics"
+Private Const PAUSE_SLICE_MS As Long = 50   ' V23.7 (F9-11) : attente pendant la pause
 
 Private m_Cancelled As Boolean
 Private m_Paused As Boolean
@@ -17,7 +32,7 @@ Private m_ProgressBarWidth As Double  ' Largeur max de la barre
 Private m_Bar As Object               ' V23.6 : reference unique au remplissage
 
 Private Sub UserForm_Initialize()
-    Debug.Print "[frmProgress] Initialize..."
+    modDebugLog.DDebug MOD_NAME, "frmProgress : Initialize..."
     
     On Error Resume Next
     
@@ -32,11 +47,11 @@ Private Sub UserForm_Initialize()
     If m_ProgressBarWidth = 0 Then m_ProgressBarWidth = 480
     
     ' Initialiser les labels (sans emojis pour compatibilite)
-    lblTitre.Caption = "Analyzing emails..."
-    lblStatus.Caption = "Initializing..."
-    lblBoite.Caption = "Mailbox : -"
-    lblEmails.Caption = "Emails processed: 0 / 0"
-    lblTempsEcoule.Caption = "Elapsed time: 0 min 0 sec"
+    lblTitre.Caption = T("Analyse des mails...", "Analyzing emails...")
+    lblStatus.Caption = T("Initialisation...", "Initializing...")
+    lblBoite.Caption = T("Bo~ite : -", "Mailbox: -")
+    lblEmails.Caption = T("Mails examin~es : 0 / 0", "Emails processed: 0 / 0")
+    lblTempsEcoule.Caption = T("Temps ~ecoul~e : 0 min 0 s", "Elapsed time: 0 min 0 sec")
     lblTempsRestant.Caption = T("Temps restant estim~e : calcul...", "Estimated time left: calculating...")
     
     ' Si lblDetail existe
@@ -88,9 +103,9 @@ Private Sub UserForm_Initialize()
     
     ' Boutons
     On Error Resume Next
-    btnPause.Caption = "Pause"
+    btnPause.Caption = T("Pause", "Pause")
     btnPause.Enabled = True
-    btnAnnuler.Caption = "Cancel"
+    btnAnnuler.Caption = T("Annuler", "Cancel")
     btnAnnuler.Enabled = True
     On Error GoTo 0
     
@@ -99,7 +114,7 @@ Private Sub UserForm_Initialize()
     Me.Controls("btnFermer").Visible = False
     On Error GoTo 0
     
-    Debug.Print "[frmProgress] Initialize termine"
+    modDebugLog.DDebug MOD_NAME, "frmProgress : Initialize termine"
 End Sub
 
 ' ============================================================================
@@ -110,8 +125,10 @@ Public Sub UpdateProgress(current As Long, total As Long, storeName As String, _
     On Error Resume Next
     
     ' Gestion de la pause
+    ' V23.7 (F9-11) : vraie attente (Sleep par tranches + DoEvents) au lieu
+    ' d'un DoEvents sans pause qui occupait un coeur a 100 %.
     Do While m_Paused And Not m_Cancelled
-        DoEvents
+        modCommon.SleepMs PAUSE_SLICE_MS
     Loop
     
     If m_Cancelled Then Exit Sub
@@ -125,9 +142,9 @@ Public Sub UpdateProgress(current As Long, total As Long, storeName As String, _
     End If
     
     ' Mise a jour des labels (sans emojis)
-    lblBoite.Caption = "Mailbox : " & storeName & " (" & storeIndex & "/" & storeCount & ")"
-    lblEmails.Caption = "Emails processed: " & Format(current, "#,##0") & " / " & Format(total, "#,##0")
-    lblStatus.Caption = "Analyzing... " & Format(pct, "0") & "%"
+    lblBoite.Caption = T("Bo~ite : ", "Mailbox: ") & storeName & " (" & storeIndex & "/" & storeCount & ")"
+    lblEmails.Caption = T("Mails examin~es : ", "Emails processed: ") & Format(current, "#,##0") & " / " & Format(total, "#,##0")
+    lblStatus.Caption = T("Analyse en cours... ", "Analyzing... ") & Format(pct, "0") & "%"
     
     ' Pourcentage (si controle existe)
     On Error Resume Next
@@ -149,7 +166,7 @@ Public Sub SetTimeInfo(elapsedSeconds As Long, remainingSeconds As Long)
     Dim elapsedMin As Long, elapsedSec As Long
     elapsedMin = elapsedSeconds \ 60
     elapsedSec = elapsedSeconds Mod 60
-    lblTempsEcoule.Caption = "Elapsed time: " & elapsedMin & " min " & elapsedSec & " sec"
+    lblTempsEcoule.Caption = T("Temps ~ecoul~e : ", "Elapsed time: ") & elapsedMin & " min " & elapsedSec & T(" s", " sec")
     
     ' Temps restant
     If remainingSeconds > 0 Then
@@ -169,7 +186,7 @@ End Sub
 Public Sub SetComplete(message As String)
     On Error Resume Next
     
-    lblTitre.Caption = "Analysis complete!"
+    lblTitre.Caption = T("Analyse termin~ee !", "Analysis complete!")
     lblStatus.Caption = message
     lblStatus.ForeColor = RGB(0, 128, 0)  ' Vert
     
@@ -191,8 +208,8 @@ End Sub
 Public Sub SetError(message As String)
     On Error Resume Next
     
-    lblTitre.Caption = "Error"
-    lblStatus.Caption = "Error: " & message
+    lblTitre.Caption = T("Erreur", "Error")
+    lblStatus.Caption = T("Erreur : ", "Error: ") & message
     lblStatus.ForeColor = RGB(255, 0, 0)  ' Rouge
     
     ' Barre en rouge
@@ -220,14 +237,18 @@ End Property
 ' ============================================================================
 ' BOUTONS
 ' ============================================================================
+' V23.7 (F9-11) : Chr() n'accepte que 0 a 255 sur un poste occidental :
+' Chr(9654) / Chr(9208) levaient l'erreur 5 (masquee) et l'intitule ne
+' changeait jamais. Texte seul (pas de glyphe absent de la police).
 Private Sub btnPause_Click()
     On Error Resume Next
     m_Paused = Not m_Paused
     If m_Paused Then
-        btnPause.Caption = Chr(9654) & " " & T("Reprendre", "Resume")  ' Chr(9654) = triangle droit
-        lblStatus.Caption = "Paused..."
+        btnPause.Caption = T("Reprendre", "Resume")
+        lblStatus.Caption = T("En pause...", "Paused...")
     Else
-        btnPause.Caption = Chr(9208) & " " & T("Pause", "Pause")  ' Chr(9208) = double barre
+        btnPause.Caption = T("Pause", "Pause")
+        lblStatus.Caption = T("Reprise...", "Resuming...")
     End If
 End Sub
 

@@ -1,7 +1,7 @@
 Option Explicit
 
 '=============================================================================
-' modMeetingToAppointment  (v6.2 - 2026-09-01)
+' modMeetingToAppointment  (v6.4 - 2026-11-16)
 ' Purpose (EN): when a meeting with no third-party invitees is saved, Outlook
 '   may leave MeetingStatus = olMeeting (the inspector still shows the recipient
 '   field + Send button). DemoteIfEmptyMeeting forces olNonMeeting (a real
@@ -106,6 +106,17 @@ Option Explicit
 '   historique CleanBodyViaWordImpl (URL en texte visible obligatoire,
 '   borne sur "surtax") est supprime. BodyHasTeamsBlock (texte MAPI) sert
 '   au verdict du toast.
+' v6.3 (2026-10-25) : DumpAppointmentHTML et DiagWordBody ecrivent dans le
+'   dossier Sorties de l'outil (modConfig.MacroVBADir : <outil>\Sorties)
+'   au lieu du chemin fixe <Bureau>\Macro VBA\Outlook (modConfig v3.17).
+' v6.4 (2026-11-16) : audit 11/2026 - F6-09, F6-17 : InspectorHasTeamsLink
+'   (publique) pour le toast "lien Teams a retirer" decide par
+'   clsApptWatcher v2.3 ; trace de la sortie "pas une reunion" de
+'   DemoteIfEmptyMeeting ; variables locales "a" / "t" renommees ("ap",
+'   "txt") dans les procedures qui affichent des textes traduits (et les
+'   cas latents), regle T()/A() du projet. integration - F6-18 :
+'   commentaire de DemoteIfEmptyMeeting aligne sur le code (aucun invite
+'   AUTRE que moi, appel depuis ItemAdd, ItemChange et le rejeu "CalReplay").
 ' (Historique des versions -> CHANGELOG.)
 '
 ' PRUDENCE : defensif. S'il reste un vrai invite, nbTiers >= 1 et on ne
@@ -115,7 +126,7 @@ Option Explicit
 '=============================================================================
 
 Private Const MOD_NAME As String = "Mtg2Appt"
-Private Const MOD_VERSION As String = "v6.2 - 2026-09-01"
+Private Const MOD_VERSION As String = "v6.4 - 2026-11-16"
 
 ' Constantes Outlook (valeurs en dur, late binding)
 Private Const OL_MEETING As Long = 1            ' olMeeting
@@ -467,6 +478,24 @@ Private Function DocHasTeamsLink(ByVal doc As Object) As Boolean
 End Function
 
 '=============================================================================
+' InspectorHasTeamsLink (v6.4, F6-09) : le corps affiche par l'inspecteur
+' (WordEditor) contient-il encore un lien teams.microsoft.com (texte visible
+' ou hyperlien) ? Publique pour clsApptWatcher, qui decide du toast
+' "lien Teams a retirer" quand le nettoyage n'a pas trouve les bornes du
+' bloc. False sans WordEditor. N'echoue jamais vers l'appelant.
+'=============================================================================
+Public Function InspectorHasTeamsLink(ByVal insp As Object) As Boolean
+    InspectorHasTeamsLink = False
+    On Error Resume Next
+    If insp Is Nothing Then Exit Function
+    Dim doc As Object
+    Set doc = Nothing
+    Set doc = insp.WordEditor
+    If doc Is Nothing Then Exit Function
+    InspectorHasTeamsLink = DocHasTeamsLink(doc)
+End Function
+
+'=============================================================================
 ' CleanAllTeamsBlocks : retire TOUS les blocs Teams du document, un par
 ' passe (les index de paragraphes bougent apres chaque suppression : on
 ' rescanne depuis le debut). Renvoie le nombre de blocs retires.
@@ -745,9 +774,9 @@ End Function
 Public Sub DiagMeetingStatus()
     On Error GoTo ErrH
 
-    Dim a As Outlook.AppointmentItem
-    Set a = GetTargetAppointment()
-    If a Is Nothing Then
+    Dim ap As Outlook.AppointmentItem
+    Set ap = GetTargetAppointment()
+    If ap Is Nothing Then
         MsgBox T("S~electionnez (ou ouvrez) un rendez-vous d'abord.", "Select (or open) an appointment first."), _
                vbExclamation, T("Diagnostic - statut de r~eunion", "Diagnostics - meeting status")
         Exit Sub
@@ -757,14 +786,14 @@ Public Sub DiagMeetingStatus()
     Dim mc As String
     ms = -999: rc = -999: rs = -999: mc = "?"
     On Error Resume Next
-    ms = a.MeetingStatus
-    rc = a.recipients.count
-    rs = a.ResponseStatus
-    mc = a.MessageClass
+    ms = ap.MeetingStatus
+    rc = ap.recipients.count
+    rs = ap.ResponseStatus
+    mc = ap.MessageClass
     On Error GoTo ErrH
 
     Dim thirdPartyCount As Long
-    thirdPartyCount = CountThirdPartyRecipients(a)
+    thirdPartyCount = CountThirdPartyRecipients(ap)
 
     Dim msTxt As String
     Select Case ms
@@ -778,7 +807,7 @@ Public Sub DiagMeetingStatus()
 
     Dim msg As String
     msg = "=== Diagnostic MeetingStatus ===" & vbCrLf & vbCrLf & _
-          T("Sujet           : ", "Subject         : ") & Left(CStr(a.subject), 60) & vbCrLf & _
+          T("Sujet           : ", "Subject         : ") & Left(CStr(ap.subject), 60) & vbCrLf & _
           "MeetingStatus   : " & msTxt & vbCrLf & _
           "Recipients.Count: " & rc & T(" (dont ", " (of which ") & thirdPartyCount & T(" tiers hors moi)", " third-party, excluding me)") & vbCrLf & _
           "ResponseStatus  : " & rs & vbCrLf & _
@@ -795,7 +824,7 @@ Public Sub DiagMeetingStatus()
 
     modDebugLog.DInfo MOD_NAME, "DiagMeetingStatus ms=" & ms & " rc=" & rc & _
         " tiers=" & thirdPartyCount & " rs=" & rs & " class=" & mc & _
-        " '" & Left(CStr(a.subject), 40) & "'"
+        " '" & Left(CStr(ap.subject), 40) & "'"
 
     MsgBox msg, vbInformation, T("Diagnostic - statut de r~eunion", "Diagnostics - meeting status")
     Exit Sub
@@ -808,10 +837,13 @@ ErrH:
 End Sub
 
 '=============================================================================
-' FIX AUTO : appele depuis ThisOutlookSession.CalendarItems_ItemChange.
-' Si l'item est une reunion (olMeeting) SANS aucun destinataire, c'est une
-' reunion qu'on a videe et qu'Outlook n'a pas proprement reconvertie : on
-' force olNonMeeting (vraie conversion en rendez-vous).
+' FIX AUTO : appele depuis ThisOutlookSession (CalendarItems_ItemAdd,
+' CalendarItems_ItemChange et rejeu differe "CalReplay").
+' Si l'item est une reunion (olMeeting) SANS aucun invite AUTRE QUE MOI
+' (Outlook s'ajoute lui-meme comme destinataire : une reunion videe de ses
+' invites compte encore 1 destinataire), c'est une reunion qu'on a videe et
+' qu'Outlook n'a pas proprement reconvertie : on force olNonMeeting (vraie
+' conversion en rendez-vous).
 '=============================================================================
 Public Sub DemoteIfEmptyMeeting(ByVal appt As Object)
     On Error GoTo ErrH
@@ -819,14 +851,14 @@ Public Sub DemoteIfEmptyMeeting(ByVal appt As Object)
     If appt Is Nothing Then Exit Sub
     If Not (TypeOf appt Is Outlook.AppointmentItem) Then Exit Sub
 
-    Dim a As Outlook.AppointmentItem
-    Set a = appt
+    Dim ap As Outlook.AppointmentItem
+    Set ap = appt
 
     ' Cooldown anti-boucle (notre Save re-declenche un ItemChange asynchrone)
-    If Len(gLastEntryID) > 0 And Len(a.entryID) > 0 Then
-        If StrComp(gLastEntryID, a.entryID, vbBinaryCompare) = 0 Then
+    If Len(gLastEntryID) > 0 And Len(ap.entryID) > 0 Then
+        If StrComp(gLastEntryID, ap.entryID, vbBinaryCompare) = 0 Then
             If DateDiff("s", gLastSaveAt, Now) < COOLDOWN_SEC Then
-                modDebugLog.DTrace MOD_NAME, "Skip : cooldown sur '" & a.subject & "'"
+                modDebugLog.DTrace MOD_NAME, "Skip : cooldown sur '" & ap.subject & "'"
                 Exit Sub
             End If
         End If
@@ -840,18 +872,24 @@ Public Sub DemoteIfEmptyMeeting(ByVal appt As Object)
     Dim ms As Long
     ms = -1
     On Error Resume Next
-    ms = a.MeetingStatus
+    ms = ap.MeetingStatus
     On Error GoTo ErrH
 
-    If ms <> OL_MEETING Then Exit Sub        ' pas une reunion -> rien
+    If ms <> OL_MEETING Then
+        ' v6.4 (F6-09) : trace de diagnostic (deja rendez-vous, reunion
+        ' recue...) ; le toast d'un creneau deja converti par Outlook est
+        ' emis par clsApptWatcher au Write.
+        modDebugLog.DTrace MOD_NAME, "Skip : MeetingStatus=" & ms & " (pas une reunion a convertir)"
+        Exit Sub                             ' pas une reunion -> rien
+    End If
 
     Dim othersCount As Long
-    othersCount = CountThirdPartyRecipients(a)
+    othersCount = CountThirdPartyRecipients(ap)
 
     If othersCount > 0 Then
         ' Il reste de vrais invites : c'est une vraie reunion, on ne touche pas.
         modDebugLog.DTrace MOD_NAME, "Skip : " & othersCount & _
-            " invite(s) tiers sur '" & Left(CStr(a.subject), 40) & "'"
+            " invite(s) tiers sur '" & Left(CStr(ap.subject), 40) & "'"
         Exit Sub
     End If
 
@@ -860,18 +898,18 @@ Public Sub DemoteIfEmptyMeeting(ByVal appt As Object)
     ' Teams (qui est un bonus best-effort). On convertit + Save D'ABORD,
     ' puis on tente le nettoyage dans un bloc isole qui ne peut pas faire
     ' echouer la conversion.
-    a.MeetingStatus = OL_NON_MEETING
-    a.Save
+    ap.MeetingStatus = OL_NON_MEETING
+    ap.Save
 
     ' Memoriser pour le cooldown (avant le nettoyage : si le nettoyage
     ' relance un Save/ItemChange, le cooldown protege deja).
     On Error Resume Next
-    gLastEntryID = a.entryID
+    gLastEntryID = ap.entryID
     gLastSaveAt = Now
     On Error GoTo ErrH
 
     modDebugLog.DInfo MOD_NAME, "Reunion sans invite convertie en rendez-vous : '" & _
-        Left(CStr(a.subject), 60) & "'"
+        Left(CStr(ap.subject), 60) & "'"
 
     ' v6.2 : COULEUR. La categorie auto (reunion interne/externe) a pu etre
     ' posee par modMeetingColor quelques instants plus tot, l'item etant
@@ -880,7 +918,7 @@ Public Sub DemoteIfEmptyMeeting(ByVal appt As Object)
     ' aucun participant : on la retire ici, explicitement. Isole : un echec
     ' ne touche pas la conversion.
     On Error Resume Next
-    If modMeetingColor.ClearAutoCategory(a) Then gLastSaveAt = Now
+    If modMeetingColor.ClearAutoCategory(ap) Then gLastSaveAt = Now
     On Error GoTo ErrH
 
     ' v3.1 : nettoyage Teams ISOLE. Toute erreur ici est avalee et n'affecte
@@ -888,9 +926,9 @@ Public Sub DemoteIfEmptyMeeting(ByVal appt As Object)
     ' effectivement modifie quelque chose.
     On Error Resume Next
     Dim wasModified As Boolean
-    wasModified = CleanTeamsBlock(a)
+    wasModified = CleanTeamsBlock(ap)
     If wasModified Then
-        a.Save
+        ap.Save
         gLastSaveAt = Now    ' rafraichir le cooldown apres ce 2e Save
     End If
 
@@ -899,7 +937,7 @@ Public Sub DemoteIfEmptyMeeting(ByVal appt As Object)
     ' (BodyHasTeamsBlock, texte MAPI), sinon simple conversion. Si
     ' clsApptWatcher a deja nettoye et toaste au Write, l'anti-doublon
     ' de NotifyPersonalSlot absorbe cet appel.
-    NotifyPersonalSlot a, gLastBodyCleaned, (Not gLastBodyCleaned) And BodyHasTeamsBlock(a)
+    NotifyPersonalSlot ap, gLastBodyCleaned, (Not gLastBodyCleaned) And BodyHasTeamsBlock(ap)
     On Error GoTo 0
     Exit Sub
 
@@ -956,10 +994,10 @@ Public Function IsRealThirdPartyMeeting(ByVal appt As Object) As Boolean
     On Error Resume Next
     If appt Is Nothing Then Exit Function
     If Not (TypeOf appt Is Outlook.AppointmentItem) Then Exit Function
-    Dim a As Outlook.AppointmentItem
-    Set a = appt
-    If a.MeetingStatus <> OL_MEETING Then Exit Function
-    If CountThirdPartyRecipients(a) > 0 Then IsRealThirdPartyMeeting = True
+    Dim ap As Outlook.AppointmentItem
+    Set ap = appt
+    If ap.MeetingStatus <> OL_MEETING Then Exit Function
+    If CountThirdPartyRecipients(ap) > 0 Then IsRealThirdPartyMeeting = True
 End Function
 
 '=============================================================================
@@ -1082,28 +1120,28 @@ End Function
 Public Sub CleanTeamsSelection()
     On Error GoTo ErrH
 
-    Dim a As Outlook.AppointmentItem
-    Set a = GetTargetAppointment()
-    If a Is Nothing Then
+    Dim ap As Outlook.AppointmentItem
+    Set ap = GetTargetAppointment()
+    If ap Is Nothing Then
         MsgBox T("Ouvrez ou s~electionnez un rendez-vous d'abord.", "Open or select an appointment first."), vbExclamation, T("Nettoyage Teams", "Teams cleanup")
         Exit Sub
     End If
 
     ' Location
-    If LocationIsTeams(CStr(a.Location)) Then a.Location = ""
+    If LocationIsTeams(CStr(ap.Location)) Then ap.Location = ""
 
     Dim insp As Outlook.Inspector
-    Set insp = FindAppointmentInspector(a)
+    Set insp = FindAppointmentInspector(ap)
     If insp Is Nothing Then
         MsgBox T("Pour nettoyer le corps, ouvrez d'abord le rendez-vous dans sa fen~xtre", "To clean the body, first open the appointment in its window") & vbCrLf & _
                T("(l'editeur de corps n'est disponible que sur un RDV ouvert).", "(the body editor is only available on an open appointment)."), _
                vbExclamation, T("Nettoyage Teams", "Teams cleanup")
-        a.Save
+        ap.Save
         Exit Sub
     End If
 
     If CleanBodyViaWord(insp) Then
-        a.Save
+        ap.Save
         MsgBox T("Bloc Microsoft Teams retire.", "Microsoft Teams block removed."), vbInformation, T("Nettoyage Teams", "Teams cleanup")
     Else
         MsgBox T("Aucun bloc Teams d~etect~e dans ce rendez-vous.", "No Teams block detected in this appointment."), vbInformation, T("Nettoyage Teams", "Teams cleanup")
@@ -1147,19 +1185,19 @@ End Function
 Private Function ParaIsUnderline(ByVal para As Object) As Boolean
     ParaIsUnderline = False
     On Error Resume Next
-    Dim t As String
-    t = para.Range.text
+    Dim txt As String
+    txt = para.Range.text
     ' retirer espaces, tabs, et marques de paragraphe (Chr 13/7/etc.)
-    t = Replace(t, " ", "")
-    t = Replace(t, vbTab, "")
-    t = Replace(t, vbCr, "")
-    t = Replace(t, vbLf, "")
-    t = Replace(t, Chr(7), "")
-    t = Replace(t, Chr(11), "")
-    If Len(t) < 20 Then Exit Function
+    txt = Replace(txt, " ", "")
+    txt = Replace(txt, vbTab, "")
+    txt = Replace(txt, vbCr, "")
+    txt = Replace(txt, vbLf, "")
+    txt = Replace(txt, Chr(7), "")
+    txt = Replace(txt, Chr(11), "")
+    If Len(txt) < 20 Then Exit Function
     Dim i As Long
-    For i = 1 To Len(t)
-        If Mid$(t, i, 1) <> "_" Then Exit Function
+    For i = 1 To Len(txt)
+        If Mid$(txt, i, 1) <> "_" Then Exit Function
     Next i
     ParaIsUnderline = True
 End Function
@@ -1215,7 +1253,7 @@ End Function
 ' bloc Teams avant d'ecrire un nettoyage chirurgical.
 '
 ' A lancer sur le RDV/reunion selectionne ou ouvert. Ecrit deux fichiers
-' sur Bureau\Macro VBA\Outlook :
+' dans le dossier Sorties de l'outil (modConfig.MacroVBADir) :
 '   - rdv_body.txt  : la propriete .Body (texte brut, lignes Teams visibles)
 '   - rdv_location.txt : le champ .Location
 ' Les AppointmentItem n'exposent PAS de .HTMLBody (contrairement aux mails) ;
@@ -1226,16 +1264,17 @@ End Function
 Public Sub DumpAppointmentHTML()
     On Error GoTo ErrH
 
-    Dim a As Outlook.AppointmentItem
-    Set a = GetTargetAppointment()
-    If a Is Nothing Then
+    Dim ap As Outlook.AppointmentItem
+    Set ap = GetTargetAppointment()
+    If ap Is Nothing Then
         MsgBox T("S~electionnez ou ouvrez un rendez-vous d'abord.", "Select or open an appointment first."), _
                vbExclamation, T("Dump RDV", "Dump appointment")
         Exit Sub
     End If
 
     Dim folder As String
-    folder = modConfig.DesktopPath() & "\Macro VBA\Outlook"
+    folder = modConfig.MacroVBADir()
+    If Len(Dir$(folder, vbDirectory)) = 0 Then MkDir folder
 
     Dim pBody As String, pLoc As String
     pBody = folder & "\rdv_body.txt"
@@ -1244,20 +1283,20 @@ Public Sub DumpAppointmentHTML()
     Dim f As Integer
     f = FreeFile
     Open pBody For Output As #f
-    Print #f, a.body
+    Print #f, ap.body
     Close #f
 
     f = FreeFile
     Open pLoc For Output As #f
-    Print #f, "Location = " & a.Location
-    Print #f, "MeetingStatus = " & a.MeetingStatus
+    Print #f, "Location = " & ap.Location
+    Print #f, "MeetingStatus = " & ap.MeetingStatus
     Close #f
 
-    modDebugLog.DInfo MOD_NAME, "DumpAppointmentHTML : body=" & Len(a.body) & _
-        " chars, location='" & a.Location & "'"
+    modDebugLog.DInfo MOD_NAME, "DumpAppointmentHTML : body=" & Len(ap.body) & _
+        " chars, location='" & ap.Location & "'"
 
     If MsgBox(T("Corps du RDV sauvegarde :", "Appointment body saved:") & vbCrLf & pBody & vbCrLf & vbCrLf & _
-              "Location : " & a.Location & vbCrLf & vbCrLf & _
+              "Location : " & ap.Location & vbCrLf & vbCrLf & _
               T("Ouvrir rdv_body.txt maintenant ?", "Open rdv_body.txt now?"), _
               vbYesNo + vbQuestion, T("Dump RDV OK", "Dump OK")) = vbYes Then
         Shell "notepad.exe """ & pBody & """", vbNormalFocus
@@ -1275,7 +1314,7 @@ End Sub
 ' c'est lui qu'il faut analyser quand "Aucun bloc Teams detecte".
 '
 ' Le RDV doit etre OUVERT (WordEditor requis). Ecrit dans
-' Bureau\Macro VBA\Outlook\rdv_word.txt :
+' <outil>\Sorties\rdv_word.txt :
 '   - le texte integral vu par Word (doc.Content.text)
 '   - puis, ligne par ligne, le numero, la longueur, et le CODE du 1er
 '     caractere non-espace (pour voir si les "lignes de separation" sont
@@ -1285,15 +1324,15 @@ End Sub
 Public Sub DiagWordBody()
     On Error GoTo ErrH
 
-    Dim a As Outlook.AppointmentItem
-    Set a = GetTargetAppointment()
-    If a Is Nothing Then
+    Dim ap As Outlook.AppointmentItem
+    Set ap = GetTargetAppointment()
+    If ap Is Nothing Then
         MsgBox T("Ouvrez ou s~electionnez un rendez-vous d'abord.", "Open or select an appointment first."), vbExclamation, T("Diag corps Word", "Diag Word body")
         Exit Sub
     End If
 
     Dim insp As Outlook.Inspector
-    Set insp = FindAppointmentInspector(a)
+    Set insp = FindAppointmentInspector(ap)
     If insp Is Nothing Then
         MsgBox T("Ouvrez le rendez-vous dans sa fen~xtre (WordEditor requis).", "Open the appointment in its window (WordEditor required)."), _
                vbExclamation, T("Diag corps Word", "Diag Word body")
@@ -1311,7 +1350,8 @@ Public Sub DiagWordBody()
     txt = doc.Content.text
 
     Dim folder As String
-    folder = modConfig.DesktopPath() & "\Macro VBA\Outlook"
+    folder = modConfig.MacroVBADir()
+    If Len(Dir$(folder, vbDirectory)) = 0 Then MkDir folder
     Dim p As String
     p = folder & "\rdv_word.txt"
 

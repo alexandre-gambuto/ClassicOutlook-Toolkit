@@ -1,12 +1,15 @@
 Option Explicit
 
 '=============================================================================
-' clsAppEvents v4.1  (2026-07-25)
+' clsAppEvents v4.3  (2026-11-16)
 ' Purpose (EN): central WithEvents listener on Application.Inspectors and the
 '   active Explorer; relays NewInspector / InlineResponse events to the modules
 '   that need them (late binding, no UserForm).
 ' Classe d'ecoute des evenements de Application.Inspectors et Application.Explorers
 ' pour relayer aux modules interesses :
+'   - ThisOutlookSession.OnFirstExplorer  : (v4.3) role donne a la premiere
+'                                            fenetre ouverte d'une session
+'                                            lancee sans fenetre
 '   - modNewMeetingDefault.OnNewInspector  : force duree 15 min sur RDV vierge
 '   - modReplyInPlace.OnNewInspector       : memorise dossier parent des
 '                                            Reply/ReplyAll/Forward ouverts
@@ -22,7 +25,8 @@ Option Explicit
 ' des WithEvents internes, lues via modNewMeetingDefault par
 ' modMaintenance.AssertBindings). NB : m_Explorer peut etre legitimement
 ' Nothing si aucune fenetre Outlook n'existait a l'initialisation
-' (ActiveExplorer = Nothing) ; un Reinit le repare.
+' (ActiveExplorer = Nothing) ; un Reinit le repare. [v4.3 : relie tout seul
+' a l'ouverture de la premiere fenetre, NewExplorer -> OnFirstExplorer.]
 '
 ' v3 (2026-07-07) : FIL D'ARIANE de crash dans NewInspector. Motive par
 ' l'evenement Windows 1000 du 06/07 ("Outlook s'est arrete pendant le
@@ -39,6 +43,16 @@ Option Explicit
 ' v4.2 (2026-08-18) : relais NewInspector + InlineResponse vers modHideBcc
 ' (champ Cci force masque sur les fenetres de composition).
 '
+' v4.3 (2026-11-16) : audit 11/2026 - F1-07, F1-10 : (a) ecoute de
+'   Application.Explorers (NewExplorer) relayee a
+'   ThisOutlookSession.OnFirstExplorer : Outlook lance SANS fenetre par un
+'   classeur (ActiveExplorer = Nothing a l'initialisation) recoit ses
+'   liaisons de fenetre courrier (volet de lecture : reponse rangee,
+'   salutation, Cci masque ; fenetres courrier / calendrier) des que
+'   l'utilisateur ouvre la fenetre, sans Reinit ; (b) en-tete : numero de
+'   version aligne sur MOD_VERSION (l'en-tete annoncait v4.1, la constante
+'   v4.2).
+'
 ' v4.1 (2026-07-25) : MOD_NAME (le nom "AppEvents" etait ecrit en dur dans
 ' chaque DTrace - une faute de frappe rendait la ligne invisible du filtre)
 ' + ModVersion. NB : une classe n'est interrogeable par
@@ -46,19 +60,35 @@ Option Explicit
 '=============================================================================
 
 Private Const MOD_NAME As String = "AppEvents"
-Private Const MOD_VERSION As String = "v4.2 - 2026-08-18"
+Private Const MOD_VERSION As String = "v4.3 - 2026-11-16"
 
 Private WithEvents m_Inspectors As Outlook.Inspectors
 Private WithEvents m_Explorer As Outlook.Explorer
+' v4.3 (F1-07) : nouvelles fenetres (session lancee sans fenetre).
+Private WithEvents m_Explorers As Outlook.Explorers
 
 Private Sub Class_Initialize()
     Set m_Inspectors = Application.Inspectors
     Set m_Explorer = Application.ActiveExplorer
+    Set m_Explorers = Application.Explorers
 End Sub
 
 Private Sub Class_Terminate()
     Set m_Inspectors = Nothing
     Set m_Explorer = Nothing
+    Set m_Explorers = Nothing
+End Sub
+
+'=============================================================================
+' NewExplorer (v4.3, F1-07) : une fenetre Outlook s'ouvre. ThisOutlookSession
+' ne lui donne un role (courrier ou calendrier, selon ce qu'elle affiche) que
+' si AUCUNE fenetre a role n'existe encore : cas d'Outlook lance sans fenetre
+' par un classeur. Les fenetres creees par l'outil et celles ouvertes a la
+' main ensuite restent hors de ce relais.
+'=============================================================================
+Private Sub m_Explorers_NewExplorer(ByVal Explorer As Outlook.Explorer)
+    On Error Resume Next
+    ThisOutlookSession.OnFirstExplorer Explorer
 End Sub
 
 '=============================================================================

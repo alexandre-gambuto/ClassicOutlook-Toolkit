@@ -1,32 +1,76 @@
 Option Explicit
 
 '=============================================================================
-' modContactCommon  (v1.0 - 2026-09-02)  [PACK v3 - C3]
-' Purpose (EN): stateless helpers shared by the six contact modules
-'   (Birthday, Export, FromMail, Import, Normalize, Relation): folder skip
-'   rules (patterns / hidden / Deleted Items subtree), accent stripping,
-'   whitespace normalization, name keys, small safe conversions.
+' modContactCommon  (v1.1 - 2026-11-16)  [PACK v3 - C3]
+' v1.1 (2026-11-16) : audit 11/2026 - F7-13, F7-14 : fichier d'annulation
+'   des modifications en masse des fiches (UndoLine / UndoSave + commande
+'   ContactUndoLastRun) ; outils repris des modules contacts (NameKeySorted,
+'   MailIn, PhoneTail, AnsiOnly, JournalInsert, SafeSave, WriteUtf8,
+'   OwnIdentity, ContactSkipDefault).
+'   integration - F7-16 : ligne "(Boutons natifs : ...)" retiree du
+'   choix Simulation / Appliquer : modMsgBoxCustom v2.1 l'ajoute lui-meme
+'   en cas de repli sur des boutons natifs.
+' Purpose (EN): helpers shared by the nine contact modules (Birthday,
+'   Common, Enrich, Export, FromMail, Import, Normalize, Note, Relation):
+'   folder skip rules (patterns / hidden / Deleted Items subtree), accent
+'   stripping, whitespace normalization, name keys, small safe conversions,
+'   undo file of bulk card changes (v1.1).
 '
-' Helpers SANS ETAT partages par les 6 modules contacts. Avant le pack v3,
+' Helpers partages par les modules contacts. Avant le pack v3,
 ' IsSkippedFolder / IsInDeletedItems existaient en 6 copies, StripAccents /
 ' CollapseSpaces en 4 (deux variantes chacune), NormKey en 3. Les copies
 ' locales sont devenues des delegations d'une ligne : signatures et
-' comportements des modules consommateurs inchanges.
+' comportements des modules consommateurs inchanges. v1.1 : meme principe
+' pour la cle de nom triee (ex-modContactEnrich.NameKeyOf), la lecture
+' d'une adresse dans un texte, les 9 derniers chiffres d'un numero, le
+' filtre ANSI des boites de saisie, l'insertion dans le journal de la fiche
+' (section "=== JOURNAL ===", modContactNote / modContactEnrich),
+' l'enregistrement avec essais, l'ecriture UTF-8, tes adresses et tes noms,
+' la liste par defaut des dossiers de contacts exclus.
+'
+' ANNULATION (v1.1, F7-13) : harmonisation (modContactNormalize, purge des
+' categories comprise), completion (modContactEnrich) et reimport
+' (modContactImport) ecrivent, en mode Appliquer, un fichier
+' "<rapport>-undo.tsv" a cote de leur rapport (dossier Sorties de l'outil) :
+'   1re ligne  # ClassicOutlook-Toolkit contact undo v1<TAB>source<TAB>date
+'   puis       StoreID<TAB>EntryID<TAB>Propriete<TAB>avant<TAB>apres
+' Propriete : nom ContactItem ; "UP:Nom" = UserProperty texte ; "DATE:Nom"
+' = date aaaa-mm-jj (vide = aucune) ; "LONG:Nom" = entier. Valeurs
+' echappees (\\ \t \r \n). ContactUndoLastRun relit le fichier le plus
+' recent, simule puis retablit chaque champ SEULEMENT s'il porte encore la
+' valeur ecrite par la passe ; le fichier passe ensuite en "-undo-done.tsv".
+' Hors annulation : photos, deplacements de dossier, fiches creees.
 '
 ' REGLES :
-'   - Fonctions pures, aucune variable module-level.
+'   - Fonctions sans etat, aucune variable module-level (la commande
+'     ContactUndoLastRun ne garde rien entre deux appels).
 '   - Les motifs d'exclusion (ContactSkipFolders) sont PASSES en argument :
 '     chaque module garde sa propre lecture de config (LoadSettings).
 '   - StripAccents = variante ETENDUE (latin-1 + latin etendu A) : superset
 '     des deux variantes historiques ; CollapseSpaces neutralise aussi les
 '     tabulations et les espaces insecables (superset).
-' DEPENDANCES : aucune applicative (Outlook uniquement).
+' SUB PUBLIQUE (a epingler au ruban Contacts) : ContactUndoLastRun.
+' DEPENDANCES : modConfig (T, MacroVBADir), modDebugLog, modUi,
+'   modMsgBoxCustom (Confirm3), modDefer (BeginHeavy / EndHeavy).
 '=============================================================================
 
 Private Const MOD_NAME As String = "ContCommon"
-Private Const MOD_VERSION As String = "v1.0 - 2026-09-02"
+Private Const MOD_VERSION As String = "v1.1 - 2026-11-16"
 
 Private Const PROPTAG_HIDDEN As String = "http://schemas.microsoft.com/mapi/proptag/0x10F4000B"
+
+' Section du journal de la fiche (fonctionnelle, identique dans les 2 langues).
+Private Const JOURNAL_MARK As String = "=== JOURNAL ==="
+' Dossiers de contacts systeme (motifs Like, insensibles a la casse).
+Private Const DEFAULT_CONTACT_SKIP As String = "{*|Recipient Cache|*sugg*|GAL Contacts|Organizational Contacts|Companies|PeopleCentricConversation Buddies|*Lync*|*Skype*|ExternalContacts"
+' Civilites et titres retires des noms (mots entiers, apres normalisation).
+Private Const TITLE_WORDS As String = "|DR|PR|PROF|MME|MLLE|MR|MRS|MS|ME|MM|PHD|MBA|HDR|MSC|ING|JR|SR|MONSIEUR|MADAME|MADEMOISELLE|"
+' Fichier d'annulation (v1.1).
+Private Const UNDO_MAGIC As String = "# ClassicOutlook-Toolkit contact undo v1"
+Private Const UNDO_SUFFIX As String = "-undo.tsv"
+Private Const UNDO_DONE_SUFFIX As String = "-undo-done.tsv"
+
+Private Declare PtrSafe Sub Sleep Lib "kernel32" (ByVal dwMilliseconds As Long)
 
 Public Function ModVersion() As String
     ModVersion = MOD_VERSION
@@ -185,4 +229,642 @@ Public Function DigitsOnly(ByVal s As String) As String
         ch = Mid$(s, idx, 1)
         If ch Like "#" Then DigitsOnly = DigitsOnly & ch
     Next idx
+End Function
+
+' Liste par defaut de ContactSkipFolders (v1.1, F7-14 : 6 copies avant).
+Public Function ContactSkipDefault() As String
+    ContactSkipDefault = DEFAULT_CONTACT_SKIP
+End Function
+
+'=============================================================================
+' Noms, adresses, numeros (v1.1 - F7-14 : repris de modContactEnrich)
+'=============================================================================
+
+' Cle de nom TRIEE : "DUPONT Jean (ACME)" / "Jean Dupont" / "Dupont, Jean" /
+' jean.dupont@x.fr -> "DUPONT JEAN" (majuscules, sans accents, civilites et
+' initiales retirees, mots tries). "" si moins de 2 mots ou plus de 5, et
+' pour "X via Y" (notification d'un service, pas la personne).
+Public Function NameKeySorted(ByVal s As String) As String
+    Dim low As String, p As Long, words() As String, w As String, k As Long, n As Long
+    Dim keep(1 To 6) As String
+    s = Replace(s, Chr$(34), " ")
+    s = Replace(Replace(s, ChrW$(8220), " "), ChrW$(8221), " ")
+    s = Trim$(s)
+    If Len(s) < 3 Or Len(s) > 150 Then Exit Function
+    low = LCase$(s)
+    If InStr(low, " via ") > 0 Or InStr(low, "(via") > 0 Then Exit Function
+    p = InStr(s, "<")
+    If p = 1 Then
+        s = Mid$(s, 2)
+        p = InStr(s, ">")
+        If p > 0 Then s = Left$(s, p - 1)
+    ElseIf p > 1 Then
+        s = Trim$(Left$(s, p - 1))
+    End If
+    s = CutAtFirst(s)
+    p = InStr(s, "@")
+    If p > 0 Then
+        ' Adresse seule : partie locale "jean.dupont" -> "jean dupont".
+        If InStr(s, " ") > 0 Then Exit Function
+        s = Left$(s, p - 1)
+        s = Replace(Replace(Replace(s, ".", " "), "_", " "), "-", " ")
+    End If
+    s = NormKey(s)
+    If Len(s) = 0 Then Exit Function
+    words = Split(s, " ")
+    For k = LBound(words) To UBound(words)
+        w = words(k)
+        If Len(w) >= 2 Then
+            If InStr(TITLE_WORDS, "|" & w & "|") = 0 Then
+                n = n + 1
+                If n > 5 Then Exit Function
+                keep(n) = w
+            End If
+        End If
+    Next k
+    If n < 2 Then Exit Function
+    NameKeySorted = SortedJoin(keep, n)
+End Function
+
+' Coupe au premier complement : " (", " [", " | ", " / ", " - ", tirets longs.
+Private Function CutAtFirst(ByVal s As String) As String
+    Dim seps As Variant, k As Long, p As Long, best As Long
+    seps = Array(" (", " [", " | ", " / ", " - ", " " & ChrW$(8211) & " ", " " & ChrW$(8212) & " ", _
+                 " " & ChrW$(8226) & " ")
+    For k = LBound(seps) To UBound(seps)
+        p = InStr(s, CStr(seps(k)))
+        If p > 1 Then
+            If best = 0 Or p < best Then best = p
+        End If
+    Next k
+    If best > 0 Then s = Left$(s, best - 1)
+    CutAtFirst = Trim$(s)
+End Function
+
+Private Function SortedJoin(ByRef w() As String, ByVal n As Long) As String
+    Dim i As Long, j As Long, tmp As String, res As String
+    For i = 2 To n
+        tmp = w(i)
+        j = i - 1
+        Do While j >= 1
+            If w(j) > tmp Then
+                w(j + 1) = w(j)
+                j = j - 1
+            Else
+                Exit Do
+            End If
+        Loop
+        w(j + 1) = tmp
+    Next i
+    For i = 1 To n
+        If i > 1 Then res = res & " "
+        res = res & w(i)
+    Next i
+    SortedJoin = res
+End Function
+
+' Premiere adresse e-mail d'un texte, en minuscules ("" si aucune). Sans
+' expression reguliere : appelee sur chaque destinataire d'une liste.
+Public Function MailIn(ByVal s As String) As String
+    Dim posAt As Long, p As Long, q As Long, ch As String, lp As String, dom As String
+    posAt = InStr(s, "@")
+    If posAt < 2 Then Exit Function
+    p = posAt - 1
+    Do While p >= 1
+        ch = Mid$(s, p, 1)
+        If ch Like "[A-Za-z0-9._%+-]" Then
+            p = p - 1
+        Else
+            Exit Do
+        End If
+    Loop
+    q = posAt + 1
+    Do While q <= Len(s)
+        ch = Mid$(s, q, 1)
+        If ch Like "[A-Za-z0-9.-]" Then
+            q = q + 1
+        Else
+            Exit Do
+        End If
+    Loop
+    lp = Mid$(s, p + 1, posAt - p - 1)
+    dom = Mid$(s, posAt + 1, q - posAt - 1)
+    Do While Right$(dom, 1) = "."
+        dom = Left$(dom, Len(dom) - 1)
+    Loop
+    If Len(lp) = 0 Or InStr(dom, ".") = 0 Then Exit Function
+    MailIn = LCase$(lp & "@" & dom)
+End Function
+
+' 9 derniers chiffres d'un numero (06 12 34 56 78 = +33 6 12 34 56 78) ;
+' 6 a 8 chiffres : tous ; "" si illisible.
+Public Function PhoneTail(ByVal s As String) As String
+    Dim d As String
+    d = DigitsOnly(s)
+    If Len(d) >= 9 Then
+        PhoneTail = Right$(d, 9)
+    ElseIf Len(d) >= 6 Then
+        PhoneTail = d
+    End If
+End Function
+
+' InputBox / MsgBox n'affichent que la page de code ANSI : emojis retires
+' (le texte reel n'est pas touche, seulement sa copie affichee).
+Public Function AnsiOnly(ByVal s As String) As String
+    Dim k As Long, code As Long, ch As String, res As String
+    For k = 1 To Len(s)
+        ch = Mid$(s, k, 1)
+        code = AscW(ch)
+        If code < 0 Then code = code + 65536
+        If code <= 255 Or code = 338 Or code = 339 Or code = 8364 Then res = res & ch
+    Next k
+    AnsiOnly = CollapseSpaces(Trim$(res))
+End Function
+
+' Tes adresses (comptes du profil, adresse Exchange principale, et les
+' adresses Exchange internes "/o=..." des comptes) et tes noms (cles
+' NameKeySorted) sous la forme "|a|b|". Jamais d'erreur.
+Public Sub OwnIdentity(ByRef ownAddr As String, ByRef ownKeys As String)
+    On Error Resume Next
+    Dim ns As Object, accs As Object, acc As Object, ex As Object
+    Dim i As Long, n As Long, s As String, k As String
+    ownAddr = "|"
+    ownKeys = "|"
+    Set ns = Application.Session
+    Set accs = ns.Accounts
+    n = 0
+    n = accs.Count
+    For i = 1 To n
+        Set acc = Nothing
+        Set acc = accs.Item(i)
+        If Not acc Is Nothing Then
+            s = LCase$(Trim$(SafeStr(acc.SmtpAddress)))
+            If InStr(s, "@") > 0 Then AddOnce ownAddr, s
+            s = ""
+            s = LCase$(Trim$(SafeStr(acc.CurrentUser.Address)))
+            If Left$(s, 1) = "/" Then AddOnce ownAddr, s
+            k = NameKeySorted(SafeStr(acc.UserName))
+            If Len(k) > 0 Then AddOnce ownKeys, k
+        End If
+    Next i
+    Set ex = ns.CurrentUser.AddressEntry.GetExchangeUser
+    If Not ex Is Nothing Then
+        s = LCase$(Trim$(SafeStr(ex.PrimarySmtpAddress)))
+        If InStr(s, "@") > 0 Then AddOnce ownAddr, s
+    End If
+    s = ""
+    s = LCase$(Trim$(SafeStr(ns.CurrentUser.AddressEntry.Address)))
+    If Left$(s, 1) = "/" Then AddOnce ownAddr, s
+    k = NameKeySorted(SafeStr(ns.CurrentUser.Name))
+    If Len(k) > 0 Then AddOnce ownKeys, k
+    Err.Clear
+End Sub
+
+Private Sub AddOnce(ByRef lst As String, ByVal v As String)
+    If InStr(lst, "|" & v & "|") = 0 Then lst = lst & v & "|"
+End Sub
+
+'=============================================================================
+' Fiche : journal, enregistrement, fichiers (v1.1 - F7-14)
+'=============================================================================
+
+' Notes de la fiche avec une entree datee en tete de la section
+' "=== JOURNAL ===" (creee si besoin ; tout le reste est conserve).
+Public Function JournalInsert(ByVal body As String, ByVal entry As String) As String
+    Dim pos As Long
+    pos = InStr(1, body, JOURNAL_MARK, vbTextCompare)
+    If pos > 0 Then
+        JournalInsert = Left$(body, pos + Len(JOURNAL_MARK) - 1) & vbCrLf & entry & _
+                        Mid$(body, pos + Len(JOURNAL_MARK))
+    Else
+        JournalInsert = JOURNAL_MARK & vbCrLf & entry & vbCrLf & _
+                        IIf(Len(Trim$(body)) > 0, vbCrLf & body, "")
+    End If
+End Function
+
+' Save avec 3 essais (Exchange Online : erreurs transitoires).
+Public Function SafeSave(ByVal itm As Object, Optional ByVal modName As String = "ContCommon") As Boolean
+    Dim tries As Long
+    On Error Resume Next
+    For tries = 1 To 3
+        Err.Clear
+        itm.Save
+        If Err.Number = 0 Then
+            SafeSave = True
+            Exit Function
+        End If
+        modDebugLog.DDebug modName, "Save essai " & tries & " err " & Err.Number & " - " & Err.Description
+        Sleep 300 * tries
+    Next tries
+    SafeSave = False
+End Function
+
+' Ecrit un fichier texte UTF-8 (avec BOM, lisible par Excel et le Bloc-notes).
+' True si ecrit ; erreur au journal sinon.
+Public Function WriteUtf8(ByVal path As String, ByVal txt As String) As Boolean
+    Dim stm As Object, errNo As Long, errDesc As String
+    On Error GoTo ErrH
+    Set stm = CreateObject("ADODB.Stream")
+    stm.Type = 2                    ' adTypeText
+    stm.Charset = "utf-8"
+    stm.Open
+    stm.WriteText txt
+    stm.SaveToFile path, 2          ' adSaveCreateOverWrite
+    stm.Close
+    WriteUtf8 = True
+    Exit Function
+ErrH:
+    errNo = Err.Number
+    errDesc = Err.Description
+    On Error Resume Next
+    If Not stm Is Nothing Then stm.Close
+    modDebugLog.DError MOD_NAME, "WriteUtf8 err " & errNo & " - " & errDesc & " (" & path & ")"
+End Function
+
+Private Function ReadUtf8(ByVal path As String) As String
+    On Error Resume Next
+    Dim stm As Object
+    Set stm = CreateObject("ADODB.Stream")
+    stm.Type = 2
+    stm.Charset = "utf-8"
+    stm.Open
+    stm.LoadFromFile path
+    ReadUtf8 = stm.ReadText(-1)
+    stm.Close
+    If Left$(ReadUtf8, 1) = ChrW$(65279) Then ReadUtf8 = Mid$(ReadUtf8, 2)
+    Err.Clear
+End Function
+
+'=============================================================================
+' Fichier d'annulation (v1.1 - audit 11/2026, F7-13). Format : en-tete.
+'=============================================================================
+
+' Une ligne d'annulation pour un champ ecrit sur la fiche itm ("" si la
+' fiche n'a pas encore d'identifiant). A appeler AVANT ou APRES l'ecriture,
+' avec l'ancienne et la nouvelle valeur ; l'appelant ne garde la ligne que
+' si le Save reussit.
+Public Function UndoLine(ByVal itm As Object, ByVal prop As String, _
+                         ByVal oldV As String, ByVal newV As String) As String
+    On Error Resume Next
+    Dim sid As String, eid As String
+    sid = SafeStr(itm.Parent.StoreID)
+    eid = SafeStr(itm.EntryID)
+    Err.Clear
+    If Len(sid) = 0 Or Len(eid) = 0 Then Exit Function
+    UndoLine = sid & vbTab & eid & vbTab & prop & vbTab & UndoEscape(oldV) & vbTab & _
+               UndoEscape(newV) & vbCrLf
+End Function
+
+' "...\ContactNormalize-20261116-101500.txt" -> "...-20261116-101500-undo.tsv"
+Public Function UndoPathFor(ByVal reportPath As String) As String
+    Dim p As Long
+    p = InStrRev(reportPath, ".")
+    If p > InStrRev(reportPath, "\") Then
+        UndoPathFor = Left$(reportPath, p - 1) & UNDO_SUFFIX
+    Else
+        UndoPathFor = reportPath & UNDO_SUFFIX
+    End If
+End Function
+
+' Ecrit le fichier d'annulation d'une passe (rien si aucune ligne).
+Public Function UndoSave(ByVal undoPath As String, ByVal source As String, ByVal body As String) As Boolean
+    If Len(body) = 0 Or Len(undoPath) = 0 Then Exit Function
+    UndoSave = WriteUtf8(undoPath, UNDO_MAGIC & vbTab & source & vbTab & _
+                         Format$(Now, "yyyy-mm-dd hh:nn:ss") & vbCrLf & body)
+    If UndoSave Then modDebugLog.DInfo MOD_NAME, "Fichier d'annulation : " & FileNameOf(undoPath)
+End Function
+
+Private Function UndoEscape(ByVal s As String) As String
+    s = Replace(s, "\", "\\")
+    s = Replace(s, vbTab, "\t")
+    s = Replace(s, vbCr, "\r")
+    s = Replace(s, vbLf, "\n")
+    UndoEscape = s
+End Function
+
+Private Function UndoUnescape(ByVal s As String) As String
+    Dim k As Long, ch As String, res As String
+    k = 1
+    Do While k <= Len(s)
+        ch = Mid$(s, k, 1)
+        If ch = "\" And k < Len(s) Then
+            Select Case Mid$(s, k + 1, 1)
+                Case "t": res = res & vbTab
+                Case "r": res = res & vbCr
+                Case "n": res = res & vbLf
+                Case Else: res = res & Mid$(s, k + 1, 1)
+            End Select
+            k = k + 2
+        Else
+            res = res & ch
+            k = k + 1
+        End If
+    Loop
+    UndoUnescape = res
+End Function
+
+'=============================================================================
+' ContactUndoLastRun (v1.1, F7-13 - a epingler au ruban Contacts)
+' Annule la DERNIERE modification en masse des fiches (harmonisation, purge
+' des categories, completion, reimport) : Simulation / Retablir, puis
+' rapport. Un champ n'est retabli que s'il porte encore la valeur ecrite
+' par la passe (une correction faite depuis n'est jamais ecrasee).
+'=============================================================================
+Public Sub ContactUndoLastRun()
+    Dim errNo As Long, errDesc As String, heavyOn As Boolean
+    Dim undoPath As String, txt As String, rows() As String, hdr() As String
+    Dim source As String, stamp As String, nFields As Long, nCards As Long
+    Dim choice As VbMsgBoxResult, dryRun As Boolean, rpt As String, rptPath As String
+    Dim nDone As Long, nChanged As Long, nMissing As Long, nErr As Long
+    On Error GoTo ErrH
+    modConfig.EnsureLoaded
+    undoPath = LatestUndoFile(modConfig.MacroVBADir())
+    If Len(undoPath) = 0 Then
+        modUi.Inform T("Aucune modification en masse des fiches ~a annuler (aucun fichier *-undo.tsv " & _
+                       "dans le dossier des rapports).", _
+                       "No bulk card change to undo (no *-undo.tsv file in the report folder)."), UndoTitle()
+        Exit Sub
+    End If
+    txt = Replace(ReadUtf8(undoPath), vbCrLf, vbLf)
+    rows = Split(txt, vbLf)
+    If UBound(rows) < 1 Then GoTo BadFile
+    If Left$(rows(0), Len(UNDO_MAGIC)) <> UNDO_MAGIC Then GoTo BadFile
+    hdr = Split(rows(0), vbTab)
+    If UBound(hdr) >= 1 Then source = hdr(1)
+    If UBound(hdr) >= 2 Then stamp = hdr(2)
+    CountUndo rows, nFields, nCards
+    If nFields = 0 Then GoTo BadFile
+
+    choice = modMsgBoxCustom.Confirm3( _
+        T("Derni~fre modification en masse des fiches :", "Last bulk change of the cards:") & vbCrLf & _
+        "   " & source & " - " & stamp & vbCrLf & _
+        "   " & nCards & T(" fiche(s), ", " card(s), ") & nFields & T(" champ(s)", " field(s)") & vbCrLf & _
+        T("Fichier : ", "File: ") & FileNameOf(undoPath) & vbCrLf & vbCrLf & _
+        T("Simulation : rien n'est ~ecrit, le rapport liste ce qui SERAIT r~etabli." & vbCrLf & _
+          "R~etablir : chaque champ reprend sa valeur d'avant la passe, s'il n'a pas ~et~e modifi~e depuis.", _
+          "Dry run: nothing is written, the report lists what WOULD be restored." & vbCrLf & _
+          "Restore: each field gets back its value from before the run, unless it was changed since."), _
+        UndoTitle(), T("&Simulation", "&Dry run"), T("&R~etablir", "&Restore"), T("A&nnuler", "&Cancel"))
+    If choice = vbCancel Then Exit Sub
+    dryRun = (choice = vbYes)
+
+    modDefer.BeginHeavy
+    heavyOn = True
+    Do
+        rpt = ""
+        nDone = 0: nChanged = 0: nMissing = 0: nErr = 0
+        RunUndo rows, dryRun, rpt, nDone, nChanged, nMissing, nErr
+        rptPath = modConfig.MacroVBADir() & "\ContactUndo-" & Format$(Now, "yyyymmdd-hhnnss") & ".txt"
+        WriteUtf8 rptPath, "modContactCommon " & MOD_VERSION & " - " & Format$(Now, "yyyy-mm-dd hh:nn:ss") & vbCrLf & _
+                           IIf(dryRun, "MODE : SIMULATION (aucune modification)", "MODE : RETABLISSEMENT") & vbCrLf & _
+                           "Annulation de : " & source & " du " & stamp & " (" & FileNameOf(undoPath) & ")" & vbCrLf & _
+                           String$(78, "-") & vbCrLf & rpt & String$(78, "-") & vbCrLf & _
+                           "Retablis : " & nDone & " - modifies depuis (laisses) : " & nChanged & _
+                           " - fiches introuvables : " & nMissing & " champ(s) - erreurs : " & nErr & vbCrLf
+        modDebugLog.DInfo MOD_NAME, "Annulation " & source & " " & stamp & " : retablis=" & nDone & _
+            " modifies=" & nChanged & " introuvables=" & nMissing & " erreurs=" & nErr & " dryRun=" & dryRun
+        If Not dryRun And nErr = 0 Then
+            ' Passe annulee : le fichier ne sera plus propose.
+            On Error Resume Next
+            Name undoPath As Left$(undoPath, Len(undoPath) - Len(UNDO_SUFFIX)) & UNDO_DONE_SUFFIX
+            If Err.Number <> 0 Then modDebugLog.DError MOD_NAME, "Renommage du fichier d'annulation err " & Err.Number
+            Err.Clear
+            On Error GoTo ErrH
+        End If
+        If Not ShowUndoSummary(dryRun, rptPath, nDone, nChanged, nMissing, nErr) Then Exit Do
+        dryRun = False
+    Loop
+    modDefer.EndHeavy
+    heavyOn = False
+    Exit Sub
+BadFile:
+    modUi.Fail T("Fichier d'annulation illisible : ", "Unreadable undo file: ") & FileNameOf(undoPath), UndoTitle()
+    Exit Sub
+ErrH:
+    errNo = Err.Number
+    errDesc = Err.Description
+    On Error Resume Next
+    If heavyOn Then modDefer.EndHeavy
+    modDebugLog.DError MOD_NAME, "ContactUndoLastRun err " & errNo & " - " & errDesc
+    modUi.Fail T("Erreur : ", "Error: ") & errNo & " - " & errDesc, UndoTitle()
+End Sub
+
+Private Function UndoTitle() As String
+    UndoTitle = T("Annuler la derni~fre modification des fiches", "Undo the last change of the cards")
+End Function
+
+' Bilan ; True = retablir maintenant (apres une simulation).
+Private Function ShowUndoSummary(ByVal dryRun As Boolean, ByVal rptPath As String, ByVal nDone As Long, _
+                                 ByVal nChanged As Long, ByVal nMissing As Long, ByVal nErr As Long) As Boolean
+    Dim msg As String, r As VbMsgBoxResult
+    msg = IIf(dryRun, T("SIMULATION - rien n'a ~et~e ~ecrit.", "DRY RUN - nothing was written."), _
+                      T("Termin~e.", "Done.")) & vbCrLf & vbCrLf & _
+          T("Champs ~a r~etablir / r~etablis : ", "Fields to restore / restored: ") & nDone & vbCrLf & _
+          T("Champs modifi~es depuis (laiss~es tels quels) : ", "Fields changed since (left as is): ") & nChanged & vbCrLf & _
+          T("Champs de fiches introuvables : ", "Fields of cards not found: ") & nMissing & vbCrLf & _
+          T("Erreurs : ", "Errors: ") & nErr & vbCrLf & vbCrLf & _
+          T("Rapport : ", "Report: ") & FileNameOf(rptPath)
+    If dryRun And nDone > 0 Then
+        r = modMsgBoxCustom.Confirm3(msg & vbCrLf & vbCrLf & T("R~etablir maintenant ?", "Restore now?"), _
+                                     UndoTitle(), T("&R~etablir maintenant", "&Restore now"), _
+                                     T("&Ouvrir le rapport", "&Open report"), T("&Fermer", "&Close"), vbInformation)
+        If r = vbYes Then
+            ShowUndoSummary = True
+            Exit Function
+        End If
+        If r <> vbNo Then Exit Function
+    ElseIf MsgBox(msg & vbCrLf & vbCrLf & T("Ouvrir le rapport ?", "Open the report?"), _
+                  vbYesNo + vbInformation, UndoTitle()) <> vbYes Then
+        Exit Function
+    End If
+    On Error Resume Next
+    If Len(Dir$(rptPath)) > 0 Then Shell "notepad.exe " & Chr$(34) & rptPath & Chr$(34), vbNormalFocus
+    Err.Clear
+End Function
+
+' Fichier *-undo.tsv le plus recent du dossier ("" si aucun).
+Private Function LatestUndoFile(ByVal dirPath As String) As String
+    On Error Resume Next
+    Dim nm As String, best As String, bestD As Date, d As Date
+    nm = Dir$(dirPath & "\*" & UNDO_SUFFIX)
+    Do While Len(nm) > 0
+        If LCase$(Right$(nm, Len(UNDO_SUFFIX))) = UNDO_SUFFIX Then
+            d = 0
+            d = FileDateTime(dirPath & "\" & nm)
+            If Len(best) = 0 Or d > bestD Then
+                best = nm
+                bestD = d
+            End If
+        End If
+        nm = Dir$
+    Loop
+    If Len(best) > 0 Then LatestUndoFile = dirPath & "\" & best
+    Err.Clear
+End Function
+
+Private Sub CountUndo(ByRef rows() As String, ByRef nFields As Long, ByRef nCards As Long)
+    Dim i As Long, f() As String, lastKey As String
+    For i = 1 To UBound(rows)
+        If Len(rows(i)) > 0 And Left$(rows(i), 1) <> "#" Then
+            f = Split(rows(i), vbTab)
+            If UBound(f) >= 4 Then
+                nFields = nFields + 1
+                If f(0) & vbTab & f(1) <> lastKey Then
+                    nCards = nCards + 1
+                    lastKey = f(0) & vbTab & f(1)
+                End If
+            End If
+        End If
+    Next i
+End Sub
+
+' Parcours du fichier : lignes consecutives d'une meme fiche = un bloc.
+Private Sub RunUndo(ByRef rows() As String, ByVal dryRun As Boolean, ByRef rpt As String, _
+                    ByRef nDone As Long, ByRef nChanged As Long, ByRef nMissing As Long, ByRef nErr As Long)
+    Dim i As Long, j As Long, f() As String, cardKey As String, nCard As Long
+    i = 1
+    Do While i <= UBound(rows)
+        If Len(rows(i)) = 0 Or Left$(rows(i), 1) = "#" Then
+            i = i + 1
+        Else
+            f = Split(rows(i), vbTab)
+            If UBound(f) < 4 Then
+                rpt = rpt & "!! ligne " & (i + 1) & " illisible, ignoree" & vbCrLf
+                nErr = nErr + 1
+                i = i + 1
+            Else
+                cardKey = f(0) & vbTab & f(1) & vbTab
+                j = i
+                Do While j + 1 <= UBound(rows)
+                    If Left$(rows(j + 1), Len(cardKey)) <> cardKey Then Exit Do
+                    j = j + 1
+                Loop
+                UndoCard rows, i, j, f(0), f(1), dryRun, rpt, nDone, nChanged, nMissing, nErr
+                nCard = nCard + 1
+                If (nCard Mod 20) = 0 Then DoEvents
+                i = j + 1
+            End If
+        End If
+    Loop
+End Sub
+
+' Une fiche : controle de TOUS ses champs avant toute ecriture (Outlook
+' recompose les noms quand on ecrit FullName), puis ecriture dans l'ordre
+' du fichier et un seul Save.
+Private Sub UndoCard(ByRef rows() As String, ByVal i0 As Long, ByVal i1 As Long, _
+                     ByVal sid As String, ByVal eid As String, ByVal dryRun As Boolean, _
+                     ByRef rpt As String, ByRef nDone As Long, ByRef nChanged As Long, _
+                     ByRef nMissing As Long, ByRef nErr As Long)
+    Dim ct As Object, k As Long, f() As String, who As String, anyWrite As Boolean
+    Dim props() As String, oldV() As String, newV() As String, curV() As String, ok() As Boolean
+    On Error Resume Next
+    Set ct = Application.Session.GetItemFromID(eid, sid)
+    If Err.Number <> 0 Or ct Is Nothing Then
+        Err.Clear
+        nMissing = nMissing + (i1 - i0 + 1)
+        rpt = rpt & "[ABSENTE] fiche introuvable (supprimee ou deplacee) : " & (i1 - i0 + 1) & " champ(s)" & vbCrLf
+        Exit Sub
+    End If
+    who = SafeStr(ct.FullName)
+    If Len(who) = 0 Then who = SafeStr(ct.FileAs)
+    ReDim props(i0 To i1)
+    ReDim oldV(i0 To i1)
+    ReDim newV(i0 To i1)
+    ReDim curV(i0 To i1)
+    ReDim ok(i0 To i1)
+    For k = i0 To i1
+        f = Split(rows(k), vbTab)
+        props(k) = f(2)
+        oldV(k) = UndoUnescape(f(3))
+        newV(k) = UndoUnescape(f(4))
+        curV(k) = ReadUndoProp(ct, props(k))
+        ok(k) = SameUndoValue(props(k), curV(k), newV(k))
+    Next k
+    rpt = rpt & "[" & IIf(dryRun, "SIMUL ", "RETABL") & "] " & who & vbCrLf
+    For k = i0 To i1
+        If ok(k) Then
+            rpt = rpt & "   " & props(k) & " : " & ShortFlat(newV(k)) & "  ->  " & ShortFlat(oldV(k)) & vbCrLf
+            If dryRun Then
+                nDone = nDone + 1
+            ElseIf WriteUndoProp(ct, props(k), oldV(k)) Then
+                nDone = nDone + 1
+                anyWrite = True
+            Else
+                nErr = nErr + 1
+                rpt = rpt & "   !! " & props(k) & " : ecriture en echec" & vbCrLf
+            End If
+        Else
+            nChanged = nChanged + 1
+            rpt = rpt & "   " & props(k) & " : modifie depuis, laisse tel quel (actuel : " & ShortFlat(curV(k)) & ")" & vbCrLf
+        End If
+    Next k
+    If anyWrite Then
+        If Not SafeSave(ct, MOD_NAME) Then
+            nErr = nErr + 1
+            rpt = rpt & "   !! Save en echec, fiche non retablie" & vbCrLf
+        End If
+    End If
+    Err.Clear
+End Sub
+
+Private Function ReadUndoProp(ByVal ct As Object, ByVal prop As String) As String
+    On Error Resume Next
+    Dim up As Object, v As Variant
+    If Left$(prop, 3) = "UP:" Then
+        Set up = ct.UserProperties.Find(Mid$(prop, 4))
+        If Not up Is Nothing Then ReadUndoProp = Trim$(SafeStr(up.Value))
+    ElseIf Left$(prop, 5) = "DATE:" Then
+        v = CallByName(ct, Mid$(prop, 6), VbGet)
+        If IsDate(v) Then
+            If Year(CDate(v)) < 4500 And CDate(v) > DateSerial(1600, 1, 1) Then ReadUndoProp = Format$(CDate(v), "yyyy-mm-dd")
+        End If
+    ElseIf Left$(prop, 5) = "LONG:" Then
+        ReadUndoProp = CStr(CLng(CallByName(ct, Mid$(prop, 6), VbGet)))
+    Else
+        ReadUndoProp = SafeStr(CallByName(ct, prop, VbGet))
+    End If
+    Err.Clear
+End Function
+
+Private Function SameUndoValue(ByVal prop As String, ByVal cur As String, ByVal wanted As String) As Boolean
+    If prop = "Body" Then
+        SameUndoValue = (StrComp(FlatText(cur), FlatText(wanted), vbBinaryCompare) = 0)
+    Else
+        SameUndoValue = (StrComp(cur, wanted, vbBinaryCompare) = 0)
+    End If
+End Function
+
+Private Function WriteUndoProp(ByVal ct As Object, ByVal prop As String, ByVal v As String) As Boolean
+    On Error Resume Next
+    Dim up As Object, nm As String
+    Err.Clear
+    If Left$(prop, 3) = "UP:" Then
+        nm = Mid$(prop, 4)
+        Set up = ct.UserProperties.Find(nm)
+        If up Is Nothing And Len(v) > 0 Then Set up = ct.UserProperties.Add(nm, olText, False)
+        If Not up Is Nothing Then up.Value = v
+    ElseIf Left$(prop, 5) = "DATE:" Then
+        If Len(v) = 0 Then
+            CallByName ct, Mid$(prop, 6), VbLet, DateSerial(4501, 1, 1)
+        Else
+            CallByName ct, Mid$(prop, 6), VbLet, DateSerial(CLng(Left$(v, 4)), CLng(Mid$(v, 6, 2)), CLng(Mid$(v, 9, 2)))
+        End If
+    ElseIf Left$(prop, 5) = "LONG:" Then
+        CallByName ct, Mid$(prop, 6), VbLet, CLng(Val(v))
+    Else
+        CallByName ct, prop, VbLet, v
+    End If
+    WriteUndoProp = (Err.Number = 0)
+    If Err.Number <> 0 Then modDebugLog.DError MOD_NAME, "Annulation : " & prop & " err " & Err.Number & " - " & Err.Description
+    Err.Clear
+End Function
+
+Private Function ShortFlat(ByVal s As String) As String
+    s = Replace(Replace(Replace(s, vbCrLf, " / "), vbCr, " / "), vbLf, " / ")
+    If Len(s) > 80 Then s = Left$(s, 77) & "..."
+    ShortFlat = s
+End Function
+
+Private Function FileNameOf(ByVal path As String) As String
+    FileNameOf = Mid$(path, InStrRev(path, "\") + 1)
 End Function

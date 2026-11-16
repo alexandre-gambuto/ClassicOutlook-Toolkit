@@ -55,13 +55,22 @@ Option Explicit
 '     compte par defaut) ; repli sur l'utilisateur courant sinon.
 '   - Le corps commun des deux recherches est factorise (RunSearch) :
 '     les deux Subs ne portent plus que leur filtre et leur vue finale.
+'
+' v4.1 (2026-11-16) : audit 11/2026 (signale par le lot Fondations, hors
+'   constat) : l'attente d'une seconde apres Explorer.Search passe par
+'   modCommon.SleepMs 1000 (vraie attente, Outlook garde la main). L'ancienne
+'   boucle "Do While Timer < t0 + 1 : DoEvents : Loop" occupait un coeur a
+'   100 % et ne sortait jamais si la commande partait dans la derniere
+'   seconde avant minuit (Timer repasse a 0). ResetSearch est conservee : le
+'   ruban recoit un bouton "Retour" qui l'appelle (F3-19, choix A).
 ' (Historique des versions -> CHANGELOG.)
 '
-' Dependances : modConfig (Cfg), modDebugLog, modStoreContext.
+' Dependances : modConfig (Cfg), modDebugLog, modStoreContext,
+' modCommon (SleepMs).
 ' =====================================================================
 
 Private Const MOD_NAME As String = "Search"
-Private Const MOD_VERSION As String = "v4 - 2026-09-17"
+Private Const MOD_VERSION As String = "v4.1 - 2026-11-16"
 
 ' OlSearchScope (valeurs de la doc Microsoft, nommees ici pour eviter
 ' toute magie numerique - c'etait la cause du bug corrige en v4).
@@ -225,12 +234,10 @@ Private Function RunSearch(ByVal qry As String, ByVal label As String) As Boolea
     End If
 
     ' Attendre qu'Outlook traite la recherche.
-    ' v3 (B7) : "Dim T" masquait le wrapper global T(fr,en) ici.
-    Dim t0 As Double
-    t0 = Timer
-    Do While Timer < t0 + 1
-        DoEvents
-    Loop
+    ' v4.1 : vraie attente (modCommon.SleepMs : Sleep par tranches + DoEvents)
+    ' au lieu d'une boucle Timer a vide, bloquee si l'attente chevauchait
+    ' minuit. (v3 / B7 : l'ancienne variable "T" masquait le wrapper T().)
+    modCommon.SleepMs 1000
 
     RunSearch = True
     Err.Clear

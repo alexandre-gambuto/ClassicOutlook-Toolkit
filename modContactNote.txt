@@ -1,7 +1,10 @@
 Option Explicit
 
 '=============================================================================
-' modContactNote v1.0  (2026-08-20)
+' modContactNote v1.1  (2026-11-16)
+' v1.1 (2026-11-16) : audit 11/2026 - F7-14 : insertion dans la section
+'   "=== JOURNAL ===" partagee avec modContactEnrich
+'   (modContactCommon.JournalInsert). Comportement inchange.
 ' Purpose (EN): per-person journal. ContactAddNote prepends a dated entry
 '   ("[dd/mm/yyyy] text") under a "=== JOURNAL ===" section at the TOP of the
 '   Notes of the selected (explorer) or open (inspector) contact card. The
@@ -17,15 +20,15 @@ Option Explicit
 '
 ' SUB PUBLIQUE (epinglable au QAT / ruban) : ContactAddNote
 '
-' Dependances : modConfig (T, A), modDebugLog, modCommon (SetStatus).
+' Dependances : modConfig (T, A), modDebugLog, modCommon (SetStatus),
+'   modContactCommon v1.1+ (JournalInsert).
 ' Aucune cle config.ini.
 '=============================================================================
 
 Private Const MOD_NAME As String = "ContNote"
-Private Const MOD_VERSION As String = "v1.0 - 2026-08-20"
+Private Const MOD_VERSION As String = "v1.1 - 2026-11-16"
 
-' Marqueur de section (fonctionnel, hors T() : identique dans les 2 langues).
-Private Const JOURNAL_MARK As String = "=== JOURNAL ==="
+' v1.1 : marqueur de section "=== JOURNAL ===" dans modContactCommon.
 
 '=============================================================================
 ' ModVersion - version REELLEMENT chargee dans le VBE.
@@ -55,19 +58,10 @@ Public Sub ContactAddNote()
                            "(added with today's date at the top of the card's journal)"), UiTitle()))
     If Len(txt) = 0 Then Exit Sub
 
-    Dim entry As String, body As String, pos As Long
+    Dim entry As String
     entry = "[" & Format$(Date, "dd/mm/yyyy") & "] " & txt
-    body = ct.Body
-    pos = InStr(1, body, JOURNAL_MARK, vbTextCompare)
-    If pos > 0 Then
-        ' Insertion juste sous la ligne du marqueur existant.
-        body = Left$(body, pos + Len(JOURNAL_MARK) - 1) & vbCrLf & entry & _
-               Mid$(body, pos + Len(JOURNAL_MARK))
-    Else
-        body = JOURNAL_MARK & vbCrLf & entry & vbCrLf & _
-               IIf(Len(Trim$(body)) > 0, vbCrLf & body, "")
-    End If
-    ct.Body = body
+    ' Insertion juste sous la ligne du marqueur (section creee si absente).
+    ct.Body = modContactCommon.JournalInsert(ct.Body, entry)
     ct.Save
 
     modDebugLog.DInfo MOD_NAME, "Note ajoutee : " & ct.FullName

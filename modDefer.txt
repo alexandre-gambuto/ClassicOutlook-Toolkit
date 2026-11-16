@@ -1,7 +1,33 @@
 Option Explicit
 
 '=============================================================================
-' modDefer v1.16  (2026-10-05)
+' modDefer v1.18  (2026-11-16)
+' v1.18 (2026-11-16) : audit 11/2026 - F10-01, F10-13, F1-06, F1-10 :
+'   (a) "BirthdayView" (mise en place de la vue calendrier, jusqu'a
+'       plusieurs dizaines de secondes) et "SentPrompt" (fenetre de
+'       classement d'un envoye, modale) deviennent LOURDES : elles ne
+'       s'executent plus a l'interieur d'un autre traitement lourd, et
+'       aucun traitement lourd ne demarre pendant qu'elles tournent ;
+'   (b) le report d'un traitement lourd est ecrit au journal (INFO) une
+'       fois par serie de reports, avec le traitement en cours (avant :
+'       niveau TRACE seulement, invisible) ;
+'   (c) cle "CleanFlags" retiree (choix B de F1-06 : purge mensuelle des
+'       drapeaux supprimee) ;
+'   (d) en-tete : delais de demarrage reels ;
+'   (e) integration : cles LEGERES "CalReplay" (rejeu des evenements
+'       calendrier recus pendant la question d'etiquetage, F6-05),
+'       "SnoozeCatchUp" (retour des mails reportes dont le rappel a ete
+'       rate, F3-16) et "StartupConfirm" (demarrage confirme, F10-14) ;
+'       cle "SentPrompt" retiree (F3-06 choix A : plus de fenetre de
+'       classement automatique, commande ThisOutlookSession.FileSentPending
+'       encadree par BeginHeavy / EndHeavy).
+' v1.17 (2026-10-24) : cle "CampaignCmd" (lourde) -> modMailCampaign.
+'   CampaignRunPending : commandes du classeur Campagnes.xlsm (verification,
+'   brouillons, envoi, actualisation des reponses, relances) executees hors
+'   de l'evenement du canal de commandes. Lourde : une lecture des fils de
+'   200 lignes ne doit pas s'imbriquer dans un autre traitement lourd. Les
+'   cles "CampaignNext" (pas d'envoi) et "CampaignSent" (ecriture Excel
+'   apres un envoi) restent legeres.
 ' v1.16 (2026-10-05) : cle "DashRefresh" (lourde) -> modMailResponseTracker.
 '   RefreshDashboard : actualisation du suivi des mails demandee par le
 '   classeur Excel (bouton Actualiser), executee en differe.
@@ -36,7 +62,7 @@ Option Explicit
 ' et rattrapages au demarrage, re-application duree RDV).
 '
 ' USAGE :
-'   modDefer.Arm "SentPrompt", 1          ' execute la cible dans ~1 s
+'   modDefer.Arm "UrgentFlush", 2         ' execute la cible dans ~2 s
 '   modDefer.Arm "MeetingAdjust", 1, key  ' avec argument texte
 ' Cles connues : voir Dispatch (Select Case en dur - ajouter une Case par
 ' nouvelle cible ; pas de resolution par chaine possible sous Outlook).
@@ -52,8 +78,12 @@ Option Explicit
 '     Outlook. Tout est sous On Error Resume Next / erreurs loguees.
 '   - NE PAS recompiler le VBA (Ctrl+S) pendant qu'un timer est arme :
 '     le pointeur AddressOf devient invalide (risque de crash). Fenetres
-'     courtes (1-2 s) partout, sauf AutoArchive (120 s) et CleanFlags
-'     (180 s) au demarrage.
+'     courtes (1-2 s) partout, sauf les differes du demarrage (v1.18 :
+'     CatchUpColor 15 s, RemindOverdue 20 s, SentCatchUp 25 s, TagPreload
+'     45 s, QMWatch 60 s, AutoArchive 120 s, SnoozeCatchUp 180 s,
+'     MonthlyBackup 210 s, Reindex 240 s, StartupConfirm 250 s) : ne pas
+'     modifier le code dans les 4 minutes qui
+'     suivent le lancement d'Outlook (ou appeler CancelAll avant).
 '   - Un timer "orphelin" (reset d'etat entre Arm et l'echeance :
 '     dictionnaire vide) est tue puis ignore proprement.
 '
@@ -100,7 +130,7 @@ Option Explicit
 '=============================================================================
 
 Private Const MOD_NAME As String = "Defer"
-Private Const MOD_VERSION As String = "v1.16 - 2026-10-05"
+Private Const MOD_VERSION As String = "v1.18 - 2026-11-16"
 
 Private Declare PtrSafe Function SetTimer Lib "user32" _
     (ByVal hWnd As LongPtr, ByVal nIDEvent As LongPtr, _
@@ -112,10 +142,17 @@ Private Declare PtrSafe Function KillTimer Lib "user32" _
 Private g_Actions As Object   ' Scripting.Dictionary
 
 ' v1.15 : garde "un traitement lourd a la fois" (cf. en-tete).
+' v1.17 : + CampaignCmd.
+' v1.18 : + BirthdayView ; - CleanFlags (purge supprimee) ; SentPrompt
+' ajoutee puis retiree avec la cle (F3-06 choix A).
 Private Const HEAVY_KEYS As String = _
-    "|CatchUpColor|RemindOverdue|SentCatchUp|TagPreload|AutoArchive|Reindex|CleanFlags|MonthlyBackup|DashRefresh|"
+    "|CatchUpColor|RemindOverdue|SentCatchUp|TagPreload|AutoArchive|Reindex|MonthlyBackup|DashRefresh|CampaignCmd|BirthdayView|"
 Private Const HEAVY_RETRY_SEC As Long = 5
 Private mHeavyDepth As Long
+' v1.18 (F10-13) : traitement lourd en cours (journal des reports) et
+' series de reports en cours : cle -> nombre de reports.
+Private mHeavyName As String
+Private mPostponed As Object   ' Scripting.Dictionary
 
 '=============================================================================
 ' ModVersion - version REELLEMENT chargee dans le VBE (constante du module,
@@ -195,6 +232,10 @@ End Sub
 Public Sub Cancel(ByVal actionKey As String)
     On Error Resume Next
     CancelKey actionKey
+    ' v1.18 : une serie de reports en cours sur cette cle est close.
+    If Not mPostponed Is Nothing Then
+        If mPostponed.Exists(actionKey) Then mPostponed.Remove actionKey
+    End If
 End Sub
 
 Private Sub CancelKey(ByVal actionKey As String)
@@ -240,6 +281,7 @@ Public Sub CancelAll()
         nb = nb + 1
     Next k
     g_Actions.RemoveAll
+    If Not mPostponed Is Nothing Then mPostponed.RemoveAll
     modDebugLog.DInfo MOD_NAME, "CancelAll : " & nb & " timer(s) annule(s)"
 End Sub
 
@@ -287,11 +329,12 @@ Private Sub Dispatch(ByVal actionKey As String, ByVal argText As String)
     If isHeavy Then
         If mHeavyDepth > 0 Then
             ArmUnique actionKey, HEAVY_RETRY_SEC, argText
-            modDebugLog.DTrace MOD_NAME, "'" & actionKey & "' reporte de " & _
-                HEAVY_RETRY_SEC & " s (traitement lourd en cours)"
+            NotePostponed actionKey
             Exit Sub
         End If
         mHeavyDepth = mHeavyDepth + 1
+        mHeavyName = actionKey
+        EndPostponedSeries actionKey
     End If
     Dim t0 As Double
     t0 = Timer
@@ -302,8 +345,9 @@ Private Sub Dispatch(ByVal actionKey As String, ByVal argText As String)
     modDebugLog.DTrace MOD_NAME, "Echeance '" & actionKey & "'"
 
     Select Case actionKey
-        Case "SentPrompt"
-            ThisOutlookSession.ProcessNextSentPrompt
+        ' v1.18 : Case "SentPrompt" retiree (F3-06 choix A : la fenetre de
+        ' classement des envoyes ne s'ouvre plus que sur commande,
+        ' ThisOutlookSession.FileSentPending).
         Case "ReplySusp"
             modReplySuspicion.ProposeDeferredFollowup
         Case "MeetingAdjust"
@@ -325,8 +369,8 @@ Private Sub Dispatch(ByVal actionKey As String, ByVal argText As String)
             modMaximizeWindow.MaximizePass argText
         Case "SentCatchUp"
             modReplyInPlace.CatchUpRecentSent
-        Case "CleanFlags"
-            ThisOutlookSession.CleanOldFlags
+        ' v1.18 : Case "CleanFlags" retiree (F1-06, choix B : la purge
+        ' mensuelle des drapeaux est supprimee, avec son armement).
         Case "ActivateRole"
             ThisOutlookSession.ActivateRoleDeferred argText
         Case "TeamsPreClean"
@@ -338,6 +382,8 @@ Private Sub Dispatch(ByVal actionKey As String, ByVal argText As String)
         Case "MonthlyBackup"
             modBackupAuto.RunMonthlyBackupIfNeeded
         Case "CampaignSent"
+            ' v1.10 / v12 : ecriture Excel apres un envoi de campagne
+            ' (identifiants, statut manuel, compteur de relances).
             modMailCampaign.CampaignSentFlush
         Case "HideBcc"
             modHideBcc.HideBccPass argText
@@ -345,6 +391,17 @@ Private Sub Dispatch(ByVal actionKey As String, ByVal argText As String)
             modInboxAlert.InboxAlertFlush
         Case "BirthdayView"
             ThisOutlookSession.SetupBirthdayViewDeferred argText
+        Case "CalReplay"
+            ' v1.18 (F6-05) : rejoue les evenements calendrier ignores pendant la
+            ' question d'etiquetage (file d'EntryID de ThisOutlookSession).
+            ThisOutlookSession.CalendarReplayDeferred
+        Case "SnoozeCatchUp"
+            ' v1.18 (F3-16) : retour des mails reportes dont le rappel a ete rate.
+            modSnooze.SnoozeCatchUp
+        Case "StartupConfirm"
+            ' v1.18 (F10-14) : session vivante apres les taches de demarrage ->
+            ' compteur du demarrage prudent remis a zero.
+            ThisOutlookSession.ConfirmStartupDeferred
         Case "Reindex"
             ' v1.15 (pack v4) : reindexation QuickMove PAR PAQUETS. Chaque
             ' echeance traite ~120 ms de dossiers puis se re-arme : Outlook
@@ -362,6 +419,9 @@ Private Sub Dispatch(ByVal actionKey As String, ByVal argText As String)
             ' Pack v3 (C7) : envoi de campagne asynchrone, une ligne par
             ' echeance (Outlook reste utilisable pendant la cadence).
             modMailCampaign.CampaignSendNext
+        Case "CampaignCmd"
+            ' v1.17 : commandes du classeur Campagnes.xlsm (lourde).
+            modMailCampaign.CampaignRunPending
         Case "QuickStart"
             ' 2026-09-15 : guide de demarrage rapide (premier lancement sans
             ' config.ini). Les conditions sont re-testees dans la cible.
@@ -379,6 +439,7 @@ Private Sub Dispatch(ByVal actionKey As String, ByVal argText As String)
     If isHeavy Then
         mHeavyDepth = mHeavyDepth - 1
         If mHeavyDepth < 0 Then mHeavyDepth = 0
+        If mHeavyDepth = 0 Then mHeavyName = ""
     End If
 
     ' v1.15 : duree au journal (>= 1 s) - le coupable d'un gel se lit dans
@@ -399,10 +460,42 @@ End Sub
 ' au lieu de s'executer a l'interieur. Toujours appeler EndHeavy apres.
 '=============================================================================
 Public Sub BeginHeavy()
+    If mHeavyDepth = 0 Then mHeavyName = "(hors differe)"
     mHeavyDepth = mHeavyDepth + 1
 End Sub
 
 Public Sub EndHeavy()
     mHeavyDepth = mHeavyDepth - 1
     If mHeavyDepth < 0 Then mHeavyDepth = 0
+    If mHeavyDepth = 0 Then mHeavyName = ""
+End Sub
+
+'=============================================================================
+' NotePostponed / EndPostponedSeries (v1.18 - audit 11/2026, F10-13)
+' Un traitement lourd reporte l'est toutes les HEAVY_RETRY_SEC secondes
+' tant qu'un autre tourne : une ligne INFO au PREMIER report de la serie
+' (avec le traitement en cours), les suivants en TRACE ; une ligne DEBUG
+' quand il part enfin, avec le nombre de reports.
+'=============================================================================
+Private Sub NotePostponed(ByVal actionKey As String)
+    On Error Resume Next
+    If mPostponed Is Nothing Then Set mPostponed = CreateObject("Scripting.Dictionary")
+    If mPostponed.Exists(actionKey) Then
+        mPostponed(actionKey) = mPostponed(actionKey) + 1
+        modDebugLog.DTrace MOD_NAME, "'" & actionKey & "' reporte de " & HEAVY_RETRY_SEC & _
+            " s (report " & mPostponed(actionKey) & ")"
+    Else
+        mPostponed(actionKey) = 1
+        modDebugLog.DInfo MOD_NAME, "'" & actionKey & "' reporte (traitement lourd en cours : " & _
+            IIf(Len(mHeavyName) > 0, mHeavyName, "?") & ") ; nouvel essai toutes les " & _
+            HEAVY_RETRY_SEC & " s"
+    End If
+End Sub
+
+Private Sub EndPostponedSeries(ByVal actionKey As String)
+    On Error Resume Next
+    If mPostponed Is Nothing Then Exit Sub
+    If Not mPostponed.Exists(actionKey) Then Exit Sub
+    modDebugLog.DDebug MOD_NAME, "'" & actionKey & "' lance apres " & mPostponed(actionKey) & " report(s)"
+    mPostponed.Remove actionKey
 End Sub

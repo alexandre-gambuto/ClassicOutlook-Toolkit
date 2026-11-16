@@ -1,10 +1,18 @@
 Option Explicit
 
 '=============================================================================
-' Code du module "ThisWorkbook" (Ce classeur) - Suivi des mails.xlsm - v7
+' Code du module "ThisWorkbook" (Ce classeur) - Suivi des mails.xlsm - v7.1
 ' A coller dans ThisWorkbook : VBE Excel (Alt+F11) -> double-clic sur
 ' "ThisWorkbook" (ou "Ce classeur") sous VBAProject(Suivi des mails.xlsm) ->
 ' tout remplacer par ce code.
+'
+' v7.1 (2026-11-16) : audit 11/2026 - F4-14, F4-07 : deux evenements de plus
+'   (prerequis : modMailTracker v1.4) :
+'     - fermeture        : rendez-vous OnTime annules (le classeur ne se
+'                          rouvre plus tout seul une a deux minutes apres),
+'                          barre d'etat rendue ;
+'     - apres enregistrement : fichier des echeances ecrit pour le rappel
+'                          du matin d'Outlook (sans Excel).
 '
 ' v7 (2026-10-05) : tous les evenements du classeur sont branches ici et
 '   delegues a modMailTracker (prerequis : ce module standard existe, et le
@@ -38,4 +46,14 @@ End Sub
 
 Private Sub Workbook_SheetChange(ByVal Sh As Object, ByVal Target As Range)
     modMailTracker.OnSheetChanged Sh, Target
+End Sub
+
+Private Sub Workbook_BeforeClose(Cancel As Boolean)
+    On Error Resume Next
+    modMailTracker.OnBeforeClose
+End Sub
+
+Private Sub Workbook_AfterSave(ByVal Success As Boolean)
+    On Error Resume Next
+    If Success Then modMailTracker.WriteDueCache
 End Sub

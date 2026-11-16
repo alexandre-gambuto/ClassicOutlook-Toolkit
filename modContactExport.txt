@@ -1,7 +1,12 @@
 Option Explicit
 
 '=============================================================================
-' modContactExport v1.3  (2026-08-17)
+' modContactExport v1.4  (2026-11-16)
+' v1.4 (2026-11-16) : audit 11/2026 - F7-07, F7-14 : README - ouvrir le CSV
+'   dans Excel par Donnees > A partir d'un fichier texte/CSV, colonnes
+'   telephone et code postal en Texte (un double-clic perd le "+" et le 0
+'   initial ; le reimport v1.5 les tolere) ; code mort retire, ecriture
+'   UTF-8 et liste des dossiers exclus repris de modContactCommon.
 ' Purpose (EN): export every contact of every contact folder of a chosen
 '   store to ONE UTF-8 CSV (Outlook property names as headers) plus a
 '   photos\ folder, in a time-stamped directory. Stamps each card with a
@@ -47,14 +52,13 @@ Option Explicit
 '=============================================================================
 
 Private Const MOD_NAME As String = "ContExp"
-Private Const MOD_VERSION As String = "v1.3 - 2026-08-17"
+Private Const MOD_VERSION As String = "v1.4 - 2026-11-16"
 
 ' UserProperty d'identite permanente (fonctionnelle, hors T()).
 Private Const UP_SYNC As String = "ContactSyncID"
 ' UserProperty fete du prenom "MM-JJ" (posee par modContactNormalize).
 Private Const UP_NAMEDAY As String = "NameDay"
-Private Const PROPTAG_HIDDEN As String = "http://schemas.microsoft.com/mapi/proptag/0x10F4000B"
-Private Const DEFAULT_SKIP As String = "{*|Recipient Cache|*sugg*|GAL Contacts|Organizational Contacts|Companies|PeopleCentricConversation Buddies|*Lync*|*Skype*|ExternalContacts"
+' v1.4 (F7-14) : dossiers exclus par defaut = modContactCommon.ContactSkipDefault.
 Private Const NO_DATE_YEAR As Long = 4500
 
 ' CONTRAT DE COLONNES - IDENTIQUE dans modContactImport (verifie au build).
@@ -190,7 +194,7 @@ Private Sub LoadSettings()
     mSep = modConfig.Cfg("ContactCsvSeparator", ";")
     If Len(mSep) <> 1 Then mSep = ";"
     mPhotos = modConfig.CfgB("ContactExportPhotos", True)
-    mSkipFolders = modConfig.Cfg("ContactSkipFolders", DEFAULT_SKIP)
+    mSkipFolders = modConfig.Cfg("ContactSkipFolders", modContactCommon.ContactSkipDefault())
 End Sub
 
 Private Function UiTitle() As String
@@ -270,12 +274,6 @@ End Sub
 Private Function IsSkippedFolder(ByVal fld As Outlook.MAPIFolder) As Boolean
     ' Pack v3 (C3) : delegation modContactCommon (helper partage).
     IsSkippedFolder = modContactCommon.IsSkippedFolder(fld, mSkipFolders)
-End Function
-
-' Dossier situe sous les Elements supprimes de son compte (corbeille) ?
-Private Function IsInDeletedItems(ByVal fld As Outlook.MAPIFolder) As Boolean
-    ' Pack v3 (C3) : delegation modContactCommon (helper partage).
-    IsInDeletedItems = modContactCommon.IsInDeletedItems(fld)
 End Function
 
 
@@ -487,19 +485,8 @@ End Function
 
 ' UTF-8 avec BOM (Excel et le Bloc-notes le lisent correctement).
 Private Sub SaveUtf8(ByVal path As String, ByVal content As String)
-    On Error Resume Next
-    Dim stm As Object
-    Set stm = CreateObject("ADODB.Stream")
-    stm.Type = 2
-    stm.Charset = "utf-8"
-    stm.Open
-    stm.WriteText content
-    stm.SaveToFile path, 2
-    stm.Close
-    If Err.Number <> 0 Then
-        modDebugLog.DError MOD_NAME, "SaveUtf8 err " & Err.Number & " - " & Err.Description & " (" & path & ")"
-        Err.Clear
-    End If
+    ' v1.4 (F7-14) : delegation modContactCommon (erreur journalisee par elle).
+    modContactCommon.WriteUtf8 path, content
 End Sub
 
 Private Sub OpenFolder(ByVal targetFolder As String)
@@ -523,8 +510,9 @@ Private Function ReadmeText(ByVal storeNames As String) As String
     s = s & "  _Folder    dossier de la fiche - MODIFIABLE : le reimport deplace la fiche" & vbCrLf
     s = s & "             (dossier cree s'il n'existe pas ; jamais d'un compte a l'autre)" & vbCrLf
     s = s & "  _NameDay   fete du prenom MM-JJ - MODIFIABLE ('-' = retirer)" & vbCrLf
-    s = s & "  _Photo     fichier dans photos\ - MODIFIABLE : nouveau fichier = nouvelle photo," & vbCrLf
-    s = s & "             '-' = retirer la photo, vide = ne rien changer" & vbCrLf
+    s = s & "  _Photo     fichier dans photos\ - MODIFIABLE : autre nom de fichier = nouvelle" & vbCrLf
+    s = s & "             photo ; meme fichier remplace = pose s'il est plus recent que" & vbCrLf
+    s = s & "             l'export ; '-' = retirer la photo, vide = ne rien changer" & vbCrLf
     s = s & "  _Modified  derniere modification Outlook (lecture seule)" & vbCrLf
     s = s & "  _Exported  horodatage de l'export (lecture seule, sert a detecter les conflits)" & vbCrLf
     s = s & "  _Action    vide = mettre a jour ; skip = ignorer la ligne ; creer = creer une" & vbCrLf
@@ -540,9 +528,18 @@ Private Function ReadmeText(ByVal storeNames As String) As String
     s = s & "    (le reimport ne SUPPRIME jamais de fiche)" & vbCrLf
     s = s & "  - fiche modifiee dans Outlook apres l'export = ligne ignoree, sauf _Action=force" & vbCrLf
     s = s & "  - toujours lancer le reimport en SIMULATION d'abord (rapport champ par champ)" & vbCrLf & vbCrLf
-    s = s & "EXCEL : ouvrir contacts.csv, editer, enregistrer au format 'CSV UTF-8 (delimite par" & vbCrLf
-    s = s & "  des virgules)' ou 'CSV (separateur : point-virgule)'. Le reimport detecte le" & vbCrLf
-    s = s & "  separateur et l'encodage. Ne pas editer les Notes (Body) dans le Bloc-notes." & vbCrLf & vbCrLf
+    s = s & "EXCEL : NE PAS ouvrir contacts.csv par un double-clic : Excel transforme alors" & vbCrLf
+    s = s & "  '+33612345678' en nombre (le '+' disparait) et '01000' en 1000. Dans un classeur" & vbCrLf
+    s = s & "  vide : Donnees > A partir d'un fichier texte/CSV > contacts.csv, Origine du" & vbCrLf
+    s = s & "  fichier 65001 (UTF-8), puis Transformer et passer les colonnes des telephones," & vbCrLf
+    s = s & "  des fax et des codes postaux en Texte (ou toutes les colonnes) avant de charger." & vbCrLf
+    s = s & "  Enregistrer au format 'CSV UTF-8 (delimite par des virgules)' (le format" & vbCrLf
+    s = s & "  'CSV (separateur : point-virgule)' remplace par '?' les lettres hors" & vbCrLf
+    s = s & "  Windows-1252). Le reimport detecte le separateur et l'encodage ; il garde" & vbCrLf
+    s = s & "  la fiche telle quelle quand seuls le '+', les espaces ou le 0 initial ont ete" & vbCrLf
+    s = s & "  perdus, et refuse (note au rapport) un numero en notation scientifique ou des" & vbCrLf
+    s = s & "  lettres devenues '?'. Excel coupe une cellule a 32 767 caracteres : des Notes" & vbCrLf
+    s = s & "  plus longues sont gardees. Ne pas editer les Notes (Body) dans le Bloc-notes." & vbCrLf & vbCrLf
     s = s & "EN - Column headers are Outlook ContactItem property names. Empty cell = leave" & vbCrLf
     s = s & "  unchanged, '-' = clear. _Folder move, _Photo replace, _Action skip/creer/force." & vbCrLf
     s = s & "  Re-import never deletes a card. Always dry-run first." & vbCrLf

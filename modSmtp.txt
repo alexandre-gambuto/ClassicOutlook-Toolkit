@@ -1,7 +1,20 @@
 Option Explicit
 
 '=============================================================================
-' modSmtp  (v1.0 - 2026-09-02)  [PACK v3 - C2 / B8]
+' modSmtp  (v1.1 - 2026-11-16)  [PACK v3 - C2 / B8]
+' v1.1 (2026-11-16) : audit 11/2026 - F4-02, F5-08, F5-22, F6-19 : regles
+'   COMMUNES de lecture d'un fil (une seule version, au lieu des copies
+'   divergentes du suivi des mails et des campagnes) :
+'   - MessageClassKind(classe) : reponse possible / reponse automatique /
+'     accuse de remise ou de lecture / NON-remise / autre, sur la seule
+'     classe de message (lisible dans une Table, sans ouvrir l'element) ;
+'   - IsAutoReplyItem(item) : absence Exchange, en-tetes standard
+'     (Auto-Submitted, X-Autoreply, X-Autorespond, Precedence: auto_reply)
+'     et objet (prefixe de passerelle "[EXT]" retire) ;
+'   - MyAddresses / IsMyAddress / IsFromMe : toutes les adresses de
+'     l'utilisateur (comptes du profil, adresse principale et alias) ;
+'   - HasExternalRecipient(item) : au moins un destinataire externe.
+'   En-tete : ClearCache n'est appele par aucun module (diagnostic, tests).
 ' Purpose (EN): single place for SMTP address resolution (current user,
 '   recipients, organizer, sender), domain extraction and the internal /
 '   external verdict, with a session cache. Replaces the 2-3 private copies
@@ -19,7 +32,18 @@ Option Explicit
 '                                  egalite OU sous-domaine (".domaine")
 '   - IsInternalSmtp(smtp)       : raccourci ExtractDomain + IsInternalDomain
 '   - IsMe(smtp)                 : adresse = compte courant
-'   - ClearCache                 : vide le cache (modDevTools.Reinit / tests)
+'   - ClearCache                 : vide le cache (fenetre Execution, tests ;
+'                                  aucun appelant dans le code)
+'   v1.1 :
+'   - MyAddresses()              : Dictionary des adresses de l'utilisateur
+'   - IsMyAddress(smtp)          : smtp est une adresse de l'utilisateur
+'   - IsFromMe(item)             : l'element vient de l'utilisateur
+'   - MessageClassKind(classe)   : MSG_KIND_NORMAL / AUTOREPLY / RECEIPT /
+'                                  NDR / OTHER
+'   - IsAutoReplySubject(objet)  : objet de reponse automatique
+'   - IsAutoReplyItem(item)      : reponse automatique (classe, en-tetes, objet)
+'   - HasExternalRecipient(item) : au moins un destinataire hors domaines
+'                                  internes (InternalDomains)
 '
 ' POURQUOI UN CACHE : sur un meme evenement calendrier, modMeetingColor,
 ' modMeetingToAppointment et modAppointmentPrivacy resolvaient chacun les
@@ -42,13 +66,24 @@ Option Explicit
 '=============================================================================
 
 Private Const MOD_NAME As String = "Smtp"
-Private Const MOD_VERSION As String = "v1.0 - 2026-09-02"
+Private Const MOD_VERSION As String = "v1.1 - 2026-11-16"
 
 Private Const PR_SMTP_ADDRESS As String = "http://schemas.microsoft.com/mapi/proptag/0x39FE001E"
 Private Const PR_EMAIL_ADDRESS As String = "http://schemas.microsoft.com/mapi/proptag/0x3003001E"
 Private Const PR_SENDER_SMTP As String = "http://schemas.microsoft.com/mapi/proptag/0x5D01001F"
 Private Const PR_SENT_REPR_SMTP As String = "http://schemas.microsoft.com/mapi/proptag/0x5D02001F"
 Private Const PR_SENT_REPR_EMAIL As String = "http://schemas.microsoft.com/mapi/proptag/0x0065001F"
+' v1.1 : en-tetes Internet du message recu (absent pour un mail interne
+' Exchange) et adresses secondaires (alias "smtp:...") de l'utilisateur.
+Private Const PR_TRANSPORT_HEADERS As String = "http://schemas.microsoft.com/mapi/proptag/0x007D001F"
+Private Const PR_PROXY_ADDRESSES As String = "http://schemas.microsoft.com/mapi/proptag/0x800F101F"
+
+' v1.1 : nature d'un element d'apres sa classe de message (MessageClassKind).
+Public Const MSG_KIND_NORMAL As Long = 0      ' mail ordinaire (IPM.Note...) : reponse possible
+Public Const MSG_KIND_AUTOREPLY As Long = 1   ' reponse automatique Exchange (absence, regle)
+Public Const MSG_KIND_RECEIPT As Long = 2     ' accuse de remise, de lecture ou de non-lecture, avis de retard
+Public Const MSG_KIND_NDR As Long = 3         ' rapport de NON-remise (echec de livraison)
+Public Const MSG_KIND_OTHER As Long = 4       ' autre (reunion, tache, rappel de message...)
 
 ' AddressEntryUserType (valeurs en dur : late binding tolere partout)
 Private Const AE_EXCHANGE_USER As Long = 0
@@ -62,6 +97,7 @@ Private Const CACHE_MAX As Long = 3000
 Private mMySmtp As String
 Private mMyName As String
 Private mCache As Object          ' Scripting.Dictionary : cle -> SMTP
+Private mMyAddrs As Object        ' v1.1 : Scripting.Dictionary des adresses de l'utilisateur
 
 Public Function ModVersion() As String
     ModVersion = MOD_VERSION
@@ -82,6 +118,7 @@ End Sub
 Public Sub ClearCache()
     On Error Resume Next
     Set mCache = Nothing
+    Set mMyAddrs = Nothing
     mMySmtp = ""
     mMyName = ""
     modDebugLog.DDebug MOD_NAME, "Cache SMTP vide"
@@ -136,6 +173,97 @@ Public Function IsMe(ByVal smtp As String) As Boolean
     mine = MySmtp()
     If Len(mine) = 0 Or Len(smtp) = 0 Then Exit Function
     IsMe = (StrComp(Trim$(smtp), mine, vbTextCompare) = 0)
+End Function
+
+'=============================================================================
+' MyAddresses (v1.1 - audit 11/2026, F4-02) : TOUTES les adresses SMTP de
+' l'utilisateur, en minuscules, dans un Scripting.Dictionary (cle = adresse,
+' insensible a la casse) : adresse de chaque compte du profil, adresse
+' principale du compte courant et ses alias Exchange ("smtp:..." de
+' l'annuaire). Calcule une fois par session (cache ; ClearCache le vide).
+' Ne jamais modifier le dictionnaire renvoye (il est partage).
+'=============================================================================
+Public Function MyAddresses() As Object
+    On Error Resume Next
+    If Not mMyAddrs Is Nothing Then
+        Set MyAddresses = mMyAddrs
+        Exit Function
+    End If
+
+    Dim d As Object
+    Set d = CreateObject("Scripting.Dictionary")
+    d.CompareMode = 1   ' TextCompare
+
+    Dim s As String
+    Dim accs As Object, acc As Object, i As Long, n As Long
+    Set accs = Nothing
+    Set accs = Application.Session.Accounts
+    n = 0
+    If Not accs Is Nothing Then n = accs.Count
+    For i = 1 To n
+        Set acc = Nothing
+        Set acc = accs.Item(i)
+        If Not acc Is Nothing Then
+            s = ""
+            s = LCase$(Trim$(CStr(acc.SmtpAddress)))
+            If InStr(s, "@") > 0 Then d(s) = True
+        End If
+    Next i
+
+    s = LCase$(MySmtp())
+    If InStr(s, "@") > 0 Then d(s) = True
+
+    ' Alias Exchange de l'utilisateur (adresses secondaires "smtp:...").
+    Dim xu As Object, v As Variant, k As Long
+    Set xu = Nothing
+    Set xu = Application.Session.CurrentUser.AddressEntry.GetExchangeUser
+    If Not xu Is Nothing Then
+        v = Empty
+        v = xu.PropertyAccessor.GetProperty(PR_PROXY_ADDRESSES)
+        If IsArray(v) Then
+            For k = LBound(v) To UBound(v)
+                s = LCase$(Trim$(CStr(v(k))))
+                If Left$(s, 5) = "smtp:" Then
+                    s = Mid$(s, 6)
+                    If InStr(s, "@") > 0 Then d(s) = True
+                End If
+            Next k
+        End If
+    End If
+
+    modDebugLog.DDebug MOD_NAME, "MyAddresses : " & d.Count & " adresse(s)"
+    Set mMyAddrs = d
+    Set MyAddresses = d
+End Function
+
+' True si smtp est l'une des adresses de l'utilisateur (MyAddresses).
+Public Function IsMyAddress(ByVal smtp As String) As Boolean
+    On Error Resume Next
+    IsMyAddress = False
+    Dim s As String
+    s = LCase$(Trim$(smtp))
+    If InStr(s, "@") = 0 Then Exit Function
+    IsMyAddress = MyAddresses().Exists(s)
+End Function
+
+'=============================================================================
+' IsFromMe (v1.1) : l'element (mail recu ou envoye) vient-il de
+' l'utilisateur ? Expediteur (SenderSmtp) OU expediteur represente ("de la
+' part de") parmi MyAddresses. Comparaison par ADRESSE, jamais par nom
+' (deux personnes peuvent porter le meme nom de famille).
+'=============================================================================
+Public Function IsFromMe(ByVal itm As Object) As Boolean
+    On Error Resume Next
+    IsFromMe = False
+    If itm Is Nothing Then Exit Function
+    If IsMyAddress(SenderSmtp(itm)) Then
+        IsFromMe = True
+        Exit Function
+    End If
+    Dim s As String
+    s = ""
+    s = CStr(itm.PropertyAccessor.GetProperty(PR_SENT_REPR_SMTP))
+    If InStr(s, "@") > 0 Then IsFromMe = IsMyAddress(s)
 End Function
 
 '=============================================================================
@@ -359,6 +487,194 @@ End Function
 
 Public Function IsInternalSmtp(ByVal smtp As String) As Boolean
     IsInternalSmtp = IsInternalDomain(ExtractDomain(smtp))
+End Function
+
+'=============================================================================
+' HasExternalRecipient (v1.1 - audit 11/2026, F6-19) : l'element (mail,
+' invitation, rendez-vous) a-t-il au moins un destinataire hors des domaines
+' internes (InternalDomains) ? L'utilisateur lui-meme est ignore.
+' unknownIsExternal : un destinataire dont l'adresse SMTP reste introuvable
+' compte comme EXTERNE (defaut, prudent : sert a ne pas envoyer de donnees
+' internes au-dehors). False = l'ignorer.
+'=============================================================================
+Public Function HasExternalRecipient(ByVal itm As Object, _
+                                     Optional ByVal unknownIsExternal As Boolean = True) As Boolean
+    On Error Resume Next
+    HasExternalRecipient = False
+    If itm Is Nothing Then Exit Function
+
+    Dim rcps As Object, rcp As Object, i As Long, n As Long, s As String
+    Set rcps = Nothing
+    Set rcps = itm.Recipients
+    n = 0
+    If Not rcps Is Nothing Then n = rcps.Count
+    For i = 1 To n
+        Set rcp = Nothing
+        Set rcp = rcps.Item(i)
+        If Not rcp Is Nothing Then
+            s = RecipientSmtp(rcp)
+            If Len(s) = 0 Then
+                If unknownIsExternal Then
+                    modDebugLog.DDebug MOD_NAME, "HasExternalRecipient : destinataire sans adresse SMTP, compte comme externe"
+                    HasExternalRecipient = True
+                    Exit Function
+                End If
+            ElseIf Not IsMyAddress(s) Then
+                If Not IsInternalSmtp(s) Then
+                    HasExternalRecipient = True
+                    Exit Function
+                End If
+            End If
+        End If
+    Next i
+End Function
+
+'=============================================================================
+' LECTURE D'UN FIL : reponses automatiques et rapports (v1.1 - audit 11/2026)
+' Une seule regle pour le suivi des mails (F4-02) et les campagnes (F5-08,
+' F5-22). Usage type dans une boucle sur conv.GetTable :
+'     Select Case modSmtp.MessageClassKind(CStr(rw.Item("MessageClass")))
+'         Case modSmtp.MSG_KIND_NDR        : ' echec de livraison
+'         Case modSmtp.MSG_KIND_NORMAL     : ' ouvrir l'element, puis
+'             If Not modSmtp.IsAutoReplyItem(itm) Then ... ' vraie reponse
+'         Case Else                        : ' absence, accuse, reunion : ignore
+'     End Select
+'=============================================================================
+
+'-----------------------------------------------------------------------------
+' MessageClassKind : nature d'un element d'apres sa classe de message seule
+' (lisible sur une ligne de Table, sans ouvrir l'element).
+'   REPORT.*.NDR                      -> MSG_KIND_NDR (non-remise)
+'   REPORT.* autre (.DR, .IPNRN, .IPNNRN, .DELAYED...)
+'                                     -> MSG_KIND_RECEIPT (accuse : la
+'                                        remise a eu lieu, ce n'est ni une
+'                                        reponse ni un echec)
+'   *OOFTEMPLATE*, IPM.Note.Rules.*   -> MSG_KIND_AUTOREPLY
+'   vide, IPM, IPM.Note, IPM.Note.*   -> MSG_KIND_NORMAL
+'   autre (IPM.Schedule.*, IPM.Outlook.Recall...) -> MSG_KIND_OTHER
+'-----------------------------------------------------------------------------
+Public Function MessageClassKind(ByVal messageClass As String) As Long
+    Dim mc As String
+    mc = UCase$(Trim$(messageClass))
+    If Left$(mc, 7) = "REPORT." Then
+        If InStr(mc, ".NDR") > 0 Then
+            MessageClassKind = MSG_KIND_NDR
+        Else
+            MessageClassKind = MSG_KIND_RECEIPT
+        End If
+    ElseIf InStr(mc, "OOFTEMPLATE") > 0 Or Left$(mc, 14) = "IPM.NOTE.RULES" Then
+        MessageClassKind = MSG_KIND_AUTOREPLY
+    ElseIf Len(mc) = 0 Or mc = "IPM" Or mc = "IPM.NOTE" Or Left$(mc, 9) = "IPM.NOTE." Then
+        MessageClassKind = MSG_KIND_NORMAL
+    Else
+        MessageClassKind = MSG_KIND_OTHER
+    End If
+End Function
+
+'-----------------------------------------------------------------------------
+' IsAutoReplySubject : objet d'une reponse automatique ? Prefixes de
+' passerelle entre crochets retires d'abord ("[EXT] ", "[Externe] "...).
+' Debuts reconnus (minuscules) : automatic reply, reponse automatique (avec
+' ou sans accent), absence, absent, out of office, auto:, automatische
+' antwort. Un "RE: ..." n'est jamais reconnu ici (voir les en-tetes).
+'-----------------------------------------------------------------------------
+Public Function IsAutoReplySubject(ByVal subj As String) As Boolean
+    IsAutoReplySubject = False
+    Dim s As String, p As Long
+    s = LCase$(Trim$(subj))
+    Do While Left$(s, 1) = "["
+        p = InStr(s, "]")
+        If p = 0 Then Exit Do
+        s = Trim$(Mid$(s, p + 1))
+    Loop
+    If Len(s) = 0 Then Exit Function
+
+    Dim prefixes() As String, i As Long
+    prefixes = Split("automatic reply|reponse automatique|r" & ChrW$(233) & "ponse automatique|" & _
+                     "absence|absent|out of office|auto:|automatische antwort", "|")
+    For i = LBound(prefixes) To UBound(prefixes)
+        If Left$(s, Len(prefixes(i))) = prefixes(i) Then
+            IsAutoReplySubject = True
+            Exit Function
+        End If
+    Next i
+End Function
+
+'-----------------------------------------------------------------------------
+' IsAutoReplyItem : l'element ouvert est-il une reponse automatique ?
+'   1. classe de message (absence Exchange, regle de reponse) ;
+'   2. en-tetes Internet (RFC 3834) : Auto-Submitted autre que "no",
+'      X-Autoreply, X-Autorespond, Precedence: auto_reply ;
+'   3. objet (IsAutoReplySubject).
+' Les accuses et rapports (REPORT.*) sont a trier par MessageClassKind.
+'-----------------------------------------------------------------------------
+Public Function IsAutoReplyItem(ByVal itm As Object) As Boolean
+    On Error Resume Next
+    IsAutoReplyItem = False
+    If itm Is Nothing Then Exit Function
+
+    Dim mc As String
+    mc = ""
+    mc = CStr(itm.MessageClass)
+    If MessageClassKind(mc) = MSG_KIND_AUTOREPLY Then
+        IsAutoReplyItem = True
+        Exit Function
+    End If
+
+    Dim hdr As String
+    hdr = ""
+    hdr = CStr(itm.PropertyAccessor.GetProperty(PR_TRANSPORT_HEADERS))
+    If Len(hdr) > 0 Then
+        If HeadersSayAutoReply(hdr) Then
+            IsAutoReplyItem = True
+            Exit Function
+        End If
+    End If
+
+    Dim subj As String
+    subj = ""
+    subj = CStr(itm.Subject)
+    IsAutoReplyItem = IsAutoReplySubject(subj)
+End Function
+
+' En-tetes Internet bruts -> reponse automatique selon la RFC 3834 et les
+' en-tetes usuels des repondeurs.
+Private Function HeadersSayAutoReply(ByVal hdr As String) As Boolean
+    HeadersSayAutoReply = False
+    Dim h As String, v As String
+    h = vbLf & LCase$(Replace(Replace(hdr, vbCrLf, vbLf), vbCr, vbLf))
+
+    v = HeaderValue(h, "auto-submitted")
+    If Len(v) > 0 And Left$(v, 2) <> "no" Then
+        HeadersSayAutoReply = True
+        Exit Function
+    End If
+    v = HeaderValue(h, "x-autoreply")
+    If Len(v) > 0 And v <> "no" And v <> "false" And v <> "0" Then
+        HeadersSayAutoReply = True
+        Exit Function
+    End If
+    v = HeaderValue(h, "x-autorespond")
+    If Len(v) > 0 And v <> "no" And v <> "false" And v <> "0" Then
+        HeadersSayAutoReply = True
+        Exit Function
+    End If
+    v = HeaderValue(h, "precedence")
+    If v = "auto_reply" Then HeadersSayAutoReply = True
+End Function
+
+' Valeur (minuscules, sans espaces autour) du premier en-tete nameLower dans
+' hLower (en-tetes en minuscules, lignes separees par vbLf, debut par vbLf).
+' "" si absent.
+Private Function HeaderValue(ByVal hLower As String, ByVal nameLower As String) As String
+    HeaderValue = ""
+    Dim p As Long, q As Long
+    p = InStr(1, hLower, vbLf & nameLower & ":")
+    If p = 0 Then Exit Function
+    p = p + Len(nameLower) + 2
+    q = InStr(p, hLower, vbLf)
+    If q = 0 Then q = Len(hLower) + 1
+    HeaderValue = Trim$(Replace(Mid$(hLower, p, q - p), vbTab, " "))
 End Function
 
 '=============================================================================

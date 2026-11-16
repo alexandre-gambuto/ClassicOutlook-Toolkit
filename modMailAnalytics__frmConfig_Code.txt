@@ -1,7 +1,22 @@
 Option Explicit
 
 ' ============================================================================
-' frmConfig - CODE V23.7
+' frmConfig - CODE V23.8
+'
+' V23.8 (2026-11-16) : audit 11/2026 - F9-01, F9-02, F9-07, F9-08 (+ partie
+'         code de F9-12) :
+'         * F9-02 : une date de fin saisie sans heure couvre toute la
+'           journee (23:59:59) ; avant, le dernier jour etait exclu.
+'         * F9-01 : la ligne "mise a jour" du mode delta nomme le rapport
+'           repris (texte sur deux lignes si besoin).
+'         * F9-07 : case "Resolution Exchange" masquee et propriete
+'           UseExchangeResolution retiree (les adresses passent par
+'           modSmtp, toujours).
+'         * F9-08 : le test de resolution n'affiche plus de "mode
+'           recommande" (l'adresse sert des qu'elle est connue, le mot-cle
+'           en repli ; le choix Adresse / Mot-cle n'est plus lu).
+'         * F9-12 : journal par modDebugLog (MOD_NAME "Analytics", comme le
+'           module), libelles par T().
 '
 ' V23.7 (2026-08-22) : revue traduction. Les deux seules MsgBox du
 '         formulaire etaient en dur : "frmConfig initialization error" en
@@ -28,6 +43,8 @@ Option Explicit
 ' ============================================================================
 
 ' --- Variables de module ---
+' V23.8 (F9-12) : meme filtre de journal que modMailAnalytics.
+Private Const MOD_NAME As String = "Analytics"
 Private m_MailboxConfigs As Object    ' Dictionary: storeName -> config (Dictionary)
 Private m_Cancelled As Boolean
 Private m_LastSelectedStore As String
@@ -38,13 +55,13 @@ Private m_LastSelectedStore As String
 Private Sub UserForm_Initialize()
     On Error GoTo ErrInit
     
-    Debug.Print "[frmConfig] Initialize debut..."
+    modDebugLog.DDebug MOD_NAME, "frmConfig : Initialize debut..."
     
     Set m_MailboxConfigs = CreateObject("Scripting.Dictionary")
     m_Cancelled = True
     m_LastSelectedStore = ""
     
-    Debug.Print "[frmConfig] Remplissage cboCouleur..."
+    modDebugLog.DDebug MOD_NAME, "frmConfig : remplissage cboCouleur..."
     ' Remplir la liste des couleurs
     With cboCouleur
         .Clear
@@ -66,16 +83,16 @@ Private Sub UserForm_Initialize()
         .ListIndex = 0
     End With
     
-    Debug.Print "[frmConfig] Lecture config.ini (StatMailboxN)..."
+    modDebugLog.DDebug MOD_NAME, "frmConfig : lecture config.ini (StatMailboxN)..."
     ' V23.5 : relire config.ini a chaque ouverture du formulaire pour
     ' prendre en compte les modifications sans redemarrer l'hote.
     Call ReloadStatMailboxConfig
     
-    Debug.Print "[frmConfig] LoadMailboxes..."
+    modDebugLog.DDebug MOD_NAME, "frmConfig : LoadMailboxes..."
     ' Charger les boites aux lettres
     Call LoadMailboxes
     
-    Debug.Print "[frmConfig] Initialisation periode..."
+    modDebugLog.DDebug MOD_NAME, "frmConfig : initialisation periode..."
     ' Initialiser periode
     optTout.Value = True
     cboDepuis.Enabled = False
@@ -83,10 +100,13 @@ Private Sub UserForm_Initialize()
     txtDateFin.Enabled = False
     Call LoadYearsCombo
     
-    Debug.Print "[frmConfig] Initialisation options..."
+    modDebugLog.DDebug MOD_NAME, "frmConfig : initialisation options..."
     ' Initialiser options ; V23.9 : analyse COMPLETE par defaut (pas Test)
     optTest.Value = False
-    chkResolutionExchange.Value = True
+    ' V23.8 (F9-07) : case "Resolution Exchange" masquee - les adresses
+    ' passent toujours par modSmtp (rapide, sans appel a l'annuaire par mail).
+    chkResolutionExchange.Value = False
+    chkResolutionExchange.Visible = False
     chkAnalyseDistincte.Value = False
     chkAnalyseLongueur.Value = False
     
@@ -96,13 +116,15 @@ Private Sub UserForm_Initialize()
     ' pre-remplie et la periode verrouillee.
     Call ApplyDeltaMode
 
-    Debug.Print "[frmConfig] Initialize termine OK"
+    modDebugLog.DDebug MOD_NAME, "frmConfig : Initialize termine"
     Exit Sub
     
 ErrInit:
-    Debug.Print "[frmConfig] !!! ERREUR Initialize: " & Err.Number & " - " & Err.Description
+    Dim initErr As String
+    initErr = Err.Description   ' avant modDebugLog (son On Error Resume Next remet Err a zero)
+    modDebugLog.DError MOD_NAME, "frmConfig : erreur Initialize " & Err.Number & " - " & initErr
     MsgBox T("Erreur d'initialisation de frmConfig : ", _
-             "frmConfig initialization error: ") & Err.Description, _
+             "frmConfig initialization error: ") & initErr, _
            vbCritical + vbMsgBoxSetForeground, _
            T("Statistiques", "Analytics")
 End Sub
@@ -140,14 +162,17 @@ Private Sub ApplyDeltaMode()
         GoTo LockPeriod
     End If
 
+    ' V23.8 (F9-01) : le libelle nomme le rapport repris : plus large, sur
+    ' deux lignes si besoin.
     With chk
         .Caption = modMailAnalytics.DeltaBannerText()
         .Value = True
         .Enabled = False           ' cochee et non decochable
         .Left = optDepuis.Left
         .Top = optDepuis.Top + optDepuis.Height + 6
-        .Width = 320
-        .Height = 18
+        .Width = 420
+        .Height = 30
+        .WordWrap = True
     End With
 
 LockPeriod:
@@ -160,7 +185,7 @@ LockPeriod:
     optTest.Enabled = False
     optTout.Value = True
 
-    Debug.Print "[frmConfig] Mode delta : " & modMailAnalytics.DeltaBannerText()
+    modDebugLog.DDebug MOD_NAME, "frmConfig : mode delta"
 End Sub
 
 '----------------------------------------------------------------------------
@@ -240,7 +265,7 @@ Private Sub ApplyPresetConfig(storeName As String, ByRef cfg As Object, colorInd
             cfg("AddressMode") = False
             cfg("ColorIndex") = colorIndex Mod 15
             cfg("ColorRGB") = GetColorByIndex(colorIndex Mod 15)
-            Debug.Print "[frmConfig] delta preset " & storeName & " -> " & dEmail & " / " & dKey
+            modDebugLog.DDebug MOD_NAME, "frmConfig : boite pre-remplie depuis l'etat du rapport repris"
             Exit Sub
         End If
     End If
@@ -449,7 +474,7 @@ Private Sub lstBoites_Change()
     ' Aucune selection : desactiver le panneau config
     If selectedCount = 0 Then
         fraConfigBoite.Enabled = False
-        fraConfigBoite.Caption = "Selected mailbox configuration"
+        fraConfigBoite.Caption = T("Configuration de la bo~ite s~electionn~ee", "Selected mailbox configuration")
         Call ClearConfigFields
         m_LastSelectedStore = ""
         Exit Sub
@@ -479,9 +504,9 @@ Private Sub lstBoites_Change()
     ' Activer le panneau et mettre a jour le titre
     fraConfigBoite.Enabled = True
     If Len(storeName) > 30 Then
-        fraConfigBoite.Caption = "Config: " & Left(storeName, 27) & "..."
+        fraConfigBoite.Caption = T("Configuration : ", "Config: ") & Left(storeName, 27) & "..."
     Else
-        fraConfigBoite.Caption = "Config: " & storeName
+        fraConfigBoite.Caption = T("Configuration : ", "Config: ") & storeName
     End If
     
     ' Charger la config de la boite selectionnee
@@ -596,7 +621,7 @@ End Sub
 Private Sub btnAppliquerConfig_Click()
     If Len(m_LastSelectedStore) > 0 Then
         Call SaveCurrentConfig(m_LastSelectedStore)
-        lblResultatTest.Caption = "Configuration applied."
+        lblResultatTest.Caption = T("Configuration appliqu~ee.", "Configuration applied.")
         lblResultatTest.ForeColor = RGB(0, 128, 0)
     End If
 End Sub
@@ -604,7 +629,7 @@ End Sub
 Private Sub btnTesterResolution_Click()
     If Len(m_LastSelectedStore) = 0 Then Exit Sub
     
-    lblResultatTest.Caption = "Testing..."
+    lblResultatTest.Caption = T("Test en cours...", "Testing...")
     lblResultatTest.ForeColor = RGB(0, 0, 0)
     DoEvents
     
@@ -644,18 +669,20 @@ Private Sub btnTesterResolution_Click()
     Next store
     On Error GoTo 0
     
+    ' V23.8 (F9-08) : plus de "mode recommande" - l'analyse reconnait
+    ' l'utilisateur par adresse des qu'elle est connue, le mot-cle en repli.
     If testCount > 0 Then
         Dim pct As Long
         pct = (resolvedCount * 100) \ testCount
-        lblResultatTest.Caption = "Resolution: " & resolvedCount & "/" & testCount & " (" & pct & "%)" & vbCrLf & _
-                                  IIf(pct >= 80, "Address mode recommended", "Keyword mode recommended")
+        lblResultatTest.Caption = T("Adresses r~esolues : ", "Addresses resolved: ") & _
+                                  resolvedCount & "/" & testCount & " (" & pct & "%)"
         If pct >= 80 Then
             lblResultatTest.ForeColor = RGB(0, 128, 0)
         Else
             lblResultatTest.ForeColor = RGB(255, 128, 0)
         End If
     Else
-        lblResultatTest.Caption = "No email found for the test"
+        lblResultatTest.Caption = T("Aucun mail trouv~e pour le test", "No email found for the test")
         lblResultatTest.ForeColor = RGB(255, 0, 0)
     End If
 End Sub
@@ -742,7 +769,7 @@ End Sub
 ' BOUTONS PRINCIPAUX
 ' ============================================================================
 Private Sub btnLancer_Click()
-    Debug.Print "[frmConfig] btnLancer_Click debut..."
+    modDebugLog.DDebug MOD_NAME, "frmConfig : btnLancer_Click debut..."
     
     ' Verifier qu'au moins une boite est selectionnee
     Dim i As Long, hasSelection As Boolean
@@ -751,7 +778,7 @@ Private Sub btnLancer_Click()
         If lstBoites.Selected(i) Then hasSelection = True: Exit For
     Next i
     
-    Debug.Print "[frmConfig] hasSelection = " & hasSelection
+    modDebugLog.DDebug MOD_NAME, "frmConfig : hasSelection = " & hasSelection
     
     If Not hasSelection Then
         MsgBox T("S~electionnez au moins une bo~ite aux lettres.", _
@@ -763,17 +790,17 @@ Private Sub btnLancer_Click()
     
     ' Sauvegarder la derniere config
     If Len(m_LastSelectedStore) > 0 Then
-        Debug.Print "[frmConfig] Sauvegarde config: " & m_LastSelectedStore
+        modDebugLog.DDebug MOD_NAME, "frmConfig : sauvegarde de la config de la boite courante"
         Call SaveCurrentConfig(m_LastSelectedStore)
     End If
     
-    Debug.Print "[frmConfig] m_Cancelled = False"
+    modDebugLog.DDebug MOD_NAME, "frmConfig : m_Cancelled = False"
     m_Cancelled = False
     
-    Debug.Print "[frmConfig] Appel Hide..."
+    modDebugLog.DDebug MOD_NAME, "frmConfig : appel Hide..."
     On Error Resume Next
     Me.Hide
-    Debug.Print "[frmConfig] Hide termine, err=" & Err.Number
+    modDebugLog.DDebug MOD_NAME, "frmConfig : Hide termine, err=" & Err.Number
     On Error GoTo 0
 End Sub
 
@@ -812,10 +839,6 @@ Public Property Get IsTestMode() As Boolean
     IsTestMode = optTest.Value
 End Property
 
-Public Property Get UseExchangeResolution() As Boolean
-    UseExchangeResolution = chkResolutionExchange.Value
-End Property
-
 Public Property Get AnalyzeLength() As Boolean
     AnalyzeLength = chkAnalyseLongueur.Value
 End Property
@@ -841,14 +864,23 @@ Public Property Get PeriodStart() As Date
     End If
 End Property
 
+' V23.8 (F9-02) : une date de fin saisie SANS heure couvre toute la journee
+' (23:59:59). Avant : 30/06 = 30/06 a 00:00, tout le 30/06 etait exclu
+' alors que l'etat le declarait couvert.
 Public Property Get PeriodEnd() As Date
     If optTout.Value Or optDepuis.Value Then
         PeriodEnd = Now
     Else
+        Dim d As Date
         On Error Resume Next
-        PeriodEnd = CDate(txtDateFin.Text)
-        If Err.Number <> 0 Then PeriodEnd = Now
+        d = CDate(txtDateFin.Text)
+        If Err.Number <> 0 Then
+            d = Now
+        ElseIf CDbl(d) = Int(CDbl(d)) Then
+            d = d + TimeSerial(23, 59, 59)
+        End If
         On Error GoTo 0
+        PeriodEnd = d
     End If
 End Property
 

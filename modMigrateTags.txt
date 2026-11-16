@@ -1,7 +1,7 @@
 Option Explicit
 
 ' ============================================================
-' modMigrateTags v2.0  (2026-08-22)
+' modMigrateTags v2.1  (2026-11-16)
 ' Purpose (EN): one-shot migration that renames the tag UserProperties on
 '   calendar appointments from their old names to the current generic ones,
 '   without losing tags already set. Idempotent and re-runnable. Edit MAP_TAGS
@@ -36,6 +36,13 @@ Option Explicit
 '   des paires si ton environnement a d'autres anciens noms.
 '   (AntiChevDecale n'est PAS migre : ce n'est pas du jargon.)
 '
+' v2.1 (2026-11-16) : audit 11/2026 - F6-15 : une paire dont l'ancien nom
+'   est encore celui que le code utilise (cle UpTag ou UpShift de
+'   config.ini) est ecartee et signalee dans la boite de confirmation :
+'   la migrer rendait toutes les etiquettes memorisees invisibles a
+'   CheckReTag. Pour la migrer : changer d'abord la cle (et, pour UpTag, la
+'   constante NOM_PROP_TAG du classeur Suivi de temps), puis relancer.
+'
 ' v2.0 (2026-08-22) : revue UX pop-ups.
 '   (a) CONFIRMATION + MODE SIMULATION AJOUTES (manquaient). Le module
 '       ecrivait une UserProperty et faisait un .Save sur TOUS les RDV du
@@ -65,7 +72,7 @@ Option Explicit
 ' ============================================================
 
 Private Const MOD_NAME As String = "MigrateTags"
-Private Const MOD_VERSION As String = "v2.0 - 2026-08-22"
+Private Const MOD_VERSION As String = "v2.1 - 2026-11-16"
 
 ' Table de correspondance ANCIEN > NOUVEAU (paires ; separateur).
 ' Pack v3 (D12) : la table de renommage vient de config.ini (cle
@@ -93,6 +100,21 @@ Private Function UiTitle() As String
 End Function
 
 '=============================================================================
+' NameStillUsedByCode (v2.1, F6-15) : ce nom de UserProperty est-il celui
+' que le code lit et ecrit aujourd'hui (modConfig.UpTag : etiquette projet ;
+' modConfig.UpShiftName : marque de l'anti-chevauchement) ? Sans casse.
+'=============================================================================
+Private Function NameStillUsedByCode(ByVal propName As String) As Boolean
+    NameStillUsedByCode = False
+    If Len(propName) = 0 Then Exit Function
+    If StrComp(propName, modConfig.UpTag(), vbTextCompare) = 0 Then
+        NameStillUsedByCode = True
+    ElseIf StrComp(propName, modConfig.UpShiftName(), vbTextCompare) = 0 Then
+        NameStillUsedByCode = True
+    End If
+End Function
+
+'=============================================================================
 ' MigrateProjectTags - point d'entree.
 '=============================================================================
 Public Sub MigrateProjectTags()
@@ -115,6 +137,48 @@ Public Sub MigrateProjectTags()
     ' on ecrit donc la UserProperty directement sur le master.
     items.IncludeRecurrences = False
 
+    ' --- v2.1 (F6-15) : paires applicables -----------------------------------
+    ' Une paire dont l'ANCIEN nom est encore celui que le code lit et ecrit
+    ' (cles UpTag / UpShift de config.ini) est ecartee : la migrer rendrait
+    ' toutes les etiquettes memorisees invisibles (CheckReTag ne les verrait
+    ' plus) pendant que les nouveaux etiquetages recreeraient l'ancien nom.
+    Dim allPairs() As String, q As Long, kv0() As String
+    Dim effMap As String, skippedTxt As String
+    effMap = ""
+    skippedTxt = ""
+    allPairs = Split(TagMap(), ";")
+    For q = LBound(allPairs) To UBound(allPairs)
+        kv0 = Split(allPairs(q), ">")
+        If UBound(kv0) = 1 Then
+            If NameStillUsedByCode(Trim$(kv0(0))) Then
+                skippedTxt = skippedTxt & "    " & Trim$(kv0(0)) & " > " & Trim$(kv0(1)) & vbCrLf
+                modDebugLog.DInfo MOD_NAME, "Paire ecartee (ancien nom encore lu par le code) : " & Trim$(allPairs(q))
+            Else
+                If Len(effMap) > 0 Then effMap = effMap & ";"
+                effMap = effMap & Trim$(allPairs(q))
+            End If
+        End If
+    Next q
+
+    Dim skippedNote As String
+    skippedNote = ""
+    If Len(skippedTxt) > 0 Then
+        skippedNote = T("Non migr~e (ancien nom encore utilis~e par le code, cl~e UpTag ou UpShift de config.ini) :", _
+                        "Not migrated (old name still used by the code, config.ini key UpTag or UpShift):") & _
+                      vbCrLf & skippedTxt & _
+                      T("Pour le migrer : changer d'abord cette cl~e dans config.ini (et, pour UpTag, la constante" & vbCrLf & _
+                        "NOM_PROP_TAG du classeur Suivi de temps), puis relancer la migration.", _
+                        "To migrate it: first change that key in config.ini (and, for UpTag, the NOM_PROP_TAG" & vbCrLf & _
+                        "constant of the time-tracking workbook), then run the migration again.")
+    End If
+
+    If Len(effMap) = 0 Then
+        modDebugLog.DInfo MOD_NAME, "Migration : aucune paire applicable"
+        modUi.Inform T("Aucun renommage applicable.", "No applicable rename.") & vbCrLf & vbCrLf & _
+                     skippedNote, UiTitle()
+        Exit Sub
+    End If
+
     ' --- v2.0 : confirmation + choix du mode ------------------------------
     Dim choice As VbMsgBoxResult
     choice = modMsgBoxCustom.Confirm3( _
@@ -122,7 +186,8 @@ Public Sub MigrateProjectTags()
           "principal.", _
           "Migration of the project tag UserProperties on the main " & _
           "calendar.") & vbCrLf & vbCrLf & _
-        T("Renommages : ", "Renames: ") & TagMap() & vbCrLf & _
+        T("Renommages : ", "Renames: ") & effMap & vbCrLf & _
+        IIf(Len(skippedNote) > 0, skippedNote & vbCrLf, "") & _
         T("~El~ements ~a parcourir : ", "Items to scan: ") & items.count & vbCrLf & vbCrLf & _
         T("Simulation : rien n'est ~ecrit, le compte de ce qui SERAIT migr~e " & _
           "est report~e.", _
@@ -147,7 +212,7 @@ Public Sub MigrateProjectTags()
             Exit Sub
     End Select
 
-    pairs = Split(TagMap(), ";")
+    pairs = Split(effMap, ";")     ' v2.1 : paires applicables seulement
 
     modDebugLog.DInfo MOD_NAME, "Migration tags : debut, " & _
         items.count & " elements dans le calendrier principal, dryRun=" & dryRun

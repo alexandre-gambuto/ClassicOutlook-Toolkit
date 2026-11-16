@@ -2,7 +2,41 @@ Option Explicit
 
 '=============================================================================
 ' MODULE : modProjectTag
-' modProjectTag v9.2  (2026-10-22)
+' modProjectTag v9.3  (2026-11-16)
+'
+' v9.3 (2026-11-16) : audit 11/2026 - F6-07, F6-10, F6-11, F6-12, F6-13,
+'   F6-14, F6-19 :
+'   (a) F6-07 : occurrence de reunion periodique (Affecter selection,
+'       Affecter le projet sur "cette occurrence", detection auto, creation
+'       de dossier) : une question "Toute la serie / Ce jour seulement /
+'       Annuler" ; la serie est etiquetee sur le MAITRE (sujet, propriete,
+'       couleur) ; "ce jour" ne colore plus toute la serie (ApplyTagScoped).
+'   (b) F6-10 : plus de question "Affecter un projet ?" avant la recherche
+'       (Annuler = pas d'etiquette) ni de confirmation du resultat unique ;
+'       toast "Etiquete : <etiquette>" a la place. Lot "Taguer RDV recents" :
+'       Annuler = passer, STOP = arreter (CheckAssignment(.., batchMode),
+'       BatchStopRequested).
+'   (c) F6-11 : marche/arret de la question automatique MEMORISE (registre,
+'       AutoAskEnabled) ; ToggleAutoAsk par toast.
+'   (d) F6-12 : dans la liste des resultats, un texte affine la liste
+'       (ProjectMatches, partage avec la recherche) au lieu d'etre perdu.
+'   (e) F6-13 : opportunite sans DV etiquetee avec son CODE d'opportunite
+'       (reconnu comme etiquette), plus avec le libelle de la colonne B.
+'   (f) F6-14 (choix A) : CreateFolderFromAppointment etiquette par
+'       BuildProject + ApplyTag, comme la fenetre de choix ; toast final.
+'   (g) F6-19 : StripProjectTag (publique) : objet sans etiquette interne,
+'       pour les invitations envoyees a des invites externes
+'       (ThisOutlookSession.Application_ItemSend).
+'   (h) integration - F1-12 : LoadProjects / LoadProjectsFromFile
+'       recoivent un parametre facultatif silent, passe a True par
+'       InitProjectTag (prechargement differe "TagPreload" au demarrage et
+'       apres une reparation des liaisons) : classeur introuvable, feuille
+'       absente ou liste vide = ligne ERR au journal au lieu de 4 MsgBox
+'       bloquantes ; les commandes de l'utilisateur gardent leur message.
+'       ShowInternalList : liste bornee en caracteres (MSGLOOP).
+'       F6-18 : commentaires remis d'accord avec le code (points d'entree
+'       evenementiels, boites atteignables depuis un evenement, bouton de
+'       CreateFolderFromAppointment).
 '
 ' v9.2 (2026-10-22) : exemples de codes remplaces par des valeurs fictives (relecture de confidentialite du depot public). Aucun changement de comportement.
 '
@@ -27,7 +61,10 @@ Option Explicit
 '       ThisOutlookSession v10.6. Idem dans ApplyTag (sujet original).
 '   (b) Les deux boites declenchees par EVENEMENT - CheckAssignment
 '       (CalendarItems_ItemAdd, Application_ItemSend) et CheckReTag
-'       (CalendarItems_ItemChange) - passent par modUi.Ask. Elles
+'       (CalendarItems_ItemChange) - passent par modUi.Ask. [11/2026 :
+'       CheckAssignment n'est appelee que par CalendarItems_ItemAdd /
+'       _ItemChange - l'appel depuis Application_ItemSend a ete retire le
+'       24/04 - et n'a plus de question Oui/Non depuis v9.3.] Elles
 '       s'ouvraient au moment precis ou Outlook referme la fenetre du RDV,
 '       contexte ou le premier plan est instable par construction : la
 '       boite pouvait apparaitre derriere et bloquer la suite en silence.
@@ -40,10 +77,14 @@ Option Explicit
 '   (d) La confirmation "Tag restaure : ..." passe en toast : l'utilisateur
 '       vient de repondre Oui, et le nouveau titre est visible dans le
 '       calendrier. Erreurs via modUi.Fail.
-'   NOTE : les MsgBox restantes (declenchees par clic ruban, contexte ou le
-'   premier plan est acquis par construction) sont inchangees a dessein -
-'   les basculer en masse aurait exige de reecrire les continuations de
-'   ligne sur 2500 lignes, pour un gain nul.
+'   NOTE : les MsgBox restantes sont inchangees a dessein - les basculer en
+'   masse aurait exige de reecrire les continuations de ligne sur 2500
+'   lignes. [11/2026, F6-18 : elles ne sont PAS toutes declenchees par un
+'   clic de ruban. Atteignables depuis un evenement calendrier (via
+'   CheckAssignment) : SelectProject, CreateFolderInline,
+'   AskNewFolderFields et ShowInternalList (MsgBox natives, sans remontee
+'   au premier plan). LoadProjectsFromFile ne montre plus les siennes
+'   quand le chargement est automatique (silent, v9.3).]
 '   Dependance ajoutee : modUi.
 '
 ' v8.8 (2026-07-05) : lecture config via getters modConfig (EnsureLoaded-
@@ -69,6 +110,9 @@ Option Explicit
 '   - CreateFolderFromAppointment     : creer un dossier quand aucun match
 '   - InvalidateProjectsCache    : (v8.4) force le rechargement au prochain tag
 '                                 - utile depuis VBE si modif manuelle du .xlsm
+'   - AutoAskEnabled          : (v9.3) etat memorise de la question auto
+'   - BatchStopRequested      : (v9.3) STOP tape pendant le lot de modMeetingColor
+'   - StripProjectTag         : (v9.3) objet sans etiquette (invites externes)
 '
 ' CONVENTIONS DE NOMMAGE (prefixes/formats configures dans config.ini) :
 '   Avec opportunite : [<projet>/<dossier>] titre (<opportunite>)
@@ -158,7 +202,7 @@ Private Const MAX_RECENTS As Long = 5
 
 ' v8.4 : nom court pour le logger
 Private Const MOD_NAME As String = "ProjectTag"
-Private Const MOD_VERSION As String = "v9.2 - 2026-10-22"
+Private Const MOD_VERSION As String = "v9.3 - 2026-11-16"
 
 ' v8.5 -> pack v3 : le retry/backoff COM vit dans modExcelBridge.
 
@@ -177,6 +221,17 @@ Private mCacheFileMTime As Date
 Private Const LOCAL_CACHE_FILE As String = "ProjectTagCache.txt"
 Private Const LOCAL_CACHE_HDR As String = "#PT1"
 
+' v9.3 (F6-07) : portee de l'etiquetage d'une occurrence de reunion periodique.
+Private Const TAG_SCOPE_CANCEL As Long = -1      ' l'utilisateur a annule
+Private Const TAG_SCOPE_ITEM As Long = 0         ' element simple (ou maitre) : comportement historique
+Private Const TAG_SCOPE_SERIES As Long = 1       ' occurrence -> toute la serie (maitre)
+Private Const TAG_SCOPE_OCCURRENCE As Long = 2   ' occurrence -> ce jour seulement
+
+' v9.3 (F6-10) : lot "Taguer RDV recents" - mot tape dans la recherche pour
+' arreter le lot (mot de confirmation : jamais traduit).
+Private Const BATCH_STOP_WORD As String = "STOP"
+Private mBatchStop As Boolean
+
 '=============================================================================
 ' INIT
 '=============================================================================
@@ -188,7 +243,9 @@ Public Function ModVersion() As String
 End Function
 
 Public Sub InitProjectTag()
-    PROJECT_AUTO_ASK = True
+    ' v9.3 (F6-11) : etat MEMORISE (registre) au lieu de True a chaque
+    ' demarrage, reparation des liaisons ou prechargement differe.
+    PROJECT_AUTO_ASK = AutoAskEnabled()
 
     ' v8.4 : precharge le cache au demarrage pour eviter le freeze au
     ' premier tag du matin. Si le fichier n'est pas accessible (OneDrive
@@ -197,7 +254,10 @@ Public Sub InitProjectTag()
     On Error Resume Next
     Dim dummy() As TProject
     Dim n As Long
-    LoadProjects dummy, n
+    ' v9.3 (F1-12) : chargement silencieux (appel differe "TagPreload", au
+    ' demarrage et apres une reparation des liaisons) : classeur introuvable
+    ' = ligne ERR au journal, plus de MsgBox bloquante.
+    LoadProjects dummy, n, True
     If Err.Number <> 0 Then
         modDebugLog.DDebug MOD_NAME, "InitProjectTag : preload cache echoue err " & _
             Err.Number & " (sera retente au 1er tag)"
@@ -260,12 +320,35 @@ ErrPush:
     mCacheLoaded = False
 End Sub
 
+'=============================================================================
+' AutoAskEnabled (v9.3, F6-11) : la question d'etiquetage automatique (nouveau
+' rendez-vous, reunion acceptee, etiquette perdue) est-elle active ?
+' Etat MEMORISE dans le registre (HKCU, ClassicOutlookToolkit\Options\
+' AutoAsk ; "1" par defaut) : il survit au redemarrage d'Outlook, a la
+' reparation automatique des liaisons et au prechargement differe. Relu a
+' chaque appel (lecture HKCU, negligeable) : juste meme apres une remise a
+' zero du projet VBA. PROJECT_AUTO_ASK n'en est plus que le reflet.
+'=============================================================================
+Public Function AutoAskEnabled() As Boolean
+    On Error Resume Next
+    AutoAskEnabled = (GetSetting(APP_NAME, "Options", "AutoAsk", "1") <> "0")
+End Function
+
 Public Sub ToggleAutoAsk()
-    PROJECT_AUTO_ASK = Not PROJECT_AUTO_ASK
-    If PROJECT_AUTO_ASK Then
-        MsgBox T("D~etection automatique : ACTIVEE", "Auto-detection: ON"), vbInformation, T("Projet", "Project")
+    ' v9.3 (F6-11) : bascule memorisee + toast (plus de MsgBox).
+    Dim newState As Boolean
+    newState = Not AutoAskEnabled()
+    SaveSetting APP_NAME, "Options", "AutoAsk", IIf(newState, "1", "0")
+    PROJECT_AUTO_ASK = newState
+    modDebugLog.DInfo MOD_NAME, "Question d'etiquetage automatique : " & IIf(newState, "activee", "desactivee")
+    If newState Then
+        modUi.Toast T("Question d'~etiquetage automatique : ACTIV~EE", _
+                      "Automatic tagging question: ON"), uiInfo, True
     Else
-        MsgBox T("D~etection automatique : DESACTIVEE", "Auto-detection: OFF"), vbInformation, T("Projet", "Project")
+        modUi.Toast T("Question d'~etiquetage automatique : D~ESACTIV~EE" & vbLf & _
+                      "(r~eglage m~emoris~e : m~xme bouton pour la r~eactiver)", _
+                      "Automatic tagging question: OFF" & vbLf & _
+                      "(setting saved: same button to turn it back on)"), uiInfo, True
     End If
 End Sub
 
@@ -300,14 +383,25 @@ Public Sub TagProject()
     Dim appt As Outlook.AppointmentItem
     Set appt = oItem
     
+    ' v9.3 (F6-07) : fenetre ouverte sur UNE occurrence d'une serie : toute
+    ' la serie (maitre) ou ce jour seulement ? Demande AVANT l'enregistrement
+    ' de synchronisation ci-dessous, qui ferait de l'occurrence une exception.
+    Dim scope As Long
+    scope = TAG_SCOPE_ITEM
+    If IsSeriesOccurrence(appt) Then
+        scope = AskOccurrenceScope(CStr(appt.subject))
+        If scope = TAG_SCOPE_CANCEL Then Exit Sub
+    End If
     
     ' FORCER la synchronisation de l'Inspector ouvert avec l'AppointmentItem.
     ' Quand un Inspector est ouvert, les modifications saisies par l'utilisateur
     ' ne sont pas toujours propagees a AppointmentItem.Subject tant qu'il n'a pas
     ' explicitement sauvegarde. On force la synchronisation en lisant WordEditor.
+    ' (v9.3 : pas pour "toute la serie" : le maitre est etiquete sur son propre
+    ' objet, l'occurrence affichee n'est pas enregistree.)
     Dim insp As Outlook.Inspector
     Set insp = Application.ActiveInspector
-    If Not insp Is Nothing Then
+    If Not insp Is Nothing And scope <> TAG_SCOPE_SERIES Then
         On Error Resume Next
         ' Methode 1 : lire le titre depuis le WordEditor de l'inspector
         Dim wordDoc As Object
@@ -320,7 +414,7 @@ Public Sub TagProject()
     End If
     
     ' Si le sujet est toujours vide, demander a l'utilisateur de confirmer
-    If Len(Trim(CStr(appt.subject))) = 0 Then
+    If Len(Trim(CStr(appt.subject))) = 0 And scope <> TAG_SCOPE_SERIES Then
         Dim emptyReply As VbMsgBoxResult
         emptyReply = MsgBox(T("Le sujet du RDV est vide." & vbCrLf & vbCrLf & _
                          "Astuce : avant de tagger, clique dans la fen~xtre du RDV ailleurs " & _
@@ -344,8 +438,18 @@ Public Sub TagProject()
     Dim idx As Long
     idx = SelectProject(projects, projectCount, prefill, appt)
     If idx < 0 Then Exit Sub
-    ApplyTag appt, projects(idx)
+    ' v9.3 (F6-07) : selon la portee (pas d'enregistrement de la fenetre :
+    ' l'utilisateur l'enregistre ; la serie, elle, est enregistree ici).
+    ApplyTagScoped appt, projects(idx), scope, False
     SaveRecent projects(idx).displayText
+    ' v9.3 (F6-10) : l'etiquette posee est annoncee (plus de confirmation).
+    If scope = TAG_SCOPE_SERIES Then
+        ToastTagged projects(idx), scope, _
+            T("La fen~xtre ouverte montre une seule occurrence : fermez-la sans l'enregistrer.", _
+              "The open window shows a single occurrence: close it without saving.")
+    Else
+        ToastTagged projects(idx), scope
+    End If
 End Sub
 
 '=============================================================================
@@ -374,6 +478,22 @@ Public Sub TagSelection()
         End If
     Next i
     
+    ' v9.3 (F6-07) : une occurrence de reunion periodique dans la selection ?
+    ' Une seule question pour toute la selection : toute la serie (maitre :
+    ' etiquette ET couleur sur toutes les occurrences) ou ce jour seulement.
+    Dim scope As Long
+    scope = TAG_SCOPE_ITEM
+    Dim hasOccurrence As Boolean
+    hasOccurrence = False
+    For i = 1 To oSel.count
+        If IsSeriesOccurrence(oSel.Item(i)) Then
+            hasOccurrence = True
+            scope = AskOccurrenceScope(CStr(oSel.Item(i).subject))
+            If scope = TAG_SCOPE_CANCEL Then Exit Sub
+            Exit For
+        End If
+    Next i
+
     Dim projects() As TProject
     Dim projectCount As Long
     If Not LoadProjects(projects, projectCount) Then Exit Sub
@@ -396,26 +516,54 @@ Public Sub TagSelection()
     If idx < 0 Then Exit Sub
     
     ' Appliquer a tous les elements selectionnes
+    ' v9.3 (F6-07) : occurrences selon la portee choisie ; une serie dont
+    ' plusieurs occurrences sont selectionnees n'est etiquetee qu'une fois.
     Dim appt As Outlook.AppointmentItem
     Dim tagCount As Long
+    Dim doneSeries As Object
+    Dim seriesId As String
+    Set doneSeries = CreateObject("Scripting.Dictionary")
     tagCount = 0
     For i = 1 To oSel.count
         Set appt = oSel.Item(i)
-        ApplyTag appt, projects(idx)
-        appt.Save
+        If hasOccurrence And IsSeriesOccurrence(appt) Then
+            If scope = TAG_SCOPE_SERIES Then
+                seriesId = SeriesKey(appt)
+                If Len(seriesId) > 0 Then
+                    If doneSeries.Exists(seriesId) Then GoTo NextSelected
+                    doneSeries.Add seriesId, True
+                End If
+            End If
+            ApplyTagScoped appt, projects(idx), scope, True
+        Else
+            ApplyTagScoped appt, projects(idx), TAG_SCOPE_ITEM, True
+        End If
         tagCount = tagCount + 1
+NextSelected:
     Next i
     
     SaveRecent projects(idx).displayText
+    ' v9.3 (F6-10) : l'etiquette posee est annoncee (plus de confirmation).
+    If tagCount > 1 Then
+        ToastTagged projects(idx), scope, tagCount & T(" rendez-vous ~etiquet~es", " appointments tagged")
+    Else
+        ToastTagged projects(idx), scope
+    End If
 End Sub
 
 '=============================================================================
 ' DETECTION AUTO : appelee par les events dans ThisOutlookSession
 '=============================================================================
-Public Function CheckAssignment(ByVal appt As Outlook.AppointmentItem) As Boolean
+Public Function CheckAssignment(ByVal appt As Outlook.AppointmentItem, _
+                                Optional ByVal batchMode As Boolean = False) As Boolean
     CheckAssignment = False
+    mBatchStop = False
     
-    If Not PROJECT_AUTO_ASK Then Exit Function
+    ' v9.3 (F6-11) : etat memorise (registre). Le lot manuel "Taguer RDV
+    ' recents" (batchMode) est une commande explicite : il n'en depend pas.
+    If Not batchMode Then
+        If Not AutoAskEnabled() Then Exit Function
+    End If
     
     ' Exclure journee entiere (rappels, feries, etc.)
     If appt.AllDayEvent Then Exit Function
@@ -429,21 +577,21 @@ Public Function CheckAssignment(ByVal appt As Outlook.AppointmentItem) As Boolea
     ' Si deja tague => rien a faire
     If ContainsTag(appt.subject) Then Exit Function
     
-    ' v8.5 : via modUi.Ask. Appelee depuis CalendarItems_ItemAdd et depuis
-    ' Application_ItemSend : dans les deux cas la fenetre du RDV vient de se
-    ' fermer et le premier plan est instable - c'est exactement le contexte
-    ' ou une MsgBox native s'ouvre derriere et bloque la suite en silence.
-    ' (Le sujet etait deja correctement hors de T() ici.)
-    Dim rep As VbMsgBoxResult
-    rep = modUi.Ask( _
-        T("Evenement non affecte a un projet :", _
-          "Event not assigned to a project:") & vbCrLf & vbCrLf & _
-        Chr(34) & appt.subject & Chr(34) & vbCrLf & vbCrLf & _
-        T("Affecter un projet ?", "Assign a project?"), _
-        T("Projet", "Project"), _
-        vbYesNo + vbQuestion)
+    ' v9.3 (F6-10) : plus de question prealable "Affecter un projet ?" : la
+    ' recherche s'ouvre directement, le sujet du RDV en en-tete ; Annuler (ou
+    ' une saisie vide) = pas d'etiquette. La recherche passe par
+    ' modUi.AskText (premier plan garanti, cf. v8.5 : appel depuis un
+    ' evenement, fenetre du RDV en train de se fermer).
     
-    If rep = vbNo Then Exit Function
+    ' v9.3 (F6-07) : occurrence d'une reunion periodique (cas rare depuis un
+    ' evenement : Outlook livre d'ordinaire le maitre) -> meme choix que
+    ' "Affecter selection".
+    Dim scope As Long
+    scope = TAG_SCOPE_ITEM
+    If IsSeriesOccurrence(appt) Then
+        scope = AskOccurrenceScope(CStr(appt.subject))
+        If scope = TAG_SCOPE_CANCEL Then Exit Function
+    End If
     
     Dim projects() As TProject
     Dim projectCount As Long
@@ -453,13 +601,24 @@ Public Function CheckAssignment(ByVal appt As Outlook.AppointmentItem) As Boolea
     prefill = ExtractPrefill(appt.subject)
     
     Dim idx As Long
-    idx = SelectProject(projects, projectCount, prefill, appt)
+    idx = SelectProject(projects, projectCount, prefill, appt, batchMode)
     If idx < 0 Then Exit Function
     
-    ApplyTag appt, projects(idx)
-    appt.Save
+    ApplyTagScoped appt, projects(idx), scope, True
     SaveRecent projects(idx).displayText
+    ' v9.3 (F6-10) : l'etiquette posee est annoncee (plus de confirmation).
+    ToastTagged projects(idx), scope
     CheckAssignment = True
+End Function
+
+'=============================================================================
+' BatchStopRequested (v9.3, F6-10) : True si, pendant le dernier appel
+' CheckAssignment(..., batchMode:=True), l'utilisateur a tape STOP dans la
+' recherche. Lu par modMeetingColor.TagRecentItemsCore pour arreter le lot
+' (Annuler, lui, passe seulement au rendez-vous suivant).
+'=============================================================================
+Public Function BatchStopRequested() As Boolean
+    BatchStopRequested = mBatchStop
 End Function
 
 '=============================================================================
@@ -483,7 +642,8 @@ End Function
 ' la UserProperty etait desynchronisee declenchait la popup. Faux positif.
 '=============================================================================
 Public Sub CheckReTag(ByVal appt As Outlook.AppointmentItem)
-    If Not PROJECT_AUTO_ASK Then Exit Sub
+    ' v9.3 (F6-11) : etat memorise (registre) au lieu de la variable de session.
+    If Not AutoAskEnabled() Then Exit Sub
     
     Dim savedTag As String
     savedTag = ReadUserProperty(appt)
@@ -592,7 +752,11 @@ End Function
 ' ne trouve aucun match. Elle permet de creer a la volee un nouveau dossier
 ' dans la feuille "Temps par mois" de Suivi de temps.xlsm.
 '
-' A bind a un bouton du ruban distinct (ex: "Creer dossier Projet")
+' 11/2026 (F6-18) : la commande n'avait aucun bouton dans les rubans
+' livres ni actifs (Alt+F8 seulement) ; la reorganisation des rubans (F2-06)
+' lui donne le bouton "Creer le dossier du projet" de l'onglet du
+' rendez-vous selectionne. La fenetre de choix du projet propose aussi la
+' creation a la volee (CreateFolderInline).
 '=============================================================================
 Public Sub CreateFolderFromAppointment()
     Dim rdv As Object
@@ -679,28 +843,29 @@ Public Sub CreateFolderFromAppointment()
     If MsgBox(T("Dossier ", "Folder ") & """" & nFolder & """" & T(" cr~e~e dans Suivi de temps.xlsm.", " created in the time-tracking workbook.") & vbCrLf & vbCrLf & _
               T("Tagger le RDV maintenant avec ce dossier ?", "Tag the appointment now with this folder?"), _
               vbYesNo + vbInformation, T("Projet - Cr~e~e", "Project - Created")) = vbYes Then
-        ' Construire le tag et l'appliquer
-        Dim tag As String
-        If Len(nProjCode) > 0 And nProjCode <> "0" And nProjCode <> "9999" Then
-            If Len(nOpp) > 0 Then
-                tag = "[" & nOpp & "/" & modConfig.ProjectPrefix() & nProjCode & IIf(Len(nFolder) > 0, "/" & nFolder, "") & "]"
-            Else
-                tag = "[" & modConfig.ProjectPrefix() & nProjCode & IIf(Len(nFolder) > 0, "/" & nFolder, "") & "]"
-            End If
-        ElseIf Len(nContract) > 0 Then
-            tag = "[" & nContract & IIf(Len(nFolder) > 0, "/" & nFolder, "") & "]"
-        Else
-            tag = "[" & nFolder & "]"
+        ' v9.3 (F6-14, choix A) : meme constructeur que la fenetre de choix du
+        ' projet (BuildProject + ApplyTag, comme CreateFolderInline) : ordre
+        ' des codes, partenaire, suffixe opportunite, cas transversal et
+        ' categorie Outlook identiques. Avant : etiquette fabriquee a la main
+        ' ("[<opportunite>/<code>/<dossier>]", sans partenaire ni categorie).
+        Dim proj As TProject
+        Dim projCodeNum As Long
+        If IsNumeric(nProjCode) Then projCodeNum = CLng(nProjCode) Else projCodeNum = 0
+        BuildProject proj, nOpp, nContract, projCodeNum, nFolder, nPartner
+
+        ' v9.3 (F6-07) : occurrence d'une reunion periodique -> meme choix
+        ' que "Affecter selection".
+        Dim scope As Long
+        scope = TAG_SCOPE_ITEM
+        If IsSeriesOccurrence(rdv) Then
+            scope = AskOccurrenceScope(CStr(rdv.subject))
+            If scope = TAG_SCOPE_CANCEL Then Exit Sub
         End If
         
-        Dim subjectText As String
-        subjectText = Trim(CStr(rdv.subject))
-        If Not ContainsTag(subjectText) Then
-            rdv.subject = tag & " " & subjectText
-            WriteUserProperty rdv, tag
-            rdv.Save
-            MsgBox T("RDV tagge : ", "Appointment tagged: ") & rdv.subject, vbInformation, T("Projet", "Project")
-        End If
+        ApplyTagScoped rdv, proj, scope, True
+        SaveRecent proj.displayText
+        ' Toast au lieu de la MsgBox finale (l'etiquette est visible).
+        ToastTagged proj, scope
     End If
 End Sub
 
@@ -902,7 +1067,19 @@ Private Sub BuildProject(ByRef proj As TProject, ByVal opp As String, ByVal cont
             .Category = "CONTRAT"
             Dim contractCode As String
             contractCode = ExtractContractCode(contract)
-            .tagText = AssembleTag(contractCode, folder, partner)
+            ' v9.3 (F6-13) : sans vrai code contrat (colonne B = libelle
+            ' "opportunite", ou vide), l'etiquette porte le CODE
+            ' d'opportunite : "[<opportunite>/<dossier>/<partenaire>]",
+            ' reconnu par IsValidProjectTag (donc retire avant un nouvel
+            ' etiquetage) et par l'extraction des heures. Avant :
+            ' "[<libelle>/...]", jamais reconnu. Le libelle (displayText,
+            ' cle des recents) ne change pas.
+            Dim tagCode As String
+            tagCode = contractCode
+            If Len(opp) > 0 Then
+                If Len(tagCode) = 0 Or Not modConfig.ContainsContractCode(tagCode) Then tagCode = opp
+            End If
+            .tagText = AssembleTag(tagCode, folder, partner)
             .displayText = contractCode & Suffix(folder) & Suffix(partner)
             .SuffixOpp = ""
         Else
@@ -967,7 +1144,8 @@ End Function
 '=============================================================================
 Private Function SelectProject(ByRef projects() As TProject, ByVal projectCount As Long, _
                                      ByVal prefill As String, _
-                                     Optional ByVal appt As Object = Nothing) As Long
+                                     Optional ByVal appt As Object = Nothing, _
+                                     Optional ByVal batchMode As Boolean = False) As Long
     SelectProject = -1
     
     Dim recents As String
@@ -999,6 +1177,12 @@ Private Function SelectProject(ByRef projects() As TProject, ByVal projectCount 
     
     Do
         prompt = "=== " & headerTitle & " ===" & vbCrLf & vbCrLf
+
+        ' v9.3 (F6-10) : lot "Taguer RDV recents" : comment passer / arreter.
+        If batchMode Then
+            prompt = prompt & T("(Lot : Annuler = passer ce RDV ; ", "(Batch: Cancel = skip this appointment; ") & _
+                     BATCH_STOP_WORD & T(" = arr~xter le lot)", " = end the batch)") & vbCrLf & vbCrLf
+        End If
         
         If recents <> "" Then
             prompt = prompt & T("--- RECENTS ---", "--- RECENT ---") & vbCrLf & recents & vbCrLf
@@ -1035,6 +1219,16 @@ Private Function SelectProject(ByRef projects() As TProject, ByVal projectCount 
         choice = modUi.AskText(prompt, T("Projet - Affectation dans le calendrier", "Project - Assign in calendar"), defaultVal)
         If choice = "" Then Exit Function
         choice = Trim(choice)
+
+        ' v9.3 (F6-10) : mot reserve du lot -> fin du lot (lu par
+        ' BatchStopRequested).
+        If batchMode Then
+            If StrComp(choice, BATCH_STOP_WORD, vbTextCompare) = 0 Then
+                mBatchStop = True
+                modDebugLog.DInfo MOD_NAME, "Lot d'etiquetage : STOP demande"
+                Exit Function
+            End If
+        End If
         
         If Left(choice, 1) = "#" Then
             Dim numR As Long
@@ -1083,16 +1277,12 @@ Private Function SelectProject(ByRef projects() As TProject, ByVal projectCount 
                 End If
                 
             ElseIf resCount = 1 Then
-                Dim conf As VbMsgBoxResult
-                conf = MsgBox(T("Projet trouve :", "Project found:") & vbCrLf & vbCrLf & _
-                              projects(results(1)).displayText & vbCrLf & _
-                              T("Tag : ", "Tag: ") & projects(results(1)).tagText & _
-                              projects(results(1)).SuffixOpp & vbCrLf & vbCrLf & _
-                              T("Confirmer ?", "Confirm?"), vbYesNo + vbQuestion, T("Projet", "Project"))
-                If conf = vbYes Then
-                    SelectProject = results(1)
-                    Exit Function
-                End If
+                ' v9.3 (F6-10) : resultat unique retenu SANS confirmation :
+                ' l'action n'est ni destructive ni definitive (un nouvel
+                ' etiquetage corrige) ; l'appelant annonce l'etiquette posee
+                ' par un toast (ToastTagged).
+                SelectProject = results(1)
+                Exit Function
                 
             Else
                 Dim idxMulti As Long
@@ -1121,43 +1311,86 @@ Private Sub SearchProjects(ByRef projects() As TProject, ByVal projectCount As L
     
     Dim termNum As Long
     Dim termIsNum As Boolean
-    termIsNum = IsNumeric(term)
-    If termIsNum Then termNum = CLng(term)
+    ParseSearchNumber term, termIsNum, termNum
     
+    ' v9.3 (F6-12) : test de correspondance partage avec l'affinage de la
+    ' liste des resultats (ShowResults / FilterIndices).
     Dim i As Long
     For i = 1 To projectCount
-        Dim match As Boolean
-        match = False
-        
-        If termIsNum Then
-            If projects(i).projCode = termNum Then match = True
-        End If
-        
-        If Not match Then
-            With projects(i)
-                If InStr(1, .UpFolder, termUp, vbBinaryCompare) > 0 Then
-                    match = True
-                ElseIf InStr(1, .UpContract, termUp, vbBinaryCompare) > 0 Then
-                    match = True
-                ElseIf InStr(1, .UpOpportunity, termUp, vbBinaryCompare) > 0 Then
-                    match = True
-                ElseIf InStr(1, .UpPartner, termUp, vbBinaryCompare) > 0 Then
-                    match = True
-                ElseIf InStr(1, .UpCrossCode, termUp, vbBinaryCompare) > 0 Then
-                    match = True
-                ElseIf InStr(1, .UpDisplayText, termUp, vbBinaryCompare) > 0 Then
-                    match = True
-                End If
-            End With
-        End If
-        
-        If match Then
+        If ProjectMatches(projects(i), termUp, termIsNum, termNum) Then
             resCount = resCount + 1
             results(resCount) = i
         End If
     Next i
     
     If resCount > 0 Then ReDim Preserve results(1 To resCount)
+End Sub
+
+'=============================================================================
+' ProjectMatches (v9.3, F6-12) : le projet correspond-il au terme cherche ?
+' Code projet egal au nombre tape, ou terme (deja en majuscules) contenu
+' dans le dossier, le contrat, l'opportunite, le partenaire, le code
+' transversal ou le libelle. Meme test qu'avant dans SearchProjects.
+'=============================================================================
+Private Function ProjectMatches(ByRef proj As TProject, ByVal termUp As String, _
+                                ByVal termIsNum As Boolean, ByVal termNum As Long) As Boolean
+    ProjectMatches = False
+    If termIsNum Then
+        If proj.projCode = termNum Then
+            ProjectMatches = True
+            Exit Function
+        End If
+    End If
+    With proj
+        If InStr(1, .UpFolder, termUp, vbBinaryCompare) > 0 Then
+            ProjectMatches = True
+        ElseIf InStr(1, .UpContract, termUp, vbBinaryCompare) > 0 Then
+            ProjectMatches = True
+        ElseIf InStr(1, .UpOpportunity, termUp, vbBinaryCompare) > 0 Then
+            ProjectMatches = True
+        ElseIf InStr(1, .UpPartner, termUp, vbBinaryCompare) > 0 Then
+            ProjectMatches = True
+        ElseIf InStr(1, .UpCrossCode, termUp, vbBinaryCompare) > 0 Then
+            ProjectMatches = True
+        ElseIf InStr(1, .UpDisplayText, termUp, vbBinaryCompare) > 0 Then
+            ProjectMatches = True
+        End If
+    End With
+End Function
+
+' v9.3 : terme numerique (IsNumeric puis CLng, comme avant), sans erreur de
+' depassement sur une longue suite de chiffres (terme alors traite en texte).
+Private Sub ParseSearchNumber(ByVal term As String, ByRef isNum As Boolean, ByRef num As Long)
+    isNum = False
+    num = 0
+    On Error Resume Next
+    If IsNumeric(term) Then
+        num = CLng(term)
+        If Err.Number = 0 Then isNum = True Else num = 0
+        Err.Clear
+    End If
+End Sub
+
+'=============================================================================
+' FilterIndices (v9.3, F6-12) : sous-liste de src(1..n) dont le projet
+' correspond au terme (ProjectMatches) ; l'ordre est conserve.
+'=============================================================================
+Private Sub FilterIndices(ByRef projects() As TProject, ByRef src() As Long, ByVal n As Long, _
+                          ByVal term As String, ByRef dst() As Long, ByRef dstCount As Long)
+    dstCount = 0
+    If n < 1 Then Exit Sub
+    ReDim dst(1 To n)
+    Dim termUp As String, termIsNum As Boolean, termNum As Long
+    termUp = UCase$(term)
+    ParseSearchNumber term, termIsNum, termNum
+    Dim k As Long
+    For k = 1 To n
+        If ProjectMatches(projects(src(k)), termUp, termIsNum, termNum) Then
+            dstCount = dstCount + 1
+            dst(dstCount) = src(k)
+        End If
+    Next k
+    If dstCount > 0 Then ReDim Preserve dst(1 To dstCount)
 End Sub
 
 '=============================================================================
@@ -1194,34 +1427,62 @@ Private Function ShowResults(ByRef projects() As TProject, ByRef indices() As Lo
     Next z
     SortIndicesByDisplayText projects, ord, nb
 
-    Dim txt As String
-    txt = nb & T(" resultats trouves :", " results found:") & vbCrLf & vbCrLf
+    ' v9.3 (F6-12) : boucle LOCALE. Un TEXTE affine la liste affichee (meme
+    ' test que la recherche, ProjectMatches) : 1 resultat -> retenu ;
+    ' plusieurs -> liste reduite ; 0 -> la liste precedente revient, avec un
+    ' mot. Un NUMERO de la liste choisit ; un nombre hors liste (un code
+    ' projet, par exemple) sert lui aussi a affiner, et s'il ne donne rien la
+    ' meme liste revient. Avant : tout ce qui n'etait pas un numero valide
+    ' renvoyait a la recherche vide, le texte tape etait perdu.
+    Dim txt As String, note As String, rep As String
+    Dim maxA As Long, i As Long, num As Long, pass As Long
+    Dim fOrd() As Long, fN As Long
+    note = ""
+    Do
+        pass = pass + 1
+        If pass > 50 Then Exit Function      ' garde-fou (chaque tour = une saisie)
     
-    Dim maxA As Long
-    maxA = nb
-    If maxA > modConfig.TagPageSize() Then maxA = modConfig.TagPageSize()
+        txt = ""
+        If Len(note) > 0 Then txt = note & vbCrLf & vbCrLf
+        note = ""
+        txt = txt & nb & T(" resultats trouves :", " results found:") & vbCrLf & vbCrLf
     
-    Dim i As Long
-    For i = 1 To maxA
-        txt = txt & i & ") " & projects(ord(i)).displayText & vbCrLf
-    Next i
+        maxA = nb
+        If maxA > modConfig.TagPageSize() Then maxA = modConfig.TagPageSize()
     
-    If nb > modConfig.TagPageSize() Then
-        txt = txt & vbCrLf & T("... et ", "... and ") & (nb - modConfig.TagPageSize()) & T(" autres. Affinez.", " more. Refine.")
-    End If
-    txt = txt & vbCrLf & T("NUMERO pour choisir, ou TEXTE pour affiner :", "NUMBER to choose, or TEXT to refine:")
+        For i = 1 To maxA
+            txt = txt & i & ") " & projects(ord(i)).displayText & vbCrLf
+        Next i
     
-    Dim rep As String
-    rep = modUi.AskText(txt, T("Projet - ", "Project - ") & nb & T(" resultats", " results"))
-    If rep = "" Then Exit Function
+        If nb > modConfig.TagPageSize() Then
+            txt = txt & vbCrLf & T("... et ", "... and ") & (nb - modConfig.TagPageSize()) & T(" autres. Affinez.", " more. Refine.")
+        End If
+        txt = txt & vbCrLf & T("NUMERO pour choisir, ou TEXTE pour affiner :", "NUMBER to choose, or TEXT to refine:")
     
-    If IsNumeric(Trim(rep)) Then
-        Dim num As Long
-        num = CLng(Trim(rep))
+        rep = Trim$(modUi.AskText(txt, T("Projet - ", "Project - ") & nb & T(" resultats", " results")))
+        If rep = "" Then Exit Function
+
+        ' Numero de la liste affichee (chiffres seuls, 1..maxA)
+        num = 0
+        If Len(rep) <= 4 And rep Like String(Len(rep), "#") Then num = CLng(rep)
         If num >= 1 And num <= maxA Then
             ShowResults = ord(num)
+            Exit Function
         End If
-    End If
+
+        ' Sinon : affinage de la liste affichee
+        FilterIndices projects, ord, nb, rep, fOrd, fN
+        If fN = 1 Then
+            ShowResults = fOrd(1)
+            Exit Function
+        ElseIf fN > 1 Then
+            ord = fOrd
+            nb = fN
+        Else
+            note = T("Aucun r~esultat pour ", "No result for ") & Chr(34) & rep & Chr(34) & _
+                   T(" : liste pr~ec~edente.", ": previous list.")
+        End If
+    Loop
 End Function
 
 '=============================================================================
@@ -1254,13 +1515,20 @@ Private Function ShowInternalList(ByRef projects() As TProject, ByVal projectCou
 
     Dim txt As String
     txt = T("=== TACHES INTERNES ===", "=== INTERNAL TASKS ===") & vbCrLf & vbCrLf
+    ' Integration 11/2026 (MSGLOOP) : liste coupee avant ~800 caracteres (une
+    ' boite de saisie est coupee vers 1 024) ; les numeros restent valables.
     For i = 1 To count
+        If Len(txt) > 800 Then
+            txt = txt & T("... et ", "... and ") & (count - i + 1) & T(" autres", " more") & vbCrLf
+            Exit For
+        End If
         txt = txt & i & ") " & projects(mapping(i)).displayText & vbCrLf
     Next i
 
     txt = txt & vbCrLf & T("Entrez le numero (1-", "Enter the number (1-") & count & T(") :", "):")
     
     Dim rep As String
+    ' MSGLOOP-OK : liste coupee avant ~800 caracteres (boucle ci-dessus).
     rep = modUi.AskText(txt, T("Projet - Taches internes", "Project - Internal tasks"))
     If rep = "" Then Exit Function
     If Not IsNumeric(rep) Then Exit Function
@@ -1290,7 +1558,11 @@ End Function
 ' Signature inchangee : (ByRef projets, ByRef nbProjets) -> Boolean.
 ' Les appelants existants n'ont rien a modifier.
 '=============================================================================
-Private Function LoadProjects(ByRef projects() As TProject, ByRef projectCount As Long) As Boolean
+' v9.3 (F1-12) : silent = chargement automatique (prechargement differe
+' "TagPreload" au demarrage et apres une reparation des liaisons) : un
+' classeur introuvable ou vide est journalise, sans boite bloquante.
+Private Function LoadProjects(ByRef projects() As TProject, ByRef projectCount As Long, _
+                              Optional ByVal silent As Boolean = False) As Boolean
     LoadProjects = False
 
     ' --- Verifier si le cache est utilisable ---
@@ -1334,7 +1606,7 @@ Private Function LoadProjects(ByRef projects() As TProject, ByRef projectCount A
     fromLocal = LoadProjectsFromLocalCache(projects, projectCount)
     If Not fromLocal Then
         modDebugLog.DDebug MOD_NAME, "LoadProjects MISS cache, reload fichier"
-        If Not LoadProjectsFromFile(projects, projectCount) Then Exit Function
+        If Not LoadProjectsFromFile(projects, projectCount, silent) Then Exit Function
     End If
 
     ' --- Mettre a jour le cache ---
@@ -1469,13 +1741,20 @@ End Function
 ' Renomme en v8.4 car le front-end "LoadProjects" gere maintenant le
 ' cache. Tous les appelants existants passent par le front-end.
 '=============================================================================
-Private Function LoadProjectsFromFile(ByRef projects() As TProject, ByRef projectCount As Long) As Boolean
+Private Function LoadProjectsFromFile(ByRef projects() As TProject, ByRef projectCount As Long, _
+                                      Optional ByVal silent As Boolean = False) As Boolean
     LoadProjectsFromFile = False
     
+    ' v9.3 (F1-12) : silent -> chaque probleme ci-dessous va au journal
+    ' (ERR) au lieu d'une MsgBox native (prechargement automatique).
     Dim xlApp As Object, xlWb As Object, closeExcel As Boolean, wasOpen As Boolean
     ' v7 : ouvrir en lecture seule pour ne pas verrouiller le fichier
     If Not OpenTimeTrackingReadOnly(xlApp, xlWb, closeExcel, wasOpen) Then
-        MsgBox T("Fichier introuvable : ", "File not found: ") & modConfig.TimeTrackingPath(), vbCritical, T("Projet", "Project")
+        If silent Then
+            modDebugLog.DError MOD_NAME, "Chargement des projets : fichier introuvable : " & modConfig.TimeTrackingPath()
+        Else
+            MsgBox T("Fichier introuvable : ", "File not found: ") & modConfig.TimeTrackingPath(), vbCritical, T("Projet", "Project")
+        End If
         Exit Function
     End If
     
@@ -1484,8 +1763,12 @@ Private Function LoadProjectsFromFile(ByRef projects() As TProject, ByRef projec
     Set xlWs = xlWb.Worksheets(modConfig.TimeTrackingSheet())
     On Error GoTo 0
     If xlWs Is Nothing Then
-        MsgBox T("Feuille '", "Sheet '") & modConfig.TimeTrackingSheet() & T("' introuvable dans le classeur.", "' not found in the workbook."), _
-               vbCritical, T("Projet", "Project")
+        If silent Then
+            modDebugLog.DError MOD_NAME, "Chargement des projets : feuille '" & modConfig.TimeTrackingSheet() & "' introuvable dans le classeur"
+        Else
+            MsgBox T("Feuille '", "Sheet '") & modConfig.TimeTrackingSheet() & T("' introuvable dans le classeur.", "' not found in the workbook."), _
+                   vbCritical, T("Projet", "Project")
+        End If
         CloseTimeTracking xlApp, xlWb, closeExcel, wasOpen, False
         Exit Function
     End If
@@ -1497,7 +1780,11 @@ Private Function LoadProjectsFromFile(ByRef projects() As TProject, ByRef projec
     lastRow = modExcelBridge.DataLastRow(xlWs, 2, 5)
     
     If lastRow < 2 Then
-        MsgBox T("Aucune ligne de donn~ees dans '", "No data row in '") & modConfig.TimeTrackingSheet() & "'.", vbExclamation, T("Projet", "Project")
+        If silent Then
+            modDebugLog.DError MOD_NAME, "Chargement des projets : aucune ligne de donnees dans '" & modConfig.TimeTrackingSheet() & "'"
+        Else
+            MsgBox T("Aucune ligne de donn~ees dans '", "No data row in '") & modConfig.TimeTrackingSheet() & "'.", vbExclamation, T("Projet", "Project")
+        End If
         CloseTimeTracking xlApp, xlWb, closeExcel, wasOpen, False
         Exit Function
     End If
@@ -1555,7 +1842,11 @@ SuivantLigne:
     CloseTimeTracking xlApp, xlWb, closeExcel, wasOpen, False
     
     If projectCount = 0 Then
-        MsgBox T("Aucun projet trouve dans '", "No project found in '") & modConfig.TimeTrackingSheet() & "'.", vbExclamation, T("Projet", "Project")
+        If silent Then
+            modDebugLog.DError MOD_NAME, "Chargement des projets : aucun projet trouve dans '" & modConfig.TimeTrackingSheet() & "'"
+        Else
+            MsgBox T("Aucun projet trouve dans '", "No project found in '") & modConfig.TimeTrackingSheet() & "'.", vbExclamation, T("Projet", "Project")
+        End If
         Exit Function
     End If
     
@@ -1838,7 +2129,11 @@ End Function
 '=============================================================================
 ' APPLIQUER TAG + UserProperty
 '=============================================================================
-Private Sub ApplyTag(ByRef appt As Outlook.AppointmentItem, ByRef proj As TProject)
+Private Sub ApplyTag(ByRef appt As Outlook.AppointmentItem, ByRef proj As TProject, _
+                     Optional ByVal occurrenceOnly As Boolean = False)
+    ' v9.3 (F6-07) : occurrenceOnly = "ce jour seulement" sur une occurrence
+    ' de serie : la categorie de couleur n'est jamais ecrite sur le maitre
+    ' (elle colorerait toute la serie), seulement tentee sur l'occurrence.
     Dim originalSubject As String
     originalSubject = Trim(CStr(appt.subject))
     
@@ -1889,7 +2184,13 @@ Private Sub ApplyTag(ByRef appt As Outlook.AppointmentItem, ByRef proj As TProje
     ' d'ecrire directement.
     If proj.OutlookCategory <> "" Then
         Dim catTarget As Outlook.AppointmentItem
-        Set catTarget = AppointmentForCategory(appt)
+        If occurrenceOnly Then
+            ' v9.3 (F6-07) : l'occurrence elle-meme (certaines versions
+            ' d'Outlook refusent : erreur ignoree ci-dessous, pas de couleur).
+            Set catTarget = appt
+        Else
+            Set catTarget = AppointmentForCategory(appt)
+        End If
         
         If Not catTarget Is Nothing Then
             On Error Resume Next
@@ -1901,8 +2202,9 @@ Private Sub ApplyTag(ByRef appt As Outlook.AppointmentItem, ByRef proj As TProje
                 ElseIf InStr(1, currentCats, proj.OutlookCategory, vbTextCompare) = 0 Then
                     catTarget.Categories = currentCats & ", " & proj.OutlookCategory
                 End If
-                ' Sauvegarder le Master si c'en est un
-                If catTarget.IsRecurring Then catTarget.Save
+                ' Sauvegarder le Master si c'en est un (v9.3 : jamais
+                ' l'occurrence seule ici : l'appelant l'enregistre)
+                If catTarget.IsRecurring And Not occurrenceOnly Then catTarget.Save
             End If
             If Err.Number <> 0 Then
                 Err.Clear
@@ -1916,6 +2218,174 @@ Private Sub ApplyTag(ByRef appt As Outlook.AppointmentItem, ByRef proj As TProje
     WriteUserProperty appt, proj.tagText
     On Error GoTo 0
 End Sub
+
+'=============================================================================
+' v9.3 (F6-07) : REUNIONS PERIODIQUES
+' La selection d'une reunion periodique dans le calendrier (ou sa fenetre
+' ouverte sur "cette occurrence") renvoie l'OCCURRENCE du jour. L'etiqueter
+' seule en fait une exception sans le dire, alors que la couleur partait sur
+' le maitre (toute la serie). On demande donc une fois : toute la serie
+' (etiquette, propriete et couleur sur le MAITRE, regle du projet) ou ce
+' jour seulement (etiquette sur l'occurrence, couleur du maitre intacte).
+'=============================================================================
+Private Function IsSeriesOccurrence(ByVal appt As Outlook.AppointmentItem) As Boolean
+    IsSeriesOccurrence = False
+    On Error Resume Next
+    Dim st As Long
+    st = olApptNotRecurring
+    st = appt.RecurrenceState
+    IsSeriesOccurrence = (st = olApptOccurrence Or st = olApptException)
+End Function
+
+' Renvoie TAG_SCOPE_SERIES, TAG_SCOPE_OCCURRENCE ou TAG_SCOPE_CANCEL.
+Private Function AskOccurrenceScope(ByVal subjectText As String) As Long
+    AskOccurrenceScope = TAG_SCOPE_CANCEL
+    Dim shownSubject As String
+    shownSubject = Left$(CleanAllTags(subjectText), 120)
+    Dim choice As VbMsgBoxResult
+    choice = modMsgBoxCustom.Confirm3( _
+        T("Cette r~eunion fait partie d'une s~erie p~eriodique :", _
+          "This meeting belongs to a recurring series:") & vbCrLf & vbCrLf & _
+        "    " & Chr(34) & shownSubject & Chr(34) & vbCrLf & vbCrLf & _
+        T("Toute la s~erie : ~etiquette et couleur sur toutes les occurrences." & vbCrLf & _
+          "Ce jour seulement : cette occurrence devient une exception de la s~erie.", _
+          "Whole series: tag and color on every occurrence." & vbCrLf & _
+          "This day only: this occurrence becomes an exception of the series."), _
+        T("Projet - R~eunion p~eriodique", "Project - Recurring meeting"), _
+        T("&Toute la s~erie", "&Whole series"), _
+        T("&Ce jour seulement", "&This day only"), _
+        T("&Annuler", "&Cancel"), vbQuestion, 0, 1)
+    Select Case choice
+        Case vbYes: AskOccurrenceScope = TAG_SCOPE_SERIES
+        Case vbNo:  AskOccurrenceScope = TAG_SCOPE_OCCURRENCE
+        Case Else:  AskOccurrenceScope = TAG_SCOPE_CANCEL
+    End Select
+End Function
+
+' Maitre de la serie d'une occurrence (GetRecurrencePattern.Parent, repli
+' .Parent). Nothing si introuvable. A n'appeler que sur une occurrence :
+' GetRecurrencePattern sur un element simple le rendrait periodique.
+Private Function SeriesMaster(ByVal appt As Outlook.AppointmentItem) As Outlook.AppointmentItem
+    Set SeriesMaster = Nothing
+    If Not IsSeriesOccurrence(appt) Then Exit Function
+    On Error Resume Next
+    Set SeriesMaster = appt.GetRecurrencePattern.parent
+    If SeriesMaster Is Nothing Then Set SeriesMaster = appt.parent
+End Function
+
+' Identifiant de la serie (EntryID du maitre) : une serie dont plusieurs
+' occurrences sont selectionnees n'est etiquetee qu'une fois.
+Private Function SeriesKey(ByVal appt As Outlook.AppointmentItem) As String
+    SeriesKey = ""
+    On Error Resume Next
+    Dim master As Outlook.AppointmentItem
+    Set master = SeriesMaster(appt)
+    If Not master Is Nothing Then SeriesKey = CStr(master.EntryID)
+End Function
+
+'=============================================================================
+' ApplyTagScoped (v9.3, F6-07) : etiquette selon la portee choisie.
+'   TAG_SCOPE_SERIES     : sur le MAITRE (sujet, propriete, couleur),
+'                          enregistre ici quel que soit saveItem.
+'   TAG_SCOPE_OCCURRENCE : sur l'occurrence seule ; couleur jamais posee
+'                          sur le maitre.
+'   TAG_SCOPE_ITEM       : comportement historique (element simple ou maitre).
+' saveItem : enregistrer l'element recu (False pour une fenetre ouverte,
+' que l'utilisateur enregistre lui-meme).
+'=============================================================================
+Private Sub ApplyTagScoped(ByVal appt As Outlook.AppointmentItem, ByRef proj As TProject, _
+                           ByVal scope As Long, ByVal saveItem As Boolean)
+    If scope = TAG_SCOPE_SERIES Then
+        Dim master As Outlook.AppointmentItem
+        Set master = SeriesMaster(appt)
+        If Not master Is Nothing Then
+            ApplyTag master, proj
+            master.Save
+            modDebugLog.DInfo MOD_NAME, "Serie etiquetee sur le maitre : " & proj.tagText
+            Exit Sub
+        End If
+        ' Maitre introuvable : repli prudent sur l'occurrence seule.
+        modDebugLog.DError MOD_NAME, "Maitre de serie introuvable : etiquette posee sur l'occurrence seule"
+        scope = TAG_SCOPE_OCCURRENCE
+    End If
+    ApplyTag appt, proj, (scope = TAG_SCOPE_OCCURRENCE)
+    If saveItem Then appt.Save
+End Sub
+
+'=============================================================================
+' ToastTagged (v9.3, F6-10) : annonce l'etiquette posee. Remplace la
+' confirmation "Projet trouve : ... Confirmer ?" du resultat unique.
+' L'etiquette est concatenee HORS de T() (elle peut contenir un "~").
+'=============================================================================
+Private Sub ToastTagged(ByRef proj As TProject, ByVal scope As Long, _
+                        Optional ByVal extraLine As String = "")
+    On Error Resume Next
+    Dim msg As String
+    If scope = TAG_SCOPE_SERIES Then
+        msg = T("S~erie ~etiquet~ee : ", "Series tagged: ")
+    Else
+        msg = T("~Etiquet~e : ", "Tagged: ")
+    End If
+    msg = msg & proj.tagText & proj.SuffixOpp
+    If Len(extraLine) > 0 Then msg = msg & vbLf & extraLine
+    modUi.Toast msg, uiSuccess, True
+End Sub
+
+'=============================================================================
+' StripProjectTag (v9.3, F6-19) : objet SANS l'etiquette projet interne.
+' Retire les etiquettes projet reconnues (CleanAllTags : code projet,
+' contrat, opportunite ou code transversal, avec dossier et partenaire) et
+' le suffixe " (<code opportunite>)" pose par ApplyTag. Le reste est garde :
+' prefixe ajoute par Outlook ("Annule : ", "Accepte : ", "TR : ") et tout
+' crochet qui n'est pas une etiquette projet ("[PROJ-123]").
+' Publique : appelee par ThisOutlookSession.Application_ItemSend pour un
+' element de reunion qui part vers au moins un invite externe ; le
+' rendez-vous de l'organisateur garde son etiquette. Renvoie "" si l'objet
+' n'etait qu'une etiquette. En cas d'erreur imprevue : TOUS les crochets
+' sont retires (ne jamais laisser partir l'etiquette).
+'=============================================================================
+Public Function StripProjectTag(ByVal subjectText As String) As String
+    On Error GoTo Fail
+    Dim res As String
+    res = CleanAllTags(subjectText)
+
+    ' Suffixe " (<code opportunite>)" en fin d'objet (cas PROJET + opportunite)
+    If Right$(res, 1) = ")" Then
+        Dim pO As Long
+        pO = InStrRev(res, "(")
+        If pO > 0 Then
+            Dim inner As String
+            inner = UCase$(Trim$(Mid$(res, pO + 1, Len(res) - pO - 1)))
+            If Len(inner) > 0 Then
+                If StrComp(modConfig.ScanOpportunityCode(inner), inner, vbBinaryCompare) = 0 Then
+                    res = Trim$(Left$(res, pO - 1))
+                End If
+            End If
+        End If
+    End If
+    StripProjectTag = res
+    Exit Function
+Fail:
+    modDebugLog.DError MOD_NAME, "StripProjectTag err " & Err.Number & " - " & Err.Description & _
+        " : repli (tous les crochets retires)"
+    StripProjectTag = StripAllBrackets(subjectText)
+End Function
+
+' Repli de StripProjectTag : retire tout segment "[...]" (sans config).
+Private Function StripAllBrackets(ByVal s As String) As String
+    On Error Resume Next
+    Dim posO As Long, posF As Long, guard As Long
+    Do
+        guard = guard + 1
+        If guard > 50 Then Exit Do
+        posO = InStr(1, s, "[")
+        If posO = 0 Then Exit Do
+        posF = InStr(posO, s, "]")
+        If posF = 0 Then Exit Do
+        s = Trim$(Trim$(Left$(s, posO - 1)) & " " & Trim$(Mid$(s, posF + 1)))
+    Loop
+    StripAllBrackets = Trim$(s)
+End Function
 
 '=============================================================================
 ' RESOLUTION du bon objet AppointmentItem pour modifier .Categories :

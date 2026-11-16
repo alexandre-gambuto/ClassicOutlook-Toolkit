@@ -1,7 +1,21 @@
 Option Explicit
 
 '=============================================================================
-' modContactFromMail v1.6  (2026-10-22)
+' modContactFromMail v1.8  (2026-11-16)
+' v1.8 (2026-11-16) : audit 11/2026 - F7-09, F7-10, F7-11, F7-14, F7-15 :
+'   numero francais classe par son prefixe (06 / 07 = mobile, sinon fixe),
+'   libelles lus en mots entiers ("support" n'est plus "port", "hotel" plus
+'   "tel") ; anti-doublon insensible a l'ordre prenom / nom ("Dupont Jean" =
+'   "Jean DUPONT"), recherche sur l'un ou l'autre mot ; formules de
+'   politesse completees (merci, bonne fin de journee, bonne soiree, au
+'   plaisir...) et, pour SenderSignaturePhones, sans formule reconnue la
+'   signature commence a la ligne qui porte le nom de l'expediteur (aucune
+'   = aucun numero) ; numero deja connu compare sur ses 9 derniers chiffres.
+' v1.7 (2026-11-02) : nouvelle fonction PUBLIQUE SenderSignaturePhones (telephones
+'   lus dans la signature de l'EXPEDITEUR d'un mail, haut du mail seulement),
+'   pour modContactEnrich ("Completer les coordonnees des contacts"). Meme
+'   moteur de lecture que la creation de fiche. Aucun changement de
+'   comportement des commandes existantes.
 ' v1.6 (2026-10-22) : signature d'exemple des commentaires (societe, domaine, ORIAS,
 '   telephone) remplacee par des valeurs fictives. Aucun changement de comportement.
 ' Purpose (EN): create a contact card from the signature of the selected or
@@ -25,9 +39,11 @@ Option Explicit
 '     "Dupont, Jean" et "prenom.nom@" reconnues.
 '   - Signature : zone surlignee si un mail est ouvert avec une selection ;
 '     sinon detection automatique = lignes qui suivent la formule de
-'     politesse (Cordialement, Bien a vous, Regards...) et precedent tout
-'     historique cite (De :, From:, -----Message d'origine-----, "a ecrit :",
-'     separateur Outlook). A defaut, les 10 dernieres lignes.
+'     politesse (Cordialement, Bien a vous, Regards, Merci, Bonne soiree...)
+'     et precedent tout historique cite (De :, From:, -----Message
+'     d'origine-----, "a ecrit :", separateur Outlook). A defaut, les 10
+'     dernieres lignes (v1.8 : pour SenderSignaturePhones, a partir de la
+'     ligne qui porte le nom de l'expediteur seulement).
 '   - Dans la signature : telephones (normalises E.164, mobile / fixe
 '     distingues), site web, adresse postale (ligne code postal + ville,
 '     precedee de la ligne "rue"), fonction et societe (les deux premieres
@@ -46,7 +62,8 @@ Option Explicit
 '
 ' ANTI-DOUBLON : avant creation, recherche dans les dossiers de contacts du
 ' compte cible par adresse e-mail puis par nom. Si trouve : Oui = ouvrir la
-' fiche existante, Non = creer quand meme, Annuler.
+' fiche existante, Non = creer quand meme, Annuler. v1.8 : noms compares
+' mots tries (l'ordre prenom / nom ne compte plus).
 '
 ' NOUVEAU v1.4 :
 '   - COMPLETER UNE FICHE EXISTANTE : si l'anti-doublon trouve la personne,
@@ -55,7 +72,9 @@ Option Explicit
 '     validation - rien n'est ecrit avant ton Enregistrer. La signature
 '     datee est ajoutee EN TETE des notes, l'existant est conserve.
 '   - EXTRACTION DURCIE : libelles de ligne lus (Mob/Port/GSM -> mobile,
-'     Tel/Fixe/Standard/Office -> bureau, Fax ecarte) ; "+33(6) 03..."
+'     Tel/Fixe/Standard/Office -> bureau, Fax ecarte ; v1.8 : mots entiers,
+'     et un numero francais est classe par son prefixe, quel que soit le
+'     libelle : 06 / 07 = mobile, autre = bureau) ; "+33(6) 03..."
 '     reconnu ; adresse "72000, Le Mans" (virgule) et "F-75008" (prefixe
 '     pays) reconnues ; rue sur 2 lignes (complement Bureau/Bat/Zone...) ;
 '     pays detecte (", France" ou ligne seule) ; lignes reseaux sociaux /
@@ -111,6 +130,8 @@ Option Explicit
 '   ContactCreateFromMail        creation / completion depuis un e-mail
 '   ContactFromMailDiagnose      diagnostic de l'analyse (aucune ecriture)
 '   ContactFromMailProbeFolders  diagnostic des dossiers de contacts
+' FONCTION PUBLIQUE (v1.7, appelee par modContactEnrich) :
+'   SenderSignaturePhones        telephones de la signature de l'expediteur
 '
 ' Dependances : modConfig (Cfg, T, A, MacroVBADir), modDebugLog,
 '   modMsgBoxCustom (Confirm3), modContactNormalize (PhoneFormatCanonical
@@ -122,14 +143,16 @@ Option Explicit
 '=============================================================================
 
 Private Const MOD_NAME As String = "ContMail"
-Private Const MOD_VERSION As String = "v1.6 - 2026-10-22"
+Private Const MOD_VERSION As String = "v1.8 - 2026-11-16"
 
 Private Const PROPTAG_HIDDEN As String = "http://schemas.microsoft.com/mapi/proptag/0x10F4000B"
 Private Const PROPTAG_SENDER_SMTP As String = "http://schemas.microsoft.com/mapi/proptag/0x5D02001F"
 Private Const PROPTAG_RECIP_SMTP As String = "http://schemas.microsoft.com/mapi/proptag/0x39FE001F"
-Private Const DEFAULT_SKIP As String = "{*|Recipient Cache|*sugg*|GAL Contacts|Organizational Contacts|Companies|PeopleCentricConversation Buddies|*Lync*|*Skype*|ExternalContacts"
 ' Formules de politesse (minuscules, sans accent) qui precedent une signature.
-Private Const CLOSINGS As String = "cordialement|bien cordialement|tres cordialement|sinceres salutations|salutations|salutations distinguees|bien a vous|bien a toi|amicalement|a bientot|belle journee|bonne journee|bonne reception|merci d'avance|merci par avance|cdlt|cdt|best regards|kind regards|warm regards|regards|best|thanks|thank you|many thanks|sincerely|cheers"
+Private Const CLOSINGS1 As String = "cordialement|bien cordialement|tres cordialement|sinceres salutations|salutations|salutations distinguees|bien a vous|bien a toi|amicalement|a bientot|belle journee|bonne journee|bonne reception|merci d'avance|merci par avance|cdlt|cdt|best regards|kind regards|warm regards|regards|best|thanks|thank you|many thanks|sincerely|cheers"
+' v1.8 (F7-11) : formules courantes absentes avant ("Merci, Jean DUPONT"),
+' reconnues sur une ligne courte seulement (IsClosing).
+Private Const CLOSINGS2 As String = "merci|merci beaucoup|bonne fin de journee|belle fin de journee|bonne soiree|belle soiree|bon week-end|bon weekend|au plaisir|a tres vite|a tres bientot|excellente journee|tres bonne journee"
 ' Marqueurs d'historique cite (debut de ligne, minuscules, sans accent).
 Private Const HISTORY_MARKS As String = "de :|de:|from:|from :|envoye :|envoye:|sent:|sent :|-----message d'origine|-----original message|________________________________|le * a ecrit|on * wrote:|-*message transfere|-*forwarded message|debut du message reexpedie|begin forwarded message|>"
 ' Libelles du bloc d'en-tete cite (De / Envoye / A / Cc / Objet...), sautes
@@ -138,9 +161,13 @@ Private Const QUOTED_HEADER_LABELS As String = "de :|de:|from:|from :|envoye :|e
 ' Adresse e-mail (VBScript.RegExp, IgnoreCase).
 Private Const MAIL_PATTERN As String = "[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}"
 ' Libelles de telephone (minuscules, sans accent) - fax teste en premier.
-Private Const FAX_LABELS As String = "fax|telecopie"
-Private Const MOBILE_LABELS As String = "mob|portable|port|gsm|cell"
-Private Const FIXED_LABELS As String = "tel|fixe|standard|office|bureau|direct|phone|work|ligne"
+' v1.8 (F7-09) : libelles compares en MOTS ENTIERS (LabelIn) - "support",
+' "transport", "aeroport" ne sont plus "port", "hotel" n'est plus "tel".
+' "M" seul = mobile (numeros etrangers ; un numero francais est classe par
+' son prefixe).
+Private Const FAX_LABELS As String = "fax|telecopie|telecopieur"
+Private Const MOBILE_LABELS As String = "mob|mobile|portable|port|gsm|cell|cellulaire|cellular|m"
+Private Const FIXED_LABELS As String = "tel|telephone|fixe|standard|office|bureau|direct|phone|ph|work|ligne"
 ' Mots de fonction (jetons entiers) : classe une ligne comme FONCTION.
 Private Const TITLE_HINTS1 As String = "directeur|directrice|director|dg|ceo|cto|coo|cfo|cio|president|presidente|vp|responsable|manager|charge|chargee|chef|head|ingenieur|ingenieure|engineer|consultant|consultante|associe|associee|partner|fondateur|fondatrice|founder|cofondateur|gerant|gerante|adjoint|adjointe|deputy|officer|assistant|assistante|juriste|avocat|avocate|notaire|docteur|dr|professeur|chercheur|chercheuse|researcher|analyste|analyst|account|developer|commercial|commerciale|sales|marketing|achats|buyer|expert|experte|architecte|technicien|technicienne|coordinateur|coordinatrice|referent|referente|leader|lead|owner"
 Private Const TITLE_HINTS2 As String = "courtier|broker|conseiller|conseillere|advisor|adviser|agent|attache|attachee|delegue|deleguee|gestionnaire|secretaire|secretary|stagiaire|intern|alternant|alternante|apprenti|apprentie|doctorant|doctorante|postdoc|post-doc|phd|enseignant|enseignante|maitre|lecturer|scientist|scientifique|specialist|specialiste|comptable|accountant|controleur|controller|auditeur|auditrice|auditor|formateur|formatrice|trainer|coach|designer|developpeur|developpeuse|administrateur|administratrice|administrator|recruteur|recruteuse|recruiter|redacteur|redactrice|editor|journaliste|journalist"
@@ -207,6 +234,7 @@ Private mQuoteStart As Long       ' index de la ligne d'historique dont l'auteur
 Private mSigSource As Long        ' 0 = haut du mail, 1 = zone surlignee, 2 = message cite
 Private mNameLine As Long         ' index de la ligne "Prenom NOM" dans la signature (-1 = aucune)
 Private mNameRest As String       ' reste de la ligne nom ("Directeur" dans "Jean Dupont | Directeur")
+Private mSigNoClosing As Boolean  ' v1.8 (F7-11) : signature prise "10 dernieres lignes" (aucune formule)
 
 '=============================================================================
 ' ModVersion - version REELLEMENT chargee dans le VBE.
@@ -374,6 +402,64 @@ ErrH:
 End Sub
 
 '=============================================================================
+' SenderSignaturePhones (v1.7) - PUBLIQUE, sans affichage ni ecriture.
+' Appelee par modContactEnrich ("Completer les coordonnees des contacts").
+' Lit la signature de l'EXPEDITEUR du mail : haut du mail seulement (avant
+' tout historique cite), personne visee = l'expediteur lui-meme (pas de
+' bascule vers l'auteur d'un message cite, contrairement a la creation de
+' fiche ; ta propre signature est ecartee comme dans AnalyzeMail).
+' Telephones a la convention du toolkit (PhoneFormatCanonical).
+'   mail              : mail RECU de la personne
+'   mobile / phone / phone2 : numeros lus ("" si absent), fax ecarte
+'   sigText           : texte de la signature lue (controle du nom par
+'                       l'appelant)
+'   reload            : relire les reglages (True au 1er appel d'une serie)
+' Renvoie True si au moins un numero a ete lu.
+'=============================================================================
+Public Function SenderSignaturePhones(ByVal mail As Outlook.MailItem, ByRef mobile As String, _
+                                      ByRef phone As String, ByRef phone2 As String, _
+                                      ByRef sigText As String, _
+                                      Optional ByVal reload As Boolean = True) As Boolean
+    Dim errNo As Long, errDesc As String, lines() As String
+    On Error GoTo ErrH
+    mobile = ""
+    phone = ""
+    phone2 = ""
+    sigText = ""
+    If mail Is Nothing Then Exit Function
+    If reload Or Len(mCountryCode) = 0 Then LoadSettings
+    ResetResult
+    lines = Split(NormalizeLines(SafeStr(mail.Body)), vbLf)
+    mSmtp = SenderSmtp(mail)
+    mDisplay = Trim$(SafeStr(mail.SenderName))
+    If Len(mDisplay) = 0 And Len(mSmtp) > 0 Then mDisplay = mSmtp
+    mHeaderSmtp = mSmtp
+    SplitDisplayName mDisplay, mFirst, mLast
+    mQuoteStart = -1
+    mSig = ExtractSignature(lines, -1)
+    mSigSource = 0
+    ' v1.8 (F7-11) : sans formule de politesse reconnue, les "10 dernieres
+    ' lignes" peuvent contenir le texte du mail (un numero d'un tiers) : on
+    ' ne garde que les lignes a partir de celle qui porte le nom de
+    ' l'expediteur ; aucune ne le porte = pas de signature lue.
+    If mSigNoClosing Then mSig = FromNameLine(mSig)
+    If Len(Trim$(mSig)) = 0 Then Exit Function
+    If IsOwnSignature(mSig) Then Exit Function       ' ta propre signature (citee) : jamais lue
+    ParseSignature
+    mobile = mMobile
+    phone = mPhone
+    phone2 = mPhone2
+    sigText = mSig
+    SenderSignaturePhones = (Len(mobile) + Len(phone) + Len(phone2) > 0)
+    Exit Function
+ErrH:
+    errNo = Err.Number
+    errDesc = Err.Description
+    On Error Resume Next
+    modDebugLog.DError MOD_NAME, "SenderSignaturePhones err " & errNo & " - " & errDesc
+End Function
+
+'=============================================================================
 ' Reglages / etat
 '=============================================================================
 Private Sub LoadSettings()
@@ -383,7 +469,7 @@ Private Sub LoadSettings()
     mCountryCode = DigitsOnly(modConfig.Cfg("PhoneDefaultCountryCode", "33"))
     If Len(mCountryCode) = 0 Then mCountryCode = "33"
     mInternal = "|" & LCase$(Replace(modConfig.Cfg("InternalDomains", ""), " ", "")) & "|"
-    mSkipFolders = modConfig.Cfg("ContactSkipFolders", DEFAULT_SKIP)
+    mSkipFolders = modConfig.Cfg("ContactSkipFolders", modContactCommon.ContactSkipDefault())
     BuildOwnIdentity
 End Sub
 
@@ -416,7 +502,7 @@ Private Function IsSelf(ByVal smtp As String) As Boolean
     IsSelf = (InStr(mOwnAddr, "|" & LCase$(Trim$(smtp)) & "|") > 0)
 End Function
 
-' "GAMBUTO Alexandre" = "Alexandre Gambuto" (ordre des mots indifferent).
+' "DUPONT Jean" = "Jean Dupont" (ordre des mots indifferent).
 Private Function IsOwnName(ByVal s As String) As Boolean
     Dim k As String
     k = NormKey(s)
@@ -446,7 +532,7 @@ Private Sub ResetResult()
     mDept = "": mCountry = "": mPhoneLines = "|"
     mMailDate = 0: mMailSubject = ""
     mHeaderSmtp = "": mSigMail = "": mQuoteStart = -1: mSigSource = 0
-    mNameLine = -1: mNameRest = ""
+    mNameLine = -1: mNameRest = "": mSigNoClosing = False
 End Sub
 
 Private Function UiTitle() As String
@@ -872,8 +958,10 @@ End Function
 
 ' Lignes qui suivent la derniere formule de politesse de la plage (15 max),
 ' sinon les 10 dernieres lignes non vides. dq : retire les prefixes ">".
+' v1.8 : mSigNoClosing = True quand c'est le repli "10 dernieres lignes".
 Private Function SignatureInRange(ByRef lines() As String, ByVal segFrom As Long, ByVal segTo As Long, ByVal dq As Boolean) As String
     Dim li As Long, startAt As Long, res As String, cnt As Long, ln As String
+    mSigNoClosing = False
     If segTo < segFrom Then Exit Function
     startAt = -1
     For li = segTo To segFrom Step -1
@@ -896,6 +984,7 @@ Private Function SignatureInRange(ByRef lines() As String, ByVal segFrom As Long
         Next li
     End If
     If cnt = 0 Then
+        mSigNoClosing = True
         For li = segTo To segFrom Step -1
             ln = Trim$(lines(li))
             If dq Then ln = Dequote(ln)
@@ -907,6 +996,24 @@ Private Function SignatureInRange(ByRef lines() As String, ByVal segFrom As Long
         Next li
     End If
     SignatureInRange = res
+End Function
+
+' v1.8 (F7-11) : lignes de sig a partir de la premiere qui porte le nom (ou
+' le prenom) de l'expediteur, en mots entiers (LooksLikeName) ; "" si aucune.
+Private Function FromNameLine(ByVal sig As String) As String
+    Dim arr() As String, li As Long, k As Long, res As String
+    arr = Split(sig, vbLf)
+    For li = LBound(arr) To UBound(arr)
+        If Len(Trim$(arr(li))) > 0 Then
+            If LooksLikeName(arr(li)) Then
+                For k = li To UBound(arr)
+                    If Len(arr(k)) > 0 Then res = res & arr(k) & vbLf
+                Next k
+                Exit For
+            End If
+        End If
+    Next li
+    FromNameLine = res
 End Function
 
 Private Function IsHistoryMark(ByVal ln As String) As Boolean
@@ -929,9 +1036,20 @@ Private Function IsClosing(ByVal ln As String) As Boolean
     s = StripAccents(LCase$(Trim$(ln)))
     s = Replace(Replace(s, ",", ""), ".", "")
     If Len(s) = 0 Or Len(s) > 40 Then Exit Function
-    cl = Split(CLOSINGS, "|")
+    cl = Split(CLOSINGS1, "|")
     For idx = LBound(cl) To UBound(cl)
         If s = cl(idx) Or s Like cl(idx) & " *" Or s Like cl(idx) & "*" Then
+            IsClosing = True
+            Exit Function
+        End If
+    Next idx
+    ' v1.8 (F7-11) : formules ajoutees, sur une ligne COURTE seulement : "Merci
+    ' de penser a l'environnement avant d'imprimer" (mention en bas de
+    ' signature) ne doit pas passer pour la formule de politesse.
+    If Len(s) > 25 Then Exit Function
+    cl = Split(CLOSINGS2, "|")
+    For idx = LBound(cl) To UBound(cl)
+        If s = cl(idx) Or s Like cl(idx) & " *" Or s Like cl(idx) & "!*" Then
             IsClosing = True
             Exit Function
         End If
@@ -1284,7 +1402,7 @@ Private Function PersonNameFrom(ByVal s As String, ByRef rest As String) As Stri
     Loop
     If Len(work) < 3 Then Exit Function
     parts = Split(work, " ")
-    ' formule d'appel ("Bonjour Alexandre") : jamais un nom
+    ' formule d'appel ("Bonjour Jean") : jamais un nom
     wl = Replace(StripAccents(LCase$(parts(LBound(parts)))), ".", "")
     If InStr("|" & GREETINGS & "|", "|" & wl & "|") > 0 Then Exit Function
     ' civilites en tete (Dr, Pr, Me, M., Mme...)
@@ -1389,6 +1507,9 @@ End Function
 '=============================================================================
 ' Telephones : segment par segment (/, ;, |), libelle lu avant le numero.
 ' Fax ecarte. Mobile = libelle Mob/Port/GSM, sinon prefixe +336/+337.
+' v1.8 (F7-09) : un numero FRANCAIS (+33, 9 chiffres) est classe par son
+' prefixe, le libelle ne compte plus (les signatures ecrivent souvent
+' "Tel : 06..." devant un portable) ; libelles en mots entiers (LabelIn).
 '=============================================================================
 Private Sub ExtractPhones()
     On Error Resume Next
@@ -1408,11 +1529,11 @@ Private Sub ExtractPhones()
             If mt.Count > 0 Then
                 segLow = StripAccents(LCase$(Left$(seg, mt.Item(0).FirstIndex)))
                 kind = 0                                   ' 0=auto 1=mobile 2=fixe 3=fax
-                If HasHint(segLow, FAX_LABELS) Then
+                If LabelIn(segLow, FAX_LABELS) Then
                     kind = 3
-                ElseIf HasHint(segLow, MOBILE_LABELS) Then
+                ElseIf LabelIn(segLow, MOBILE_LABELS) Then
                     kind = 1
-                ElseIf HasHint(segLow, FIXED_LABELS) Then
+                ElseIf LabelIn(segLow, FIXED_LABELS) Then
                     kind = 2
                 End If
                 mPhoneLines = mPhoneLines & li & "|"
@@ -1420,7 +1541,12 @@ Private Sub ExtractPhones()
                     For k = 0 To mt.Count - 1
                         e164 = ToE164(mt.Item(k).Value)
                         If Len(e164) > 0 And e164 <> mMobile And e164 <> mPhone And e164 <> mPhone2 Then
-                            isMob = (kind = 1) Or (kind = 0 And (Left$(e164, 4) = "+336" Or Left$(e164, 4) = "+337"))
+                            If Left$(e164, 3) = "+33" And Len(e164) = 12 Then
+                                ' Numero francais : 06 / 07 = mobile, sinon fixe.
+                                isMob = (Mid$(e164, 4, 1) = "6" Or Mid$(e164, 4, 1) = "7")
+                            Else
+                                isMob = (kind = 1)
+                            End If
                             If isMob And Len(mMobile) = 0 Then
                                 mMobile = e164
                             ElseIf Len(mPhone) = 0 Then
@@ -1464,6 +1590,27 @@ Private Function HasHint(ByVal low As String, ByVal hintList As String) As Boole
             Exit Function
         End If
     Next idx
+End Function
+
+' v1.8 (F7-09) : libelle devant un numero ("Tel. :", "Mob:", "T :") - un
+' des MOTS ENTIERS du texte (lettres seules, toute autre marque = espace)
+' figure-t-il dans la liste ?
+Private Function LabelIn(ByVal low As String, ByVal tokenList As String) As Boolean
+    Dim k As Long, ch As String, s As String, words() As String, bag As String
+    For k = 1 To Len(low)
+        ch = Mid$(low, k, 1)
+        If ch Like "[a-z]" Then s = s & ch Else s = s & " "
+    Next k
+    s = CollapseSpaces(Trim$(s))
+    If Len(s) = 0 Then Exit Function
+    words = Split(s, " ")
+    bag = "|" & tokenList & "|"
+    For k = LBound(words) To UBound(words)
+        If InStr(bag, "|" & words(k) & "|") > 0 Then
+            LabelIn = True
+            Exit Function
+        End If
+    Next k
 End Function
 
 ' Un des MOTS ENTIERS de la ligne figure-t-il dans la liste ?
@@ -1905,20 +2052,9 @@ End Function
 ' les emojis et autres caracteres hors plage sortiraient en "??". On les
 ' retire du libelle affiche (le nom reel du dossier n'est pas touche).
 Private Function AnsiOnly(ByVal s As String) As String
-    Dim idx As Long, code As Long, ch As String, out As String
-    For idx = 1 To Len(s)
-        ch = Mid$(s, idx, 1)
-        code = AscW(ch)
-        If code < 0 Then code = code + 65536
-        If code <= 255 Or (code >= 338 And code <= 339) Or code = 8364 Then
-            out = out & ch
-        ElseIf code >= 55296 And code <= 57343 Then
-            ' moitie de paire de substitution (emoji) : ignoree
-        ElseIf code = 65039 Or code = 8205 Then
-            ' selecteur de variante / joncteur : ignores
-        End If
-    Next idx
-    AnsiOnly = CollapseSpaces(Trim$(out))
+    ' v1.8 (F7-14) : delegation modContactCommon (meme regle : latin-1, OE,
+    ' euro ; emojis, selecteurs et joncteurs retires).
+    AnsiOnly = modContactCommon.AnsiOnly(s)
 End Function
 
 Private Function IsSkippedFolder(ByVal fld As Outlook.MAPIFolder) As Boolean
@@ -1941,8 +2077,10 @@ Private Function FindExisting(ByVal st As Outlook.Store) As Outlook.ContactItem
     Dim folders As Collection, idx As Long, itm As Object
     Set folders = New Collection
     CollectContactFolders st.GetRootFolder, folders
+    ' v1.8 (F7-10) : cle mots TRIES - "Dupont Jean" (ordre non tranche par
+    ' SplitDisplayName) retrouve la fiche "Jean DUPONT".
     Dim wantKey As String
-    wantKey = NormKey(mFirst & " " & mLast)
+    wantKey = WordsSorted(NormKey(mFirst & " " & mLast))
 
     ' Pack v3 (B11) : 1) adresse e-mail par Restrict (filtre evalue cote
     ' MAPI, 3 champs Email) - avant : parcours de TOUTES les fiches avec
@@ -1973,23 +2111,33 @@ Private Function FindExisting(ByVal st As Outlook.Store) As Outlook.ContactItem
 
     Dim byNameHit As Outlook.ContactItem
     If Len(wantKey) = 0 Then Exit Function
+    ' v1.8 (F7-10) : passe 1 sur l'un OU l'autre mot du nom (le nom de
+    ' famille peut etre dans mFirst quand l'ordre n'a pas pu etre tranche).
+    Dim snFlt As String, words() As String, w As Long, allWords As String
+    allWords = CollapseSpaces(Trim$(mFirst & " " & mLast))
+    words = Split(allWords, " ")
+    For w = LBound(words) To UBound(words)
+        If Len(words(w)) > 1 Then
+            snFlt = snFlt & IIf(Len(snFlt) > 0, " OR ", "") & Chr(34) & "urn:schemas:contacts:sn" & Chr(34) & _
+                    " LIKE '%" & Replace(words(w), "'", "''") & "%'"
+        End If
+    Next w
     Dim k As Long
     For k = 1 To 2
         For idx = 1 To folders.Count
             Set hits = Nothing
             Err.Clear
-            If k = 1 And Len(mLast) > 1 Then
+            If k = 1 And Len(snFlt) > 0 Then
                 ' Passe 1 : candidats par nom de famille (LIKE, cote MAPI)
-                Set hits = folders(idx).Items.Restrict("@SQL=" & Chr(34) & _
-                    "urn:schemas:contacts:sn" & Chr(34) & " LIKE '%" & Replace(mLast, "'", "''") & "%'")
+                Set hits = folders(idx).Items.Restrict("@SQL=" & snFlt)
             ElseIf k = 2 Then
                 Set hits = folders(idx).Items
             End If
             If Err.Number = 0 And Not hits Is Nothing Then
                 For Each itm In hits
                     If TypeName(itm) = "ContactItem" Then
-                        If NormKey(SafeStr(itm.FirstName) & " " & SafeStr(itm.LastName)) = wantKey Or _
-                           NormKey(SafeStr(itm.FullName)) = wantKey Then
+                        If WordsSorted(NormKey(SafeStr(itm.FirstName) & " " & SafeStr(itm.LastName))) = wantKey Or _
+                           WordsSorted(NormKey(SafeStr(itm.FullName))) = wantKey Then
                             Set FindExisting = itm
                             Exit Function
                         End If
@@ -1998,11 +2146,11 @@ Private Function FindExisting(ByVal st As Outlook.Store) As Outlook.ContactItem
             End If
             Err.Clear
         Next idx
-        If k = 1 And Len(mLast) <= 1 Then Exit For
+        If k = 1 And Len(snFlt) = 0 Then Exit For
         ' Le parcours complet (passe 2) n'a de sens que si le nom porte des
         ' accents (LIKE est sensible aux accents, NormKey ne l'est pas) :
         ' sinon la passe 1 est exhaustive et on evite de re-lire toute la boite.
-        If k = 1 And StripAccents(mLast) = mLast Then Exit For
+        If k = 1 And StripAccents(allWords) = allWords Then Exit For
     Next k
     Set FindExisting = byNameHit
     Err.Clear
@@ -2086,16 +2234,17 @@ Private Function NewFieldsSummary(ByVal ct As Outlook.ContactItem) As String
     Err.Clear
 End Function
 
-' Numero deja porte par la fiche (comparaison chiffres seuls, tous champs) ?
+' Numero deja porte par la fiche (tous champs) ? v1.8 (F7-14) : compare sur
+' les 9 derniers chiffres comme modContactEnrich ("06 12..." = "+33 6 12...").
 Private Function PhoneKnown(ByVal ct As Outlook.ContactItem, ByVal e164 As String) As Boolean
     On Error Resume Next
     Dim props As Variant, idx As Long, digits As String, have As String
-    digits = DigitsOnly(e164)
+    digits = modContactCommon.PhoneTail(e164)
     If Len(digits) = 0 Then Exit Function
     props = Array("MobileTelephoneNumber", "BusinessTelephoneNumber", "Business2TelephoneNumber", _
                   "HomeTelephoneNumber", "CompanyMainTelephoneNumber", "OtherTelephoneNumber")
     For idx = LBound(props) To UBound(props)
-        have = DigitsOnly(SafeStr(CallByName(ct, CStr(props(idx)), VbGet)))
+        have = modContactCommon.PhoneTail(SafeStr(CallByName(ct, CStr(props(idx)), VbGet)))
         If Len(have) > 0 And have = digits Then
             PhoneKnown = True
             Exit Function
@@ -2157,8 +2306,8 @@ End Sub
 ' les dossiers de contacts de TOUS les comptes - chemin complet, nombre de
 ' fiches, motifs d'exclusion ([SKIP] motif ContactSkipFolders, [MASQUE]
 ' dossier cache, [CORBEILLE]). Sert a retrouver un dossier disparu des
-' decomptes. Rapport texte dans Bureau\Macro VBA\Outlook, ouvert dans
-' Notepad sur demande.
+' decomptes. Rapport texte dans <outil>\Sorties\ (modConfig.MacroVBADir),
+' ouvert dans Notepad sur demande.
 '=============================================================================
 Public Sub ContactFromMailProbeFolders()
     Dim errNo As Long, errDesc As String

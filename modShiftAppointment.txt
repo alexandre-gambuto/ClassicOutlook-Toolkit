@@ -1,7 +1,12 @@
 Option Explicit
 
 ' =====================================================================
-' modShiftAppointment v3.1
+' modShiftAppointment v3.2
+' v3.2 (2026-11-16) : audit 11/2026 - F6-08 : un rendez-vous decale par
+'   -15 / +15 min ou ajuste par "Duree reelle" recoit la marque "place a la
+'   main" (modAntiOverlap.MarkAsUserPlaced) avant son Save : l'anti-
+'   chevauchement ne l'annule plus ("-15" sur un creneau pris) et ne le
+'   double plus ("+15" vers un creneau pris). Dependance : modAntiOverlap v7.2.
 ' Purpose (EN): shifts the selected calendar appointment by +/-15 min
 '   (duration unchanged). Refuses recurring masters; warns before turning
 '   a recurring occurrence into an exception. v3 adds SetActualDuration:
@@ -69,7 +74,7 @@ Option Explicit
 ' =====================================================================
 
 Private Const MOD_NAME As String = "ShiftAppt"
-Private Const MOD_VERSION As String = "v3.1 - 2026-06-11"
+Private Const MOD_VERSION As String = "v3.2 - 2026-11-16"
 
 Public Function ModVersion() As String
     ModVersion = MOD_VERSION
@@ -164,6 +169,11 @@ Private Sub ShiftSelectedAppointment(ByVal minutesToShift As Long)
     ' mais par securite on recalcule End explicitement.
     appt.Start = newStart
     appt.End = DateAdd("n", minutesToShift, origEnd)
+
+    ' v3.2 (F6-08) : place a la main -> l'anti-chevauchement ne le deplace
+    ' plus (sinon "-15" sur un creneau pris revenait aussitot a sa place, et
+    ' "+15" partait a +30). Marque posee avant le Save, sans Save propre.
+    modAntiOverlap.MarkAsUserPlaced appt
 
     appt.Save
 
@@ -287,6 +297,9 @@ Public Sub SetActualDuration()
     ' --- Save silencieux : suspendre le pipeline calendrier ---
     ThisOutlookSession.SuspendCalendarEvents = True
     appt.End = DateAdd("n", newMin, appt.Start)
+    ' v3.2 (F6-08) : la suspension ne couvre pas un ItemChange livre apres
+    ' le retour ; la marque "place a la main" rend TryShift inoffensif.
+    modAntiOverlap.MarkAsUserPlaced appt
     appt.Save
     ThisOutlookSession.SuspendCalendarEvents = False
 

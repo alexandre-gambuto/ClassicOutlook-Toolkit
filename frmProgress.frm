@@ -13,19 +13,41 @@ Attribute VB_GlobalNameSpace = False
 Attribute VB_Creatable = False
 Attribute VB_PredeclaredId = True
 Attribute VB_Exposed = False
-' ============================================================================
-' frmProgress - CODE V23
-' Formulaire de progression de l'analyse
-' ADAPTÉ aux noms de contrôles existants
-' ============================================================================
 Option Explicit
+
+' ============================================================================
+' frmProgress - CODE V23.7
+' Formulaire de progression de l'analyse
+' V23.7 (2026-11-16) : audit 11/2026 - F9-11, F9-04 (+ partie code de F9-12) :
+'         * F9-11 : le bouton Pause change vraiment d'intitule (Chr(9654) /
+'           Chr(9208) levaient l'erreur 5, masquee : la ligne etait sautee ;
+'           symboles retires, texte seul) ; etat "En pause..." traduit ;
+'           la pause attend par modCommon.SleepMs (avant : boucle DoEvents
+'           sans pause, un coeur du processeur a 100 %).
+'         * F9-04 : modMailAnalytics affiche le message final puis ferme la
+'           fenetre lui-meme (plus d'attente du clic sur Fermer).
+'         * F9-12 : libelles par T(), journal par modDebugLog, Option
+'           Explicit en ligne 1.
+' V23.6 : la barre bleue s'affichait en haut a gauche du FORMULAIRE :
+'         lblProgressBar existe bien dans la maquette mais comme enfant
+'         du formulaire (pas du cadre gris), et la V23.4 le positionnait
+'         en Left=0/Top=0 (coordonnees formulaire). La barre est
+'         desormais superposee au cadre fraProgressBack quel que soit
+'         son parent, et pilotee via une reference m_Bar unique.
+' ADAPTE aux noms de controles existants
+' ============================================================================
+
+' V23.7 (F9-12) : meme filtre de journal que modMailAnalytics.
+Private Const MOD_NAME As String = "Analytics"
+Private Const PAUSE_SLICE_MS As Long = 50   ' V23.7 (F9-11) : attente pendant la pause
 
 Private m_Cancelled As Boolean
 Private m_Paused As Boolean
 Private m_ProgressBarWidth As Double  ' Largeur max de la barre
+Private m_Bar As Object               ' V23.6 : reference unique au remplissage
 
 Private Sub UserForm_Initialize()
-    Debug.Print "[frmProgress] Initialize..."
+    modDebugLog.DDebug MOD_NAME, "frmProgress : Initialize..."
     
     On Error Resume Next
     
@@ -39,56 +61,89 @@ Private Sub UserForm_Initialize()
     End If
     If m_ProgressBarWidth = 0 Then m_ProgressBarWidth = 480
     
-    ' Initialiser les labels (sans emojis pour compatibilité)
-    lblTitre.caption = "Analyzing emails..."
-    lblStatus.caption = "Initializing..."
-    lblBoite.caption = "Mailbox : -"
-    lblEmails.caption = "Emails processed: 0 / 0"
-    lblTempsEcoule.caption = "Elapsed time: 0 min 0 sec"
-    lblTempsRestant.caption = "Estimated time left: calculating..."
+    ' Initialiser les labels (sans emojis pour compatibilite)
+    lblTitre.Caption = T("Analyse des mails...", "Analyzing emails...")
+    lblStatus.Caption = T("Initialisation...", "Initializing...")
+    lblBoite.Caption = T("Bo~ite : -", "Mailbox: -")
+    lblEmails.Caption = T("Mails examin~es : 0 / 0", "Emails processed: 0 / 0")
+    lblTempsEcoule.Caption = T("Temps ~ecoul~e : 0 min 0 s", "Elapsed time: 0 min 0 sec")
+    lblTempsRestant.Caption = T("Temps restant estim~e : calcul...", "Estimated time left: calculating...")
     
     ' Si lblDetail existe
     On Error Resume Next
-    Me.controls("lblDetail").caption = ""
+    Me.Controls("lblDetail").Caption = ""
     On Error GoTo 0
     
     ' Si lblPercent existe, l'initialiser
     On Error Resume Next
-    Me.controls("lblPercent").caption = "0%"
+    Me.Controls("lblPercent").Caption = "0%"
     On Error GoTo 0
     
-    ' Si lblProgressBar existe, l'initialiser
+    ' V23.6 : barre de remplissage. lblProgressBar existe dans la maquette
+    ' comme enfant du FORMULAIRE : on le superpose au cadre gris
+    ' fraProgressBack (coordonnees du parent detectees). S'il n'existe
+    ' pas, on cree un label directement sur le formulaire.
     On Error Resume Next
-    Me.controls("lblProgressBar").Width = 0
-    Me.controls("lblProgressBar").BackColor = RGB(68, 114, 196)
+    Set m_Bar = Nothing
+    Set m_Bar = Me.Controls("lblProgressBar")
+    If m_Bar Is Nothing Then
+        Set m_Bar = Me.Controls.Add("Forms.Label.1", "lblProgressBarRT", True)
+    End If
+    If Not m_Bar Is Nothing Then
+        Dim parentIsFrame As Boolean
+        parentIsFrame = False
+        parentIsFrame = (m_Bar.Parent.Name = fraProgressBack.Name)
+        
+        If parentIsFrame Then
+            ' Coordonnees internes au cadre
+            m_Bar.Left = 1
+            m_Bar.Top = 1
+        Else
+            ' Coordonnees formulaire : superposer au cadre
+            m_Bar.Left = fraProgressBack.Left + 2
+            m_Bar.Top = fraProgressBack.Top + 2
+            m_Bar.ZOrder 0   ' devant le cadre
+        End If
+        m_Bar.Height = fraProgressBack.Height - 4
+        m_Bar.Width = 0
+        m_Bar.Caption = ""
+        m_Bar.BackStyle = 1   ' opaque
+        m_Bar.BackColor = RGB(68, 114, 196)
+        m_Bar.Visible = True
+        
+        ' Largeur utile = largeur du cadre moins les marges
+        m_ProgressBarWidth = fraProgressBack.Width - 4
+    End If
     On Error GoTo 0
     
     ' Boutons
     On Error Resume Next
-    btnPause.caption = "Pause"
+    btnPause.Caption = T("Pause", "Pause")
     btnPause.Enabled = True
-    btnAnnuler.caption = "Cancel"
+    btnAnnuler.Caption = T("Annuler", "Cancel")
     btnAnnuler.Enabled = True
     On Error GoTo 0
     
     ' Bouton Fermer (si existe)
     On Error Resume Next
-    Me.controls("btnFermer").Visible = False
+    Me.Controls("btnFermer").Visible = False
     On Error GoTo 0
     
-    Debug.Print "[frmProgress] Initialize terminé"
+    modDebugLog.DDebug MOD_NAME, "frmProgress : Initialize termine"
 End Sub
 
 ' ============================================================================
-' MISE À JOUR DE LA PROGRESSION
+' MISE A JOUR DE LA PROGRESSION
 ' ============================================================================
 Public Sub UpdateProgress(current As Long, total As Long, storeName As String, _
                           storeIndex As Long, storeCount As Long)
     On Error Resume Next
     
     ' Gestion de la pause
+    ' V23.7 (F9-11) : vraie attente (Sleep par tranches + DoEvents) au lieu
+    ' d'un DoEvents sans pause qui occupait un coeur a 100 %.
     Do While m_Paused And Not m_Cancelled
-        DoEvents
+        modCommon.SleepMs PAUSE_SLICE_MS
     Loop
     
     If m_Cancelled Then Exit Sub
@@ -101,19 +156,19 @@ Public Sub UpdateProgress(current As Long, total As Long, storeName As String, _
         pct = 0
     End If
     
-    ' Mise à jour des labels (sans emojis)
-    lblBoite.caption = "Mailbox : " & storeName & " (" & storeIndex & "/" & storeCount & ")"
-    lblEmails.caption = "Emails processed: " & Format(current, "#,##0") & " / " & Format(total, "#,##0")
-    lblStatus.caption = "Analyzing... " & Format(pct, "0") & "%"
+    ' Mise a jour des labels (sans emojis)
+    lblBoite.Caption = T("Bo~ite : ", "Mailbox: ") & storeName & " (" & storeIndex & "/" & storeCount & ")"
+    lblEmails.Caption = T("Mails examin~es : ", "Emails processed: ") & Format(current, "#,##0") & " / " & Format(total, "#,##0")
+    lblStatus.Caption = T("Analyse en cours... ", "Analyzing... ") & Format(pct, "0") & "%"
     
-    ' Pourcentage (si contrôle existe)
+    ' Pourcentage (si controle existe)
     On Error Resume Next
-    Me.controls("lblPercent").caption = Format(pct, "0") & "%"
+    Me.Controls("lblPercent").Caption = Format(pct, "0") & "%"
     On Error GoTo 0
     
-    ' Barre de progression (si contrôle lblProgressBar existe)
+    ' Barre de progression (V23.6 : via la reference m_Bar)
     On Error Resume Next
-    Me.controls("lblProgressBar").Width = (pct / 100) * m_ProgressBarWidth
+    If Not m_Bar Is Nothing Then m_Bar.Width = (pct / 100) * m_ProgressBarWidth
     On Error GoTo 0
     
     DoEvents
@@ -122,22 +177,22 @@ End Sub
 Public Sub SetTimeInfo(elapsedSeconds As Long, remainingSeconds As Long)
     On Error Resume Next
     
-    ' Temps écoulé
+    ' Temps ecoule
     Dim elapsedMin As Long, elapsedSec As Long
     elapsedMin = elapsedSeconds \ 60
     elapsedSec = elapsedSeconds Mod 60
-    lblTempsEcoule.caption = "Elapsed time: " & elapsedMin & " min " & elapsedSec & " sec"
+    lblTempsEcoule.Caption = T("Temps ~ecoul~e : ", "Elapsed time: ") & elapsedMin & " min " & elapsedSec & T(" s", " sec")
     
     ' Temps restant
     If remainingSeconds > 0 Then
         Dim remMin As Long, remSec As Long
         remMin = remainingSeconds \ 60
         remSec = remainingSeconds Mod 60
-        lblTempsRestant.caption = "Estimated time left: " & remMin & " min " & remSec & " sec"
+        lblTempsRestant.Caption = T("Temps restant estim~e : ", "Estimated time left: ") & remMin & " min " & remSec & " sec"
     ElseIf remainingSeconds = 0 Then
-        lblTempsRestant.caption = "Estimated time left: < 1 min"
+        lblTempsRestant.Caption = T("Temps restant estim~e : < 1 min", "Estimated time left: < 1 min")
     Else
-        lblTempsRestant.caption = "Estimated time left: calculating..."
+        lblTempsRestant.Caption = T("Temps restant estim~e : calcul...", "Estimated time left: calculating...")
     End If
     
     DoEvents
@@ -146,21 +201,21 @@ End Sub
 Public Sub SetComplete(message As String)
     On Error Resume Next
     
-    lblTitre.caption = "Analysis complete!"
-    lblStatus.caption = message
+    lblTitre.Caption = T("Analyse termin~ee !", "Analysis complete!")
+    lblStatus.Caption = message
     lblStatus.ForeColor = RGB(0, 128, 0)  ' Vert
     
-    ' Barre à 100%
-    Me.controls("lblPercent").caption = "100%"
-    Me.controls("lblProgressBar").Width = m_ProgressBarWidth
-    Me.controls("lblProgressBar").BackColor = RGB(112, 173, 71)  ' Vert
+    ' Barre a 100%
+    Me.Controls("lblPercent").Caption = "100%"
+    If Not m_Bar Is Nothing Then m_Bar.Width = m_ProgressBarWidth
+    If Not m_Bar Is Nothing Then m_Bar.BackColor = RGB(112, 173, 71)  ' Vert
     
     ' Boutons
     btnPause.Enabled = False
     btnAnnuler.Enabled = False
     
     ' Afficher bouton Fermer si existe
-    Me.controls("btnFermer").Visible = True
+    Me.Controls("btnFermer").Visible = True
     
     DoEvents
 End Sub
@@ -168,23 +223,23 @@ End Sub
 Public Sub SetError(message As String)
     On Error Resume Next
     
-    lblTitre.caption = "Error"
-    lblStatus.caption = "Error: " & message
+    lblTitre.Caption = T("Erreur", "Error")
+    lblStatus.Caption = T("Erreur : ", "Error: ") & message
     lblStatus.ForeColor = RGB(255, 0, 0)  ' Rouge
     
     ' Barre en rouge
-    Me.controls("lblProgressBar").BackColor = RGB(255, 0, 0)
+    If Not m_Bar Is Nothing Then m_Bar.BackColor = RGB(255, 0, 0)
     
     ' Boutons
     btnPause.Enabled = False
     btnAnnuler.Enabled = False
-    Me.controls("btnFermer").Visible = True
+    Me.Controls("btnFermer").Visible = True
     
     DoEvents
 End Sub
 
 ' ============================================================================
-' PROPRIÉTÉS
+' PROPRIETES
 ' ============================================================================
 Public Property Get Cancelled() As Boolean
     Cancelled = m_Cancelled
@@ -197,19 +252,25 @@ End Property
 ' ============================================================================
 ' BOUTONS
 ' ============================================================================
+' V23.7 (F9-11) : Chr() n'accepte que 0 a 255 sur un poste occidental :
+' Chr(9654) / Chr(9208) levaient l'erreur 5 (masquee) et l'intitule ne
+' changeait jamais. Texte seul (pas de glyphe absent de la police).
 Private Sub btnPause_Click()
     On Error Resume Next
     m_Paused = Not m_Paused
     If m_Paused Then
-        btnPause.caption = Chr(9654) & " Reprendre"  ' ?
-        lblStatus.caption = "Paused..."
+        btnPause.Caption = T("Reprendre", "Resume")
+        lblStatus.Caption = T("En pause...", "Paused...")
     Else
-        btnPause.caption = Chr(9208) & " Pause"  ' ?
+        btnPause.Caption = T("Pause", "Pause")
+        lblStatus.Caption = T("Reprise...", "Resuming...")
     End If
 End Sub
 
 Private Sub btnAnnuler_Click()
-    If MsgBox("Voulez-vous annuler l'analyse ?", vbYesNo + vbQuestion, "Confirmation") = vbYes Then
+    If MsgBox(T("Voulez-vous annuler l'analyse ?", "Cancel the analysis?"), _
+              vbYesNo + vbQuestion + vbMsgBoxSetForeground, _
+              T("Confirmation", "Confirmation")) = vbYes Then
         m_Cancelled = True
         m_Paused = False
     End If
@@ -227,5 +288,3 @@ Private Sub UserForm_QueryClose(Cancel As Integer, CloseMode As Integer)
         Me.Hide
     End If
 End Sub
-
-

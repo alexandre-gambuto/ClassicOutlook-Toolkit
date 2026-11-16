@@ -1,7 +1,18 @@
 Option Explicit
 
 ' =====================================================================
-' modNotify v4.5
+' modNotify v4.6
+' v4.6 (2026-11-16) : audit 11/2026 - F2-09, F1-11, F10-13 :
+'   (a) le fichier d'un toast n'est plus efface avant que mshta l'ait lu :
+'   seuls les fichiers de CETTE session dont le toast est ferme depuis plus
+'   d'une minute sont supprimes (avant : tous les notify_*.hta a chaque
+'   toast ; deux toasts dans la meme seconde pouvaient perdre le premier) ;
+'   (b) le script du toast est en JavaScript (moteur toujours present dans
+'   mshta) au lieu de VBScript, que Windows retire progressivement : sans
+'   lui, le toast ne se placait plus et ne se fermait plus ;
+'   (c) IsRectVisibleOnScreen : une position de fenetre tombe-t-elle sur un
+'   ecran branche ? (fenetre calendrier, F1-11) ;
+'   (d) "Toast affiche" passe au niveau DEBUG (3 300 lignes en 3 mois).
 ' Purpose (EN): non-blocking, auto-closing toast notification via an external
 '   mshta.exe process (chosen after every native non-modal channel failed in
 '   the target environment). Colors and duration come from config.ini.
@@ -20,8 +31,9 @@ Option Explicit
 '                            lui-meme (window.setTimeout), independante du
 '                            timeout Popup. Apparait en bas-droite.
 '
-' PRINCIPE : on ecrit un fichier .hta A NOM UNIQUE dans %TEMP% (les
-' anciens sont purges a chaque appel : pas d'accumulation, v4.2), puis on
+' PRINCIPE : on ecrit un fichier .hta A NOM UNIQUE dans %TEMP% (v4.6 :
+' efface une minute apres la fermeture du toast, au toast suivant ; les
+' restes d'une session precedente partent au premier toast), puis on
 ' le lance via WScript.Shell
 ' .Run en mode non bloquant (3e parametre = False). VBA rend la main
 ' immediatement. Le HTA s'affiche puis se ferme seul apres g_ToastDurationMs.
@@ -98,6 +110,9 @@ Option Explicit
 '   NotifyKeptInSent()              - "Reste dans les Elements envoyes"
 '                                         (pilote par g_ToastKeptInSent ;
 '                                          desactive par defaut)
+'   IsRectVisibleOnScreen(gauche, haut, largeur, hauteur)
+'                                  - position de fenetre sur un ecran
+'                                    branche ? (v4.6, F1-11)
 ' =====================================================================
 
 Private Const MOD_NAME As String = "Notify"
@@ -105,6 +120,12 @@ Private Const MOD_NAME As String = "Notify"
 ' Prefixe des fichiers HTA (v4.2 : nom unique par toast, anciens purges).
 Private Const HTA_PREFIX As String = "notify_"
 Private mHtaSeq As Long
+' v4.6 (F2-09) : HTA ecrits pendant la session. Chaque element est un
+' Array(echeance, chemin) : le fichier peut etre efface quand
+' modCommon.TickMs() depasse l'echeance (fermeture du toast + 1 min).
+Private mHtaFiles As Collection
+Private Const HTA_KEEP_MS As Long = 60000
+Private Const HTA_LIST_MAX As Long = 200
 
 ' Dimensions de la fenetre toast (doivent matcher window.resizeTo).
 Private Const TOAST_W As Long = 340
@@ -119,7 +140,7 @@ Private Declare PtrSafe Function MonitorFromWindow Lib "user32" ( _
     ByVal hWnd As LongPtr, ByVal dwFlags As Long) As LongPtr
 Private Declare PtrSafe Function GetMonitorInfo Lib "user32" Alias "GetMonitorInfoA" ( _
     ByVal hMonitor As LongPtr, ByRef lpmi As MONITORINFO) As Long
-Private Const MOD_VERSION As String = "v4.5 - 2026-08-18"
+Private Const MOD_VERSION As String = "v4.6 - 2026-11-16"
 
 ' Moniteur "epingle" pour le PROCHAIN toast uniquement (v4, 2026-06-17).
 ' Arme par RememberToastMonitorFromForeground (appele depuis ItemSend, quand
@@ -149,6 +170,16 @@ Private Type MONITORINFO
 End Type
 
 Private Const MONITOR_DEFAULTTONEAREST As Long = 2
+
+' v4.6 (F1-11) : moniteur qui recoupe un rectangle, ou 0 si aucun
+' (MONITOR_DEFAULTTONULL). API passive : ne touche a aucune fenetre.
+Private Declare PtrSafe Function MonitorFromRect Lib "user32" ( _
+    ByRef lprc As RECT, ByVal dwFlags As Long) As LongPtr
+Private Const MONITOR_DEFAULTTONULL As Long = 0
+' Partie d'une fenetre qui doit rester visible : sa bande de titre (hauteur)
+' sur au moins cette largeur, pour pouvoir la saisir a la souris.
+Private Const VISIBLE_BAND_PX As Long = 40
+Private Const VISIBLE_MIN_W_PX As Long = 100
 
 ' ---------------------------------------------------------------------
 ' Notify
@@ -210,8 +241,9 @@ Public Sub NotifyEx(ByVal message As String, Optional ByVal borderColor As Strin
     ' 3e parametre False = non bloquant : VBA continue immediatement.
     sh.Run "mshta.exe """ & htaPath & """", 1, False
 
-    ' Log ASCII (pas d'accents dans les logs).
-    modDebugLog.DInfo MOD_NAME, "Toast affiche"
+    ' Log ASCII (pas d'accents dans les logs). v4.6 (F10-13) : DEBUG, la
+    ' ligne de l'appelant dit deja ce que le toast annonce.
+    modDebugLog.DDebug MOD_NAME, "Toast affiche"
     Exit Sub
 
 ErrH:
@@ -319,8 +351,9 @@ End Function
 
 ' ---------------------------------------------------------------------
 ' WriteHTA (interne)
-' Genere le contenu HTA et l'ecrit dans %TEMP%\notify.hta (reecrit),
-' en UTF-8 via ADODB.Stream. Renvoie le chemin complet, ou "" si echec.
+' Genere le contenu HTA et l'ecrit dans %TEMP%\notify_<heure>_<n>.hta
+' (nom unique), en UTF-8 via ADODB.Stream. Renvoie le chemin complet, ou
+' "" si echec.
 '
 ' Le HTA :
 '   - <meta charset=utf-8> pour interpreter correctement les accents
@@ -329,6 +362,7 @@ End Function
 '   - se positionne en bas-droite du moniteur Outlook (coordonnees
 '     absolues calculees cote VBA) ; fallback screen.* si indisponible
 '   - se ferme seul apres g_ToastDurationMs (window.setTimeout)
+'   - v4.6 : script en JavaScript (et non plus VBScript)
 ' ---------------------------------------------------------------------
 Private Function WriteHTA(ByVal message As String, ByVal borderColor As String, _
                           ByVal durationMs As Long, ByVal widthPx As Long, _
@@ -344,12 +378,12 @@ Private Function WriteHTA(ByVal message As String, ByVal borderColor As String, 
 
     ' v4.2 : nom UNIQUE par toast. L'ancien notify.hta fixe pouvait etre
     ' reecrit pendant que le mshta du toast precedent le chargeait (rafale)
-    ' -> toast perdu. On purge au passage les anciens notify_*.hta : ceux
-    ' encore tenus par un mshta actif resistent au Kill et partent au tour
-    ' suivant (pas d'accumulation).
-    On Error Resume Next
-    Kill tempDir & "\" & HTA_PREFIX & "*.hta"
-    On Error GoTo ErrH
+    ' -> toast perdu.
+    ' v4.6 (F2-09) : la purge ne vise plus TOUS les notify_*.hta : un mshta
+    ' qui demarre n'a pas encore ouvert son fichier pendant les premieres
+    ' centaines de millisecondes, et le toast suivant l'effacait. Seuls les
+    ' fichiers de toasts fermes depuis plus d'une minute partent.
+    PurgeOldHta tempDir
     mHtaSeq = mHtaSeq + 1
     Dim htaPath As String
     htaPath = tempDir & "\" & HTA_PREFIX & Format(Now, "hhnnss") & "_" & mHtaSeq & ".hta"
@@ -386,13 +420,14 @@ Private Function WriteHTA(ByVal message As String, ByVal borderColor As String, 
     End If
 
     ' Position : moniteur Outlook si resolvable, sinon fallback HTA screen.*.
+    ' v4.6 : instructions JavaScript.
     Dim posX As Long, posY As Long
     Dim moveJs As String
     If GetActiveToastPos(posX, posY, widthPx, heightPx) Then
-        moveJs = "  window.moveTo " & posX & "," & posY & vbCrLf
+        moveJs = "  window.moveTo(" & posX & "," & posY & ");" & vbCrLf
     Else
-        moveJs = "  window.moveTo screen.availWidth-" & (widthPx + TOAST_MARGIN) & _
-                 ", screen.availHeight-" & (heightPx + TOAST_MARGIN) & vbCrLf
+        moveJs = "  window.moveTo(screen.availWidth-" & (widthPx + TOAST_MARGIN) & _
+                 ", screen.availHeight-" & (heightPx + TOAST_MARGIN) & ");" & vbCrLf
     End If
 
     ' v4.5 : son joue par le HTA lui-meme (bgsound, moteur IE). Chemin en
@@ -422,10 +457,10 @@ Private Function WriteHTA(ByVal message As String, ByVal borderColor As String, 
           "display:flex;align-items:center;" & _
           "box-shadow:0 2px 8px rgba(0,0,0,0.18);'>" & _
           msgHtml & "</div>" & vbCrLf & _
-          "<script language='vbscript'>" & vbCrLf & _
-          "  window.resizeTo " & widthPx & "," & heightPx & vbCrLf & _
+          "<script type='text/javascript'>" & vbCrLf & _
+          "  window.resizeTo(" & widthPx & "," & heightPx & ");" & vbCrLf & _
           moveJs & _
-          "  window.setTimeout ""window.close()"", " & durationMs & vbCrLf & _
+          "  window.setTimeout(function(){ window.close(); }, " & durationMs & ");" & vbCrLf & _
           "</script></body></html>"
 
     ' Ecriture UTF-8 via ADODB.Stream (FileSystemObject ne sait pas
@@ -439,6 +474,7 @@ Private Function WriteHTA(ByVal message As String, ByVal borderColor As String, 
     stm.SaveToFile htaPath, 2    ' adSaveCreateOverWrite
     stm.Close
 
+    RememberHta htaPath, durationMs
     WriteHTA = htaPath
     Exit Function
 
@@ -446,5 +482,110 @@ ErrH:
     modDebugLog.DError MOD_NAME, "WriteHTA error " & Err.Number & _
         " - " & Err.Description
     WriteHTA = ""
+End Function
+
+' ---------------------------------------------------------------------
+' RememberHta / PurgeOldHta (v4.6 - audit 11/2026, F2-09)
+' Chaque HTA ecrit est note avec son echeance (fermeture prevue du toast
+' + HTA_KEEP_MS). Au toast suivant, seuls les fichiers dont l'echeance est
+' passee sont effaces ; un fichier encore tenu par un mshta (effacement
+' refuse) est retente au tour suivant. Premier toast de la session (ou
+' apres une remise a zero du projet VBA) : effacement des restes des
+' sessions precedentes (aucun toast de cette session n'est en cours).
+' Aucun Dir$ : la boucle Dir$ d'un appelant n'est jamais perturbee.
+' ---------------------------------------------------------------------
+Private Sub RememberHta(ByVal htaPath As String, ByVal durationMs As Long)
+    On Error Resume Next
+    If mHtaFiles Is Nothing Then Set mHtaFiles = New Collection
+    mHtaFiles.Add Array(modCommon.TickMs() + CDbl(durationMs) + HTA_KEEP_MS, htaPath)
+    Do While mHtaFiles.Count > HTA_LIST_MAX
+        mHtaFiles.Remove 1
+    Loop
+End Sub
+
+Private Sub PurgeOldHta(ByVal tempDir As String)
+    On Error Resume Next
+    If mHtaFiles Is Nothing Then
+        Set mHtaFiles = New Collection
+        Kill tempDir & "\" & HTA_PREFIX & "*.hta"
+        Err.Clear
+        Exit Sub
+    End If
+
+    Dim i As Long, v As Variant, nowMs As Double, e As Long
+    nowMs = modCommon.TickMs()
+    For i = mHtaFiles.Count To 1 Step -1
+        v = mHtaFiles(i)
+        If nowMs >= CDbl(v(0)) Then
+            Err.Clear
+            Kill CStr(v(1))
+            e = Err.Number
+            Err.Clear
+            ' 0 = efface ; 53 = deja absent. Autre (fichier encore ouvert
+            ' par mshta) : nouvel essai au prochain toast.
+            If e = 0 Or e = 53 Then mHtaFiles.Remove i
+        End If
+    Next i
+End Sub
+
+' ---------------------------------------------------------------------
+' IsRectVisibleOnScreen (v4.6 - audit 11/2026, F1-11)
+' Une fenetre placee a (leftPx, topPx) avec cette taille (pixels d'ecran,
+' comme Explorer.Left / Top / Width / Height) serait-elle utilisable sur
+' un ecran BRANCHE ? Vrai si sa bande de titre (40 px du haut) recoupe la
+' zone de travail d'un moniteur sur au moins 100 px de large (ou toute sa
+' largeur si elle est plus etroite) : la fenetre se voit et se saisit a la
+' souris. Faux si elle tomberait hors de tout ecran (position memorisee
+' sur un second ecran debranche, portable seul).
+' API passive (MonitorFromRect / GetMonitorInfo). En cas d'erreur : Vrai
+' (on ne refuse pas un placement sur un simple doute).
+' Exemple (ThisOutlookSession, avant d'appliquer une position memorisee) :
+'     If Not modNotify.IsRectVisibleOnScreen(l, t, w, h) Then Exit Sub
+' ---------------------------------------------------------------------
+Public Function IsRectVisibleOnScreen(ByVal leftPx As Long, ByVal topPx As Long, _
+                                      ByVal widthPx As Long, ByVal heightPx As Long) As Boolean
+    On Error GoTo ErrH
+    IsRectVisibleOnScreen = False
+    If widthPx <= 0 Or heightPx <= 0 Then Exit Function
+
+    Dim r As RECT, band As Long
+    band = VISIBLE_BAND_PX
+    If heightPx < band Then band = heightPx
+    r.Left = leftPx
+    r.Top = topPx
+    r.Right = leftPx + widthPx
+    r.Bottom = topPx + band
+
+    Dim hMon As LongPtr
+    hMon = MonitorFromRect(r, MONITOR_DEFAULTTONULL)
+    If hMon = 0 Then Exit Function
+
+    Dim mi As MONITORINFO
+    mi.cbSize = Len(mi)
+    If GetMonitorInfo(hMon, mi) = 0 Then
+        IsRectVisibleOnScreen = True      ' un ecran recoupe, detail illisible
+        Exit Function
+    End If
+
+    Dim ix As Long, iy As Long, needW As Long
+    ix = MinL(r.Right, mi.rcWork.Right) - MaxL(r.Left, mi.rcWork.Left)
+    iy = MinL(r.Bottom, mi.rcWork.Bottom) - MaxL(r.Top, mi.rcWork.Top)
+    needW = VISIBLE_MIN_W_PX
+    If widthPx < needW Then needW = widthPx
+    IsRectVisibleOnScreen = (ix >= needW And iy > 0)
+    Exit Function
+
+ErrH:
+    modDebugLog.DError MOD_NAME, "IsRectVisibleOnScreen error " & Err.Number & _
+        " - " & Err.Description
+    IsRectVisibleOnScreen = True
+End Function
+
+Private Function MinL(ByVal x As Long, ByVal y As Long) As Long
+    If x < y Then MinL = x Else MinL = y
+End Function
+
+Private Function MaxL(ByVal x As Long, ByVal y As Long) As Long
+    If x > y Then MaxL = x Else MaxL = y
 End Function
 
